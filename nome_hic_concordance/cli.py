@@ -83,8 +83,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Read processing
     parser.add_argument("--trim-ends", type=int, default=5,
                         help="Bases to trim from read ends (default: 5).")
-    parser.add_argument("--mapq-min", type=int, default=20,
-                        help="Minimum mapping quality (default: 20).")
+    parser.add_argument("--mapq-min", type=int, default=30,
+                        help="Minimum mapping quality on both ends (default: 30).")
 
     # EM fitting options
     parser.add_argument("--em-subsample", type=int, default=10_000_000,

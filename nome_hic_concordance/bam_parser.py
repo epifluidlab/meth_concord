@@ -121,7 +121,7 @@ def parse_cell_bam(
     bam_path: str,
     context_positions: dict[str, np.ndarray],
     trim_ends: int = 5,
-    mapq_min: int = 20,
+    mapq_min: int = 30,
 ) -> pd.DataFrame:
     """Parse a single cell's BAM into a DataFrame of read-pair context counts.
 
@@ -135,12 +135,24 @@ def parse_cell_bam(
     trim_ends : int
         Bases to trim from each read end.
     mapq_min : int
-        Minimum mapping quality.
+        Minimum mapping quality. **Both** ends of a pair must meet this
+        threshold (default: 30).
 
     Returns
     -------
     DataFrame with columns ``chrom, pos1, k1, n1, pos2, k2, n2, distance``.
-    Only intra-chromosomal, properly-paired, primary alignments are kept.
+
+    Filtering applied to every read before buffering:
+      - unmapped or mate-unmapped → skip
+      - secondary or supplementary → skip
+      - PCR / optical duplicate (``is_duplicate``) → skip
+      - not properly paired → skip
+      - inter-chromosomal → skip
+      - MAPQ < ``mapq_min`` → skip
+
+    After pairing, an additional check ensures that **both** mates satisfy
+    MAPQ ≥ ``mapq_min`` (the per-read filter already covers the first-seen
+    mate, but the second mate's MAPQ is verified here for safety).
     """
     import pysam
 
@@ -156,6 +168,8 @@ def parse_cell_bam(
                 continue
             if read.is_secondary or read.is_supplementary:
                 continue
+            if read.is_duplicate:
+                continue
             if read.mapping_quality < mapq_min:
                 continue
             if not read.is_proper_pair:
@@ -170,6 +184,14 @@ def parse_cell_bam(
                 # bounds memory in pathological cases where a read's mate is
                 # far downstream.
                 read_buffer[qname] = read
+                continue
+
+            # Both ends must be uniquely mapped with MAPQ >= mapq_min.
+            # The per-read filter above already guarantees the current read
+            # passes, but the buffered mate was only checked when *it* was
+            # the loop variable.  Re-check here in case the mate's flags or
+            # MAPQ changed between buffering and now (defensive).
+            if mate.mapping_quality < mapq_min:
                 continue
 
             # Order so r1 has the smaller reference_start (deterministic).
@@ -220,7 +242,7 @@ def parse_all_cells(
     output_dir: str,
     n_threads: int = 4,
     trim_ends: int = 5,
-    mapq_min: int = 20,
+    mapq_min: int = 30,
     **_unused_kwargs,
 ) -> dict[str, str]:
     """Parse all cell BAMs in parallel and save per-cell parquet outputs.
@@ -235,6 +257,7 @@ def parse_all_cells(
         Directory for ``{cell_name}.read_pairs.parquet`` outputs.
     n_threads : int
     trim_ends, mapq_min : int
+        ``mapq_min`` applies to **both** ends of a pair (default: 30).
 
     Returns
     -------
