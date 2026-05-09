@@ -201,14 +201,11 @@ def run_context(
         logger.info(f"Step 3: Fitting beta-binomial mixture for {context}")
         logger.info("=" * 60)
 
-        all_pairs = pd.concat(
-            [pd.read_parquet(p, columns=["k1", "n1", "k2", "n2", "distance"])
-             for p in cell_parquets.values()],
-            ignore_index=True,
-        )
-
-        fit_results = mixture_model.fit_and_compare(
-            all_pairs,
+        # Stream-subsample: reads one cell at a time instead of loading all
+        # parquets into memory.  Peak RAM ≈ one parquet + subsample pool
+        # (~400 MB) instead of ~60–95 GB for the full concatenation.
+        fit_results = mixture_model.fit_and_compare_from_parquets(
+            cell_parquets,
             short_range_max=args.short_range_max,
             min_distance=args.min_distance,
             output_dir=str(mixture_dir),

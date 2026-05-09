@@ -350,8 +350,244 @@ class BetaBinomialMixture:
 
 
 # ---------------------------------------------------------------------------
+# Streaming subsample — reads one cell at a time to avoid loading all parquets
+# ---------------------------------------------------------------------------
+
+
+def stream_subsample_from_parquets(
+    cell_parquet_paths: dict[str, str],
+    max_subsample: int = 10_000_000,
+    short_range_max: int = 1_000,
+    min_distance: int = 20_000,
+    random_state: int = 42,
+) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict]:
+    """Stream through per-cell parquets, drawing a proportional sample per cell.
+
+    Only one cell's data is in memory at a time, so peak RAM is bounded by
+    the size of a single parquet plus the accumulated subsample (~160 MB for
+    10M read ends).
+
+    The per-cell quota is set slightly above ``max_subsample / n_cells`` to
+    allow the final n-stratified pass in :func:`subsample_for_em` to trim
+    precisely.
+
+    Parameters
+    ----------
+    cell_parquet_paths : dict
+        Mapping ``cell_name -> parquet path``.
+    max_subsample : int
+        Target number of read ends per distance subset.
+    short_range_max, min_distance : int
+        Distance thresholds for the short/long subsets.
+    random_state : int
+
+    Returns
+    -------
+    (subsampled, subsample_log)
+
+    subsampled : dict
+        ``{subset_name: (k_array, n_array)}`` with <= ``max_subsample`` entries
+        each, already n-stratified.
+    subsample_log : dict
+        Per-subset metadata (original and used counts).
+    """
+    n_cells = len(cell_parquet_paths)
+    if n_cells == 0:
+        empty = np.array([], dtype=float)
+        return {"all": (empty, empty), "short": (empty, empty), "long": (empty, empty)}, {}
+
+    # 20% headroom so the final n-stratified trim has enough material.
+    per_cell_quota = int(np.ceil(max_subsample * 1.2 / n_cells))
+    rng = np.random.RandomState(random_state)
+
+    # Accumulators: lists of small arrays, concatenated at the end.
+    collectors: dict[str, tuple[list, list]] = {
+        "all": ([], []),
+        "short": ([], []),
+        "long": ([], []),
+    }
+    total_ends: dict[str, int] = {"all": 0, "short": 0, "long": 0}
+
+    for cell_name, parquet_path in cell_parquet_paths.items():
+        df = pd.read_parquet(
+            parquet_path, columns=["k1", "n1", "k2", "n2", "distance"],
+        )
+        if len(df) == 0:
+            continue
+
+        # Stack both ends.  Each pair contributes two read ends.
+        k_both = np.concatenate([df["k1"].values, df["k2"].values]).astype(float)
+        n_both = np.concatenate([df["n1"].values, df["n2"].values]).astype(float)
+
+        # The distance array must be duplicated to match (one copy per end).
+        dist = np.concatenate([df["distance"].values, df["distance"].values]).astype(float)
+
+        # Drop uninformative ends.
+        valid = n_both >= 1
+        k_both, n_both, dist = k_both[valid], n_both[valid], dist[valid]
+
+        # Assign each read end to the applicable distance subsets.
+        masks: dict[str, np.ndarray] = {
+            "all": np.ones(len(k_both), dtype=bool),
+            "short": dist < short_range_max,
+            "long": dist >= min_distance,
+        }
+
+        for subset, mask in masks.items():
+            k_sub = k_both[mask]
+            n_sub = n_both[mask]
+            total_ends[subset] += len(k_sub)
+
+            if len(k_sub) == 0:
+                continue
+
+            # Draw at most per_cell_quota from this cell for this subset.
+            if len(k_sub) > per_cell_quota:
+                idx = rng.choice(len(k_sub), per_cell_quota, replace=False)
+                k_sub = k_sub[idx]
+                n_sub = n_sub[idx]
+
+            collectors[subset][0].append(k_sub)
+            collectors[subset][1].append(n_sub)
+
+        del df, k_both, n_both, dist  # free eagerly
+
+    # Concatenate per-subset pools, then apply final n-stratified subsample.
+    subsampled: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    subsample_log: dict[str, dict] = {}
+
+    for subset in ("all", "short", "long"):
+        k_parts, n_parts = collectors[subset]
+        if not k_parts:
+            subsampled[subset] = (np.array([], dtype=float), np.array([], dtype=float))
+            subsample_log[subset] = {
+                "original_read_ends": 0, "used_read_ends": 0, "subsampled": False,
+            }
+            continue
+
+        k_pool = np.concatenate(k_parts)
+        n_pool = np.concatenate(n_parts)
+        del k_parts, n_parts  # free the lists
+
+        pool_size = len(k_pool)
+        k_pool, n_pool = subsample_for_em(k_pool, n_pool, max_subsample, random_state)
+
+        subsampled[subset] = (k_pool, n_pool)
+        subsample_log[subset] = {
+            "original_read_ends": int(total_ends[subset]),
+            "pool_before_stratify": int(pool_size),
+            "used_read_ends": int(len(k_pool)),
+            "subsampled": bool(total_ends[subset] > len(k_pool)),
+        }
+
+    return subsampled, subsample_log
+
+
+# ---------------------------------------------------------------------------
 # Three-subset fit + comparison diagnostic
 # ---------------------------------------------------------------------------
+
+
+def fit_and_compare_from_parquets(
+    cell_parquet_paths: dict[str, str],
+    short_range_max: int = 1_000,
+    min_distance: int = 20_000,
+    output_dir: str = "output/03_mixture_model",
+    max_subsample: int = 10_000_000,
+    random_state: int = 42,
+    max_iter: int = 200,
+    tol: float = 1e-6,
+    n_restarts: int = 5,
+) -> dict:
+    """Fit mixture on three distance subsets using streaming subsampling.
+
+    Memory-efficient alternative to :func:`fit_and_compare`.  Instead of
+    loading all parquets into a single DataFrame, this streams through each
+    cell's parquet once (peak RAM ≈ one parquet + the subsample pool).
+
+    Parameters
+    ----------
+    cell_parquet_paths : dict
+        Mapping ``cell_name -> parquet path``.
+    short_range_max, min_distance : int
+        Thresholds for the short- and long-range subsets (bp).
+    output_dir : str
+    max_subsample, random_state, max_iter, tol, n_restarts :
+        Passed through to EM fitting.
+
+    Returns
+    -------
+    dict with keys ``models`` and ``comparison``.
+    """
+    out_path = ensure_dir(output_dir)
+
+    logger.info(
+        f"Stream-subsampling from {len(cell_parquet_paths)} cell parquets "
+        f"(target {max_subsample:,} read ends per subset)..."
+    )
+    subsampled, subsample_log = stream_subsample_from_parquets(
+        cell_parquet_paths,
+        max_subsample=max_subsample,
+        short_range_max=short_range_max,
+        min_distance=min_distance,
+        random_state=random_state,
+    )
+
+    with open(out_path / "subsample_log.json", "w") as f:
+        json.dump(subsample_log, f, indent=2)
+
+    results: dict[str, BetaBinomialMixture] = {}
+
+    for name in ("all", "short", "long"):
+        k_arr, n_arr = subsampled[name]
+        if len(k_arr) == 0:
+            logger.warning(f"Subset '{name}' is empty; skipping EM fit.")
+            continue
+
+        logger.info(f"\nFitting mixture on '{name}' subset ({len(k_arr):,} read ends)...")
+        model = BetaBinomialMixture(
+            max_iter=max_iter, tol=tol, n_restarts=n_restarts, random_state=random_state,
+        )
+        model.fit(k_arr, n_arr)
+        results[name] = model
+
+        with open(out_path / f"em_fit_{name}.json", "w") as f:
+            json.dump(model.to_dict(), f, indent=2)
+
+    comparison = {
+        name: {
+            "mean_closed": float(m.alpha_[0] / (m.alpha_[0] + m.beta_[0])),
+            "mean_accessible": float(m.alpha_[1] / (m.alpha_[1] + m.beta_[1])),
+            "od_closed": float(1.0 / (m.alpha_[0] + m.beta_[0] + 1.0)),
+            "od_accessible": float(1.0 / (m.alpha_[1] + m.beta_[1] + 1.0)),
+            "pi": float(m.pi_),
+        }
+        for name, m in results.items()
+    }
+
+    for param in ("mean_closed", "mean_accessible"):
+        vals = [comparison[s][param] for s in comparison]
+        if len(vals) >= 2:
+            spread = max(vals) - min(vals)
+            if spread > 0.05:
+                logger.warning(
+                    f"  WARNING: {param} differs by {spread:.3f} across subsets — "
+                    f"investigate possible technical bias between short/long-range pairs."
+                )
+
+    with open(out_path / "mixture_comparison.json", "w") as f:
+        json.dump(comparison, f, indent=2)
+
+    try:
+        _plot_mixture_comparison(comparison, out_path)
+        # Use the "all" subsample for the density overlay — it's already the
+        # right size for a histogram (~10M points).
+        k_all, n_all = subsampled.get("all", (np.array([]), np.array([])))
+        _plot_mixture_fit_density_from_arrays(results, k_all, n_all, out_path)
+    except Exception as exc:
+        logger.warning(f"Failed to generate mixture diagnostic plots: {exc}")
+
+    return {"models": results, "comparison": comparison}
 
 
 def fit_and_compare(
@@ -365,22 +601,13 @@ def fit_and_compare(
     tol: float = 1e-6,
     n_restarts: int = 5,
 ) -> dict:
-    """Fit mixture on three subsets (all / short / long) and compare parameters.
+    """Fit mixture on three subsets from an in-memory DataFrame.
 
-    Parameters
-    ----------
-    all_read_ends : DataFrame
-        Must contain columns ``k1, n1, k2, n2, distance``.
-    short_range_max, min_distance : int
-        Thresholds for short- and long-range subsets (bp).
-    output_dir : str
-        Destination for JSON summaries and diagnostic plots.
-    max_subsample : int
-        Upper bound on read ends used for fitting each subset.
+    .. note::
 
-    Returns
-    -------
-    dict with keys ``models`` (name -> fitted model) and ``comparison``.
+       For large datasets (hundreds of cells), prefer
+       :func:`fit_and_compare_from_parquets` which streams through cells
+       one at a time and uses ~100× less RAM.
     """
     out_path = ensure_dir(output_dir)
 
@@ -439,7 +666,6 @@ def fit_and_compare(
         for name, m in results.items()
     }
 
-    # Warn on divergence between subsets.
     for param in ("mean_closed", "mean_accessible"):
         vals = [comparison[s][param] for s in comparison]
         if len(vals) >= 2:
@@ -453,11 +679,12 @@ def fit_and_compare(
     with open(out_path / "mixture_comparison.json", "w") as f:
         json.dump(comparison, f, indent=2)
 
-    # Optional plots: keep these best-effort; a missing matplotlib backend
-    # should not crash the pipeline.
     try:
         _plot_mixture_comparison(comparison, out_path)
-        _plot_mixture_fit_density(results, all_read_ends, out_path)
+        k_obs = np.concatenate([all_read_ends["k1"].values, all_read_ends["k2"].values])
+        n_obs = np.concatenate([all_read_ends["n1"].values, all_read_ends["n2"].values])
+        mask = n_obs >= 1
+        _plot_mixture_fit_density_from_arrays(results, k_obs[mask], n_obs[mask], out_path)
     except Exception as exc:
         logger.warning(f"Failed to generate mixture diagnostic plots: {exc}")
 
@@ -597,24 +824,23 @@ def _plot_mixture_comparison(comparison: dict, out_path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_mixture_fit_density(
+def _plot_mixture_fit_density_from_arrays(
     models: dict[str, BetaBinomialMixture],
-    all_read_ends: pd.DataFrame,
+    k_all: np.ndarray,
+    n_all: np.ndarray,
     out_path: Path,
 ) -> None:
-    """Overlay fitted mixture densities on observed k/n histograms for small n."""
+    """Overlay fitted mixture densities on observed k/n histograms for small n.
+
+    Accepts pre-stacked, pre-filtered ``(k, n)`` arrays (e.g. from the
+    stream-subsampled pool) so no full DataFrame is needed in memory.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if not models:
+    if not models or len(k_all) == 0:
         return
-
-    # Stack both ends.
-    k_all = np.concatenate([all_read_ends["k1"].values, all_read_ends["k2"].values])
-    n_all = np.concatenate([all_read_ends["n1"].values, all_read_ends["n2"].values])
-    mask = n_all >= 1
-    k_all, n_all = k_all[mask], n_all[mask]
 
     n_values = [3, 5, 10, 20]
     fig, axes = plt.subplots(1, len(n_values), figsize=(4 * len(n_values), 3.5), sharey=False)

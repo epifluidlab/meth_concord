@@ -1,8 +1,9 @@
-"""Unit tests for BetaBinomialMixture and subsample_for_em."""
+"""Unit tests for BetaBinomialMixture, subsample_for_em, and stream_subsample."""
 
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 from scipy.stats import betabinom as sp_betabinom
 
@@ -173,3 +174,92 @@ def test_fit_raises_on_empty():
     model = BetaBinomialMixture()
     with pytest.raises(ValueError):
         model.fit(np.array([]), np.array([]))
+
+
+# ---------------------------------------------------------------------------
+# stream_subsample_from_parquets tests
+# ---------------------------------------------------------------------------
+
+
+def test_stream_subsample_respects_max_subsample(tmp_path):
+    """Streaming subsample should produce <= max_subsample read ends per subset."""
+    from nome_hic_concordance.mixture_model import stream_subsample_from_parquets
+
+    rng = np.random.default_rng(0)
+    cell_paths = {}
+    for i in range(10):
+        n_pairs = 5_000
+        df = pd.DataFrame({
+            "chrom": "chr1",
+            "pos1": rng.integers(0, 1_000_000, n_pairs),
+            "k1": rng.integers(0, 6, n_pairs).astype(np.int32),
+            "n1": np.full(n_pairs, 5, dtype=np.int32),
+            "pos2": rng.integers(0, 1_000_000, n_pairs),
+            "k2": rng.integers(0, 6, n_pairs).astype(np.int32),
+            "n2": np.full(n_pairs, 5, dtype=np.int32),
+            "distance": rng.integers(100, 50_000, n_pairs).astype(np.int64),
+        })
+        path = str(tmp_path / f"cell_{i}.parquet")
+        df.to_parquet(path, index=False)
+        cell_paths[f"cell_{i}"] = path
+
+    # 10 cells × 5000 pairs × 2 ends = 100K total read ends.
+    # Request max 20K.
+    subsampled, log = stream_subsample_from_parquets(
+        cell_paths, max_subsample=20_000, random_state=42,
+    )
+
+    assert len(subsampled["all"][0]) <= 20_000
+    assert len(subsampled["all"][1]) <= 20_000
+    assert log["all"]["original_read_ends"] == 100_000
+    assert log["all"]["used_read_ends"] <= 20_000
+
+
+def test_stream_subsample_distance_subsets(tmp_path):
+    """Short and long subsets should only contain pairs from the right distance range."""
+    from nome_hic_concordance.mixture_model import stream_subsample_from_parquets
+
+    # All pairs have distance exactly 500 (short) or 30_000 (long).
+    df_short = pd.DataFrame({
+        "chrom": "chr1", "pos1": np.arange(100), "pos2": np.arange(100) + 500,
+        "k1": np.ones(100, dtype=np.int32), "n1": np.full(100, 5, dtype=np.int32),
+        "k2": np.ones(100, dtype=np.int32), "n2": np.full(100, 5, dtype=np.int32),
+        "distance": np.full(100, 500, dtype=np.int64),
+    })
+    df_long = pd.DataFrame({
+        "chrom": "chr1", "pos1": np.arange(100), "pos2": np.arange(100) + 30_000,
+        "k1": np.ones(100, dtype=np.int32), "n1": np.full(100, 5, dtype=np.int32),
+        "k2": np.ones(100, dtype=np.int32), "n2": np.full(100, 5, dtype=np.int32),
+        "distance": np.full(100, 30_000, dtype=np.int64),
+    })
+
+    p1 = str(tmp_path / "short_cell.parquet")
+    p2 = str(tmp_path / "long_cell.parquet")
+    df_short.to_parquet(p1, index=False)
+    df_long.to_parquet(p2, index=False)
+
+    subsampled, log = stream_subsample_from_parquets(
+        {"short_cell": p1, "long_cell": p2},
+        max_subsample=10_000_000,
+        short_range_max=1_000,
+        min_distance=20_000,
+        random_state=0,
+    )
+
+    assert log["all"]["original_read_ends"] == 400   # 200 pairs × 2 ends
+    assert log["short"]["original_read_ends"] == 200  # 100 short pairs × 2 ends
+    assert log["long"]["original_read_ends"] == 200   # 100 long pairs × 2 ends
+
+    # Verify sizes match expectations (no subsampling needed at this scale).
+    assert len(subsampled["short"][0]) == 200
+    assert len(subsampled["long"][0]) == 200
+    assert len(subsampled["all"][0]) == 400
+
+
+def test_stream_subsample_empty_input():
+    from nome_hic_concordance.mixture_model import stream_subsample_from_parquets
+
+    subsampled, log = stream_subsample_from_parquets({})
+    assert len(subsampled["all"][0]) == 0
+    assert len(subsampled["short"][0]) == 0
+    assert len(subsampled["long"][0]) == 0
