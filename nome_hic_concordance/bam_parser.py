@@ -37,6 +37,14 @@ from .utils import ensure_dir
 
 logger = logging.getLogger(__name__)
 
+# Try to import the C++/htslib extension.  If available it replaces the
+# pure-Python BAM parser with a ~10–15× faster implementation.
+try:
+    from . import _bam_parser_core  # type: ignore[attr-defined]
+    _CPP_AVAILABLE = True
+except ImportError:
+    _CPP_AVAILABLE = False
+
 # BAM flag bits — combined into a single skip-mask for fast filtering.
 _FLAG_UNMAPPED       = 0x4
 _FLAG_MATE_UNMAPPED  = 0x8
@@ -174,32 +182,48 @@ def _count_context_in_read(
 # ---------------------------------------------------------------------------
 
 
-def parse_cell_bam(
+def _parse_cell_bam_cpp(
     bam_path: str,
     context_positions: dict[str, np.ndarray],
     trim_ends: int = 5,
     mapq_min: int = 30,
 ) -> pd.DataFrame:
-    """Parse a single cell's BAM into a DataFrame of read-pair context counts.
+    """Parse a BAM using the C++/htslib backend (fast path)."""
+    # The C++ function expects {chrom: (pos_array, ref_base_array)}.
+    cpp_ctx = {
+        chrom: (arr["pos"], arr["ref_base"])
+        for chrom, arr in context_positions.items()
+        if len(arr) > 0
+    }
+    raw = _bam_parser_core.parse_cell_bam(bam_path, cpp_ctx, trim_ends, mapq_min)
+
+    n_pairs = len(raw["pos1"])
+    if n_pairs > 0:
+        df = pd.DataFrame({
+            "chrom": raw["chrom"],
+            "pos1": np.asarray(raw["pos1"], dtype=np.int64),
+            "k1": np.asarray(raw["k1"], dtype=np.int32),
+            "n1": np.asarray(raw["n1"], dtype=np.int32),
+            "pos2": np.asarray(raw["pos2"], dtype=np.int64),
+            "k2": np.asarray(raw["k2"], dtype=np.int32),
+            "n2": np.asarray(raw["n2"], dtype=np.int32),
+            "distance": np.asarray(raw["distance"], dtype=np.int64),
+        })
+    else:
+        df = pd.DataFrame(columns=READ_PAIR_COLUMNS)
+    return df
+
+
+def _parse_cell_bam_python(
+    bam_path: str,
+    context_positions: dict[str, np.ndarray],
+    trim_ends: int = 5,
+    mapq_min: int = 30,
+) -> pd.DataFrame:
+    """Parse a single cell's BAM using pure Python/pysam (fallback).
 
     Processes one chromosome at a time via ``bam.fetch(chrom)`` to bound
     the mate-pairing buffer.
-
-    Parameters
-    ----------
-    bam_path : str
-        Coordinate-sorted, indexed BAM.
-    context_positions : dict
-        ``chrom -> structured array`` with fields ``pos`` (int64) and
-        ``ref_base`` (uint8).
-    trim_ends : int
-        Bases to trim from each read end.
-    mapq_min : int
-        Both ends of a pair must have MAPQ >= this value (default: 30).
-
-    Returns
-    -------
-    DataFrame with columns ``chrom, pos1, k1, n1, pos2, k2, n2, distance``.
     """
     import pysam
     pysam.set_verbosity(0)
@@ -300,6 +324,38 @@ def parse_cell_bam(
     return df
 
 
+def parse_cell_bam(
+    bam_path: str,
+    context_positions: dict[str, np.ndarray],
+    trim_ends: int = 5,
+    mapq_min: int = 30,
+) -> pd.DataFrame:
+    """Parse a single cell's BAM into a DataFrame of read-pair context counts.
+
+    Automatically uses the C++/htslib backend if the extension was
+    compiled; otherwise falls back to the pure-Python/pysam implementation.
+
+    Parameters
+    ----------
+    bam_path : str
+        Coordinate-sorted, indexed BAM.
+    context_positions : dict
+        ``chrom -> structured array`` with fields ``pos`` (int64) and
+        ``ref_base`` (uint8).
+    trim_ends : int
+        Bases to trim from each read end.
+    mapq_min : int
+        Both ends of a pair must have MAPQ >= this value (default: 30).
+
+    Returns
+    -------
+    DataFrame with columns ``chrom, pos1, k1, n1, pos2, k2, n2, distance``.
+    """
+    if _CPP_AVAILABLE:
+        return _parse_cell_bam_cpp(bam_path, context_positions, trim_ends, mapq_min)
+    return _parse_cell_bam_python(bam_path, context_positions, trim_ends, mapq_min)
+
+
 def parse_all_cells(
     samples: pd.DataFrame,
     context_positions: dict[str, np.ndarray],
@@ -331,6 +387,8 @@ def parse_all_cells(
 
     out_path = ensure_dir(output_dir)
     total = len(samples)
+    backend = "C++/htslib" if _CPP_AVAILABLE else "Python/pysam"
+    logger.info(f"  BAM parser backend: {backend}")
 
     def _process_one(cell_idx: int, row) -> tuple[str, str, int]:
         import sys

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=61", "wheel", "pybind11>=2.10", "pysam>=0.21"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,6 +28,7 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "pybind11>=2.10",
 ]
 
 [project.scripts]
