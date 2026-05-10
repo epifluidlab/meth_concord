@@ -45,8 +45,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Required
     parser.add_argument("--samples", required=True,
                         help="Path to sample manifest TSV (cell_name, bam_path, [group]).")
-    parser.add_argument("--reference", required=True,
-                        help="Path to .2bit reference genome.")
+    parser.add_argument("--reference", default=None,
+                        help="Path to .2bit reference genome. Required when "
+                             "extracting contexts from the reference (no "
+                             "--context-bed). Optional when --context-bed is "
+                             "provided (chromosome sizes are read from the "
+                             "BAM headers instead).")
     parser.add_argument("--output-dir", required=True,
                         help="Output directory (will be created).")
 
@@ -199,12 +203,23 @@ def _parse_steps(spec: str) -> set[int]:
 
 
 def _get_chrom_sizes(reference_path: str) -> dict[str, int]:
+    """Read chromosome sizes from a .2bit reference."""
     import py2bit
     tb = py2bit.open(reference_path)
     try:
         return dict(tb.chroms())
     finally:
         tb.close()
+
+
+def _get_chrom_sizes_from_bam(bam_path: str) -> dict[str, int]:
+    """Read chromosome sizes from a BAM file's @SQ header lines."""
+    import pysam
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        return {
+            sq["SN"]: sq["LN"]
+            for sq in bam.header.to_dict().get("SQ", [])
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +470,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         contexts = [c.strip() for c in args.contexts.split(",") if c.strip()]
+        # Without --context-bed the .2bit reference is required for extraction.
+        if args.reference is None:
+            raise ValueError(
+                "--reference is required when not using --context-bed."
+            )
     if not contexts:
         raise ValueError("--contexts (or --context-bed) produced an empty list.")
 
@@ -482,7 +502,14 @@ def main(argv: list[str] | None = None) -> int:
             str(out / "01_context_extraction"), contexts
         )
 
-    chrom_sizes = _get_chrom_sizes(args.reference)
+    # Chromosome sizes — used for bin sorting in Step 5.
+    if args.reference is not None:
+        chrom_sizes = _get_chrom_sizes(args.reference)
+    else:
+        # Fall back to the first BAM file's @SQ header.
+        first_bam = samples["bam_path"].iloc[0]
+        logger.info(f"Reading chromosome sizes from BAM header: {first_bam}")
+        chrom_sizes = _get_chrom_sizes_from_bam(first_bam)
 
     # ---- Per-context processing (steps 2..7) -----------------------------
     for context in contexts:
