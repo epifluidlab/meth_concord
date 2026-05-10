@@ -110,13 +110,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def load_samples(path: str) -> pd.DataFrame:
-    """Load a TSV manifest: cell_name, bam_path, optional group."""
-    # Attempt to read; tolerate either 2 or 3 columns.
-    df = pd.read_csv(
-        path, sep="\t", header=None, comment="#",
-        names=["cell_name", "bam_path", "group"],
-        engine="python", dtype=str,
-    )
+    """Load a TSV manifest: cell_name, bam_path, optional group.
+
+    Accepts files with or without a header row.  If the first row looks
+    like a header (first field equals ``cell_name``), it is consumed as
+    column names; otherwise the file is treated as headerless.
+    """
+    # Peek at the first line to decide whether a header is present.
+    with open(path) as fh:
+        first_line = fh.readline().strip()
+    first_field = first_line.split("\t")[0].strip().lower()
+    has_header = first_field in ("cell_name", "cellname", "cell", "sample", "sample_name")
+
+    if has_header:
+        df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+        # Normalise column names coming from the header.
+        col_map = {c: c.strip().lower().replace(" ", "_") for c in df.columns}
+        df.rename(columns=col_map, inplace=True)
+        # Accept common synonyms.
+        if "cellname" in df.columns:
+            df.rename(columns={"cellname": "cell_name"}, inplace=True)
+        if "sample" in df.columns and "cell_name" not in df.columns:
+            df.rename(columns={"sample": "cell_name"}, inplace=True)
+        if "sample_name" in df.columns and "cell_name" not in df.columns:
+            df.rename(columns={"sample_name": "cell_name"}, inplace=True)
+    else:
+        df = pd.read_csv(
+            path, sep="\t", header=None, comment="#",
+            names=["cell_name", "bam_path", "group"],
+            engine="python", dtype=str,
+        )
+
+    if "bam_path" not in df.columns:
+        raise ValueError(
+            f"Sample manifest {path} must have a 'bam_path' column (or be a "
+            f"headerless TSV with columns: cell_name, bam_path, [group])."
+        )
 
     if "group" not in df.columns:
         df["group"] = "unknown"
