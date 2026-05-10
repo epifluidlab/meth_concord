@@ -295,6 +295,117 @@ def load_context_positions(
     return all_positions
 
 
+def load_context_from_bed(
+    bed_paths: dict[str, str],
+    chroms: Iterable[str] | None = None,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Load context positions from tabix-indexed BED files.
+
+    This is the fast alternative to :func:`extract_context_positions` when
+    the user already has pre-built GCH / HCG position files.
+
+    Parameters
+    ----------
+    bed_paths : dict
+        Mapping ``context_name -> path`` to a **bgzipped, tabix-indexed**
+        BED file (``*.bed.gz`` with a companion ``.tbi``).
+
+        Accepted BED formats (auto-detected per file):
+
+        * **4-column** ``chrom  start  end  strand_or_base``
+          where column 4 is ``+`` / ``-`` (strand) or ``C`` / ``G``
+          (reference base at the site).  ``+`` / ``C`` = plus-strand
+          cytosine;  ``-`` / ``G`` = minus-strand cytosine.
+        * **6-column (BED6)** ``chrom  start  end  name  score  strand``
+          where strand is in the standard column 6.
+        * **3-column** ``chrom  start  end`` — assumes all sites are
+          plus-strand cytosines (``ref_base='C'``).
+
+        Positions must be 0-based, half-open (standard BED).
+
+    chroms : iterable of str, optional
+        Restrict to these chromosomes. ``None`` loads all chromosomes
+        present in the tabix index.
+
+    Returns
+    -------
+    dict : context_name -> {chrom: structured array}
+    """
+    import pysam
+
+    all_positions: dict[str, dict[str, np.ndarray]] = {}
+
+    for ctx, bed_path in bed_paths.items():
+        logger.info(f"Loading {ctx} positions from {bed_path} ...")
+        tbx = pysam.TabixFile(str(bed_path))
+
+        if chroms is not None:
+            chrom_list = [c for c in chroms if c in tbx.contigs]
+        else:
+            chrom_list = list(tbx.contigs)
+
+        per_chrom: dict[str, np.ndarray] = {}
+        total_sites = 0
+
+        for chrom in chrom_list:
+            positions: list[int] = []
+            ref_bases: list[int] = []
+
+            for row in tbx.fetch(chrom):
+                fields = row.split("\t")
+                start = int(fields[1])  # 0-based BED start = the site position
+
+                # Determine ref_base from available columns.
+                ref_base_char = _parse_ref_base(fields)
+                positions.append(start)
+                ref_bases.append(ord(ref_base_char))
+
+            if positions:
+                arr = np.empty(len(positions), dtype=CONTEXT_DTYPE)
+                arr["pos"] = positions
+                arr["ref_base"] = ref_bases
+                arr.sort(order="pos")
+                per_chrom[chrom] = arr
+                total_sites += len(arr)
+            else:
+                per_chrom[chrom] = np.empty(0, dtype=CONTEXT_DTYPE)
+
+        tbx.close()
+        all_positions[ctx] = per_chrom
+        logger.info(
+            f"  {ctx}: {total_sites:,} sites across {len(chrom_list)} chromosomes"
+        )
+
+    return all_positions
+
+
+def _parse_ref_base(fields: list[str]) -> str:
+    """Determine the reference base (C or G) from a BED record's columns.
+
+    Supports 3-, 4-, and 6-column BED formats (see :func:`load_context_from_bed`).
+    """
+    n = len(fields)
+
+    # 6-column BED: strand is in column 6.
+    if n >= 6:
+        strand = fields[5].strip()
+        if strand == "+":
+            return "C"
+        if strand == "-":
+            return "G"
+
+    # 4+ columns: column 4 may be strand (+/-) or ref_base (C/G).
+    if n >= 4:
+        col4 = fields[3].strip()
+        if col4 in ("+", "C"):
+            return "C"
+        if col4 in ("-", "G"):
+            return "G"
+
+    # 3-column BED or unrecognised column 4: default to + strand.
+    return "C"
+
+
 def _chrom_from_npz(fname: str) -> str:
     """Parse the chromosome out of ``context_{ctx}.{chrom}.npz``."""
     # Strip leading 'context_' and trailing '.npz'

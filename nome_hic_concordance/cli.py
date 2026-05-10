@@ -79,6 +79,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Tabix-indexed dbSNP VCF for SNP filtering of context sites.")
     parser.add_argument("--contexts", type=str, default="GCH",
                         help='Comma-separated IUPAC cytosine contexts to analyse (default: "GCH").')
+    parser.add_argument(
+        "--context-bed", type=str, default=None,
+        help=(
+            "Load context positions from tabix-indexed BED files instead "
+            "of extracting from the .2bit reference (much faster). "
+            "Format: CONTEXT:PATH[,CONTEXT:PATH,...] e.g. "
+            '"GCH:/data/GCH.bed.gz" or '
+            '"GCH:/data/GCH.bed.gz,HCG:/data/HCG.bed.gz". '
+            "Each BED must be bgzipped with a .tbi index. "
+            "Accepted columns: (chrom, start, end, strand_or_refbase) "
+            "or standard BED6. When provided, Step 1 .2bit extraction "
+            "is skipped and --contexts is inferred from the BED paths."
+        ),
+    )
 
     # Read processing
     parser.add_argument("--trim-ends", type=int, default=5,
@@ -154,6 +168,26 @@ def load_samples(path: str) -> pd.DataFrame:
     n_groups = df["group"].nunique()
     logger.info(f"Loaded {len(df)} samples, {n_groups} group(s).")
     return df
+
+
+def _parse_context_bed(spec: str) -> dict[str, str]:
+    """Parse ``'GCH:/path/to/GCH.bed.gz,HCG:/path/to/HCG.bed.gz'`` into a dict."""
+    result: dict[str, str] = {}
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" not in token:
+            raise ValueError(
+                f"--context-bed entries must be CONTEXT:PATH, got {token!r}"
+            )
+        ctx, path = token.split(":", 1)
+        ctx = ctx.strip().upper()
+        path = path.strip()
+        if not path:
+            raise ValueError(f"Empty path for context {ctx!r} in --context-bed")
+        result[ctx] = path
+    return result
 
 
 def _parse_steps(spec: str) -> set[int]:
@@ -409,12 +443,29 @@ def main(argv: list[str] | None = None) -> int:
     logger.info(f"Running steps: {sorted(steps)}")
 
     samples = load_samples(args.samples)
-    contexts = [c.strip() for c in args.contexts.split(",") if c.strip()]
-    if not contexts:
-        raise ValueError("--contexts produced an empty list.")
 
-    # ---- Step 1: context extraction --------------------------------------
-    if 1 in steps:
+    # Resolve contexts: --context-bed overrides --contexts when provided.
+    context_bed_paths: dict[str, str] | None = None
+    if args.context_bed:
+        context_bed_paths = _parse_context_bed(args.context_bed)
+        contexts = list(context_bed_paths.keys())
+        logger.info(
+            f"Using pre-built BED files for contexts: "
+            + ", ".join(f"{c}={p}" for c, p in context_bed_paths.items())
+        )
+    else:
+        contexts = [c.strip() for c in args.contexts.split(",") if c.strip()]
+    if not contexts:
+        raise ValueError("--contexts (or --context-bed) produced an empty list.")
+
+    # ---- Step 1: context positions ----------------------------------------
+    if context_bed_paths is not None:
+        # Fast path: load from tabix-indexed BED files.
+        logger.info("=" * 60)
+        logger.info("Step 1: Loading context positions from BED files")
+        logger.info("=" * 60)
+        all_context_positions = reference.load_context_from_bed(context_bed_paths)
+    elif 1 in steps:
         logger.info("=" * 60)
         logger.info("Step 1: Extracting context positions from reference")
         logger.info("=" * 60)
