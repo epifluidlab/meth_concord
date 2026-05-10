@@ -345,7 +345,7 @@ def load_context_from_bed(
     bed_paths: dict[str, str],
     chroms: Iterable[str] | None = None,
     n_threads: int = 4,
-    c_offset: int = 1,
+    c_offset: int = 0,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Load context positions from tabix-indexed BED files.
 

@@ -98,13 +98,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--context-bed-offset", type=int, default=1,
+        "--context-bed-offset", type=int, default=0,
         help=(
-            "Offset from BED start (col 2) to the cytosine position. "
-            "Use 1 (default) when the BED start is the first base of the "
-            "trinucleotide motif (e.g. the G of GCH from seqkit locate), "
-            "so the C is at start+1. "
-            "Use 0 if the BED start already points at the C itself."
+            "Offset from BED start (col 2, 0-based) to the cytosine "
+            "position. Use 0 (default) when the BED interval already "
+            "spans the C itself (e.g. start=10481 end=10482 means C "
+            "is at 0-based position 10481). Use 1 if the BED start is "
+            "the first base of the full trinucleotide motif (the G of "
+            "GCH), so the C is at start+1."
         ),
     )
 
