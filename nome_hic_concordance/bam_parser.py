@@ -76,6 +76,69 @@ class ReadPairContext:
 
 
 # ---------------------------------------------------------------------------
+# Bisulfite conversion strand inference
+# ---------------------------------------------------------------------------
+
+# In non-directional bisulfite (bhmem), each read comes from either a
+# C→T or G→A conversion strand, but no tag records which.  A read from
+# the C→T strand is informative ONLY at ref=C sites (C=meth, T=unmeth);
+# at ref=G sites it always shows G (the unconverted reference base),
+# which would be falsely called "methylated" if counted.  The reverse
+# holds for G→A reads at ref=C sites.
+#
+# We infer the conversion direction per read by counting C→T vs G→A
+# mismatches between the read and the reference (reconstructed from the
+# MD tag via ``get_reference_sequence``).  The dominant mismatch type
+# tells us the conversion strand, and we only count context sites from
+# the matching strand.
+
+
+def _infer_conversion_strand(read) -> str:
+    """Infer whether *read* is from a C→T or G→A bisulfite conversion strand.
+
+    Counts C→T mismatches (ref=C, read=T) and G→A mismatches (ref=G,
+    read=A) across the full aligned span of the read.  The dominant
+    type determines the conversion direction.
+
+    Requires the MD tag in the BAM (present in calmd / MD-annotated BAMs).
+
+    Returns
+    -------
+    ``'CT'``, ``'GA'``, or ``'unknown'`` (if counts are tied or both zero).
+    """
+    seq = read.query_sequence
+    if seq is None:
+        return "unknown"
+
+    try:
+        ref_seq = read.get_reference_sequence()
+    except ValueError:
+        return "unknown"
+
+    if ref_seq is None:
+        return "unknown"
+
+    ct = 0
+    ga = 0
+    offset = read.query_alignment_start
+    ref_len = len(ref_seq)
+
+    for i in range(ref_len):
+        rb = ref_seq[i]
+        qb = seq[offset + i]
+        if rb == "C" and qb == "T":
+            ct += 1
+        elif rb == "G" and qb == "A":
+            ga += 1
+
+    if ct > ga:
+        return "CT"
+    elif ga > ct:
+        return "GA"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Per-read context counting
 # ---------------------------------------------------------------------------
 
@@ -88,10 +151,15 @@ def _count_context_in_read(
 ) -> tuple[int, int]:
     """Count methylated / total context sites covered by *read*.
 
-    Uses a tight Python loop rather than numpy vectorised ops because
-    the typical read covers only 5–15 context sites — at that scale
-    numpy's per-operation overhead (array creation, dtype casts)
-    exceeds the actual computation cost.
+    First infers the bisulfite conversion direction (C→T or G→A) from
+    the read's mismatch pattern, then counts only sites from the
+    matching strand:
+
+    * C→T reads → only ref=C sites are informative (C=meth, T=unmeth)
+    * G→A reads → only ref=G sites are informative (G=meth, A=unmeth)
+
+    Sites from the non-matching strand are skipped (they always show
+    the reference base and would be falsely called "methylated").
 
     Parameters
     ----------
@@ -122,31 +190,42 @@ def _count_context_in_read(
     if seq is None:
         return 0, 0
 
-    # Convert the small slice to Python lists — avoids numpy scalar
-    # overhead (~0.5 μs per element) in the inner loop.
-    site_positions = ctx_pos[i0:i1].tolist()   # 5–15 Python ints
+    # Determine which context sites are informative for this read.
+    strand = _infer_conversion_strand(read)
+    if strand == "CT":
+        informative_ref = 67   # ord('C') — only + strand sites
+    elif strand == "GA":
+        informative_ref = 71   # ord('G') — only − strand sites
+    else:
+        # Cannot determine strand (no mismatches, or tied).
+        # Skip this read — we can't tell which sites are real.
+        return 0, 0
+
+    # Convert the small slice to Python lists for fast element access.
+    site_positions = ctx_pos[i0:i1].tolist()
     site_ref_bases = ctx_ref_base[i0:i1].tolist()
 
     k = 0
     n = 0
 
-    # Fast indel check: two C int properties instead of iterating cigartuples.
     if read.reference_length == read.query_alignment_length:
-        # ---- Fast path: no indels (>90% of reads) ----
+        # ---- Fast path: no indels ----
         offset = read.query_alignment_start - read.reference_start
         seq_len = len(seq)
         for j in range(len(site_positions)):
+            rb = site_ref_bases[j]
+            if rb != informative_ref:
+                continue  # wrong strand for this read
             qp = site_positions[j] + offset
             if qp < 0 or qp >= seq_len:
                 continue
             base = seq[qp]
-            rb = site_ref_bases[j]
-            if rb == 67:    # ord('C'), + strand site
+            if rb == 67:    # ref=C, C→T strand
                 if base == "C":
                     k += 1; n += 1
                 elif base == "T":
                     n += 1
-            elif rb == 71:  # ord('G'), − strand site
+            elif rb == 71:  # ref=G, G→A strand
                 if base == "G":
                     k += 1; n += 1
                 elif base == "A":
@@ -158,11 +237,13 @@ def _count_context_in_read(
             for query_p, ref_p in read.get_aligned_pairs(matches_only=True)
         }
         for j in range(len(site_positions)):
+            rb = site_ref_bases[j]
+            if rb != informative_ref:
+                continue
             qp = pairs_dict.get(site_positions[j])
             if qp is None:
                 continue
             base = seq[qp]
-            rb = site_ref_bases[j]
             if rb == 67:
                 if base == "C":
                     k += 1; n += 1
