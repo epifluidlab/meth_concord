@@ -357,23 +357,34 @@ def parse_all_cells(
     def _process_one(cell_idx: int, row) -> tuple[str, str, int]:
         """Parse one cell and print progress to stderr.
 
-        ``logger.info()`` does not work from joblib/loky workers because
-        the logging handlers are not inherited.  ``print(..., file=stderr,
-        flush=True)`` writes directly to the file descriptor and is
-        always visible.
+        Uses ``print(file=stderr)`` instead of ``logger.info()`` because
+        joblib/loky workers don't inherit the parent's logging handlers.
         """
         import sys
+        import time
+
+        import pysam
+        # Suppress htslib's binary noise (the ^@ null bytes in logs).
+        pysam.set_verbosity(0)
 
         cell = row["cell_name"]
         bam = row["bam_path"]
+
+        print(
+            f"  [{cell_idx}/{total}] Starting {cell} ...",
+            file=sys.stderr, flush=True,
+        )
+
+        t0 = time.time()
         df = parse_cell_bam(bam, context_positions, trim_ends=trim_ends, mapq_min=mapq_min)
         parquet_path = str(out_path / f"{cell}.read_pairs.parquet")
         df.to_parquet(parquet_path, index=False)
         n_pairs = len(df)
+        elapsed = time.time() - t0
 
         print(
-            f"  [{cell_idx}/{total}] ({100 * cell_idx / total:.0f}%) "
-            f"{cell}: {n_pairs:,} pairs",
+            f"  [{cell_idx}/{total}] Done {cell}: "
+            f"{n_pairs:,} pairs ({elapsed:.0f}s)",
             file=sys.stderr, flush=True,
         )
         return cell, parquet_path, n_pairs
