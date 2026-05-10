@@ -60,6 +60,18 @@ class FakeRead:
         ref_positions = [p for _, p in self._aligned_pairs if p is not None]
         return max(ref_positions) + 1
 
+    @property
+    def reference_length(self) -> int:
+        """Sum of M/D/N/=/X operations on the reference."""
+        # ops consuming reference: M(0), D(2), N(3), =(7), X(8)
+        return sum(ln for op, ln in self.cigartuples if op in (0, 2, 3, 7, 8))
+
+    @property
+    def query_alignment_length(self) -> int:
+        """Sum of M/I/=/X operations on the query (excl. clips)."""
+        # ops consuming query: M(0), I(1), =(7), X(8)
+        return sum(ln for op, ln in self.cigartuples if op in (0, 1, 7, 8))
+
     def get_aligned_pairs(self, matches_only: bool = False):
         return list(self._aligned_pairs)
 

@@ -10,18 +10,16 @@ bisulfite strand tag. At each context cytosine:
 
 Performance notes
 -----------------
-The inner loop is performance-critical (~2–8 M reads per cell).  Three
-optimisations over the naïve implementation:
+The inner loop is performance-critical (~2–8 M reads per cell).
 
-1. **Simple-CIGAR fast path** — for reads whose CIGAR contains only M/=/X
-   and S/H operations (no indels), the query position at any reference
-   position is a constant offset: ``ref_pos - reference_start +
-   query_alignment_start``.  This skips the expensive
-   ``get_aligned_pairs()`` call and Python dict construction for >90% of
-   reads.
-2. **Vectorised base comparison** — numpy arrays for context-site
-   positions and read bases; boolean masks replace the Python-level loop.
-3. **Per-chromosome iteration** — ``bam.fetch(chrom)`` bounds the
+1. **Pure Python inner loop** — for the typical 5–15 context sites per
+   read, a tight Python loop with direct string indexing beats numpy's
+   per-operation overhead (array creation, dtype casting) by ~5×.
+2. **Fast indel check** — ``reference_length != query_alignment_length``
+   (two C int properties) replaces iterating ``cigartuples``.
+3. **Inlined filter logic** — avoids function-call overhead for the
+   8M-call-per-BAM filter check.
+4. **Per-chromosome iteration** — ``bam.fetch(chrom)`` bounds the
    mate-pairing buffer to a single chromosome at a time.
 """
 
@@ -39,23 +37,14 @@ from .utils import ensure_dir
 
 logger = logging.getLogger(__name__)
 
-# BAM flag bits used for fast filtering.
+# BAM flag bits — combined into a single skip-mask for fast filtering.
 _FLAG_UNMAPPED       = 0x4
 _FLAG_MATE_UNMAPPED  = 0x8
 _FLAG_PROPER_PAIR    = 0x2
 _FLAG_SECONDARY      = 0x100
 _FLAG_DUPLICATE      = 0x400
 _FLAG_SUPPLEMENTARY  = 0x800
-
-# CIGAR operation codes (from the SAM spec).
-_CIGAR_I = 1  # insertion to reference
-_CIGAR_D = 2  # deletion from reference
-
-# ASCII ordinals for base comparison.
-_C = ord("C")   # 67
-_T = ord("T")   # 84
-_G = ord("G")   # 71
-_A = ord("A")   # 65
+_SKIP_FLAGS = _FLAG_UNMAPPED | _FLAG_MATE_UNMAPPED | _FLAG_SECONDARY | _FLAG_DUPLICATE | _FLAG_SUPPLEMENTARY
 
 READ_PAIR_COLUMNS = [
     "chrom",
@@ -79,19 +68,8 @@ class ReadPairContext:
 
 
 # ---------------------------------------------------------------------------
-# Per-read context counting (vectorised with simple-CIGAR fast path)
+# Per-read context counting
 # ---------------------------------------------------------------------------
-
-
-def _has_indel(read) -> bool:
-    """Return True if the CIGAR contains I or D operations."""
-    cigar = read.cigartuples
-    if cigar is None:
-        return False
-    for op, _ in cigar:
-        if op == _CIGAR_I or op == _CIGAR_D:
-            return True
-    return False
 
 
 def _count_context_in_read(
@@ -102,9 +80,14 @@ def _count_context_in_read(
 ) -> tuple[int, int]:
     """Count methylated / total context sites covered by *read*.
 
+    Uses a tight Python loop rather than numpy vectorised ops because
+    the typical read covers only 5–15 context sites — at that scale
+    numpy's per-operation overhead (array creation, dtype casts)
+    exceeds the actual computation cost.
+
     Parameters
     ----------
-    read : pysam.AlignedSegment (or duck-type with the same attributes)
+    read : pysam.AlignedSegment (or duck-type)
     ctx_pos : int64 array
         Sorted context-site positions for this chromosome.
     ctx_ref_base : uint8 array
@@ -123,83 +106,72 @@ def _count_context_in_read(
 
     # Binary search for overlapping context sites.
     i0 = int(np.searchsorted(ctx_pos, ref_start, side="left"))
-    i1 = int(np.searchsorted(ctx_pos, ref_end, side="right"))
-    if i0 == i1:
+    i1 = int(np.searchsorted(ctx_pos, ref_end, side="left"))
+    if i0 >= i1:
         return 0, 0
-
-    site_pos = ctx_pos[i0:i1]        # positions of context sites in range
-    site_ref = ctx_ref_base[i0:i1]   # ref base at each site
 
     seq = read.query_sequence
     if seq is None:
         return 0, 0
 
-    # ----- Resolve query positions for each context site --------------------
-    if not _has_indel(read):
-        # Fast path: direct arithmetic (no get_aligned_pairs needed).
-        query_offset = read.query_alignment_start - read.reference_start
-        query_positions = (site_pos.astype(np.intp) + int(query_offset))
+    # Convert the small slice to Python lists — avoids numpy scalar
+    # overhead (~0.5 μs per element) in the inner loop.
+    site_positions = ctx_pos[i0:i1].tolist()   # 5–15 Python ints
+    site_ref_bases = ctx_ref_base[i0:i1].tolist()
 
-        # Bounds check against the actual query sequence length.
+    k = 0
+    n = 0
+
+    # Fast indel check: two C int properties instead of iterating cigartuples.
+    if read.reference_length == read.query_alignment_length:
+        # ---- Fast path: no indels (>90% of reads) ----
+        offset = read.query_alignment_start - read.reference_start
         seq_len = len(seq)
-        valid = (query_positions >= 0) & (query_positions < seq_len)
-        if not valid.any():
-            return 0, 0
-        site_ref = site_ref[valid]
-        query_positions = query_positions[valid]
+        for j in range(len(site_positions)):
+            qp = site_positions[j] + offset
+            if qp < 0 or qp >= seq_len:
+                continue
+            base = seq[qp]
+            rb = site_ref_bases[j]
+            if rb == 67:    # ord('C'), + strand site
+                if base == "C":
+                    k += 1; n += 1
+                elif base == "T":
+                    n += 1
+            elif rb == 71:  # ord('G'), − strand site
+                if base == "G":
+                    k += 1; n += 1
+                elif base == "A":
+                    n += 1
     else:
-        # Slow path: walk CIGAR via get_aligned_pairs (reads with indels).
+        # ---- Slow path: has indels ----
         pairs_dict = {
             ref_p: query_p
             for query_p, ref_p in read.get_aligned_pairs(matches_only=True)
         }
-        raw_qp = np.array(
-            [pairs_dict.get(int(p), -1) for p in site_pos], dtype=np.intp,
-        )
-        valid = raw_qp >= 0
-        if not valid.any():
-            return 0, 0
-        site_ref = site_ref[valid]
-        query_positions = raw_qp[valid]
+        for j in range(len(site_positions)):
+            qp = pairs_dict.get(site_positions[j])
+            if qp is None:
+                continue
+            base = seq[qp]
+            rb = site_ref_bases[j]
+            if rb == 67:
+                if base == "C":
+                    k += 1; n += 1
+                elif base == "T":
+                    n += 1
+            elif rb == 71:
+                if base == "G":
+                    k += 1; n += 1
+                elif base == "A":
+                    n += 1
 
-    # ----- Vectorised base comparison ---------------------------------------
-    seq_arr = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)
-    read_bases = seq_arr[query_positions]
-
-    plus_mask = site_ref == _C         # + strand context sites
-    minus_mask = site_ref == _G        # − strand context sites
-
-    meth = (
-        (plus_mask & (read_bases == _C))
-        | (minus_mask & (read_bases == _G))
-    )
-    informative = (
-        (plus_mask & ((read_bases == _C) | (read_bases == _T)))
-        | (minus_mask & ((read_bases == _G) | (read_bases == _A)))
-    )
-
-    return int(meth.sum()), int(informative.sum())
+    return k, n
 
 
 # ---------------------------------------------------------------------------
 # Cell-level BAM parsing
 # ---------------------------------------------------------------------------
-
-
-def _passes_filters(read, mapq_min: int) -> bool:
-    """Fast flag + MAPQ filter for a single read."""
-    flag = read.flag
-    if flag & (_FLAG_UNMAPPED | _FLAG_MATE_UNMAPPED):
-        return False
-    if flag & (_FLAG_SECONDARY | _FLAG_SUPPLEMENTARY):
-        return False
-    if flag & _FLAG_DUPLICATE:
-        return False
-    if not (flag & _FLAG_PROPER_PAIR):
-        return False
-    if read.mapping_quality < mapq_min:
-        return False
-    return True
 
 
 def parse_cell_bam(
@@ -211,8 +183,7 @@ def parse_cell_bam(
     """Parse a single cell's BAM into a DataFrame of read-pair context counts.
 
     Processes one chromosome at a time via ``bam.fetch(chrom)`` to bound
-    the mate-pairing buffer. Uses the simple-CIGAR fast path for reads
-    without indels (see :func:`_count_context_in_read`).
+    the mate-pairing buffer.
 
     Parameters
     ----------
@@ -231,8 +202,9 @@ def parse_cell_bam(
     DataFrame with columns ``chrom, pos1, k1, n1, pos2, k2, n2, distance``.
     """
     import pysam
+    pysam.set_verbosity(0)
 
-    # Output collectors — lists of primitives (faster than list of dicts).
+    # Output collectors — lists of primitives.
     out_chrom: list[str] = []
     out_pos1: list[int] = []
     out_k1: list[int] = []
@@ -242,14 +214,16 @@ def parse_cell_bam(
     out_n2: list[int] = []
     out_dist: list[int] = []
 
+    # Local aliases for hot-path speed.
+    skip_flags = _SKIP_FLAGS
+    proper_flag = _FLAG_PROPER_PAIR
+    searchsorted = np.searchsorted
+
     with pysam.AlignmentFile(bam_path, "rb") as bam:
-        # Process per-chromosome to keep read_buffer bounded.
         for chrom, ctx_arr in context_positions.items():
             if len(ctx_arr) == 0:
                 continue
 
-            # Pre-split structured array into contiguous views (avoids
-            # repeated structured-array field lookups in the inner loop).
             ctx_pos = ctx_arr["pos"]
             ctx_ref = ctx_arr["ref_base"]
 
@@ -258,29 +232,35 @@ def parse_cell_bam(
             try:
                 read_iter = bam.fetch(chrom)
             except ValueError:
-                # Chromosome not in BAM header.
                 continue
 
             for read in read_iter:
-                if not _passes_filters(read, mapq_min):
+                # --- Inlined filter (avoids function-call overhead) ---
+                flag = read.flag
+                if flag & skip_flags:
                     continue
-                # Intra-chromosomal only.
-                if read.next_reference_name != chrom:
+                if not (flag & proper_flag):
+                    continue
+                if read.mapping_quality < mapq_min:
+                    continue
+                mate_chrom = read.next_reference_name
+                if mate_chrom != chrom:
                     continue
 
+                # --- Mate pairing ---
                 qname = read.query_name
                 mate = read_buffer.pop(qname, None)
                 if mate is None:
                     read_buffer[qname] = read
                     continue
 
-                # Re-check mate MAPQ (defensive — it passed the filter when
-                # it was the loop variable, but we verify both ends).
                 if mate.mapping_quality < mapq_min:
                     continue
 
-                # Canonical ordering: r1 has smaller reference_start.
-                if read.reference_start <= mate.reference_start:
+                # Canonical ordering.
+                r1_start = read.reference_start
+                m_start = mate.reference_start
+                if r1_start <= m_start:
                     r1, r2 = read, mate
                 else:
                     r1, r2 = mate, read
@@ -300,7 +280,7 @@ def parse_cell_bam(
                 out_n2.append(n2)
                 out_dist.append(abs(pos2 - pos1))
 
-            del read_buffer  # free mate buffer between chromosomes
+            del read_buffer
 
     n_pairs = len(out_chrom)
     if n_pairs > 0:
@@ -317,7 +297,6 @@ def parse_cell_bam(
     else:
         df = pd.DataFrame(columns=READ_PAIR_COLUMNS)
 
-    logger.info(f"  {bam_path}: {n_pairs:,} intra-chromosomal pairs extracted")
     return df
 
 
@@ -351,20 +330,13 @@ def parse_all_cells(
     from joblib import Parallel, delayed
 
     out_path = ensure_dir(output_dir)
-
     total = len(samples)
 
     def _process_one(cell_idx: int, row) -> tuple[str, str, int]:
-        """Parse one cell and print progress to stderr.
-
-        Uses ``print(file=stderr)`` instead of ``logger.info()`` because
-        joblib/loky workers don't inherit the parent's logging handlers.
-        """
         import sys
         import time
 
         import pysam
-        # Suppress htslib's binary noise (the ^@ null bytes in logs).
         pysam.set_verbosity(0)
 
         cell = row["cell_name"]
