@@ -61,8 +61,10 @@ def subsample_for_em(
 
     Preserves the marginal distribution of coverage per read end so the
     mixture components are not biased toward low- or high-coverage ends.
+
+    Pass ``max_samples=0`` to disable subsampling (use all read ends).
     """
-    if len(k_all) <= max_samples:
+    if max_samples <= 0 or len(k_all) <= max_samples:
         return k_all, n_all
 
     rng = np.random.RandomState(random_state)
@@ -396,8 +398,12 @@ def stream_subsample_from_parquets(
         empty = np.array([], dtype=float)
         return {"all": (empty, empty), "short": (empty, empty), "long": (empty, empty)}, {}
 
-    # 20% headroom so the final n-stratified trim has enough material.
-    per_cell_quota = int(np.ceil(max_subsample * 1.2 / n_cells))
+    no_limit = max_subsample <= 0  # 0 = use all read ends, no subsampling
+    if no_limit:
+        per_cell_quota = 2**63  # effectively unlimited
+    else:
+        # 20% headroom so the final n-stratified trim has enough material.
+        per_cell_quota = int(np.ceil(max_subsample * 1.2 / n_cells))
     rng = np.random.RandomState(random_state)
 
     # Accumulators: lists of small arrays, concatenated at the end.
