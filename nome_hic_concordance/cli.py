@@ -97,6 +97,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "is skipped and --contexts is inferred from the BED paths."
         ),
     )
+    parser.add_argument(
+        "--context-bed-offset", type=int, default=1,
+        help=(
+            "Offset from BED start (col 2) to the cytosine position. "
+            "Use 1 (default) when the BED start is the first base of the "
+            "trinucleotide motif (e.g. the G of GCH from seqkit locate), "
+            "so the C is at start+1. "
+            "Use 0 if the BED start already points at the C itself."
+        ),
+    )
 
     # Read processing
     parser.add_argument("--trim-ends", type=int, default=5,
@@ -403,6 +413,17 @@ def run_context(
         logger.info(f"Step 7: Matrix processing + UMAP for {context}")
         logger.info("=" * 60)
 
+        if concordance_shrunk.shape[0] == 0 or concordance_shrunk.shape[1] == 0:
+            logger.warning(
+                "Concordance matrix is empty (0 cells or 0 bins). "
+                "This usually means no read pairs passed the filters "
+                "(--min-distance, --min-gch-sites). Check that the context "
+                "BED positions match the reference used for alignment, and "
+                "that --context-bed-offset is correct. Skipping matrix "
+                "processing and UMAP."
+            )
+            return
+
         matrices = matrix_ops.process_concordance_matrix(
             concordance_shrunk,
             min_cell_coverage=args.min_cell_coverage,
@@ -485,7 +506,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Step 1: Loading context positions from BED files")
         logger.info("=" * 60)
         all_context_positions = reference.load_context_from_bed(
-            context_bed_paths, n_threads=args.n_threads,
+            context_bed_paths,
+            n_threads=args.n_threads,
+            c_offset=args.context_bed_offset,
         )
     elif 1 in steps:
         logger.info("=" * 60)

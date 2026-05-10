@@ -295,11 +295,21 @@ def load_context_positions(
     return all_positions
 
 
-def _load_bed_chrom(bed_path: str, chrom: str) -> tuple[str, np.ndarray]:
+def _load_bed_chrom(
+    bed_path: str, chrom: str, c_offset: int = 1,
+) -> tuple[str, np.ndarray]:
     """Load context sites for one chromosome from a tabix-indexed BED.
 
     Each worker opens its own TabixFile handle (file handles cannot be
     shared across processes).
+
+    Parameters
+    ----------
+    c_offset : int
+        Offset from BED start to the cytosine position.  For a GCH motif
+        BED where column 2 is the G position, use ``c_offset=1`` so
+        ``pos = start + 1`` points to the C.  Use ``c_offset=0`` if
+        column 2 already points to the C itself.
     """
     import pysam
 
@@ -312,7 +322,10 @@ def _load_bed_chrom(bed_path: str, chrom: str) -> tuple[str, np.ndarray]:
             fields = row.split("\t")
             start = int(fields[1])
             ref_base_char = _parse_ref_base(fields)
-            positions.append(start)
+            # Apply offset: BED start is the motif start (e.g. the G of
+            # GCH), but we need the cytosine position.
+            pos = start + c_offset
+            positions.append(pos)
             ref_bases.append(ord(ref_base_char))
     finally:
         tbx.close()
@@ -332,6 +345,7 @@ def load_context_from_bed(
     bed_paths: dict[str, str],
     chroms: Iterable[str] | None = None,
     n_threads: int = 4,
+    c_offset: int = 1,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Load context positions from tabix-indexed BED files.
 
@@ -363,6 +377,13 @@ def load_context_from_bed(
         present in the tabix index.
     n_threads : int
         Number of parallel workers for per-chromosome loading.
+    c_offset : int
+        Offset from BED start (column 2) to the cytosine position.
+
+        * ``1`` **(default)** — BED start is the first base of the
+          trinucleotide motif (e.g. the G of GCH from ``seqkit locate``).
+          The cytosine is at ``start + 1``.
+        * ``0`` — BED start already points directly at the cytosine.
 
     Returns
     -------
@@ -374,7 +395,10 @@ def load_context_from_bed(
     all_positions: dict[str, dict[str, np.ndarray]] = {}
 
     for ctx, bed_path in bed_paths.items():
-        logger.info(f"Loading {ctx} positions from {bed_path} ...")
+        logger.info(
+            f"Loading {ctx} positions from {bed_path} "
+            f"(c_offset={c_offset}) ..."
+        )
 
         # Discover chromosomes from the tabix index.
         tbx = pysam.TabixFile(str(bed_path))
@@ -387,10 +411,10 @@ def load_context_from_bed(
         # Parallel per-chromosome loading.
         if n_threads > 1 and len(chrom_list) > 1:
             results = Parallel(n_jobs=n_threads)(
-                delayed(_load_bed_chrom)(bed_path, c) for c in chrom_list
+                delayed(_load_bed_chrom)(bed_path, c, c_offset) for c in chrom_list
             )
         else:
-            results = [_load_bed_chrom(bed_path, c) for c in chrom_list]
+            results = [_load_bed_chrom(bed_path, c, c_offset) for c in chrom_list]
 
         per_chrom: dict[str, np.ndarray] = {}
         total_sites = 0
