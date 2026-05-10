@@ -354,34 +354,39 @@ def parse_all_cells(
 
     total = len(samples)
 
-    def _process_one(row) -> tuple[str, str]:
+    def _process_one(cell_idx: int, row) -> tuple[str, str, int]:
+        """Parse one cell and print progress to stderr.
+
+        ``logger.info()`` does not work from joblib/loky workers because
+        the logging handlers are not inherited.  ``print(..., file=stderr,
+        flush=True)`` writes directly to the file descriptor and is
+        always visible.
+        """
+        import sys
+
         cell = row["cell_name"]
         bam = row["bam_path"]
         df = parse_cell_bam(bam, context_positions, trim_ends=trim_ends, mapq_min=mapq_min)
         parquet_path = str(out_path / f"{cell}.read_pairs.parquet")
         df.to_parquet(parquet_path, index=False)
-        return cell, parquet_path
+        n_pairs = len(df)
 
-    rows: Iterable = [row for _, row in samples.iterrows()]
-    results: list[tuple[str, str]] = []
+        print(
+            f"  [{cell_idx}/{total}] ({100 * cell_idx / total:.0f}%) "
+            f"{cell}: {n_pairs:,} pairs",
+            file=sys.stderr, flush=True,
+        )
+        return cell, parquet_path, n_pairs
+
+    rows = [(i + 1, row) for i, (_, row) in enumerate(samples.iterrows())]
 
     if n_threads > 1 and len(samples) > 1:
-        # return_as="generator" (joblib ≥ 1.3) yields results as they
-        # complete, letting us log a running progress counter.
-        gen = Parallel(n_jobs=n_threads, return_as="generator")(
-            delayed(_process_one)(row) for row in rows
+        raw = Parallel(n_jobs=n_threads)(
+            delayed(_process_one)(idx, row) for idx, row in rows
         )
-        for i, result in enumerate(gen, 1):
-            results.append(result)
-            logger.info(
-                f"  [{i}/{total}] ({100 * i / total:.0f}%) {result[0]} done"
-            )
     else:
-        for i, row in enumerate(rows, 1):
-            result = _process_one(row)
-            results.append(result)
-            logger.info(
-                f"  [{i}/{total}] ({100 * i / total:.0f}%) {result[0]} done"
-            )
+        raw = [_process_one(idx, row) for idx, row in rows]
 
-    return dict(results)
+    total_pairs = sum(r[2] for r in raw)
+    logger.info(f"  All {total} cells done — {total_pairs:,} total pairs")
+    return {cell: path for cell, path, _ in raw}
