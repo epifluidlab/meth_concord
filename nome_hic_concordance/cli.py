@@ -484,7 +484,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("=" * 60)
         logger.info("Step 1: Loading context positions from BED files")
         logger.info("=" * 60)
-        all_context_positions = reference.load_context_from_bed(context_bed_paths)
+        all_context_positions = reference.load_context_from_bed(
+            context_bed_paths, n_threads=args.n_threads,
+        )
     elif 1 in steps:
         logger.info("=" * 60)
         logger.info("Step 1: Extracting context positions from reference")

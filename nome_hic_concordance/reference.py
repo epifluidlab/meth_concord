@@ -295,14 +295,49 @@ def load_context_positions(
     return all_positions
 
 
+def _load_bed_chrom(bed_path: str, chrom: str) -> tuple[str, np.ndarray]:
+    """Load context sites for one chromosome from a tabix-indexed BED.
+
+    Each worker opens its own TabixFile handle (file handles cannot be
+    shared across processes).
+    """
+    import pysam
+
+    tbx = pysam.TabixFile(str(bed_path))
+    positions: list[int] = []
+    ref_bases: list[int] = []
+
+    try:
+        for row in tbx.fetch(chrom):
+            fields = row.split("\t")
+            start = int(fields[1])
+            ref_base_char = _parse_ref_base(fields)
+            positions.append(start)
+            ref_bases.append(ord(ref_base_char))
+    finally:
+        tbx.close()
+
+    if positions:
+        arr = np.empty(len(positions), dtype=CONTEXT_DTYPE)
+        arr["pos"] = positions
+        arr["ref_base"] = ref_bases
+        arr.sort(order="pos")
+    else:
+        arr = np.empty(0, dtype=CONTEXT_DTYPE)
+
+    return chrom, arr
+
+
 def load_context_from_bed(
     bed_paths: dict[str, str],
     chroms: Iterable[str] | None = None,
+    n_threads: int = 4,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Load context positions from tabix-indexed BED files.
 
     This is the fast alternative to :func:`extract_context_positions` when
-    the user already has pre-built GCH / HCG position files.
+    the user already has pre-built GCH / HCG position files.  Chromosomes
+    are loaded in parallel via ``joblib``.
 
     Parameters
     ----------
@@ -326,51 +361,43 @@ def load_context_from_bed(
     chroms : iterable of str, optional
         Restrict to these chromosomes. ``None`` loads all chromosomes
         present in the tabix index.
+    n_threads : int
+        Number of parallel workers for per-chromosome loading.
 
     Returns
     -------
     dict : context_name -> {chrom: structured array}
     """
     import pysam
+    from joblib import Parallel, delayed
 
     all_positions: dict[str, dict[str, np.ndarray]] = {}
 
     for ctx, bed_path in bed_paths.items():
         logger.info(f"Loading {ctx} positions from {bed_path} ...")
-        tbx = pysam.TabixFile(str(bed_path))
 
+        # Discover chromosomes from the tabix index.
+        tbx = pysam.TabixFile(str(bed_path))
         if chroms is not None:
             chrom_list = [c for c in chroms if c in tbx.contigs]
         else:
             chrom_list = list(tbx.contigs)
+        tbx.close()
+
+        # Parallel per-chromosome loading.
+        if n_threads > 1 and len(chrom_list) > 1:
+            results = Parallel(n_jobs=n_threads)(
+                delayed(_load_bed_chrom)(bed_path, c) for c in chrom_list
+            )
+        else:
+            results = [_load_bed_chrom(bed_path, c) for c in chrom_list]
 
         per_chrom: dict[str, np.ndarray] = {}
         total_sites = 0
+        for chrom, arr in results:
+            per_chrom[chrom] = arr
+            total_sites += len(arr)
 
-        for chrom in chrom_list:
-            positions: list[int] = []
-            ref_bases: list[int] = []
-
-            for row in tbx.fetch(chrom):
-                fields = row.split("\t")
-                start = int(fields[1])  # 0-based BED start = the site position
-
-                # Determine ref_base from available columns.
-                ref_base_char = _parse_ref_base(fields)
-                positions.append(start)
-                ref_bases.append(ord(ref_base_char))
-
-            if positions:
-                arr = np.empty(len(positions), dtype=CONTEXT_DTYPE)
-                arr["pos"] = positions
-                arr["ref_base"] = ref_bases
-                arr.sort(order="pos")
-                per_chrom[chrom] = arr
-                total_sites += len(arr)
-            else:
-                per_chrom[chrom] = np.empty(0, dtype=CONTEXT_DTYPE)
-
-        tbx.close()
         all_positions[ctx] = per_chrom
         logger.info(
             f"  {ctx}: {total_sites:,} sites across {len(chrom_list)} chromosomes"
