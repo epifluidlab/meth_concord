@@ -233,6 +233,9 @@ static py::dict parse_cell_bam_cpp(
     int trim_ends,
     int mapq_min)
 {
+    // Suppress htslib stderr noise (the ^@ null bytes).
+    hts_set_log_level(HTS_LOG_OFF);
+
     // Open BAM file.
     htsFile* fp = hts_open(bam_path.c_str(), "r");
     if (!fp) {

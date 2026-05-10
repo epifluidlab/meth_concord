@@ -394,8 +394,9 @@ def parse_all_cells(
         import sys
         import time
 
-        import pysam
-        pysam.set_verbosity(0)
+        if not _CPP_AVAILABLE:
+            import pysam
+            pysam.set_verbosity(0)
 
         cell = row["cell_name"]
         bam = row["bam_path"]
