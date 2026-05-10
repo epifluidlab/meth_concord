@@ -7,6 +7,22 @@ bisulfite strand tag. At each context cytosine:
     strand or contains a SNP/error).
   - Ref base 'G' (- strand site): read G = methylated, A = unmethylated,
     other bases (C, T, N) are skipped.
+
+Performance notes
+-----------------
+The inner loop is performance-critical (~2–8 M reads per cell).  Three
+optimisations over the naïve implementation:
+
+1. **Simple-CIGAR fast path** — for reads whose CIGAR contains only M/=/X
+   and S/H operations (no indels), the query position at any reference
+   position is a constant offset: ``ref_pos - reference_start +
+   query_alignment_start``.  This skips the expensive
+   ``get_aligned_pairs()`` call and Python dict construction for >90% of
+   reads.
+2. **Vectorised base comparison** — numpy arrays for context-site
+   positions and read bases; boolean masks replace the Python-level loop.
+3. **Per-chromosome iteration** — ``bam.fetch(chrom)`` bounds the
+   mate-pairing buffer to a single chromosome at a time.
 """
 
 from __future__ import annotations
@@ -23,6 +39,23 @@ from .utils import ensure_dir
 
 logger = logging.getLogger(__name__)
 
+# BAM flag bits used for fast filtering.
+_FLAG_UNMAPPED       = 0x4
+_FLAG_MATE_UNMAPPED  = 0x8
+_FLAG_PROPER_PAIR    = 0x2
+_FLAG_SECONDARY      = 0x100
+_FLAG_DUPLICATE      = 0x400
+_FLAG_SUPPLEMENTARY  = 0x800
+
+# CIGAR operation codes (from the SAM spec).
+_CIGAR_I = 1  # insertion to reference
+_CIGAR_D = 2  # deletion from reference
+
+# ASCII ordinals for base comparison.
+_C = ord("C")   # 67
+_T = ord("T")   # 84
+_G = ord("G")   # 71
+_A = ord("A")   # 65
 
 READ_PAIR_COLUMNS = [
     "chrom",
@@ -45,16 +78,39 @@ class ReadPairContext:
     distance: int  # genomic distance (bp) between midpoints
 
 
-def _count_context_in_read(read, context_sites_chrom, trim_ends: int = 5) -> tuple[int, int]:
-    """Count methylated / total context sites covered by a single read.
+# ---------------------------------------------------------------------------
+# Per-read context counting (vectorised with simple-CIGAR fast path)
+# ---------------------------------------------------------------------------
+
+
+def _has_indel(read) -> bool:
+    """Return True if the CIGAR contains I or D operations."""
+    cigar = read.cigartuples
+    if cigar is None:
+        return False
+    for op, _ in cigar:
+        if op == _CIGAR_I or op == _CIGAR_D:
+            return True
+    return False
+
+
+def _count_context_in_read(
+    read,
+    ctx_pos: np.ndarray,
+    ctx_ref_base: np.ndarray,
+    trim_ends: int = 5,
+) -> tuple[int, int]:
+    """Count methylated / total context sites covered by *read*.
 
     Parameters
     ----------
-    read : pysam.AlignedSegment
-    context_sites_chrom : numpy structured array
-        Fields ``pos`` (int64) and ``ref_base`` (uint8, ord('C') or ord('G')).
+    read : pysam.AlignedSegment (or duck-type with the same attributes)
+    ctx_pos : int64 array
+        Sorted context-site positions for this chromosome.
+    ctx_ref_base : uint8 array
+        Reference base at each context site (ord('C') or ord('G')).
     trim_ends : int
-        Bases to exclude from each end of the read to avoid end-repair artifacts.
+        Bases to exclude from each end to avoid end-repair artefacts.
 
     Returns
     -------
@@ -63,58 +119,87 @@ def _count_context_in_read(read, context_sites_chrom, trim_ends: int = 5) -> tup
     ref_start = read.reference_start + trim_ends
     ref_end = read.reference_end - trim_ends
     if ref_start >= ref_end:
-        return (0, 0)
+        return 0, 0
 
-    positions = context_sites_chrom["pos"]
-    idx_start = np.searchsorted(positions, ref_start, side="left")
-    idx_end = np.searchsorted(positions, ref_end, side="right")
-    sites_in_read = context_sites_chrom[idx_start:idx_end]
-    if len(sites_in_read) == 0:
-        return (0, 0)
+    # Binary search for overlapping context sites.
+    i0 = int(np.searchsorted(ctx_pos, ref_start, side="left"))
+    i1 = int(np.searchsorted(ctx_pos, ref_end, side="right"))
+    if i0 == i1:
+        return 0, 0
 
-    # Map reference positions within this read to the corresponding query
-    # (sequence) positions. ``pysam.AlignedSegment.get_aligned_pairs`` yields
-    # ``(query_position, reference_position)`` tuples; we invert that here.
-    aligned_pairs = {
-        ref_pos: query_pos
-        for query_pos, ref_pos in read.get_aligned_pairs(matches_only=True)
-    }
+    site_pos = ctx_pos[i0:i1]        # positions of context sites in range
+    site_ref = ctx_ref_base[i0:i1]   # ref base at each site
 
-    query_seq = read.query_sequence
-    if query_seq is None:
-        return (0, 0)
+    seq = read.query_sequence
+    if seq is None:
+        return 0, 0
 
-    k = 0
-    n = 0
-    c_ord = ord("C")
-    g_ord = ord("G")
+    # ----- Resolve query positions for each context site --------------------
+    if not _has_indel(read):
+        # Fast path: direct arithmetic (no get_aligned_pairs needed).
+        query_offset = read.query_alignment_start - read.reference_start
+        query_positions = (site_pos.astype(np.intp) + int(query_offset))
 
-    for site in sites_in_read:
-        ref_pos = int(site["pos"])
-        query_pos = aligned_pairs.get(ref_pos)
-        if query_pos is None:
-            continue
+        # Bounds check against the actual query sequence length.
+        seq_len = len(seq)
+        valid = (query_positions >= 0) & (query_positions < seq_len)
+        if not valid.any():
+            return 0, 0
+        site_ref = site_ref[valid]
+        query_positions = query_positions[valid]
+    else:
+        # Slow path: walk CIGAR via get_aligned_pairs (reads with indels).
+        pairs_dict = {
+            ref_p: query_p
+            for query_p, ref_p in read.get_aligned_pairs(matches_only=True)
+        }
+        raw_qp = np.array(
+            [pairs_dict.get(int(p), -1) for p in site_pos], dtype=np.intp,
+        )
+        valid = raw_qp >= 0
+        if not valid.any():
+            return 0, 0
+        site_ref = site_ref[valid]
+        query_positions = raw_qp[valid]
 
-        read_base = query_seq[query_pos]
+    # ----- Vectorised base comparison ---------------------------------------
+    seq_arr = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)
+    read_bases = seq_arr[query_positions]
 
-        if site["ref_base"] == c_ord:
-            # + strand context site
-            if read_base == "C":
-                k += 1
-                n += 1
-            elif read_base == "T":
-                n += 1
-            # G, A, N -> uninformative, skip
-        elif site["ref_base"] == g_ord:
-            # - strand context site
-            if read_base == "G":
-                k += 1
-                n += 1
-            elif read_base == "A":
-                n += 1
-            # C, T, N -> uninformative, skip
+    plus_mask = site_ref == _C         # + strand context sites
+    minus_mask = site_ref == _G        # − strand context sites
 
-    return (k, n)
+    meth = (
+        (plus_mask & (read_bases == _C))
+        | (minus_mask & (read_bases == _G))
+    )
+    informative = (
+        (plus_mask & ((read_bases == _C) | (read_bases == _T)))
+        | (minus_mask & ((read_bases == _G) | (read_bases == _A)))
+    )
+
+    return int(meth.sum()), int(informative.sum())
+
+
+# ---------------------------------------------------------------------------
+# Cell-level BAM parsing
+# ---------------------------------------------------------------------------
+
+
+def _passes_filters(read, mapq_min: int) -> bool:
+    """Fast flag + MAPQ filter for a single read."""
+    flag = read.flag
+    if flag & (_FLAG_UNMAPPED | _FLAG_MATE_UNMAPPED):
+        return False
+    if flag & (_FLAG_SECONDARY | _FLAG_SUPPLEMENTARY):
+        return False
+    if flag & _FLAG_DUPLICATE:
+        return False
+    if not (flag & _FLAG_PROPER_PAIR):
+        return False
+    if read.mapping_quality < mapq_min:
+        return False
+    return True
 
 
 def parse_cell_bam(
@@ -125,114 +210,114 @@ def parse_cell_bam(
 ) -> pd.DataFrame:
     """Parse a single cell's BAM into a DataFrame of read-pair context counts.
 
+    Processes one chromosome at a time via ``bam.fetch(chrom)`` to bound
+    the mate-pairing buffer. Uses the simple-CIGAR fast path for reads
+    without indels (see :func:`_count_context_in_read`).
+
     Parameters
     ----------
     bam_path : str
         Coordinate-sorted, indexed BAM.
     context_positions : dict
-        Mapping ``chrom -> structured array`` (as produced by
-        :func:`reference.extract_context_positions`).
+        ``chrom -> structured array`` with fields ``pos`` (int64) and
+        ``ref_base`` (uint8).
     trim_ends : int
         Bases to trim from each read end.
     mapq_min : int
-        Minimum mapping quality. **Both** ends of a pair must meet this
-        threshold (default: 30).
+        Both ends of a pair must have MAPQ >= this value (default: 30).
 
     Returns
     -------
     DataFrame with columns ``chrom, pos1, k1, n1, pos2, k2, n2, distance``.
-
-    Filtering applied to every read before buffering:
-      - unmapped or mate-unmapped → skip
-      - secondary or supplementary → skip
-      - PCR / optical duplicate (``is_duplicate``) → skip
-      - not properly paired → skip
-      - inter-chromosomal → skip
-      - MAPQ < ``mapq_min`` → skip
-
-    After pairing, an additional check ensures that **both** mates satisfy
-    MAPQ ≥ ``mapq_min`` (the per-read filter already covers the first-seen
-    mate, but the second mate's MAPQ is verified here for safety).
     """
     import pysam
 
-    records: list[dict] = []
+    # Output collectors — lists of primitives (faster than list of dicts).
+    out_chrom: list[str] = []
+    out_pos1: list[int] = []
+    out_k1: list[int] = []
+    out_n1: list[int] = []
+    out_pos2: list[int] = []
+    out_k2: list[int] = []
+    out_n2: list[int] = []
+    out_dist: list[int] = []
 
     with pysam.AlignmentFile(bam_path, "rb") as bam:
-        # Buffer reads by query name so we can pair read1 with read2 in
-        # coordinate-sorted traversal without loading the whole file.
-        read_buffer: dict[str, "pysam.AlignedSegment"] = {}
-
-        for read in bam.fetch(until_eof=True):
-            if read.is_unmapped or read.mate_is_unmapped:
-                continue
-            if read.is_secondary or read.is_supplementary:
-                continue
-            if read.is_duplicate:
-                continue
-            if read.mapping_quality < mapq_min:
-                continue
-            if not read.is_proper_pair:
-                continue
-            if read.reference_name != read.next_reference_name:
-                continue  # intra-chromosomal only
-
-            qname = read.query_name
-            mate = read_buffer.pop(qname, None)
-            if mate is None:
-                # Only buffer the first-seen mate. Keeping a single reference
-                # bounds memory in pathological cases where a read's mate is
-                # far downstream.
-                read_buffer[qname] = read
+        # Process per-chromosome to keep read_buffer bounded.
+        for chrom, ctx_arr in context_positions.items():
+            if len(ctx_arr) == 0:
                 continue
 
-            # Both ends must be uniquely mapped with MAPQ >= mapq_min.
-            # The per-read filter above already guarantees the current read
-            # passes, but the buffered mate was only checked when *it* was
-            # the loop variable.  Re-check here in case the mate's flags or
-            # MAPQ changed between buffering and now (defensive).
-            if mate.mapping_quality < mapq_min:
+            # Pre-split structured array into contiguous views (avoids
+            # repeated structured-array field lookups in the inner loop).
+            ctx_pos = ctx_arr["pos"]
+            ctx_ref = ctx_arr["ref_base"]
+
+            read_buffer: dict[str, object] = {}
+
+            try:
+                read_iter = bam.fetch(chrom)
+            except ValueError:
+                # Chromosome not in BAM header.
                 continue
 
-            # Order so r1 has the smaller reference_start (deterministic).
-            if read.reference_start <= mate.reference_start:
-                r1, r2 = read, mate
-            else:
-                r1, r2 = mate, read
+            for read in read_iter:
+                if not _passes_filters(read, mapq_min):
+                    continue
+                # Intra-chromosomal only.
+                if read.next_reference_name != chrom:
+                    continue
 
-            chrom = r1.reference_name
-            ctx_chrom = context_positions.get(chrom)
-            if ctx_chrom is None or len(ctx_chrom) == 0:
-                continue
+                qname = read.query_name
+                mate = read_buffer.pop(qname, None)
+                if mate is None:
+                    read_buffer[qname] = read
+                    continue
 
-            k1, n1 = _count_context_in_read(r1, ctx_chrom, trim_ends)
-            k2, n2 = _count_context_in_read(r2, ctx_chrom, trim_ends)
+                # Re-check mate MAPQ (defensive — it passed the filter when
+                # it was the loop variable, but we verify both ends).
+                if mate.mapping_quality < mapq_min:
+                    continue
 
-            pos1 = (r1.reference_start + r1.reference_end) // 2
-            pos2 = (r2.reference_start + r2.reference_end) // 2
-            distance = abs(pos2 - pos1)
+                # Canonical ordering: r1 has smaller reference_start.
+                if read.reference_start <= mate.reference_start:
+                    r1, r2 = read, mate
+                else:
+                    r1, r2 = mate, read
 
-            records.append({
-                "chrom": chrom,
-                "pos1": pos1, "k1": k1, "n1": n1,
-                "pos2": pos2, "k2": k2, "n2": n2,
-                "distance": distance,
-            })
+                k1, n1 = _count_context_in_read(r1, ctx_pos, ctx_ref, trim_ends)
+                k2, n2 = _count_context_in_read(r2, ctx_pos, ctx_ref, trim_ends)
 
-    if records:
-        df = pd.DataFrame.from_records(records, columns=READ_PAIR_COLUMNS)
+                pos1 = (r1.reference_start + r1.reference_end) // 2
+                pos2 = (r2.reference_start + r2.reference_end) // 2
+
+                out_chrom.append(chrom)
+                out_pos1.append(pos1)
+                out_k1.append(k1)
+                out_n1.append(n1)
+                out_pos2.append(pos2)
+                out_k2.append(k2)
+                out_n2.append(n2)
+                out_dist.append(abs(pos2 - pos1))
+
+            del read_buffer  # free mate buffer between chromosomes
+
+    n_pairs = len(out_chrom)
+    if n_pairs > 0:
+        df = pd.DataFrame({
+            "chrom": out_chrom,
+            "pos1": np.array(out_pos1, dtype=np.int64),
+            "k1": np.array(out_k1, dtype=np.int32),
+            "n1": np.array(out_n1, dtype=np.int32),
+            "pos2": np.array(out_pos2, dtype=np.int64),
+            "k2": np.array(out_k2, dtype=np.int32),
+            "n2": np.array(out_n2, dtype=np.int32),
+            "distance": np.array(out_dist, dtype=np.int64),
+        })
     else:
         df = pd.DataFrame(columns=READ_PAIR_COLUMNS)
 
-    # Downcast for on-disk compactness.
-    for col in ("pos1", "pos2", "distance"):
-        if col in df.columns and len(df) > 0:
-            df[col] = df[col].astype(np.int64)
-    for col in ("k1", "n1", "k2", "n2"):
-        if col in df.columns and len(df) > 0:
-            df[col] = df[col].astype(np.int32)
-
-    logger.info(f"  {bam_path}: {len(df):,} intra-chromosomal pairs extracted")
+    logger.info(f"  {bam_path}: {n_pairs:,} intra-chromosomal pairs extracted")
     return df
 
 
