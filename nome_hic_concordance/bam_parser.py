@@ -352,22 +352,36 @@ def parse_all_cells(
 
     out_path = ensure_dir(output_dir)
 
+    total = len(samples)
+
     def _process_one(row) -> tuple[str, str]:
         cell = row["cell_name"]
         bam = row["bam_path"]
-        logger.info(f"Processing {cell}...")
         df = parse_cell_bam(bam, context_positions, trim_ends=trim_ends, mapq_min=mapq_min)
         parquet_path = str(out_path / f"{cell}.read_pairs.parquet")
         df.to_parquet(parquet_path, index=False)
         return cell, parquet_path
 
     rows: Iterable = [row for _, row in samples.iterrows()]
+    results: list[tuple[str, str]] = []
 
     if n_threads > 1 and len(samples) > 1:
-        results = Parallel(n_jobs=n_threads)(
+        # return_as="generator" (joblib ≥ 1.3) yields results as they
+        # complete, letting us log a running progress counter.
+        gen = Parallel(n_jobs=n_threads, return_as="generator")(
             delayed(_process_one)(row) for row in rows
         )
+        for i, result in enumerate(gen, 1):
+            results.append(result)
+            logger.info(
+                f"  [{i}/{total}] ({100 * i / total:.0f}%) {result[0]} done"
+            )
     else:
-        results = [_process_one(row) for row in rows]
+        for i, row in enumerate(rows, 1):
+            result = _process_one(row)
+            results.append(result)
+            logger.info(
+                f"  [{i}/{total}] ({100 * i / total:.0f}%) {result[0]} done"
+            )
 
     return dict(results)
