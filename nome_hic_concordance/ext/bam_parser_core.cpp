@@ -94,20 +94,21 @@ static inline void cigar_lengths(const uint32_t* cigar, int n_cigar,
 // Bisulfite conversion strand inference from the MD tag
 // --------------------------------------------------------------------------
 
-// Reconstruct the reference sequence from the MD tag and the read
-// sequence, then count C→T vs G→A mismatches to infer the bisulfite
-// conversion direction.
+// Two-step approach (simple and correct):
 //
-// The MD tag encodes: matching runs as digits, mismatches as single
-// ref bases (^SEQ for deletions).  We walk the CIGAR + MD together
-// to compare read vs reference at each aligned position.
+// Step 1: Walk the CIGAR to build a ref_to_query[] array that maps
+//         each reference-consuming position to its query (read) position.
+//         Insertions advance query only; deletions get -1 (no query base).
+//
+// Step 2: Walk the MD tag.  At each mismatch position, look up the
+//         query position from ref_to_query[] and compare the reference
+//         base (from MD, uppercased) with the read base (from BAM seq).
+//         Count C→T vs G→A.
 //
 // Returns STRAND_CT, STRAND_GA, or STRAND_UNKNOWN.
 static int infer_conversion_strand(const bam1_t* b) {
-    // Get MD tag.
     const uint8_t* md_raw = bam_aux_get(b, "MD");
     if (!md_raw) return STRAND_UNKNOWN;
-
     const char* md = bam_aux2Z(md_raw);
     if (!md) return STRAND_UNKNOWN;
 
@@ -118,134 +119,65 @@ static int infer_conversion_strand(const bam1_t* b) {
     const uint32_t* cigar = bam_get_cigar(b);
     int n_cigar = b->core.n_cigar;
 
-    // Walk the CIGAR to know which query positions are aligned.
-    // We build a simple mapping: for each reference-consuming aligned
-    // position, record the query position.  Then walk the MD tag to
-    // find mismatches and check if they're C→T or G→A.
-    //
-    // For efficiency, we don't build the full mapping.  Instead, we
-    // walk CIGAR and MD in parallel.
+    // ---- Step 1: build ref_to_query mapping from CIGAR ----
+    // For each reference-consuming base, store the corresponding query
+    // position.  Deletions (ref-only) get -1.
+    std::vector<int> ref_to_query;
+    {
+        int qpos = 0;
+        for (int ci = 0; ci < n_cigar; ++ci) {
+            int op  = bam_cigar_op(cigar[ci]);
+            int len = bam_cigar_oplen(cigar[ci]);
+            if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
+                for (int x = 0; x < len; ++x)
+                    ref_to_query.push_back(qpos++);
+            } else if (op == BAM_CINS || op == BAM_CSOFT_CLIP) {
+                qpos += len;  // query only
+            } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
+                for (int x = 0; x < len; ++x)
+                    ref_to_query.push_back(-1);  // ref only, no query base
+            }
+            // BAM_CHARD_CLIP: consumes neither
+        }
+    }
+    int ref_len = (int)ref_to_query.size();
 
+    // ---- Step 2: walk MD tag, count C→T / G→A at mismatches ----
     int ct_count = 0;
     int ga_count = 0;
-
-    // qpos: current position in query (0-based, including soft clips)
-    // We advance through CIGAR ops and track where we are in the query.
-    int qpos = 0;
-
-    // First, walk past leading soft/hard clips to find qpos at first aligned base.
-    int cigar_idx = 0;
-    while (cigar_idx < n_cigar) {
-        int op = bam_cigar_op(cigar[cigar_idx]);
-        if (op == BAM_CSOFT_CLIP) {
-            qpos += bam_cigar_oplen(cigar[cigar_idx]);
-            ++cigar_idx;
-        } else if (op == BAM_CHARD_CLIP) {
-            ++cigar_idx;
-        } else {
-            break;
-        }
-    }
-
-    // Now walk MD string.  MD describes the reference relative to the
-    // aligned query.  We also need to account for insertions (query-only)
-    // from the CIGAR — they shift qpos but don't appear in MD.
-    //
-    // Strategy: flatten the CIGAR into a list of (op, per-base) entries
-    // for the aligned region, then walk MD against it.
-
-    // Build a per-base op array for the aligned region (M/I/D ops only).
-    // 'M' = match/mismatch (consumes both), 'I' = insertion (query only),
-    // 'D' = deletion (ref only, will be in MD as ^SEQ).
-    struct AlnOp { char type; };  // 'M', 'I', 'D'
-    std::vector<AlnOp> ops;
-    int total_ref_consuming = 0;
-    for (int ci = cigar_idx; ci < n_cigar; ++ci) {
-        int op  = bam_cigar_op(cigar[ci]);
-        int len = bam_cigar_oplen(cigar[ci]);
-        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
-            for (int x = 0; x < len; ++x) ops.push_back({'M'});
-            total_ref_consuming += len;
-        } else if (op == BAM_CINS) {
-            for (int x = 0; x < len; ++x) ops.push_back({'I'});
-        } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
-            for (int x = 0; x < len; ++x) ops.push_back({'D'});
-            total_ref_consuming += len;
-        } else if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
-            // trailing clips — stop
-            break;
-        }
-    }
-
-    // Walk the ops array and MD string together.
-    // ops_idx tracks our position in 'ops'.
-    // qpos_cur tracks the current query position.
-    int ops_idx = 0;
-    int qpos_cur = qpos; // starts after leading clips
+    int ref_idx = 0;   // index into ref_to_query
     const char* p = md;
 
-    while (*p && ops_idx < (int)ops.size()) {
-        // Skip insertions in the op stream (they don't appear in MD).
-        while (ops_idx < (int)ops.size() && ops[ops_idx].type == 'I') {
-            ++qpos_cur;
-            ++ops_idx;
-        }
-        if (ops_idx >= (int)ops.size()) break;
-
+    while (*p) {
         if (*p >= '0' && *p <= '9') {
-            // Matching run: parse the number.
-            int match_len = 0;
+            // Matching run — advance ref_idx by the number.
+            int n = 0;
             while (*p >= '0' && *p <= '9') {
-                match_len = match_len * 10 + (*p - '0');
+                n = n * 10 + (*p - '0');
                 ++p;
             }
-            // Advance through match_len aligned (M) positions.
-            for (int i = 0; i < match_len; ++i) {
-                while (ops_idx < (int)ops.size() && ops[ops_idx].type == 'I') {
-                    ++qpos_cur;
-                    ++ops_idx;
-                }
-                if (ops_idx >= (int)ops.size()) break;
-                // This is a match — ref == query. Skip.
-                if (ops[ops_idx].type == 'M') {
-                    ++qpos_cur;
-                }
-                ++ops_idx;
-            }
+            ref_idx += n;
         } else if (*p == '^') {
-            // Deletion from reference: ^SEQ
-            ++p; // skip '^'
-            while (*p && !(*p >= '0' && *p <= '9') && *p != '^') {
-                // Each character is a deleted reference base.
-                // Advance ops past 'D' entries.
-                while (ops_idx < (int)ops.size() && ops[ops_idx].type == 'I') {
-                    ++qpos_cur;
-                    ++ops_idx;
-                }
-                if (ops_idx < (int)ops.size() && ops[ops_idx].type == 'D') {
-                    ++ops_idx; // ref-only, no query advance
-                }
+            // Deletion: ^SEQ (letters are deleted ref bases).
+            ++p;  // skip '^'
+            while (*p && !(*p >= '0' && *p <= '9')) {
+                ++ref_idx;
                 ++p;
             }
         } else {
-            // Single mismatch: the character is the REFERENCE base.
+            // Mismatch: single character = reference base.
             char ref_base = std::toupper((unsigned char)*p);
             ++p;
 
-            // Skip insertions.
-            while (ops_idx < (int)ops.size() && ops[ops_idx].type == 'I') {
-                ++qpos_cur;
-                ++ops_idx;
+            if (ref_idx >= 0 && ref_idx < ref_len) {
+                int qp = ref_to_query[ref_idx];
+                if (qp >= 0 && qp < seq_len) {
+                    char read_base = bam_base_at(seq, qp);
+                    if (ref_base == 'C' && read_base == 'T') ++ct_count;
+                    else if (ref_base == 'G' && read_base == 'A') ++ga_count;
+                }
             }
-            if (ops_idx >= (int)ops.size()) break;
-
-            if (ops[ops_idx].type == 'M' && qpos_cur >= 0 && qpos_cur < seq_len) {
-                char read_base = bam_base_at(seq, qpos_cur);
-                if (ref_base == 'C' && read_base == 'T') ++ct_count;
-                else if (ref_base == 'G' && read_base == 'A') ++ga_count;
-                ++qpos_cur;
-            }
-            ++ops_idx;
+            ++ref_idx;
         }
     }
 
