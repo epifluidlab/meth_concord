@@ -44,11 +44,8 @@ try:
 except ImportError:
     _CPP_AVAILABLE = False
 
-# The C++ backend does not yet implement bisulfite conversion-strand
-# inference (required for non-directional bisulfite data like bhmem).
-# Force the Python backend until the C++ code is updated.
-# TODO: add strand inference to bam_parser_core.cpp, then remove this.
-_CPP_AVAILABLE = False
+# The C++ backend now implements bisulfite conversion-strand inference
+# via the MD tag, matching the Python backend's logic.
 
 # BAM flag bits — combined into a single skip-mask for fast filtering.
 _FLAG_UNMAPPED       = 0x4

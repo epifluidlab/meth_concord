@@ -5,9 +5,11 @@
  * For each cell's BAM, processes one chromosome at a time:
  *   1. Reads through all records with hts_itr_next
  *   2. Filters on flag, MAPQ, intra-chromosomal
- *   3. Pairs mates via a hash map keyed by query name
- *   4. For each pair, counts methylation at context sites using
- *      binary search + direct 4-bit sequence access
+ *   3. Infers bisulfite conversion strand (C→T vs G→A) from the MD tag
+ *   4. Pairs mates via a hash map keyed by query name
+ *   5. For each pair, counts methylation at context sites (only from
+ *      the informative strand) using binary search + direct 4-bit
+ *      sequence access
  *
  * Compiled as a Python extension via pybind11.
  */
@@ -44,21 +46,17 @@ static constexpr uint16_t SKIP_FLAGS =
     FLAG_UNMAPPED | FLAG_MATE_UNMAPPED |
     FLAG_SECONDARY | FLAG_DUPLICATE | FLAG_SUPPLEMENTARY;
 
+// Conversion strand constants
+static constexpr int STRAND_CT      = 1;  // C→T conversion
+static constexpr int STRAND_GA      = 2;  // G→A conversion
+static constexpr int STRAND_UNKNOWN = 0;
+
 // Extract a base from the 4-bit packed BAM sequence.
 // Returns 'A','C','G','T','N' (uppercase).
 static inline char bam_base_at(const uint8_t* seq, int i) {
     static const char TABLE[] = "=ACMGRSVTWYHKDBN";
     uint8_t nib = bam_seqi(seq, i);
     return TABLE[nib];
-}
-
-// Check whether the CIGAR has any I or D operations.
-static inline bool cigar_has_indel(const uint32_t* cigar, int n_cigar) {
-    for (int i = 0; i < n_cigar; ++i) {
-        int op = bam_cigar_op(cigar[i]);
-        if (op == BAM_CINS || op == BAM_CDEL) return true;
-    }
-    return false;
 }
 
 // Compute the query alignment start (number of soft/hard clipped bases
@@ -82,11 +80,9 @@ static inline void cigar_lengths(const uint32_t* cigar, int n_cigar,
     for (int i = 0; i < n_cigar; ++i) {
         int op  = bam_cigar_op(cigar[i]);
         int len = bam_cigar_oplen(cigar[i]);
-        // Reference-consuming ops: M, D, N, =, X
         if (op == BAM_CMATCH || op == BAM_CDEL || op == BAM_CREF_SKIP ||
             op == BAM_CEQUAL || op == BAM_CDIFF)
             ref_len += len;
-        // Query-consuming ops: M, I, =, X
         if (op == BAM_CMATCH || op == BAM_CINS ||
             op == BAM_CEQUAL || op == BAM_CDIFF)
             qry_len += len;
@@ -94,28 +90,193 @@ static inline void cigar_lengths(const uint32_t* cigar, int n_cigar,
 }
 
 // --------------------------------------------------------------------------
-// Per-read context counting (the hot function)
+// Bisulfite conversion strand inference from the MD tag
 // --------------------------------------------------------------------------
 
-// Count methylation at context sites covered by a read.
+// Reconstruct the reference sequence from the MD tag and the read
+// sequence, then count C→T vs G→A mismatches to infer the bisulfite
+// conversion direction.
 //
-// ctx_pos:    sorted array of context-site positions (int64)
-// ctx_ref:    reference base at each site (uint8: 'C'=67, 'G'=71)
-// n_ctx:      number of context sites
-// b:          bam1_t* for the read
-// trim_ends:  bases to trim from each end
+// The MD tag encodes: matching runs as digits, mismatches as single
+// ref bases (^SEQ for deletions).  We walk the CIGAR + MD together
+// to compare read vs reference at each aligned position.
 //
-// Returns (k_methylated, n_total) via output parameters.
+// Returns STRAND_CT, STRAND_GA, or STRAND_UNKNOWN.
+static int infer_conversion_strand(const bam1_t* b) {
+    // Get MD tag.
+    const uint8_t* md_raw = bam_aux_get(b, "MD");
+    if (!md_raw) return STRAND_UNKNOWN;
+
+    const char* md = bam_aux2Z(md_raw);
+    if (!md) return STRAND_UNKNOWN;
+
+    const uint8_t* seq = bam_get_seq(b);
+    int seq_len = b->core.l_qseq;
+    if (seq_len == 0) return STRAND_UNKNOWN;
+
+    const uint32_t* cigar = bam_get_cigar(b);
+    int n_cigar = b->core.n_cigar;
+
+    // Walk the CIGAR to know which query positions are aligned.
+    // We build a simple mapping: for each reference-consuming aligned
+    // position, record the query position.  Then walk the MD tag to
+    // find mismatches and check if they're C→T or G→A.
+    //
+    // For efficiency, we don't build the full mapping.  Instead, we
+    // walk CIGAR and MD in parallel.
+
+    int ct_count = 0;
+    int ga_count = 0;
+
+    // qpos: current position in query (0-based, including soft clips)
+    // We advance through CIGAR ops and track where we are in the query.
+    int qpos = 0;
+
+    // First, walk past leading soft/hard clips to find qpos at first aligned base.
+    int cigar_idx = 0;
+    while (cigar_idx < n_cigar) {
+        int op = bam_cigar_op(cigar[cigar_idx]);
+        if (op == BAM_CSOFT_CLIP) {
+            qpos += bam_cigar_oplen(cigar[cigar_idx]);
+            ++cigar_idx;
+        } else if (op == BAM_CHARD_CLIP) {
+            ++cigar_idx;
+        } else {
+            break;
+        }
+    }
+
+    // Now walk MD string.  MD describes the reference relative to the
+    // aligned query.  We also need to account for insertions (query-only)
+    // from the CIGAR — they shift qpos but don't appear in MD.
+    //
+    // Strategy: flatten the CIGAR into a list of (op, per-base) entries
+    // for the aligned region, then walk MD against it.
+
+    // Build a per-base op array for the aligned region (M/I/D ops only).
+    // 'M' = match/mismatch (consumes both), 'I' = insertion (query only),
+    // 'D' = deletion (ref only, will be in MD as ^SEQ).
+    struct AlnOp { char type; };  // 'M', 'I', 'D'
+    std::vector<AlnOp> ops;
+    int total_ref_consuming = 0;
+    for (int ci = cigar_idx; ci < n_cigar; ++ci) {
+        int op  = bam_cigar_op(cigar[ci]);
+        int len = bam_cigar_oplen(cigar[ci]);
+        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
+            for (int x = 0; x < len; ++x) ops.push_back({'M'});
+            total_ref_consuming += len;
+        } else if (op == BAM_CINS) {
+            for (int x = 0; x < len; ++x) ops.push_back({'I'});
+        } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
+            for (int x = 0; x < len; ++x) ops.push_back({'D'});
+            total_ref_consuming += len;
+        } else if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
+            // trailing clips — stop
+            break;
+        }
+    }
+
+    // Walk the ops array and MD string together.
+    // ops_idx tracks our position in 'ops'.
+    // qpos_cur tracks the current query position.
+    int ops_idx = 0;
+    int qpos_cur = qpos; // starts after leading clips
+    const char* p = md;
+
+    while (*p && ops_idx < (int)ops.size()) {
+        // Skip insertions in the op stream (they don't appear in MD).
+        while (ops_idx < (int)ops.size() && ops[ops_idx].type == 'I') {
+            ++qpos_cur;
+            ++ops_idx;
+        }
+        if (ops_idx >= (int)ops.size()) break;
+
+        if (*p >= '0' && *p <= '9') {
+            // Matching run: parse the number.
+            int match_len = 0;
+            while (*p >= '0' && *p <= '9') {
+                match_len = match_len * 10 + (*p - '0');
+                ++p;
+            }
+            // Advance through match_len aligned (M) positions.
+            for (int i = 0; i < match_len; ++i) {
+                while (ops_idx < (int)ops.size() && ops[ops_idx].type == 'I') {
+                    ++qpos_cur;
+                    ++ops_idx;
+                }
+                if (ops_idx >= (int)ops.size()) break;
+                // This is a match — ref == query. Skip.
+                if (ops[ops_idx].type == 'M') {
+                    ++qpos_cur;
+                }
+                ++ops_idx;
+            }
+        } else if (*p == '^') {
+            // Deletion from reference: ^SEQ
+            ++p; // skip '^'
+            while (*p && !(*p >= '0' && *p <= '9') && *p != '^') {
+                // Each character is a deleted reference base.
+                // Advance ops past 'D' entries.
+                while (ops_idx < (int)ops.size() && ops[ops_idx].type == 'I') {
+                    ++qpos_cur;
+                    ++ops_idx;
+                }
+                if (ops_idx < (int)ops.size() && ops[ops_idx].type == 'D') {
+                    ++ops_idx; // ref-only, no query advance
+                }
+                ++p;
+            }
+        } else {
+            // Single mismatch: the character is the REFERENCE base.
+            char ref_base = *p;
+            ++p;
+
+            // Skip insertions.
+            while (ops_idx < (int)ops.size() && ops[ops_idx].type == 'I') {
+                ++qpos_cur;
+                ++ops_idx;
+            }
+            if (ops_idx >= (int)ops.size()) break;
+
+            if (ops[ops_idx].type == 'M' && qpos_cur >= 0 && qpos_cur < seq_len) {
+                char read_base = bam_base_at(seq, qpos_cur);
+                if (ref_base == 'C' && read_base == 'T') ++ct_count;
+                else if (ref_base == 'G' && read_base == 'A') ++ga_count;
+                ++qpos_cur;
+            }
+            ++ops_idx;
+        }
+    }
+
+    if (ct_count > ga_count) return STRAND_CT;
+    if (ga_count > ct_count) return STRAND_GA;
+    return STRAND_UNKNOWN;
+}
+
+// --------------------------------------------------------------------------
+// Per-read context counting (strand-aware)
+// --------------------------------------------------------------------------
+
+// Count methylation at context sites covered by a read, using only
+// sites from the informative strand.
+//
+// strand:     STRAND_CT → only count ref=C sites
+//             STRAND_GA → only count ref=G sites
+//             STRAND_UNKNOWN → skip (return 0, 0)
 static void count_context(
     const int64_t* ctx_pos, const uint8_t* ctx_ref, int64_t n_ctx,
-    const bam1_t* b, int trim_ends,
+    const bam1_t* b, int trim_ends, int strand,
     int& k_out, int& n_out)
 {
     k_out = 0; n_out = 0;
 
+    if (strand == STRAND_UNKNOWN) return;
+
+    // Which ref_base is informative for this read's conversion strand?
+    uint8_t informative_ref = (strand == STRAND_CT) ? 67 : 71; // 'C' or 'G'
+
     int64_t ref_start = b->core.pos + trim_ends;
-    int64_t ref_end_raw = bam_endpos(b);
-    int64_t ref_end = ref_end_raw - trim_ends;
+    int64_t ref_end = bam_endpos(b) - trim_ends;
     if (ref_start >= ref_end) return;
 
     // Binary search for context sites in [ref_start, ref_end).
@@ -137,27 +298,28 @@ static void count_context(
     cigar_lengths(cigar, n_cigar, ref_len, qry_len);
 
     if (ref_len == qry_len) {
-        // Fast path: no indels — direct offset calculation.
+        // Fast path: no indels.
         int offset = query_alignment_start(cigar, n_cigar) - (int)b->core.pos;
 
         for (int j = i0; j < i1; ++j) {
+            uint8_t rb = ctx_ref[j];
+            if (rb != informative_ref) continue;  // wrong strand
+
             int qp = (int)ctx_pos[j] + offset;
             if (qp < 0 || qp >= seq_len) continue;
 
             char base = bam_base_at(seq, qp);
-            uint8_t rb = ctx_ref[j];
 
-            if (rb == 67) {        // 'C', + strand site
+            if (rb == 67) {        // ref=C, C→T strand
                 if (base == 'C')      { ++k_out; ++n_out; }
                 else if (base == 'T') { ++n_out; }
-            } else if (rb == 71) { // 'G', − strand site
+            } else if (rb == 71) { // ref=G, G→A strand
                 if (base == 'G')      { ++k_out; ++n_out; }
                 else if (base == 'A') { ++n_out; }
             }
         }
     } else {
         // Slow path: build ref→query mapping from CIGAR.
-        // Walk the CIGAR to map reference positions to query positions.
         std::unordered_map<int64_t, int> ref_to_query;
         ref_to_query.reserve(ref_len);
         int qpos = query_alignment_start(cigar, n_cigar);
@@ -168,31 +330,29 @@ static void count_context(
             int len = bam_cigar_oplen(cigar[ci]);
 
             if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
-                for (int x = 0; x < len; ++x) {
+                for (int x = 0; x < len; ++x)
                     ref_to_query[rpos + x] = qpos + x;
-                }
                 rpos += len; qpos += len;
             } else if (op == BAM_CINS) {
                 qpos += len;
             } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
                 rpos += len;
             } else if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
-                // Already accounted for in query_alignment_start for leading clips.
-                // Trailing clips don't affect the mapping.
-                if (ci > 0 && op == BAM_CSOFT_CLIP) {
-                    // trailing soft clip — skip
-                }
+                if (ci == 0) { /* leading: already in query_alignment_start */ }
+                // trailing: no action needed
             }
         }
 
         for (int j = i0; j < i1; ++j) {
+            uint8_t rb = ctx_ref[j];
+            if (rb != informative_ref) continue;
+
             auto it = ref_to_query.find(ctx_pos[j]);
             if (it == ref_to_query.end()) continue;
             int qp = it->second;
             if (qp < 0 || qp >= seq_len) continue;
 
             char base = bam_base_at(seq, qp);
-            uint8_t rb = ctx_ref[j];
 
             if (rb == 67) {
                 if (base == 'C')      { ++k_out; ++n_out; }
@@ -209,58 +369,39 @@ static void count_context(
 // Per-cell BAM parser
 // --------------------------------------------------------------------------
 
-// Lightweight struct to hold a read's essential fields for mate pairing.
-// We copy the minimum needed to avoid keeping the full bam1_t alive.
 struct ReadInfo {
     int32_t  tid;
-    int64_t  pos;         // reference_start
-    int64_t  end_pos;     // reference_end (exclusive)
+    int64_t  pos;
+    int64_t  end_pos;
     int      mapq;
-    int      k;           // methylated count
-    int      n;           // total informative count
+    int      k;
+    int      n;
 
     ReadInfo() : tid(-1), pos(0), end_pos(0), mapq(0), k(0), n(0) {}
 };
 
-// Parse a single cell's BAM file and return columnar numpy arrays.
-//
-// context_positions: dict of { chrom_str: (pos_array_int64, ref_base_array_uint8) }
-//
-// Returns a dict with numpy arrays: chrom, pos1, k1, n1, pos2, k2, n2, distance
 static py::dict parse_cell_bam_cpp(
     const std::string& bam_path,
     py::dict context_positions,
     int trim_ends,
     int mapq_min)
 {
-    // Suppress htslib stderr noise (the ^@ null bytes).
     hts_set_log_level(HTS_LOG_OFF);
 
-    // Open BAM file.
     htsFile* fp = hts_open(bam_path.c_str(), "r");
-    if (!fp) {
+    if (!fp)
         throw std::runtime_error("Cannot open BAM file: " + bam_path);
-    }
 
     sam_hdr_t* hdr = sam_hdr_read(fp);
-    if (!hdr) {
-        hts_close(fp);
-        throw std::runtime_error("Cannot read BAM header: " + bam_path);
-    }
+    if (!hdr) { hts_close(fp); throw std::runtime_error("Cannot read BAM header: " + bam_path); }
 
     hts_idx_t* idx = sam_index_load(fp, bam_path.c_str());
-    if (!idx) {
-        sam_hdr_destroy(hdr);
-        hts_close(fp);
-        throw std::runtime_error("Cannot load BAM index for: " + bam_path);
-    }
+    if (!idx) { sam_hdr_destroy(hdr); hts_close(fp); throw std::runtime_error("Cannot load BAM index for: " + bam_path); }
 
-    // Output collectors.
     std::vector<std::string> out_chrom;
     std::vector<int64_t> out_pos1, out_pos2, out_dist;
     std::vector<int32_t> out_k1, out_n1, out_k2, out_n2;
 
-    // Reserve space (rough estimate: ~2M pairs per cell).
     size_t reserve = 2000000;
     out_chrom.reserve(reserve);
     out_pos1.reserve(reserve); out_pos2.reserve(reserve);
@@ -270,12 +411,10 @@ static py::dict parse_cell_bam_cpp(
 
     bam1_t* b = bam_init1();
 
-    // Process per-chromosome.
     for (auto item : context_positions) {
         std::string chrom = py::cast<std::string>(item.first);
         py::tuple arrays = py::cast<py::tuple>(item.second);
 
-        // Unpack numpy arrays.
         py::array_t<int64_t> pos_arr = arrays[0].cast<py::array_t<int64_t>>();
         py::array_t<uint8_t> ref_arr = arrays[1].cast<py::array_t<uint8_t>>();
 
@@ -287,57 +426,47 @@ static py::dict parse_cell_bam_cpp(
         const int64_t* ctx_pos = pos_buf.data(0);
         const uint8_t* ctx_ref = ref_buf.data(0);
 
-        // Get chromosome tid from BAM header.
         int tid = sam_hdr_name2tid(hdr, chrom.c_str());
-        if (tid < 0) continue;  // Chromosome not in BAM.
+        if (tid < 0) continue;
 
-        // Mate-pairing buffer: qname → ReadInfo.
         std::unordered_map<std::string, ReadInfo> read_buffer;
         read_buffer.reserve(500000);
 
-        // Iterate reads on this chromosome.
         hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, INT64_MAX);
         if (!iter) continue;
 
         while (sam_itr_next(fp, iter, b) >= 0) {
             uint16_t flag = b->core.flag;
-
-            // Combined flag filter.
             if (flag & SKIP_FLAGS) continue;
             if (!(flag & FLAG_PROPER_PAIR)) continue;
             if (b->core.qual < mapq_min) continue;
-
-            // Intra-chromosomal only.
             if (b->core.mtid != tid) continue;
 
-            // Get query name.
+            // Infer bisulfite conversion strand from MD tag.
+            int strand = infer_conversion_strand(b);
+
             const char* qname = bam_get_qname(b);
 
             auto it = read_buffer.find(qname);
             if (it == read_buffer.end()) {
-                // First mate seen — count context sites and store.
                 ReadInfo ri;
                 ri.tid = tid;
                 ri.pos = b->core.pos;
                 ri.end_pos = bam_endpos(b);
                 ri.mapq = b->core.qual;
-                count_context(ctx_pos, ctx_ref, n_ctx, b, trim_ends, ri.k, ri.n);
+                count_context(ctx_pos, ctx_ref, n_ctx, b, trim_ends, strand, ri.k, ri.n);
                 read_buffer.emplace(std::string(qname), ri);
                 continue;
             }
 
-            // Second mate — retrieve and remove buffered mate.
             ReadInfo mate = it->second;
             read_buffer.erase(it);
 
-            // Re-check mate MAPQ.
             if (mate.mapq < mapq_min) continue;
 
-            // Count context for this read.
             int k2, n2;
-            count_context(ctx_pos, ctx_ref, n_ctx, b, trim_ends, k2, n2);
+            count_context(ctx_pos, ctx_ref, n_ctx, b, trim_ends, strand, k2, n2);
 
-            // Canonical ordering: r1 has smaller pos.
             int64_t pos_this = b->core.pos;
             int64_t end_this = bam_endpos(b);
 
@@ -358,7 +487,6 @@ static py::dict parse_cell_bam_cpp(
 
             int64_t mid1 = (r1_pos + r1_end) / 2;
             int64_t mid2 = (r2_pos + r2_end) / 2;
-            int64_t dist = std::abs(mid2 - mid1);
 
             out_chrom.push_back(chrom);
             out_pos1.push_back(mid1);
@@ -367,7 +495,7 @@ static py::dict parse_cell_bam_cpp(
             out_pos2.push_back(mid2);
             out_k2.push_back(r2_k);
             out_n2.push_back(r2_n);
-            out_dist.push_back(dist);
+            out_dist.push_back(std::abs(mid2 - mid1));
         }
 
         hts_itr_destroy(iter);
@@ -379,9 +507,7 @@ static py::dict parse_cell_bam_cpp(
     sam_hdr_destroy(hdr);
     hts_close(fp);
 
-    // Convert to numpy arrays.
     size_t N = out_pos1.size();
-
     py::array_t<int64_t> np_pos1(N), np_pos2(N), np_dist(N);
     py::array_t<int32_t> np_k1(N), np_n1(N), np_k2(N), np_n2(N);
 
@@ -395,7 +521,6 @@ static py::dict parse_cell_bam_cpp(
         std::memcpy(np_n2.mutable_data(),   out_n2.data(),   N * sizeof(int32_t));
     }
 
-    // Build chrom string list.
     py::list chrom_list;
     for (auto& s : out_chrom) chrom_list.append(s);
 
@@ -417,7 +542,7 @@ static py::dict parse_cell_bam_cpp(
 // --------------------------------------------------------------------------
 
 PYBIND11_MODULE(_bam_parser_core, m) {
-    m.doc() = "C++/htslib backend for BAM read-pair context counting";
+    m.doc() = "C++/htslib backend for BAM read-pair context counting (strand-aware)";
 
     m.def("parse_cell_bam", &parse_cell_bam_cpp,
           py::arg("bam_path"),
@@ -425,14 +550,13 @@ PYBIND11_MODULE(_bam_parser_core, m) {
           py::arg("trim_ends") = 5,
           py::arg("mapq_min") = 30,
           R"doc(
-          Parse a single cell's BAM file using htslib.
+          Parse a single cell's BAM file using htslib with bisulfite
+          strand inference from the MD tag.
 
           Parameters
           ----------
           bam_path : str
-              Path to coordinate-sorted, indexed BAM.
-          context_positions : dict
-              {chrom: (pos_array_int64, ref_base_array_uint8)}
+          context_positions : dict  {chrom: (pos_int64, ref_base_uint8)}
           trim_ends : int
           mapq_min : int
 
