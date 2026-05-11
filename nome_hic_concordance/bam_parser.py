@@ -44,8 +44,11 @@ try:
 except ImportError:
     _CPP_AVAILABLE = False
 
-# The C++ backend now implements bisulfite conversion-strand inference
-# via the MD tag, matching the Python backend's logic.
+# Disable C++ backend: the MD-tag parsing in the C++ extension has a
+# case-sensitivity issue that causes incorrect strand inference.
+# The Python backend (with .upper() fix) is correct.
+# TODO: fix and verify the C++ MD parser, then re-enable.
+_CPP_AVAILABLE = False
 
 # BAM flag bits — combined into a single skip-mask for fast filtering.
 _FLAG_UNMAPPED       = 0x4
