@@ -122,14 +122,26 @@ class BetaBinomialMixture:
 
     # ----- EM step helpers --------------------------------------------------
 
-    def _e_step(self, k: np.ndarray, n: np.ndarray) -> tuple[np.ndarray, float]:
-        """Compute responsibilities gamma_i = P(accessible | k_i, n_i) and LL."""
-        log_p0 = betabinom_logpmf(k, n, self.alpha_[0], self.beta_[0])
-        log_p1 = betabinom_logpmf(k, n, self.alpha_[1], self.beta_[1])
+    def _e_step(
+        self, k: np.ndarray, n: np.ndarray, log_cnk: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        """Compute responsibilities gamma_i = P(accessible | k_i, n_i) and LL.
 
-        # Guard against pi_ exactly 0 or 1.
+        ``log_cnk`` is the pre-computed ``log C(n, k)`` term (constant
+        across all EM iterations).
+        """
+        from scipy.special import betaln
+
+        # betabinom_logpmf without the constant log C(n,k):
+        #   log_cnk + betaln(k + α, n - k + β) - betaln(α, β)
+        log_p0 = (log_cnk
+                   + betaln(k + self.alpha_[0], n - k + self.beta_[0])
+                   - betaln(self.alpha_[0], self.beta_[0]))
+        log_p1 = (log_cnk
+                   + betaln(k + self.alpha_[1], n - k + self.beta_[1])
+                   - betaln(self.alpha_[1], self.beta_[1]))
+
         pi = float(np.clip(self.pi_, 1e-12, 1.0 - 1e-12))
-
         log_w0 = np.log(1 - pi) + log_p0
         log_w1 = np.log(pi) + log_p1
 
@@ -144,22 +156,50 @@ class BetaBinomialMixture:
         weights: np.ndarray,
         alpha_init: float,
         beta_init: float,
+        log_cnk: np.ndarray,
+        nmk: np.ndarray,
     ) -> tuple[float, float]:
-        """Optimise (alpha, beta) for one component by maximising the weighted LL."""
-        from scipy.optimize import minimize
+        """Optimise (α, β) with pre-computed constants and analytical gradient.
 
-        def neg_weighted_ll(params: np.ndarray) -> float:
+        ``log_cnk`` = ``log C(n, k)`` (constant, pre-computed once).
+        ``nmk`` = ``n - k`` (constant, pre-computed once).
+        """
+        from scipy.optimize import minimize
+        from scipy.special import betaln, digamma
+
+        def neg_ll_and_grad(params: np.ndarray):
             a, b = params
             if a <= 0 or b <= 0:
-                return 1e12
-            ll = float(np.sum(weights * betabinom_logpmf(k, n, a, b)))
-            # scipy minimises; return negative log-likelihood
-            return -ll
+                return 1e12, np.zeros(2)
+
+            ka = k + a
+            nmkb = nmk + b
+            ab = a + b
+            nab = n + ab
+
+            # Weighted negative log-likelihood (log_cnk drops out of gradient
+            # but we include it for correct LL monitoring).
+            ll_terms = log_cnk + betaln(ka, nmkb) - betaln(a, b)
+            neg_ll = -float(np.sum(weights * ll_terms))
+
+            # Analytical gradient using digamma (ψ).
+            psi_ka = digamma(ka)
+            psi_nmkb = digamma(nmkb)
+            psi_nab = digamma(nab)
+            psi_ab = digamma(ab)
+            psi_a = digamma(a)
+            psi_b = digamma(b)
+
+            dll_da = float(np.sum(weights * (psi_ka - psi_nab + psi_ab - psi_a)))
+            dll_db = float(np.sum(weights * (psi_nmkb - psi_nab + psi_ab - psi_b)))
+
+            return neg_ll, np.array([-dll_da, -dll_db])
 
         result = minimize(
-            neg_weighted_ll,
+            neg_ll_and_grad,
             x0=np.array([alpha_init, beta_init]),
             method="L-BFGS-B",
+            jac=True,
             bounds=[(1e-4, 500.0), (1e-4, 500.0)],
         )
         return float(result.x[0]), float(result.x[1])
@@ -173,32 +213,34 @@ class BetaBinomialMixture:
         beta_init: np.ndarray,
     ) -> tuple[float, int, bool]:
         """Run EM from a single initialisation."""
+        from scipy.special import gammaln
+
         self.pi_ = float(pi_init)
         self.alpha_ = alpha_init.copy().astype(float)
         self.beta_ = beta_init.copy().astype(float)
 
+        # Pre-compute constants that don't change across iterations.
+        log_cnk = gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1)
+        nmk = n - k
+
         prev_ll = -np.inf
         for iteration in range(self.max_iter):
-            gamma, ll = self._e_step(k, n)
+            gamma, ll = self._e_step(k, n, log_cnk)
 
             if abs(ll - prev_ll) < self.tol:
                 return ll, iteration + 1, True
             prev_ll = ll
 
-            # Update mixing weight.
             self.pi_ = float(np.mean(gamma))
 
-            # Component 1 = accessible (weights = gamma)
             self.alpha_[1], self.beta_[1] = self._m_step_component(
-                k, n, gamma, self.alpha_[1], self.beta_[1]
+                k, n, gamma, self.alpha_[1], self.beta_[1], log_cnk, nmk,
             )
-            # Component 0 = closed (weights = 1 - gamma)
             self.alpha_[0], self.beta_[0] = self._m_step_component(
-                k, n, 1 - gamma, self.alpha_[0], self.beta_[0]
+                k, n, 1 - gamma, self.alpha_[0], self.beta_[0], log_cnk, nmk,
             )
 
-        # Hit max_iter without tolerance met.
-        _, final_ll = self._e_step(k, n)
+        _, final_ll = self._e_step(k, n, log_cnk)
         return final_ll, self.max_iter, False
 
     # ----- Public API -------------------------------------------------------
@@ -295,10 +337,14 @@ class BetaBinomialMixture:
         k = np.asarray(k).astype(float)
         n = np.asarray(n).astype(float)
 
+        from scipy.special import gammaln
+
         out = np.full(len(k), np.nan, dtype=float)
         valid = n >= 1
         if valid.any():
-            gamma, _ = self._e_step(k[valid], n[valid])
+            kv, nv = k[valid], n[valid]
+            log_cnk = gammaln(nv + 1) - gammaln(kv + 1) - gammaln(nv - kv + 1)
+            gamma, _ = self._e_step(kv, nv, log_cnk)
             out[valid] = gamma
         return out
 
