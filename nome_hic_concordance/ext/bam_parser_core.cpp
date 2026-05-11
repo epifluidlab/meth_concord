@@ -474,6 +474,118 @@ static py::dict parse_cell_bam_cpp(
 // pybind11 module
 // --------------------------------------------------------------------------
 
+// --------------------------------------------------------------------------
+// Diagnostic: expose strand inference internals for debugging
+// --------------------------------------------------------------------------
+
+static py::list debug_strand_inference(const std::string& bam_path,
+                                        const std::string& chrom,
+                                        int max_reads)
+{
+    hts_set_log_level(HTS_LOG_OFF);
+    htsFile* fp = hts_open(bam_path.c_str(), "r");
+    if (!fp) throw std::runtime_error("Cannot open BAM: " + bam_path);
+    sam_hdr_t* hdr = sam_hdr_read(fp);
+    hts_idx_t* idx = sam_index_load(fp, bam_path.c_str());
+    if (!hdr || !idx) { hts_close(fp); throw std::runtime_error("Cannot read header/index"); }
+
+    int tid = sam_hdr_name2tid(hdr, chrom.c_str());
+    if (tid < 0) { hts_close(fp); throw std::runtime_error("Chrom not found: " + chrom); }
+
+    bam1_t* b = bam_init1();
+    hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, INT64_MAX);
+    py::list results;
+    int count = 0;
+
+    while (iter && sam_itr_next(fp, iter, b) >= 0 && count < max_reads) {
+        uint16_t flag = b->core.flag;
+        if (flag & SKIP_FLAGS) continue;
+        if (!(flag & FLAG_PROPER_PAIR)) continue;
+        if (b->core.qual < 30) continue;
+
+        // Get MD tag
+        const uint8_t* md_raw = bam_aux_get(b, "MD");
+        bool has_md = (md_raw != nullptr);
+        std::string md_str;
+        if (has_md) {
+            const char* md = bam_aux2Z(md_raw);
+            if (md) md_str = md;
+            else { has_md = false; md_str = "bam_aux2Z_failed"; }
+        }
+
+        // Run strand inference
+        int strand = infer_conversion_strand(b);
+
+        // Also manually count C->T and G->A for verification
+        int manual_ct = 0, manual_ga = 0;
+        if (has_md && md_str != "bam_aux2Z_failed") {
+            const uint8_t* seq = bam_get_seq(b);
+            int seq_len = b->core.l_qseq;
+            const uint32_t* cigar = bam_get_cigar(b);
+            int n_cigar = b->core.n_cigar;
+
+            // Build ref_to_query (same as infer_conversion_strand)
+            std::vector<int> r2q;
+            int qp = 0;
+            for (int ci = 0; ci < n_cigar; ++ci) {
+                int op = bam_cigar_op(cigar[ci]);
+                int len = bam_cigar_oplen(cigar[ci]);
+                if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
+                    for (int x = 0; x < len; ++x) r2q.push_back(qp++);
+                } else if (op == BAM_CINS || op == BAM_CSOFT_CLIP) {
+                    qp += len;
+                } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
+                    for (int x = 0; x < len; ++x) r2q.push_back(-1);
+                }
+            }
+
+            // Walk MD
+            const char* p = md_str.c_str();
+            int ri = 0;
+            while (*p) {
+                if (*p >= '0' && *p <= '9') {
+                    int n = 0;
+                    while (*p >= '0' && *p <= '9') { n = n*10 + (*p-'0'); ++p; }
+                    ri += n;
+                } else if (*p == '^') {
+                    ++p;
+                    while (*p && !(*p >= '0' && *p <= '9')) { ++ri; ++p; }
+                } else {
+                    char rb = std::toupper((unsigned char)*p); ++p;
+                    if (ri >= 0 && ri < (int)r2q.size()) {
+                        int q = r2q[ri];
+                        if (q >= 0 && q < seq_len) {
+                            char rdbase = bam_base_at(seq, q);
+                            if (rb == 'C' && rdbase == 'T') ++manual_ct;
+                            else if (rb == 'G' && rdbase == 'A') ++manual_ga;
+                        }
+                    }
+                    ++ri;
+                }
+            }
+        }
+
+        py::dict d;
+        d["qname"] = std::string(bam_get_qname(b));
+        d["has_md"] = has_md;
+        d["md"] = md_str.substr(0, 60);  // truncate for readability
+        d["strand"] = (strand == STRAND_CT ? "CT" :
+                       strand == STRAND_GA ? "GA" : "unknown");
+        d["manual_ct"] = manual_ct;
+        d["manual_ga"] = manual_ga;
+        results.append(d);
+        ++count;
+    }
+
+    if (iter) hts_itr_destroy(iter);
+    bam_destroy1(b);
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(hdr);
+    hts_close(fp);
+    return results;
+}
+
+
 PYBIND11_MODULE(_bam_parser_core, m) {
     m.doc() = "C++/htslib backend for BAM read-pair context counting (strand-aware)";
 
@@ -497,4 +609,10 @@ PYBIND11_MODULE(_bam_parser_core, m) {
           -------
           dict with numpy arrays: chrom, pos1, k1, n1, pos2, k2, n2, distance
           )doc");
+
+    m.def("debug_strand_inference", &debug_strand_inference,
+          py::arg("bam_path"),
+          py::arg("chrom"),
+          py::arg("max_reads") = 10,
+          "Debug: return strand inference details for the first N reads.");
 }
