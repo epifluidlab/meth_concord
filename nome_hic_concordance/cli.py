@@ -116,9 +116,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Minimum mapping quality on both ends (default: 30).")
 
     # EM fitting options
-    parser.add_argument("--em-subsample", type=int, default=0,
-                        help="Max read ends for EM fitting. "
-                             "0 (default) = use all read ends, no subsampling.")
+    parser.add_argument("--em-subsample", type=int, default=10_000_000,
+                        help="Max read ends for EM fitting (default: 10000000). "
+                             "Use 0 to disable subsampling and fit on all read ends.")
     parser.add_argument("--em-cell-specific", action="store_true",
                         help="Also fit EM per-cell for diagnostic comparison.")
 
