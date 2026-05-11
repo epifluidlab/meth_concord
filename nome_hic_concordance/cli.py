@@ -127,7 +127,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Number of parallel threads (default: 4).")
     parser.add_argument("--steps", type=str, default="all",
                         help='Steps to run: comma-separated (1-7) or "all".')
-    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--random-seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42).")
     parser.add_argument("--log-file", type=str, default=None,
                         help="Additional log file (default: stderr only).")
 
