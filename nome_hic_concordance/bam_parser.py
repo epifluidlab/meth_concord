@@ -37,13 +37,18 @@ from .utils import ensure_dir
 
 logger = logging.getLogger(__name__)
 
-# Try to import the C++/htslib extension.  If available it replaces the
-# pure-Python BAM parser with a ~10–15× faster implementation.
+# Try to import the C++/htslib extension.
 try:
     from . import _bam_parser_core  # type: ignore[attr-defined]
     _CPP_AVAILABLE = True
 except ImportError:
     _CPP_AVAILABLE = False
+
+# The C++ backend does not yet implement bisulfite conversion-strand
+# inference (required for non-directional bisulfite data like bhmem).
+# Force the Python backend until the C++ code is updated.
+# TODO: add strand inference to bam_parser_core.cpp, then remove this.
+_CPP_AVAILABLE = False
 
 # BAM flag bits — combined into a single skip-mask for fast filtering.
 _FLAG_UNMAPPED       = 0x4
@@ -97,10 +102,14 @@ def _infer_conversion_strand(read) -> str:
     """Infer whether *read* is from a C→T or G→A bisulfite conversion strand.
 
     Counts C→T mismatches (ref=C, read=T) and G→A mismatches (ref=G,
-    read=A) across the full aligned span of the read.  The dominant
-    type determines the conversion direction.
+    read=A) across the aligned span.  The dominant type determines the
+    conversion direction.
 
-    Requires the MD tag in the BAM (present in calmd / MD-annotated BAMs).
+    For reads without indels (>90%), a direct 1:1 loop is used.  For
+    reads with indels, ``get_aligned_pairs(matches_only=True)`` maps
+    reference to query positions correctly.
+
+    Requires the MD tag (present in calmd BAMs).
 
     Returns
     -------
@@ -120,16 +129,33 @@ def _infer_conversion_strand(read) -> str:
 
     ct = 0
     ga = 0
-    offset = read.query_alignment_start
-    ref_len = len(ref_seq)
 
-    for i in range(ref_len):
-        rb = ref_seq[i]
-        qb = seq[offset + i]
-        if rb == "C" and qb == "T":
-            ct += 1
-        elif rb == "G" and qb == "A":
-            ga += 1
+    if read.reference_length == read.query_alignment_length:
+        # Fast path: no indels — direct 1:1 correspondence between
+        # ref_seq[i] and seq[query_alignment_start + i].
+        offset = read.query_alignment_start
+        for i in range(len(ref_seq)):
+            rb = ref_seq[i]
+            qb = seq[offset + i]
+            if rb == "C" and qb == "T":
+                ct += 1
+            elif rb == "G" and qb == "A":
+                ga += 1
+    else:
+        # Slow path: indels break the 1:1 correspondence.  Use
+        # aligned pairs to correctly map ref → query positions.
+        ref_start = read.reference_start
+        ref_len = len(ref_seq)
+        seq_len = len(seq)
+        for qpos, rpos in read.get_aligned_pairs(matches_only=True):
+            ri = rpos - ref_start
+            if 0 <= ri < ref_len and 0 <= qpos < seq_len:
+                rb = ref_seq[ri]
+                qb = seq[qpos]
+                if rb == "C" and qb == "T":
+                    ct += 1
+                elif rb == "G" and qb == "A":
+                    ga += 1
 
     if ct > ga:
         return "CT"
