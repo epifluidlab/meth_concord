@@ -295,8 +295,16 @@ def _parse_cell_bam_cpp(
 ) -> pd.DataFrame:
     """Parse a BAM using the C++/htslib backend (fast path)."""
     # The C++ function expects {chrom: (pos_array, ref_base_array)}.
+    # CRITICAL: arr["pos"] and arr["ref_base"] are views into a structured
+    # numpy array with stride = record_size (9 bytes), NOT element_size.
+    # The C++ code uses raw pointer arithmetic (ctx_pos[j]) which assumes
+    # contiguous layout.  np.ascontiguousarray() copies them into packed
+    # arrays with stride = element_size.
     cpp_ctx = {
-        chrom: (arr["pos"], arr["ref_base"])
+        chrom: (
+            np.ascontiguousarray(arr["pos"]),
+            np.ascontiguousarray(arr["ref_base"]),
+        )
         for chrom, arr in context_positions.items()
         if len(arr) > 0
     }
