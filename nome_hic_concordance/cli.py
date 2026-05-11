@@ -504,9 +504,8 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Step 1: context positions ----------------------------------------
     if context_bed_paths is not None:
         # Fast path: load from tabix-indexed BED files.
-        logger.info("=" * 60)
-        logger.info("Step 1: Loading context positions from BED files")
-        logger.info("=" * 60)
+        # Always runs (context positions are needed by all downstream steps).
+        logger.info("Loading context positions from BED files...")
         all_context_positions = reference.load_context_from_bed(
             context_bed_paths,
             n_threads=args.n_threads,
