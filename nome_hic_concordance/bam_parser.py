@@ -117,7 +117,7 @@ def _infer_conversion_strand(read) -> str:
         return "unknown"
 
     try:
-        ref_seq = read.get_reference_sequence()
+        ref_seq = read.get_reference_sequence().upper()
     except ValueError:
         return "unknown"
 

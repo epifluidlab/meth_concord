@@ -21,6 +21,7 @@
 #include <htslib/sam.h>
 #include <htslib/hts.h>
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -228,7 +229,7 @@ static int infer_conversion_strand(const bam1_t* b) {
             }
         } else {
             // Single mismatch: the character is the REFERENCE base.
-            char ref_base = *p;
+            char ref_base = std::toupper((unsigned char)*p);
             ++p;
 
             // Skip insertions.
