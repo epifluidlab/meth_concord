@@ -120,25 +120,47 @@ class BetaBinomialMixture:
         self.n_iter_: int = 0
         self.log_likelihood_: float | None = None
 
-    # ----- EM step helpers --------------------------------------------------
+    # ----- Sufficient-statistics EM -----------------------------------------
+    #
+    # Key insight: betabinom_logpmf(k, n, α, β) only depends on the (k, n)
+    # pair, not on which read it came from.  With 10M read ends there are
+    # typically only ~500 unique (k, n) combinations.  We compute all
+    # scipy special functions on ~500 elements instead of 10M — a ~20,000×
+    # reduction in the inner-loop array sizes.
 
-    def _e_step(
-        self, k: np.ndarray, n: np.ndarray, log_cnk: np.ndarray,
-    ) -> tuple[np.ndarray, float]:
-        """Compute responsibilities gamma_i = P(accessible | k_i, n_i) and LL.
+    @staticmethod
+    def _compress_to_sufficient_stats(
+        k: np.ndarray, n: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        """Collapse (k, n) arrays to unique pairs with counts.
 
-        ``log_cnk`` is the pre-computed ``log C(n, k)`` term (constant
-        across all EM iterations).
+        Returns (uk, un, counts, N_total).
         """
+        from scipy.special import gammaln
+
+        pairs = np.column_stack([k.astype(np.int32), n.astype(np.int32)])
+        unique_pairs, counts = np.unique(pairs, axis=0, return_counts=True)
+        uk = unique_pairs[:, 0].astype(float)
+        un = unique_pairs[:, 1].astype(float)
+        counts = counts.astype(float)
+        return uk, un, counts, len(k)
+
+    def _e_step_compressed(
+        self,
+        uk: np.ndarray,
+        un: np.ndarray,
+        counts: np.ndarray,
+        N: int,
+        log_cnk: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        """E-step on compressed sufficient statistics (~500 elements)."""
         from scipy.special import betaln
 
-        # betabinom_logpmf without the constant log C(n,k):
-        #   log_cnk + betaln(k + α, n - k + β) - betaln(α, β)
         log_p0 = (log_cnk
-                   + betaln(k + self.alpha_[0], n - k + self.beta_[0])
+                   + betaln(uk + self.alpha_[0], un - uk + self.beta_[0])
                    - betaln(self.alpha_[0], self.beta_[0]))
         log_p1 = (log_cnk
-                   + betaln(k + self.alpha_[1], n - k + self.beta_[1])
+                   + betaln(uk + self.alpha_[1], un - uk + self.beta_[1])
                    - betaln(self.alpha_[1], self.beta_[1]))
 
         pi = float(np.clip(self.pi_, 1e-12, 1.0 - 1e-12))
@@ -146,24 +168,23 @@ class BetaBinomialMixture:
         log_w1 = np.log(pi) + log_p1
 
         log_total = np.logaddexp(log_w0, log_w1)
-        gamma = np.exp(log_w1 - log_total)
-        return gamma, float(np.sum(log_total))
+        gamma = np.exp(log_w1 - log_total)  # P(accessible) per unique (k,n)
 
-    def _m_step_component(
+        # Total log-likelihood, weighted by counts.
+        ll = float(np.sum(counts * log_total))
+        return gamma, ll
+
+    def _m_step_component_compressed(
         self,
-        k: np.ndarray,
-        n: np.ndarray,
-        weights: np.ndarray,
+        uk: np.ndarray,
+        un: np.ndarray,
+        eff_weights: np.ndarray,
         alpha_init: float,
         beta_init: float,
         log_cnk: np.ndarray,
-        nmk: np.ndarray,
+        unmk: np.ndarray,
     ) -> tuple[float, float]:
-        """Optimise (α, β) with pre-computed constants and analytical gradient.
-
-        ``log_cnk`` = ``log C(n, k)`` (constant, pre-computed once).
-        ``nmk`` = ``n - k`` (constant, pre-computed once).
-        """
+        """M-step on compressed data with analytical gradient (~500 elements)."""
         from scipy.optimize import minimize
         from scipy.special import betaln, digamma
 
@@ -172,17 +193,14 @@ class BetaBinomialMixture:
             if a <= 0 or b <= 0:
                 return 1e12, np.zeros(2)
 
-            ka = k + a
-            nmkb = nmk + b
+            ka = uk + a
+            nmkb = unmk + b
             ab = a + b
-            nab = n + ab
+            nab = un + ab
 
-            # Weighted negative log-likelihood (log_cnk drops out of gradient
-            # but we include it for correct LL monitoring).
             ll_terms = log_cnk + betaln(ka, nmkb) - betaln(a, b)
-            neg_ll = -float(np.sum(weights * ll_terms))
+            neg_ll = -float(np.sum(eff_weights * ll_terms))
 
-            # Analytical gradient using digamma (ψ).
             psi_ka = digamma(ka)
             psi_nmkb = digamma(nmkb)
             psi_nab = digamma(nab)
@@ -190,8 +208,8 @@ class BetaBinomialMixture:
             psi_a = digamma(a)
             psi_b = digamma(b)
 
-            dll_da = float(np.sum(weights * (psi_ka - psi_nab + psi_ab - psi_a)))
-            dll_db = float(np.sum(weights * (psi_nmkb - psi_nab + psi_ab - psi_b)))
+            dll_da = float(np.sum(eff_weights * (psi_ka - psi_nab + psi_ab - psi_a)))
+            dll_db = float(np.sum(eff_weights * (psi_nmkb - psi_nab + psi_ab - psi_b)))
 
             return neg_ll, np.array([-dll_da, -dll_db])
 
@@ -212,35 +230,46 @@ class BetaBinomialMixture:
         alpha_init: np.ndarray,
         beta_init: np.ndarray,
     ) -> tuple[float, int, bool]:
-        """Run EM from a single initialisation."""
+        """Run EM from a single initialisation using sufficient statistics."""
         from scipy.special import gammaln
 
         self.pi_ = float(pi_init)
         self.alpha_ = alpha_init.copy().astype(float)
         self.beta_ = beta_init.copy().astype(float)
 
-        # Pre-compute constants that don't change across iterations.
-        log_cnk = gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1)
-        nmk = n - k
+        # Compress 10M read ends → ~500 unique (k, n) pairs.
+        uk, un, counts, N = self._compress_to_sufficient_stats(k, n)
+        logger.info(
+            f"    Compressed {N:,} read ends → {len(uk):,} unique (k,n) pairs"
+        )
+
+        # Pre-compute constants on the compressed arrays (~500 elements).
+        log_cnk = gammaln(un + 1) - gammaln(uk + 1) - gammaln(un - uk + 1)
+        unmk = un - uk
 
         prev_ll = -np.inf
         for iteration in range(self.max_iter):
-            gamma, ll = self._e_step(k, n, log_cnk)
+            gamma, ll = self._e_step_compressed(uk, un, counts, N, log_cnk)
 
             if abs(ll - prev_ll) < self.tol:
                 return ll, iteration + 1, True
             prev_ll = ll
 
-            self.pi_ = float(np.mean(gamma))
+            # pi = weighted mean of gamma across all data points.
+            self.pi_ = float(np.sum(counts * gamma) / N)
 
-            self.alpha_[1], self.beta_[1] = self._m_step_component(
-                k, n, gamma, self.alpha_[1], self.beta_[1], log_cnk, nmk,
+            # Effective weights per unique (k,n) for each component.
+            w1 = counts * gamma        # accessible
+            w0 = counts * (1 - gamma)  # closed
+
+            self.alpha_[1], self.beta_[1] = self._m_step_component_compressed(
+                uk, un, w1, self.alpha_[1], self.beta_[1], log_cnk, unmk,
             )
-            self.alpha_[0], self.beta_[0] = self._m_step_component(
-                k, n, 1 - gamma, self.alpha_[0], self.beta_[0], log_cnk, nmk,
+            self.alpha_[0], self.beta_[0] = self._m_step_component_compressed(
+                uk, un, w0, self.alpha_[0], self.beta_[0], log_cnk, unmk,
             )
 
-        _, final_ll = self._e_step(k, n, log_cnk)
+        _, final_ll = self._e_step_compressed(uk, un, counts, N, log_cnk)
         return final_ll, self.max_iter, False
 
     # ----- Public API -------------------------------------------------------
@@ -337,14 +366,18 @@ class BetaBinomialMixture:
         k = np.asarray(k).astype(float)
         n = np.asarray(n).astype(float)
 
-        from scipy.special import gammaln
+        from scipy.special import betaln
 
         out = np.full(len(k), np.nan, dtype=float)
         valid = n >= 1
         if valid.any():
             kv, nv = k[valid], n[valid]
-            log_cnk = gammaln(nv + 1) - gammaln(kv + 1) - gammaln(nv - kv + 1)
-            gamma, _ = self._e_step(kv, nv, log_cnk)
+            log_p0 = betabinom_logpmf(kv, nv, self.alpha_[0], self.beta_[0])
+            log_p1 = betabinom_logpmf(kv, nv, self.alpha_[1], self.beta_[1])
+            pi = float(np.clip(self.pi_, 1e-12, 1.0 - 1e-12))
+            log_w0 = np.log(1 - pi) + log_p0
+            log_w1 = np.log(pi) + log_p1
+            gamma = np.exp(log_w1 - np.logaddexp(log_w0, log_w1))
             out[valid] = gamma
         return out
 
