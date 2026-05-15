@@ -158,6 +158,10 @@ def compute_delta(
     delta_var = theta_L_var + theta_U_var
     delta_z = np.where(delta_var > 0, delta / np.sqrt(delta_var), 0.0)
 
+    # Flag pairs where the category-pooled fallback was used for
+    # the unlinked baseline (per Math v1.1 §5.2).
+    used_fallback = (low_i | low_j).astype(int)
+
     result = pd.DataFrame({
         "pair_id": df["pair_id"].values,
         "n_linked": n_linked.astype(int),
@@ -168,6 +172,7 @@ def compute_delta(
         "p_j": p_j,
         "theta_U_active": theta_U,
         "theta_U_var": theta_U_var,
+        "used_fallback": used_fallback,
         "delta": delta,
         "delta_var": delta_var,
         "delta_z": delta_z,

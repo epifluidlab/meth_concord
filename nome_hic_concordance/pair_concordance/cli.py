@@ -65,12 +65,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Minimum GCH sites per read end (default: 3).",
     )
     parser.add_argument(
+        "--min-distance", type=int, default=20_000,
+        help="Minimum distance for linked reads (default: 20000).",
+    )
+    parser.add_argument(
+        "--unlinked-max-distance", type=int, default=20_000,
+        help="Max mate distance for unlinked reads — ensures they measure "
+             "LOCAL marginal accessibility (default: 20000).",
+    )
+    parser.add_argument(
         "--min-unlinked", type=int, default=5,
         help="Minimum unlinked reads per anchor for reliable p_i/p_j (default: 5).",
     )
     parser.add_argument(
         "--eb-pool-by", choices=["category", "category_band"], default="category",
         help="EB prior pooling level (default: category).",
+    )
+    parser.add_argument(
+        "--label-column", type=str, default="group",
+        help="Column in --samples TSV containing cell-type labels (default: group).",
     )
 
     # Embedding
@@ -129,13 +142,18 @@ def main(argv: list[str] | None = None) -> int:
     steps = _parse_steps(args.steps)
     logger.info(f"Running steps: {sorted(steps)}")
 
-    # Discover cells
+    # Discover cells and labels
+    label_col = args.label_column
     if args.samples:
         samples = pd.read_csv(args.samples, sep="\t", dtype=str)
         if "cell_name" not in samples.columns:
             samples.columns = ["cell_name", "bam_path"] + list(samples.columns[2:])
         cell_names = samples["cell_name"].tolist()
-        labels = samples.set_index("cell_name").get("group")
+        # Use the specified label column (default: "group")
+        labels = samples.set_index("cell_name").get(label_col)
+        if labels is None:
+            # Fall back to "group" if label_col not found
+            labels = samples.set_index("cell_name").get("group")
     else:
         cell_names = _discover_cells(args.posteriors_dir)
         labels = None
@@ -147,6 +165,11 @@ def main(argv: list[str] | None = None) -> int:
         elif gt.shape[1] >= 2:
             gt.columns = ["cell_name", "true_label"] + list(gt.columns[2:])
             labels = gt.set_index("cell_name")["true_label"]
+
+    # Exclude ambiguous cells from labels (keep them in the pipeline but
+    # exclude from supervised evaluation per design v2.2 §8.1)
+    if labels is not None:
+        labels = labels[~labels.isin(["ambiguous", "unknown", ""])]
 
     logger.info(f"Found {len(cell_names)} cells")
 
@@ -177,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
             n_threads=args.n_threads,
             posterior_threshold=args.posterior_threshold,
             min_gch_sites=args.min_gch_sites,
+            min_distance=args.min_distance,
+            unlinked_max_distance=args.unlinked_max_distance,
         )
     else:
         logger.info("Step 6p: Skipped (loading existing pair counts)")

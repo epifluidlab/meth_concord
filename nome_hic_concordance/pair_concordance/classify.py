@@ -4,9 +4,14 @@ For a given pair (region_i, region_j) from the panel, classifies each read
 pair from a cell's posteriors.parquet into one of three categories:
 
 * **Linked** — pos1 in region_i AND pos2 in region_j (or the symmetric
-  placement: pos1 in region_j AND pos2 in region_i).
-* **Unlinked-i** — one read end in region_i, mate NOT in region_j.
-* **Unlinked-j** — one read end in region_j, mate NOT in region_i.
+  placement), with distance between the two read ends >= ``min_distance``.
+  Both ends must be informative (>= ``min_gch_sites``).
+* **Unlinked-i** — one read end in region_i, mate NOT in region_j,
+  AND mate within ``unlinked_max_distance`` of anchor_i's center.
+  Only the in-anchor end must be informative.
+* **Unlinked-j** — one read end in region_j, mate NOT in region_i,
+  AND mate within ``unlinked_max_distance`` of anchor_j's center.
+  Only the in-anchor end must be informative.
 
 Read pairs are further filtered by a posterior threshold and minimum GCH
 site count before being counted.
@@ -129,6 +134,8 @@ def aggregate_pair_counts(
     panel: pd.DataFrame,
     posterior_threshold: float = 0.5,
     min_gch_sites: int = 3,
+    min_distance: int = 20_000,
+    unlinked_max_distance: int = 20_000,
 ) -> pd.DataFrame:
     """Aggregate linked and unlinked counts at every panel pair for one cell.
 
@@ -137,14 +144,19 @@ def aggregate_pair_counts(
     pairs are classified as:
 
     * **Linked** — one end in anchor_i and the other in anchor_j of the
-      same panel pair.  ``k_linked_active`` counts pairs where *both*
-      posteriors exceed ``posterior_threshold``.  ``k_linked_symmetric``
-      counts pairs where both posteriors agree (both above or both below
-      threshold).
-    * **Unlinked-i** — one end in anchor_i, mate not in anchor_j.
+      same panel pair, with distance between the two read ends >=
+      ``min_distance``.  Both ends must be informative (n >= min_gch_sites).
+      ``k_linked_active`` counts pairs where *both* posteriors exceed
+      ``posterior_threshold``.  ``k_linked_symmetric`` counts pairs where
+      both posteriors agree (both above or both below threshold).
+    * **Unlinked-i** — one end in anchor_i, mate not in anchor_j, AND
+      mate within ``unlinked_max_distance`` of anchor_i's center.  Only
+      the in-anchor end must be informative.
       ``k_unlinked_i_open`` counts those where the anchor_i end's
       posterior exceeds the threshold.
-    * **Unlinked-j** — one end in anchor_j, mate not in anchor_i.
+    * **Unlinked-j** — one end in anchor_j, mate not in anchor_i, AND
+      mate within ``unlinked_max_distance`` of anchor_j's center.  Only
+      the in-anchor end must be informative.
       ``k_unlinked_j_open`` counts those where the anchor_j end's
       posterior exceeds the threshold.
 
@@ -162,6 +174,12 @@ def aggregate_pair_counts(
     min_gch_sites : int
         Minimum informative GCH sites for a read end to be counted
         (default 3).
+    min_distance : int
+        Minimum genomic distance (bp) between the two read ends for
+        a read pair to qualify as linked (default 20,000).
+    unlinked_max_distance : int
+        Maximum distance (bp) from the relevant anchor's center for
+        the mate to qualify as an unlinked read (default 20,000).
 
     Returns
     -------
@@ -180,12 +198,14 @@ def aggregate_pair_counts(
             f"Posteriors file for {cell_name} is missing columns {sorted(missing)}"
         )
 
-    # Pre-filter: both ends need sufficient GCH sites and valid posteriors.
+    # Pre-filter: at least one end needs sufficient GCH sites and a valid
+    # posterior.  (Linked requires *both* informative; unlinked only the
+    # in-anchor end — we check per-end informativeness during classification.)
     df = df[
-        (df["n1"] >= min_gch_sites)
-        & (df["n2"] >= min_gch_sites)
-        & df["posterior1"].notna()
-        & df["posterior2"].notna()
+        (
+            ((df["n1"] >= min_gch_sites) & df["posterior1"].notna())
+            | ((df["n2"] >= min_gch_sites) & df["posterior2"].notna())
+        )
     ].copy()
 
     n_pairs_panel = len(panel)
@@ -202,6 +222,15 @@ def aggregate_pair_counts(
     # Build anchor index.
     anchor_idx = _build_anchor_index(panel)
 
+    # Precompute anchor centers for unlinked distance checks.
+    # anchor_center_i[pair_idx] = midpoint of anchor_i for that panel pair.
+    anchor_center_i = ((panel["start_i"].values + panel["end_i"].values) // 2).astype(
+        np.int64
+    )
+    anchor_center_j = ((panel["start_j"].values + panel["end_j"].values) // 2).astype(
+        np.int64
+    )
+
     # Sweep each read pair once.
     for row in df.itertuples(index=False):
         chrom = row.chrom
@@ -212,8 +241,11 @@ def aggregate_pair_counts(
 
         pos1 = row.pos1
         pos2 = row.pos2
+        n1 = row.n1
+        n2 = row.n2
         p1 = row.posterior1
         p2 = row.posterior2
+        distance = abs(pos2 - pos1)
 
         # Find which anchors each read end overlaps.
         hits1 = _find_overlapping_anchors(
@@ -235,9 +267,16 @@ def aggregate_pair_counts(
         for pair_idx, side in hits2:
             hit2_set.setdefault(pair_idx, set()).add(side)
 
-        # Check for linked pairs: pos1 in anchor_i & pos2 in anchor_j,
-        # or pos1 in anchor_j & pos2 in anchor_i.
+        # Check for linked pairs: pos1 in anchor_i & pos2 in anchor_j
+        # (or symmetric), with distance >= min_distance and both ends
+        # informative.
         linked_pairs: set[int] = set()
+        both_informative = (
+            n1 >= min_gch_sites
+            and n2 >= min_gch_sites
+            and not (np.isnan(p1) if isinstance(p1, float) else False)
+            and not (np.isnan(p2) if isinstance(p2, float) else False)
+        )
 
         all_pair_indices = set(hit1_set.keys()) | set(hit2_set.keys())
         for pair_idx in all_pair_indices:
@@ -246,7 +285,7 @@ def aggregate_pair_counts(
 
             is_linked = (0 in sides1 and 1 in sides2) or (1 in sides1 and 0 in sides2)
 
-            if is_linked:
+            if is_linked and distance >= min_distance and both_informative:
                 linked_pairs.add(pair_idx)
                 n_linked[pair_idx] += 1
 
@@ -257,43 +296,64 @@ def aggregate_pair_counts(
                 if active1 == active2:
                     k_linked_symmetric[pair_idx] += 1
 
-        # Unlinked-i: pos in anchor_i of some pair, but mate NOT in anchor_j
-        # of that same pair.
+        # Unlinked-i: pos in anchor_i of some pair, mate NOT in anchor_j,
+        # AND mate within unlinked_max_distance of anchor_i's center.
+        # The in-anchor end must be informative.
         for pair_idx, side in hits1:
             if pair_idx in linked_pairs:
                 continue
             if side == 0:
-                # pos1 is in anchor_i; check if pos2 is in anchor_j.
+                # pos1 is in anchor_i; in-anchor end must be informative.
+                if n1 < min_gch_sites or (isinstance(p1, float) and np.isnan(p1)):
+                    continue
+                # Check mate (pos2) is NOT in anchor_j.
                 sides2 = hit2_set.get(pair_idx, set())
                 if 1 not in sides2:
-                    n_unlinked_i[pair_idx] += 1
-                    if p1 >= posterior_threshold:
-                        k_unlinked_i_open[pair_idx] += 1
+                    # Mate must be within unlinked_max_distance of anchor_i center.
+                    if abs(pos2 - anchor_center_i[pair_idx]) <= unlinked_max_distance:
+                        n_unlinked_i[pair_idx] += 1
+                        if p1 >= posterior_threshold:
+                            k_unlinked_i_open[pair_idx] += 1
             elif side == 1:
-                # pos1 is in anchor_j; check if pos2 is in anchor_i.
+                # pos1 is in anchor_j; in-anchor end must be informative.
+                if n1 < min_gch_sites or (isinstance(p1, float) and np.isnan(p1)):
+                    continue
+                # Check mate (pos2) is NOT in anchor_i.
                 sides2 = hit2_set.get(pair_idx, set())
                 if 0 not in sides2:
-                    n_unlinked_j[pair_idx] += 1
-                    if p1 >= posterior_threshold:
-                        k_unlinked_j_open[pair_idx] += 1
+                    # Mate must be within unlinked_max_distance of anchor_j center.
+                    if abs(pos2 - anchor_center_j[pair_idx]) <= unlinked_max_distance:
+                        n_unlinked_j[pair_idx] += 1
+                        if p1 >= posterior_threshold:
+                            k_unlinked_j_open[pair_idx] += 1
 
         for pair_idx, side in hits2:
             if pair_idx in linked_pairs:
                 continue
             if side == 0:
-                # pos2 is in anchor_i; check if pos1 is in anchor_j.
+                # pos2 is in anchor_i; in-anchor end must be informative.
+                if n2 < min_gch_sites or (isinstance(p2, float) and np.isnan(p2)):
+                    continue
+                # Check mate (pos1) is NOT in anchor_j.
                 sides1 = hit1_set.get(pair_idx, set())
                 if 1 not in sides1:
-                    n_unlinked_i[pair_idx] += 1
-                    if p2 >= posterior_threshold:
-                        k_unlinked_i_open[pair_idx] += 1
+                    # Mate must be within unlinked_max_distance of anchor_i center.
+                    if abs(pos1 - anchor_center_i[pair_idx]) <= unlinked_max_distance:
+                        n_unlinked_i[pair_idx] += 1
+                        if p2 >= posterior_threshold:
+                            k_unlinked_i_open[pair_idx] += 1
             elif side == 1:
-                # pos2 is in anchor_j; check if pos1 is in anchor_i.
+                # pos2 is in anchor_j; in-anchor end must be informative.
+                if n2 < min_gch_sites or (isinstance(p2, float) and np.isnan(p2)):
+                    continue
+                # Check mate (pos1) is NOT in anchor_i.
                 sides1 = hit1_set.get(pair_idx, set())
                 if 0 not in sides1:
-                    n_unlinked_j[pair_idx] += 1
-                    if p2 >= posterior_threshold:
-                        k_unlinked_j_open[pair_idx] += 1
+                    # Mate must be within unlinked_max_distance of anchor_j center.
+                    if abs(pos1 - anchor_center_j[pair_idx]) <= unlinked_max_distance:
+                        n_unlinked_j[pair_idx] += 1
+                        if p2 >= posterior_threshold:
+                            k_unlinked_j_open[pair_idx] += 1
 
     result = pd.DataFrame({
         "cell_name": cell_name,
@@ -352,7 +412,8 @@ def aggregate_all_cells(
         Number of parallel workers (default 4).
     **kwargs
         Extra keyword arguments passed to :func:`aggregate_pair_counts`
-        (e.g. ``posterior_threshold``, ``min_gch_sites``).
+        (e.g. ``posterior_threshold``, ``min_gch_sites``,
+        ``min_distance``, ``unlinked_max_distance``).
 
     Returns
     -------
