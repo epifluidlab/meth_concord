@@ -33,6 +33,7 @@ dev = [
 
 [project.scripts]
 nome_hic_concordance = "nome_hic_concordance.cli:main"
+nome_hic_pair_concordance = "nome_hic_concordance.pair_concordance.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["nome_hic_concordance*"]
