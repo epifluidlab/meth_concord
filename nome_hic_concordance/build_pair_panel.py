@@ -212,6 +212,34 @@ def scan_motifs_on_chromosome(
     return df
 
 
+def _scan_one_chrom_worker(
+    genome_fa_str: str,
+    chrom: str,
+    pfm_path_strs: list[str],
+    pvalue_threshold: float,
+) -> pd.DataFrame:
+    """Worker function: opens its own Fasta handle (cannot pickle file handles).
+
+    Must be a module-level function so joblib can pickle the call (not
+    the captured closure with an open Fasta object).
+    """
+    fasta = Fasta(genome_fa_str, as_raw=True)
+    try:
+        if chrom not in fasta:
+            log.warning(f"  chromosome {chrom} not in FASTA, skipping")
+            return pd.DataFrame()
+        seq = fasta[chrom][:].upper()
+        log.info(f"  scanning {chrom} ({len(seq):,} bp)")
+        pfm_paths = [Path(p) for p in pfm_path_strs]
+        return scan_motifs_on_chromosome(chrom, seq, pfm_paths, pvalue_threshold)
+    finally:
+        # pyfaidx's Fasta has a close() method; best-effort cleanup.
+        try:
+            fasta.close()
+        except Exception:
+            pass
+
+
 def scan_genome_for_motifs(
     genome_fa: Path,
     pfm_paths: list[Path],
@@ -219,19 +247,19 @@ def scan_genome_for_motifs(
     pvalue_threshold: float,
     threads: int,
 ) -> pd.DataFrame:
-    """Scan PWMs across multiple chromosomes in parallel."""
-    fasta = Fasta(str(genome_fa), as_raw=True)
+    """Scan PWMs across multiple chromosomes in parallel.
 
-    def _scan_one(chrom: str) -> pd.DataFrame:
-        if chrom not in fasta:
-            log.warning(f"  chromosome {chrom} not in FASTA, skipping")
-            return pd.DataFrame()
-        seq = fasta[chrom][:].upper()
-        log.info(f"  scanning {chrom} ({len(seq):,} bp)")
-        return scan_motifs_on_chromosome(chrom, seq, pfm_paths, pvalue_threshold)
+    Each worker opens its own Fasta handle — file handles cannot be
+    pickled, so we cannot share a single Fasta across processes.
+    """
+    pfm_path_strs = [str(p) for p in pfm_paths]
+    genome_fa_str = str(genome_fa)
 
     dfs = Parallel(n_jobs=threads)(
-        delayed(_scan_one)(chrom) for chrom in chromosomes
+        delayed(_scan_one_chrom_worker)(
+            genome_fa_str, chrom, pfm_path_strs, pvalue_threshold,
+        )
+        for chrom in chromosomes
     )
     out = pd.concat([d for d in dfs if len(d) > 0], ignore_index=True)
     log.info(f"  total motif occurrences: {len(out):,}")
