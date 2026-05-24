@@ -1,0 +1,84 @@
+# Example pair-panel config: mouse cortex
+# ----------------------------------------
+# Cortex-specific lineage TFs:
+#   NEUROD2 (excitatory neurons)
+#   OLIG2 (oligodendrocytes)
+#   SPI1/PU.1 (microglia)
+#   MEF2C (active neurons, broad)
+# Architectural:
+#   CTCF (across all cell types)
+# Housekeeping (falsification controls):
+#   NRF1, SP1
+
+anchor_size: 5000
+
+distance_bands:
+  short: [100000, 500000]
+  mid:   [500000, 2000000]
+  long:  [2000000, 5000000]
+
+# Mouse autosomes
+chromosomes:
+  - chr1
+  - chr2
+  - chr3
+  - chr4
+  - chr5
+  - chr6
+  - chr7
+  - chr8
+  - chr9
+  - chr10
+  - chr11
+  - chr12
+  - chr13
+  - chr14
+  - chr15
+  - chr16
+  - chr17
+  - chr18
+  - chr19
+
+random_seed: 42
+
+include_co_folded: true
+target_co_folded_per_band: 3000
+
+include_random_matched: true
+target_random_per_band: 3000
+
+tf_categories:
+  - category: tf_anchored_NEUROD2
+    jaspar_ids: ["MA0668.2"]
+    chip_bed: null   # add ENCODE cortex NEUROD2 ChIP if available
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_OLIG2
+    jaspar_ids: ["MA0678.1"]
+    chip_bed: null
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_SPI1
+    jaspar_ids: ["MA0080.5"]
+    chip_bed: null
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_MEF2C
+    jaspar_ids: ["MA0497.1"]
+    chip_bed: null
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_CTCF
+    jaspar_ids: ["MA0139.2"]
+    chip_bed: null
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_NRF1
+    jaspar_ids: ["MA0506.1"]
+    chip_bed: null
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_SP1
+    jaspar_ids: ["MA0079.5"]
+    chip_bed: null
+    target_pairs_per_band: 5000
