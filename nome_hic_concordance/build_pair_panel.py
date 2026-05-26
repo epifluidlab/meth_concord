@@ -344,56 +344,133 @@ def motifs_to_anchors(
 # ----------------------------------------------------------------------
 # Pair enumeration
 # ----------------------------------------------------------------------
+def _enumerate_pairs_one_chrom(
+    chrom: str,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    scores: np.ndarray,
+    d_min: int,
+    d_max: int,
+) -> pd.DataFrame:
+    """Vectorised pair enumeration on one chromosome for one distance band.
+
+    For each anchor i, finds all j > i where d_min <= start_j - start_i <= d_max
+    using vectorised np.searchsorted + np.repeat / cumulative-arange.  Replaces
+    the previous O(N_pairs) Python double-loop.
+    """
+    n = len(starts)
+    if n < 2:
+        return pd.DataFrame()
+
+    # For each i, the range of valid j indices is [low_i, high_i)
+    lows = np.searchsorted(starts, starts + d_min, side="left")
+    highs = np.searchsorted(starts, starts + d_max, side="right")
+
+    # Restrict to j > i: j_start = max(low, i+1)
+    arange_n = np.arange(n)
+    j_starts = np.maximum(lows, arange_n + 1)
+    j_ends = highs
+    counts = np.maximum(j_ends - j_starts, 0)
+
+    total = int(counts.sum())
+    if total == 0:
+        return pd.DataFrame()
+
+    # i indices: repeat each i by counts[i]
+    i_idx = np.repeat(arange_n, counts)
+    # j indices: for each group of (j_start, j_end), build the arange
+    # using a cumulative-offset trick (no Python loop)
+    starts_per_group = np.repeat(j_starts, counts)
+    cum_offsets = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+    j_idx = starts_per_group + cum_offsets
+
+    s_i = starts[i_idx]
+    s_j = starts[j_idx]
+    e_i = ends[i_idx]
+    e_j = ends[j_idx]
+    sc_sum = scores[i_idx] + scores[j_idx]
+    dist = s_j - s_i
+
+    return pd.DataFrame({
+        "chrom_i": chrom,
+        "start_i": s_i,
+        "end_i": e_i,
+        "chrom_j": chrom,
+        "start_j": s_j,
+        "end_j": e_j,
+        "distance": dist.astype(np.int64),
+        "score_sum": sc_sum,
+    })
+
+
+def _enumerate_pairs_for_band(
+    anchors_by_chrom: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]],
+    d_min: int,
+    d_max: int,
+) -> pd.DataFrame:
+    """Worker: enumerate pairs for one distance band across all chromosomes."""
+    parts = []
+    for chrom, starts, ends, scores in anchors_by_chrom:
+        df = _enumerate_pairs_one_chrom(chrom, starts, ends, scores, d_min, d_max)
+        if len(df) > 0:
+            parts.append(df)
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True)
+
+
 def enumerate_pairs_for_anchors(
     anchors: pd.DataFrame,
     distance_bands: dict[str, tuple[int, int]],
     target_per_band: int,
     rng: np.random.Generator,
     category: str,
+    threads: int = 1,
 ) -> pd.DataFrame:
-    """
-    For a given anchor set, enumerate all anchor × anchor pairs within each distance band,
-    on the same chromosome, then sample `target_per_band` per band.
+    """For a given anchor set, enumerate all anchor x anchor pairs within each
+    distance band on the same chromosome, then sample ``target_per_band`` per band.
+
+    Vectorised inner loop + parallelism across distance bands (3 bands × parallel
+    chromosomes -> good speedup).
     """
     if len(anchors) < 2:
         return pd.DataFrame()
 
-    out_rows = []
-    for band_name, (d_min, d_max) in distance_bands.items():
-        per_chrom = []
-        for chrom, group in anchors.groupby("chrom", sort=False):
-            g = group.sort_values("anchor_start").reset_index(drop=True)
-            if len(g) < 2:
-                continue
-            starts = g["anchor_start"].to_numpy()
-            ends = g["anchor_end"].to_numpy()
-            scores = g["motif_score"].to_numpy()
-
-            # For each anchor i, find j > i where d_min <= start_j - start_i <= d_max
-            for i in range(len(g)):
-                low = np.searchsorted(starts, starts[i] + d_min, side="left")
-                high = np.searchsorted(starts, starts[i] + d_max, side="right")
-                for j in range(low, high):
-                    if j <= i:
-                        continue
-                    per_chrom.append(
-                        (chrom, starts[i], ends[i], chrom, starts[j], ends[j],
-                         int(starts[j] - starts[i]), scores[i] + scores[j])
-                    )
-
-        if not per_chrom:
+    # Pre-extract per-chromosome arrays once.
+    anchors_by_chrom: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+    for chrom, group in anchors.groupby("chrom", sort=False):
+        g = group.sort_values("anchor_start").reset_index(drop=True)
+        if len(g) < 2:
             continue
-        df = pd.DataFrame(per_chrom, columns=[
-            "chrom_i", "start_i", "end_i", "chrom_j", "start_j", "end_j",
-            "distance", "score_sum",
-        ])
+        anchors_by_chrom.append((
+            chrom,
+            g["anchor_start"].to_numpy(),
+            g["anchor_end"].to_numpy(),
+            g["motif_score"].to_numpy(),
+        ))
+
+    # Parallel across distance bands (small N, but each does a chunk of work).
+    band_items = list(distance_bands.items())
+    if threads > 1 and len(band_items) > 1:
+        band_dfs = Parallel(n_jobs=min(threads, len(band_items)))(
+            delayed(_enumerate_pairs_for_band)(anchors_by_chrom, d_min, d_max)
+            for _, (d_min, d_max) in band_items
+        )
+    else:
+        band_dfs = [
+            _enumerate_pairs_for_band(anchors_by_chrom, d_min, d_max)
+            for _, (d_min, d_max) in band_items
+        ]
+
+    out_rows = []
+    for (band_name, _), df in zip(band_items, band_dfs):
+        if len(df) == 0:
+            continue
         if len(df) > target_per_band:
-            # Weight by motif score sum for sampling — favors higher-confidence motif pairs
             weights = df["score_sum"].clip(lower=0.01).to_numpy()
             weights = weights / weights.sum()
             idx = rng.choice(len(df), size=target_per_band, replace=False, p=weights)
             df = df.iloc[idx].reset_index(drop=True)
-
         df["distance_band"] = band_name
         df["category"] = category
         df = df.drop(columns=["score_sum"])
@@ -677,6 +754,7 @@ def main():
         pairs = enumerate_pairs_for_anchors(
             anchors, cfg.distance_bands, tf_cfg.target_pairs_per_band,
             rng, tf_cfg.category,
+            threads=args.threads,
         )
         log.info(f"  {len(pairs):,} pairs across {len(cfg.distance_bands)} bands")
         category_dfs.append(pairs)
