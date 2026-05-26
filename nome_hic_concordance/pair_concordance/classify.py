@@ -41,44 +41,51 @@ logger = logging.getLogger(__name__)
 
 def _build_anchor_index(
     panel: pd.DataFrame,
-) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]]:
     """Build per-chromosome sorted anchor arrays for fast overlap queries.
 
-    For each chromosome, produces four parallel sorted arrays:
+    For each chromosome, produces four parallel sorted arrays plus the
+    maximum anchor size on that chromosome (used to bound searchsorted
+    range queries):
 
     * ``starts`` — anchor start positions (sorted).
     * ``ends`` — anchor end positions (matching order).
     * ``pair_indices`` — row index into the panel DataFrame.
     * ``sides`` — 0 for anchor_i, 1 for anchor_j.
+    * ``max_size`` — max(end - start) over all anchors on this chromosome.
 
     Returns
     -------
     dict
-        ``chrom -> (starts, ends, pair_indices, sides)``
+        ``chrom -> (starts, ends, pair_indices, sides, max_size)``
     """
     records: dict[str, list[tuple[int, int, int, int]]] = {}
 
-    for row_idx, row in enumerate(panel.itertuples(index=False)):
-        # Anchor i.
-        chrom_i = row.chrom_i
-        records.setdefault(chrom_i, []).append(
-            (row.start_i, row.end_i, row_idx, 0)
+    # Vectorised collection.
+    chrom_i = panel["chrom_i"].to_numpy()
+    start_i = panel["start_i"].to_numpy(dtype=np.int64)
+    end_i = panel["end_i"].to_numpy(dtype=np.int64)
+    chrom_j = panel["chrom_j"].to_numpy()
+    start_j = panel["start_j"].to_numpy(dtype=np.int64)
+    end_j = panel["end_j"].to_numpy(dtype=np.int64)
+
+    for row_idx in range(len(panel)):
+        records.setdefault(chrom_i[row_idx], []).append(
+            (int(start_i[row_idx]), int(end_i[row_idx]), row_idx, 0)
         )
-        # Anchor j.
-        chrom_j = row.chrom_j
-        records.setdefault(chrom_j, []).append(
-            (row.start_j, row.end_j, row_idx, 1)
+        records.setdefault(chrom_j[row_idx], []).append(
+            (int(start_j[row_idx]), int(end_j[row_idx]), row_idx, 1)
         )
 
-    index: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    index: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]] = {}
     for chrom, recs in records.items():
-        # Sort by start position for searchsorted.
         recs.sort(key=lambda t: t[0])
         starts = np.array([r[0] for r in recs], dtype=np.int64)
         ends = np.array([r[1] for r in recs], dtype=np.int64)
         pair_indices = np.array([r[2] for r in recs], dtype=np.int64)
         sides = np.array([r[3] for r in recs], dtype=np.int8)
-        index[chrom] = (starts, ends, pair_indices, sides)
+        max_size = int((ends - starts).max()) if len(ends) else 0
+        index[chrom] = (starts, ends, pair_indices, sides, max_size)
 
     return index
 
@@ -89,37 +96,32 @@ def _find_overlapping_anchors(
     chrom_ends: np.ndarray,
     chrom_pair_indices: np.ndarray,
     chrom_sides: np.ndarray,
+    max_size: int,
 ) -> list[tuple[int, int]]:
-    """Find all anchors overlapping a genomic position.
+    """Find all anchors overlapping a genomic position — O(log N) + O(k).
 
-    Uses searchsorted on the sorted starts array to limit the scan window,
-    then checks the end coordinate for each candidate.
+    Any anchor with start <= pos < end must satisfy
+    ``start in (pos - max_size, pos]``.  We use two ``searchsorted`` calls
+    to bracket this range to a tight window of size O(max_size / density),
+    then linearly check the few candidates' end coordinates.
 
-    Returns
-    -------
-    list of (pair_index, side)
-        ``side`` is 0 for anchor_i, 1 for anchor_j.
+    For a 5 kb-anchor panel with ~5 kb spacing, this is ~1 candidate per
+    query, vs. the previous O(N) backward scan that examined ALL
+    anchors with start <= pos on the chromosome.
     """
-    # All anchors with start <= pos are candidates.  Because starts is sorted,
-    # searchsorted('right') gives us the first index where start > pos.
-    right = int(np.searchsorted(chrom_starts, pos, side="right"))
-    if right == 0:
+    if len(chrom_starts) == 0:
         return []
 
-    # Among candidates [0 .. right-1], keep those whose end > pos.
-    # Scan backwards from right-1; anchors are sorted by start so once
-    # start is too far left we cannot skip further, but end values are
-    # not sorted so we must check all candidates.  For typical anchor
-    # sizes (~5 kb) and dense panels, the candidate count is small.
-    hits: list[tuple[int, int]] = []
-    for k in range(right - 1, -1, -1):
-        if chrom_ends[k] <= pos:
-            # This anchor's end is at or before pos, so it does not overlap.
-            # But earlier anchors might still overlap if they are wider,
-            # so we cannot break early — continue scanning.
-            continue
-        hits.append((int(chrom_pair_indices[k]), int(chrom_sides[k])))
+    # Restrict candidates to start in (pos - max_size, pos].
+    lo = int(np.searchsorted(chrom_starts, pos - max_size, side="left"))
+    hi = int(np.searchsorted(chrom_starts, pos, side="right"))
+    if lo >= hi:
+        return []
 
+    hits: list[tuple[int, int]] = []
+    for k in range(lo, hi):
+        if chrom_ends[k] > pos:
+            hits.append((int(chrom_pair_indices[k]), int(chrom_sides[k])))
     return hits
 
 
@@ -237,7 +239,9 @@ def aggregate_pair_counts(
         if chrom not in anchor_idx:
             continue
 
-        chrom_starts, chrom_ends, chrom_pair_indices, chrom_sides = anchor_idx[chrom]
+        chrom_starts, chrom_ends, chrom_pair_indices, chrom_sides, chrom_max_size = (
+            anchor_idx[chrom]
+        )
 
         pos1 = row.pos1
         pos2 = row.pos2
@@ -249,10 +253,12 @@ def aggregate_pair_counts(
 
         # Find which anchors each read end overlaps.
         hits1 = _find_overlapping_anchors(
-            pos1, chrom_starts, chrom_ends, chrom_pair_indices, chrom_sides
+            pos1, chrom_starts, chrom_ends, chrom_pair_indices, chrom_sides,
+            chrom_max_size,
         )
         hits2 = _find_overlapping_anchors(
-            pos2, chrom_starts, chrom_ends, chrom_pair_indices, chrom_sides
+            pos2, chrom_starts, chrom_ends, chrom_pair_indices, chrom_sides,
+            chrom_max_size,
         )
 
         if not hits1 and not hits2:
