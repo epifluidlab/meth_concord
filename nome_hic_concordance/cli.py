@@ -274,6 +274,10 @@ def run_context(
             trim_ends=args.trim_ends, mapq_min=args.mapq_min,
         )
     else:
+        # Only load step 2 output if a downstream step needs it.
+        if not ({3, 4, 5, 6, 7} & steps):
+            logger.info("Step 2: Skipped (no downstream step requires it)")
+            return
         logger.info(f"Step 2: Skipped (loading per-cell parquets from {read_pair_dir})")
         cell_parquets = {
             row["cell_name"]: str(read_pair_dir / f"{row['cell_name']}.read_pairs.parquet")
@@ -317,6 +321,10 @@ def run_context(
                 group_labels=samples.set_index("cell_name")["group"],
             )
     else:
+        # Only load step 3 output if a downstream step needs it.
+        if not ({4, 5, 6, 7} & steps):
+            logger.info("Step 3: Skipped (no downstream step requires it)")
+            return
         em_fit_path = mixture_dir / "em_fit_all.json"
         if not em_fit_path.exists():
             raise FileNotFoundError(
@@ -335,6 +343,10 @@ def run_context(
             n_threads=args.n_threads,
         )
     else:
+        # Only load step 4 output if a downstream step needs it.
+        if not ({5, 6, 7} & steps):
+            logger.info("Step 4: Skipped (no downstream step requires it)")
+            return
         posterior_paths = {
             row["cell_name"]: str(posterior_dir / f"{row['cell_name']}.posteriors.parquet")
             for _, row in samples.iterrows()
@@ -370,6 +382,10 @@ def run_context(
             output_dir=str(concordance_dir),
         )
     else:
+        # Only load step 5 output if a downstream step (6 or 7) needs it.
+        if not ({6, 7} & steps):
+            logger.info("Step 5: Skipped (no downstream step requires it)")
+            return
         raw_path = concordance_dir / "concordance_raw.parquet"
         cnt_path = concordance_dir / "pair_counts_per_bin.parquet"
         if not raw_path.exists() or not cnt_path.exists():
@@ -402,6 +418,10 @@ def run_context(
         concordance_shrunk.to_parquet(concordance_dir / "concordance_shrunk.parquet")
         concordance_shrunk.to_csv(concordance_dir / "concordance_shrunk.tsv", sep="\t")
     else:
+        # Only load step 6 output if step 7 needs it.
+        if 7 not in steps:
+            logger.info("Step 6: Skipped (no downstream step requires it)")
+            return
         shrunk_path = concordance_dir / "concordance_shrunk.parquet"
         if not shrunk_path.exists():
             raise FileNotFoundError(
