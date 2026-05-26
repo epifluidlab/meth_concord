@@ -64,6 +64,29 @@ def fit_priors(
         ``alpha_L``, ``beta_L``, ``mu_hat``, ``nu_hat``,
         ``n_obs_pairs``, ``n_obs_cells``.
     """
+    if pool_by not in ("category", "category_band"):
+        raise ValueError(f"pool_by must be 'category' or 'category_band', got {pool_by!r}")
+
+    # Merge category (and distance_band if needed) from the panel.
+    # pair_counts comes from classify.py which only stores per-cell counts,
+    # not panel metadata.  The merge attaches the lookup columns.
+    panel_lookup_cols = ["pair_id", "category"]
+    if pool_by == "category_band":
+        if "distance_band" not in panel.columns:
+            raise ValueError(
+                "pool_by='category_band' requires a 'distance_band' column in panel"
+            )
+        panel_lookup_cols.append("distance_band")
+
+    # Avoid duplicating columns already present in pair_counts.
+    to_merge_cols = ["pair_id"] + [
+        c for c in panel_lookup_cols[1:] if c not in pair_counts.columns
+    ]
+    if len(to_merge_cols) > 1:
+        pair_counts = pair_counts.merge(
+            panel[to_merge_cols], on="pair_id", how="left",
+        )
+
     required_cols = {"pair_id", "cell_name", "category", "n_linked", "k_linked_active"}
     missing = required_cols - set(pair_counts.columns)
     if missing:
@@ -73,9 +96,6 @@ def fit_priors(
         raise ValueError(
             "pool_by='category_band' requires a 'distance_band' column in pair_counts"
         )
-
-    if pool_by not in ("category", "category_band"):
-        raise ValueError(f"pool_by must be 'category' or 'category_band', got {pool_by!r}")
 
     # Only keep observations with at least one linked read.
     df = pair_counts.loc[pair_counts["n_linked"] > 0].copy()

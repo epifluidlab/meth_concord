@@ -71,6 +71,19 @@ def compute_delta(
         ``p_i``, ``p_j``, ``theta_U_active``, ``theta_U_var``,
         ``delta``, ``delta_var``, ``delta_z``.
     """
+    # Merge category (and distance_band if needed) from the panel —
+    # classify.py only stores per-cell counts, not panel metadata.
+    panel_lookup_cols = ["pair_id"]
+    if "category" not in pair_counts.columns:
+        panel_lookup_cols.append("category")
+    if "distance_band" in priors.columns and "distance_band" not in pair_counts.columns:
+        if "distance_band" in panel.columns:
+            panel_lookup_cols.append("distance_band")
+    if len(panel_lookup_cols) > 1:
+        pair_counts = pair_counts.merge(
+            panel[panel_lookup_cols], on="pair_id", how="left",
+        )
+
     required = {
         "pair_id", "category", "n_linked", "k_linked_active",
         "n_unlinked_i", "k_unlinked_i_open",
