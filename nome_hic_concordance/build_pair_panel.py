@@ -403,20 +403,48 @@ def _enumerate_pairs_one_chrom(
     })
 
 
-def _enumerate_pairs_for_band(
-    anchors_by_chrom: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]],
+def _enumerate_pairs_one_band_one_chrom(
+    chrom: str,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    scores: np.ndarray,
     d_min: int,
     d_max: int,
+    band_name: str,
 ) -> pd.DataFrame:
-    """Worker: enumerate pairs for one distance band across all chromosomes."""
-    parts = []
+    """Worker: vectorised pair enumeration for one (band, chrom) tile."""
+    df = _enumerate_pairs_one_chrom(chrom, starts, ends, scores, d_min, d_max)
+    if len(df) > 0:
+        df["distance_band"] = band_name
+    return df
+
+
+def _subsample_anchors_per_chrom(
+    anchors_by_chrom: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]],
+    max_anchors_per_chrom: int,
+    rng: np.random.Generator,
+) -> list[tuple[str, np.ndarray, np.ndarray, np.ndarray]]:
+    """Cap anchor count per chromosome via score-weighted sampling.
+
+    Pair enumeration is O(N^2) in anchor count.  With 1.7M anchors
+    collapsed at 1kb resolution, the long band yields ~10^9 candidate
+    pairs — far more than we need (target is ~5000).  Subsampling
+    anchors aggressively (weighted by motif score) cuts pair-count
+    quadratically while preserving the high-confidence anchors.
+    """
+    out = []
     for chrom, starts, ends, scores in anchors_by_chrom:
-        df = _enumerate_pairs_one_chrom(chrom, starts, ends, scores, d_min, d_max)
-        if len(df) > 0:
-            parts.append(df)
-    if not parts:
-        return pd.DataFrame()
-    return pd.concat(parts, ignore_index=True)
+        if len(starts) <= max_anchors_per_chrom:
+            out.append((chrom, starts, ends, scores))
+            continue
+        # Weighted sampling without replacement.
+        weights = np.clip(scores, a_min=0.01, a_max=None)
+        probs = weights / weights.sum()
+        idx = rng.choice(len(starts), size=max_anchors_per_chrom,
+                         replace=False, p=probs)
+        idx.sort()  # keep sorted by anchor_start
+        out.append((chrom, starts[idx], ends[idx], scores[idx]))
+    return out
 
 
 def enumerate_pairs_for_anchors(
@@ -426,12 +454,20 @@ def enumerate_pairs_for_anchors(
     rng: np.random.Generator,
     category: str,
     threads: int = 1,
+    max_anchors_per_chrom: int = 5_000,
 ) -> pd.DataFrame:
-    """For a given anchor set, enumerate all anchor x anchor pairs within each
-    distance band on the same chromosome, then sample ``target_per_band`` per band.
+    """Enumerate anchor pairs per distance band, sampled to ``target_per_band``.
 
-    Vectorised inner loop + parallelism across distance bands (3 bands × parallel
-    chromosomes -> good speedup).
+    Three layers of speedup:
+      1. **Anchor subsampling**: cap each chromosome to
+         ``max_anchors_per_chrom`` (weighted by motif score).  Pair
+         enumeration is quadratic in anchor count, so capping at 5,000
+         per chrom keeps the work to ~10^7 pairs/band genome-wide
+         (down from ~10^9).
+      2. **Vectorised inner loop**: np.searchsorted + np.repeat
+         instead of a Python double-loop.
+      3. **Parallelism across (band × chrom) tiles**: 3 bands × 22
+         chroms = 66 tasks — well-saturated with 10 workers.
     """
     if len(anchors) < 2:
         return pd.DataFrame()
@@ -449,29 +485,54 @@ def enumerate_pairs_for_anchors(
             g["motif_score"].to_numpy(),
         ))
 
-    # Parallel across distance bands (small N, but each does a chunk of work).
+    # Aggressively cap anchor count per chromosome.
+    n_before = sum(len(s) for _, s, _, _ in anchors_by_chrom)
+    anchors_by_chrom = _subsample_anchors_per_chrom(
+        anchors_by_chrom, max_anchors_per_chrom, rng,
+    )
+    n_after = sum(len(s) for _, s, _, _ in anchors_by_chrom)
+    if n_after < n_before:
+        log.info(
+            f"  subsampled anchors {n_before:,} -> {n_after:,} "
+            f"(max {max_anchors_per_chrom:,} per chrom, weighted by motif score)"
+        )
+
+    # Build the (band, chrom) task list.
     band_items = list(distance_bands.items())
-    if threads > 1 and len(band_items) > 1:
-        band_dfs = Parallel(n_jobs=min(threads, len(band_items)))(
-            delayed(_enumerate_pairs_for_band)(anchors_by_chrom, d_min, d_max)
-            for _, (d_min, d_max) in band_items
+    tasks = []
+    for band_name, (d_min, d_max) in band_items:
+        for chrom, starts, ends, scores in anchors_by_chrom:
+            tasks.append((chrom, starts, ends, scores, d_min, d_max, band_name))
+
+    # Parallel across (band × chrom) tiles.
+    if threads > 1 and len(tasks) > 1:
+        tile_dfs = Parallel(n_jobs=min(threads, len(tasks)))(
+            delayed(_enumerate_pairs_one_band_one_chrom)(
+                chrom, starts, ends, scores, d_min, d_max, band_name,
+            )
+            for (chrom, starts, ends, scores, d_min, d_max, band_name) in tasks
         )
     else:
-        band_dfs = [
-            _enumerate_pairs_for_band(anchors_by_chrom, d_min, d_max)
-            for _, (d_min, d_max) in band_items
+        tile_dfs = [
+            _enumerate_pairs_one_band_one_chrom(
+                chrom, starts, ends, scores, d_min, d_max, band_name,
+            )
+            for (chrom, starts, ends, scores, d_min, d_max, band_name) in tasks
         ]
 
+    # Group tiles by band, then sample to target_per_band.
     out_rows = []
-    for (band_name, _), df in zip(band_items, band_dfs):
-        if len(df) == 0:
+    for band_name, _ in band_items:
+        parts = [df for df, t in zip(tile_dfs, tasks)
+                 if len(df) > 0 and t[6] == band_name]
+        if not parts:
             continue
+        df = pd.concat(parts, ignore_index=True)
         if len(df) > target_per_band:
             weights = df["score_sum"].clip(lower=0.01).to_numpy()
             weights = weights / weights.sum()
             idx = rng.choice(len(df), size=target_per_band, replace=False, p=weights)
             df = df.iloc[idx].reset_index(drop=True)
-        df["distance_band"] = band_name
         df["category"] = category
         df = df.drop(columns=["score_sum"])
         out_rows.append(df)
@@ -705,6 +766,13 @@ def main():
                         help="Directory to cache JASPAR PFMs")
     parser.add_argument("--out-dir", required=True, help="Output directory")
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument(
+        "--max-anchors-per-chrom", type=int, default=5_000,
+        help="Cap anchor count per chromosome before pair enumeration. "
+             "Pair enumeration is O(N^2) in anchor count; capping at "
+             "5000 (default) keeps work to ~10^7 pairs/band genome-wide. "
+             "Higher values give denser pairs but slower runtime.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -792,6 +860,7 @@ def main():
             anchors, cfg.distance_bands, tf_cfg.target_pairs_per_band,
             rng, tf_cfg.category,
             threads=args.threads,
+            max_anchors_per_chrom=args.max_anchors_per_chrom,
         )
         log.info(f"  [{tf_cfg.category}] enumerated {len(pairs):,} pairs in {time.time()-t_pairs:.0f}s")
         category_dfs.append(pairs)
