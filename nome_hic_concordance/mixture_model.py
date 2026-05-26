@@ -251,8 +251,13 @@ class BetaBinomialMixture:
         for iteration in range(self.max_iter):
             gamma, ll = self._e_step_compressed(uk, un, counts, N, log_cnk)
 
-            if abs(ll - prev_ll) < self.tol:
-                return ll, iteration + 1, True
+            # Relative tolerance: |ΔLL| / max(|LL|, 1) < tol.  Absolute
+            # tolerance is impractical for large datasets (LL ~ 10^7 means
+            # 1e-6 absolute is unreachable by IEEE-754 floats).
+            if np.isfinite(prev_ll):
+                rel_change = abs(ll - prev_ll) / max(abs(ll), 1.0)
+                if rel_change < self.tol:
+                    return ll, iteration + 1, True
             prev_ll = ll
 
             # pi = weighted mean of gamma across all data points.
