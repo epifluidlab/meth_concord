@@ -738,58 +738,106 @@ def main():
 
     rng = np.random.default_rng(cfg.random_seed)
 
+    # ----- Progress tracking ------------------------------------------------
+    # Total steps = N TF categories + (1 if co_folded) + (1 if random_matched) + 1 (assemble)
+    import time
+    t_global_start = time.time()
+    n_tf = len(cfg.tf_categories)
+    n_extra = (1 if (cfg.include_co_folded and args.pseudobulk_cool) else 0) \
+              + (1 if cfg.include_random_matched else 0)
+    n_total = n_tf + n_extra + 1
+    step_idx = 0
+
+    def _progress(msg: str) -> None:
+        nonlocal step_idx
+        step_idx += 1
+        elapsed = time.time() - t_global_start
+        pct = 100.0 * step_idx / n_total
+        # Estimate remaining time linearly from completed steps.
+        if step_idx > 0:
+            eta = (elapsed / step_idx) * (n_total - step_idx)
+        else:
+            eta = 0.0
+        log.info(
+            f"[progress {step_idx}/{n_total} = {pct:.0f}%] "
+            f"elapsed {elapsed:.0f}s, ETA {eta:.0f}s — {msg}"
+        )
+
     # Per-TF category build
     category_dfs = []
-    for tf_cfg in cfg.tf_categories:
-        log.info(f"=== {tf_cfg.category} (motifs: {tf_cfg.jaspar_ids}) ===")
+    for tf_i, tf_cfg in enumerate(cfg.tf_categories, 1):
+        log.info(f"=== [TF {tf_i}/{n_tf}] {tf_cfg.category} (motifs: {tf_cfg.jaspar_ids}) ===")
+        t_cat = time.time()
         pfm_paths = [fetch_jaspar_pfm(mid, jaspar_cache) for mid in tf_cfg.jaspar_ids]
+
+        log.info(f"  [{tf_cfg.category}] scanning motifs across {len(chromosomes)} chromosomes...")
+        t_scan = time.time()
         motifs = scan_genome_for_motifs(
             Path(args.genome_fa), pfm_paths, chromosomes,
             tf_cfg.pseudo_pvalue_threshold, args.threads,
         )
+        log.info(f"  [{tf_cfg.category}] scan done in {time.time()-t_scan:.0f}s")
+
         if tf_cfg.chip_bed:
+            log.info(f"  [{tf_cfg.category}] intersecting with ChIP peaks...")
             motifs = intersect_motifs_with_chip(motifs, tf_cfg.chip_bed)
+
+        log.info(f"  [{tf_cfg.category}] collapsing motifs into anchors...")
         anchors = motifs_to_anchors(motifs, cfg.anchor_size, chrom_sizes)
-        log.info(f"  {len(anchors):,} distinct anchors after collapsing")
+        log.info(f"  [{tf_cfg.category}] {len(anchors):,} distinct anchors after collapsing")
+
+        log.info(f"  [{tf_cfg.category}] enumerating pairs across distance bands...")
+        t_pairs = time.time()
         pairs = enumerate_pairs_for_anchors(
             anchors, cfg.distance_bands, tf_cfg.target_pairs_per_band,
             rng, tf_cfg.category,
             threads=args.threads,
         )
-        log.info(f"  {len(pairs):,} pairs across {len(cfg.distance_bands)} bands")
+        log.info(f"  [{tf_cfg.category}] enumerated {len(pairs):,} pairs in {time.time()-t_pairs:.0f}s")
         category_dfs.append(pairs)
+
+        _progress(f"finished {tf_cfg.category} (category took {time.time()-t_cat:.0f}s)")
 
     # Co-folded category
     if cfg.include_co_folded and args.pseudobulk_cool:
-        log.info("=== co_folded (pseudobulk top decile) ===")
+        log.info(f"=== [extra] co_folded (pseudobulk top decile) ===")
+        t = time.time()
         co_pairs = build_co_folded_pairs(
             args.pseudobulk_cool, cfg.distance_bands, cfg.anchor_size,
             cfg.target_co_folded_per_band, rng, chrom_sizes,
         )
-        log.info(f"  {len(co_pairs):,} co_folded pairs")
+        log.info(f"  {len(co_pairs):,} co_folded pairs in {time.time()-t:.0f}s")
         category_dfs.append(co_pairs)
+        _progress("finished co_folded")
 
     # Random distance-matched
     if cfg.include_random_matched:
-        log.info("=== random_distance_matched ===")
+        log.info(f"=== [extra] random_distance_matched ===")
+        t = time.time()
         rand_pairs = build_random_matched_pairs(
             cfg.distance_bands, chrom_sizes, cfg.anchor_size,
             cfg.target_random_per_band, rng, args.blacklist_bed, chromosomes,
         )
-        log.info(f"  {len(rand_pairs):,} random_matched pairs")
+        log.info(f"  {len(rand_pairs):,} random_matched pairs in {time.time()-t:.0f}s")
         category_dfs.append(rand_pairs)
+        _progress("finished random_distance_matched")
 
     # Assemble and write
+    log.info(f"=== [final] assembling panel ===")
+    t = time.time()
     panel = assemble_panel(category_dfs, tier_name="tier1")
-    log.info(f"\nFinal panel: {len(panel):,} pairs across {panel['category'].nunique()} categories")
+    log.info(f"Final panel: {len(panel):,} pairs across {panel['category'].nunique()} categories "
+             f"(assembled in {time.time()-t:.0f}s)")
     log.info(panel.groupby(["category", "distance_band"]).size().to_string())
 
     parquet_path = out_dir / "pair_panel.parquet"
     bedpe_path = out_dir / "pair_panel.bedpe"
     panel.to_parquet(parquet_path, index=False)
     panel.to_csv(bedpe_path, sep="\t", index=False)
-    log.info(f"\nWrote {parquet_path}")
+    log.info(f"Wrote {parquet_path}")
     log.info(f"Wrote {bedpe_path}")
+
+    _progress(f"done — total runtime {time.time()-t_global_start:.0f}s")
 
 
 if __name__ == "__main__":
