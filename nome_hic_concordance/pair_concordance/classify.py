@@ -375,14 +375,40 @@ def _aggregate_one_cell(
     cell_name: str,
     panel: pd.DataFrame,
     output_dir: str,
+    cell_idx: int = 0,
+    total_cells: int = 0,
     **kwargs,
 ) -> tuple[str, str]:
-    """Wrapper for parallel execution: aggregate one cell and write parquet."""
+    """Wrapper for parallel execution: aggregate one cell and write parquet.
+
+    Prints per-cell start/done progress to stderr (bypasses Python
+    logging, which doesn't work from joblib loky workers).
+    """
+    import sys
+    import time
+
+    if total_cells > 0:
+        print(
+            f"  [{cell_idx}/{total_cells}] Starting {cell_name} ...",
+            file=sys.stderr, flush=True,
+        )
+
+    t0 = time.time()
     result = aggregate_pair_counts(
         posteriors_parquet, cell_name, panel, **kwargs,
     )
     out_path = Path(output_dir) / f"{cell_name}.pair_counts.parquet"
     result.to_parquet(out_path, index=False)
+    elapsed = time.time() - t0
+
+    if total_cells > 0:
+        pct = 100.0 * cell_idx / total_cells
+        n_pairs_with_data = int((result["n_linked"] > 0).sum()) if len(result) else 0
+        print(
+            f"  [{cell_idx}/{total_cells}] ({pct:.0f}%) Done {cell_name}: "
+            f"{n_pairs_with_data:,} pairs with linked data ({elapsed:.0f}s)",
+            file=sys.stderr, flush=True,
+        )
     return cell_name, str(out_path)
 
 
@@ -438,26 +464,42 @@ def aggregate_all_cells(
         logger.warning("No posteriors files found — nothing to aggregate")
         return {}
 
+    total = len(items)
     logger.info(
-        f"Aggregating pair counts for {len(items)} cells "
+        f"Aggregating pair counts for {total} cells "
         f"({len(panel)} panel pairs) using {n_threads} threads"
     )
+
+    import time
+    t_start = time.time()
+
+    # Number the cells (1-based) so workers can print [i/total] progress.
+    indexed = [(i + 1, cell_name, pq_path)
+               for i, (cell_name, pq_path) in enumerate(items)]
 
     if n_threads > 1 and len(items) > 1:
         results = Parallel(n_jobs=n_threads)(
             delayed(_aggregate_one_cell)(
-                pq_path, cell_name, panel, str(out_path), **kwargs,
+                pq_path, cell_name, panel, str(out_path),
+                cell_idx=cell_idx, total_cells=total,
+                **kwargs,
             )
-            for cell_name, pq_path in items
+            for cell_idx, cell_name, pq_path in indexed
         )
     else:
         results = [
             _aggregate_one_cell(
-                pq_path, cell_name, panel, str(out_path), **kwargs,
+                pq_path, cell_name, panel, str(out_path),
+                cell_idx=cell_idx, total_cells=total,
+                **kwargs,
             )
-            for cell_name, pq_path in items
+            for cell_idx, cell_name, pq_path in indexed
         ]
 
     cell_to_path = dict(results)
-    logger.info(f"Pair-count aggregation complete for {len(cell_to_path)} cells")
+    elapsed = time.time() - t_start
+    logger.info(
+        f"Pair-count aggregation complete: {len(cell_to_path)} cells "
+        f"in {elapsed:.0f}s ({elapsed/max(len(cell_to_path),1):.1f}s/cell)"
+    )
     return cell_to_path
