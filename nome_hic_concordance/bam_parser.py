@@ -292,6 +292,7 @@ def _parse_cell_bam_cpp(
     context_positions: dict[str, np.ndarray],
     trim_ends: int = 5,
     mapq_min: int = 30,
+    require_proper_pair: bool = False,
 ) -> pd.DataFrame:
     """Parse a BAM using the C++/htslib backend (fast path)."""
     # The C++ function expects {chrom: (pos_array, ref_base_array)}.
@@ -308,7 +309,27 @@ def _parse_cell_bam_cpp(
         for chrom, arr in context_positions.items()
         if len(arr) > 0
     }
-    raw = _bam_parser_core.parse_cell_bam(bam_path, cpp_ctx, trim_ends, mapq_min)
+    # Pass require_proper_pair as keyword; older compiled C++ extensions
+    # may not accept it — fall back to positional call.
+    try:
+        raw = _bam_parser_core.parse_cell_bam(
+            bam_path, cpp_ctx, trim_ends, mapq_min,
+            require_proper_pair=require_proper_pair,
+        )
+    except TypeError:
+        # Old C++ extension (always requires proper pair).  Warn and
+        # fall through to the Python backend, which honors the flag.
+        if not require_proper_pair:
+            logger.warning(
+                "Installed C++ extension does not support "
+                "require_proper_pair=False; falling back to Python backend "
+                "for this cell. Rebuild via 'pip install -e .' to update."
+            )
+            return _parse_cell_bam_python(
+                bam_path, context_positions, trim_ends, mapq_min,
+                require_proper_pair=False,
+            )
+        raw = _bam_parser_core.parse_cell_bam(bam_path, cpp_ctx, trim_ends, mapq_min)
 
     n_pairs = len(raw["pos1"])
     if n_pairs > 0:
@@ -332,11 +353,16 @@ def _parse_cell_bam_python(
     context_positions: dict[str, np.ndarray],
     trim_ends: int = 5,
     mapq_min: int = 30,
+    require_proper_pair: bool = False,
 ) -> pd.DataFrame:
     """Parse a single cell's BAM using pure Python/pysam (fallback).
 
     Processes one chromosome at a time via ``bam.fetch(chrom)`` to bound
     the mate-pairing buffer.
+
+    For Hi-C data, ``require_proper_pair`` should be ``False`` (default)
+    because BWA-MEM flags long-range Hi-C ligation products as
+    *improperly paired* (insert size violates short-insert expectation).
     """
     import pysam
     pysam.set_verbosity(0)
@@ -376,7 +402,7 @@ def _parse_cell_bam_python(
                 flag = read.flag
                 if flag & skip_flags:
                     continue
-                if not (flag & proper_flag):
+                if require_proper_pair and not (flag & proper_flag):
                     continue
                 if read.mapping_quality < mapq_min:
                     continue
@@ -442,6 +468,7 @@ def parse_cell_bam(
     context_positions: dict[str, np.ndarray],
     trim_ends: int = 5,
     mapq_min: int = 30,
+    require_proper_pair: bool = False,
 ) -> pd.DataFrame:
     """Parse a single cell's BAM into a DataFrame of read-pair context counts.
 
@@ -459,14 +486,25 @@ def parse_cell_bam(
         Bases to trim from each read end.
     mapq_min : int
         Both ends of a pair must have MAPQ >= this value (default: 30).
+    require_proper_pair : bool
+        If True, require BAM proper-pair flag (default: False).
+        For Hi-C data, this should be False — BWA-MEM does NOT flag
+        long-range ligation products as proper pairs, so requiring it
+        would silently discard most cis Hi-C contacts.
 
     Returns
     -------
     DataFrame with columns ``chrom, pos1, k1, n1, pos2, k2, n2, distance``.
     """
     if _CPP_AVAILABLE:
-        return _parse_cell_bam_cpp(bam_path, context_positions, trim_ends, mapq_min)
-    return _parse_cell_bam_python(bam_path, context_positions, trim_ends, mapq_min)
+        return _parse_cell_bam_cpp(
+            bam_path, context_positions, trim_ends, mapq_min,
+            require_proper_pair=require_proper_pair,
+        )
+    return _parse_cell_bam_python(
+        bam_path, context_positions, trim_ends, mapq_min,
+        require_proper_pair=require_proper_pair,
+    )
 
 
 def parse_all_cells(
@@ -476,6 +514,7 @@ def parse_all_cells(
     n_threads: int = 4,
     trim_ends: int = 5,
     mapq_min: int = 30,
+    require_proper_pair: bool = False,
     **_unused_kwargs,
 ) -> dict[str, str]:
     """Parse all cell BAMs in parallel and save per-cell parquet outputs.
@@ -520,7 +559,10 @@ def parse_all_cells(
         )
 
         t0 = time.time()
-        df = parse_cell_bam(bam, context_positions, trim_ends=trim_ends, mapq_min=mapq_min)
+        df = parse_cell_bam(
+            bam, context_positions, trim_ends=trim_ends, mapq_min=mapq_min,
+            require_proper_pair=require_proper_pair,
+        )
         parquet_path = str(out_path / f"{cell}.read_pairs.parquet")
         df.to_parquet(parquet_path, index=False)
         n_pairs = len(df)

@@ -114,6 +114,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Bases to trim from read ends (default: 5).")
     parser.add_argument("--mapq-min", type=int, default=30,
                         help="Minimum mapping quality on both ends (default: 30).")
+    parser.add_argument("--require-proper-pair", action="store_true",
+                        help="Require BAM proper-pair flag (default: off). "
+                             "BWA-MEM does NOT flag long-range Hi-C ligation "
+                             "products as proper pairs, so enabling this filter "
+                             "silently discards most cis Hi-C contacts. Only "
+                             "enable for non-Hi-C short-insert paired-end data.")
 
     # EM fitting options
     parser.add_argument("--em-subsample", type=int, default=10_000_000,
@@ -272,6 +278,7 @@ def run_context(
             str(read_pair_dir),
             n_threads=args.n_threads,
             trim_ends=args.trim_ends, mapq_min=args.mapq_min,
+            require_proper_pair=args.require_proper_pair,
         )
     else:
         # Only load step 2 output if a downstream step needs it.

@@ -317,7 +317,8 @@ static py::dict parse_cell_bam_cpp(
     const std::string& bam_path,
     py::dict context_positions,
     int trim_ends,
-    int mapq_min)
+    int mapq_min,
+    bool require_proper_pair)
 {
     hts_set_log_level(HTS_LOG_OFF);
 
@@ -371,7 +372,7 @@ static py::dict parse_cell_bam_cpp(
         while (sam_itr_next(fp, iter, b) >= 0) {
             uint16_t flag = b->core.flag;
             if (flag & SKIP_FLAGS) continue;
-            if (!(flag & FLAG_PROPER_PAIR)) continue;
+            if (require_proper_pair && !(flag & FLAG_PROPER_PAIR)) continue;
             if (b->core.qual < mapq_min) continue;
             if (b->core.mtid != tid) continue;
 
@@ -594,6 +595,7 @@ PYBIND11_MODULE(_bam_parser_core, m) {
           py::arg("context_positions"),
           py::arg("trim_ends") = 5,
           py::arg("mapq_min") = 30,
+          py::arg("require_proper_pair") = false,
           R"doc(
           Parse a single cell's BAM file using htslib with bisulfite
           strand inference from the MD tag.
