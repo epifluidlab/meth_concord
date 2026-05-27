@@ -212,15 +212,35 @@ def main(argv: list[str] | None = None) -> int:
 
     # Stack all cell counts
     all_counts = []
+    missing_paths = []
     for cell, path in cell_count_paths.items():
         if Path(path).exists():
             df = pd.read_parquet(path)
             all_counts.append(df)
+        else:
+            missing_paths.append(path)
     if all_counts:
         pair_counts_stacked = pd.concat(all_counts, ignore_index=True)
     else:
         pair_counts_stacked = pd.DataFrame()
     logger.info(f"  Total pair-cell observations: {len(pair_counts_stacked):,}")
+
+    # Fail early with a clear message if downstream steps require pair counts
+    # but none exist (e.g. user ran --steps 7p,8p,9p without first running 6p).
+    if (("7p" in steps or "8p" in steps or "9p" in steps)
+            and len(pair_counts_stacked) == 0):
+        n_missing = len(missing_paths)
+        example_missing = missing_paths[0] if missing_paths else "(none)"
+        raise FileNotFoundError(
+            f"Step 6p output not found at {counts_dir} "
+            f"({n_missing} of {len(cell_count_paths)} per-cell parquets missing; "
+            f"first missing: {example_missing}).\n"
+            f"You ran with --steps {sorted(steps)} which SKIPS Step 6p.\n"
+            f"To regenerate counts with the current settings "
+            f"(--min-distance={args.min_distance}, "
+            f"--unlinked-max-distance={args.unlinked_max_distance}), "
+            f"include '6p' in --steps, e.g. --steps 6p,7p,8p,9p"
+        )
 
     # ---- Step 7p: EB priors + hierarchical Δ -----------------------------
     from . import empirical_bayes as eb_mod
