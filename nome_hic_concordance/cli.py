@@ -120,6 +120,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "products as proper pairs, so enabling this filter "
                              "silently discards most cis Hi-C contacts. Only "
                              "enable for non-Hi-C short-insert paired-end data.")
+    parser.add_argument("--keep-supplementary", action="store_true",
+                        help="Keep supplementary alignments (chimeric-read "
+                             "splits). Default off — standard Hi-C practice. "
+                             "Enable if you suspect bhmem assigns 'primary' "
+                             "to the wrong half of a junction-spanning chimera.")
 
     # EM fitting options
     parser.add_argument("--em-subsample", type=int, default=10_000_000,
@@ -279,6 +284,7 @@ def run_context(
             n_threads=args.n_threads,
             trim_ends=args.trim_ends, mapq_min=args.mapq_min,
             require_proper_pair=args.require_proper_pair,
+            keep_supplementary=args.keep_supplementary,
         )
     else:
         # Only load step 2 output if a downstream step needs it.

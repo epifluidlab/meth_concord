@@ -43,9 +43,11 @@ static constexpr uint16_t FLAG_PROPER_PAIR   = 0x2;
 static constexpr uint16_t FLAG_SECONDARY     = 0x100;
 static constexpr uint16_t FLAG_DUPLICATE     = 0x400;
 static constexpr uint16_t FLAG_SUPPLEMENTARY = 0x800;
-static constexpr uint16_t SKIP_FLAGS =
+static constexpr uint16_t SKIP_FLAGS_BASE =
     FLAG_UNMAPPED | FLAG_MATE_UNMAPPED |
-    FLAG_SECONDARY | FLAG_DUPLICATE | FLAG_SUPPLEMENTARY;
+    FLAG_SECONDARY | FLAG_DUPLICATE;
+static constexpr uint16_t SKIP_FLAGS =
+    SKIP_FLAGS_BASE | FLAG_SUPPLEMENTARY;
 
 // Conversion strand constants
 static constexpr int STRAND_CT      = 1;  // C→T conversion
@@ -318,9 +320,12 @@ static py::dict parse_cell_bam_cpp(
     py::dict context_positions,
     int trim_ends,
     int mapq_min,
-    bool require_proper_pair)
+    bool require_proper_pair,
+    bool keep_supplementary)
 {
     hts_set_log_level(HTS_LOG_OFF);
+    const uint16_t skip_flags_active =
+        keep_supplementary ? SKIP_FLAGS_BASE : SKIP_FLAGS;
 
     htsFile* fp = hts_open(bam_path.c_str(), "r");
     if (!fp)
@@ -371,7 +376,7 @@ static py::dict parse_cell_bam_cpp(
 
         while (sam_itr_next(fp, iter, b) >= 0) {
             uint16_t flag = b->core.flag;
-            if (flag & SKIP_FLAGS) continue;
+            if (flag & skip_flags_active) continue;
             if (require_proper_pair && !(flag & FLAG_PROPER_PAIR)) continue;
             if (b->core.qual < mapq_min) continue;
             if (b->core.mtid != tid) continue;
@@ -596,6 +601,7 @@ PYBIND11_MODULE(_bam_parser_core, m) {
           py::arg("trim_ends") = 5,
           py::arg("mapq_min") = 30,
           py::arg("require_proper_pair") = false,
+          py::arg("keep_supplementary") = false,
           R"doc(
           Parse a single cell's BAM file using htslib with bisulfite
           strand inference from the MD tag.

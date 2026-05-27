@@ -55,7 +55,8 @@ _FLAG_PROPER_PAIR    = 0x2
 _FLAG_SECONDARY      = 0x100
 _FLAG_DUPLICATE      = 0x400
 _FLAG_SUPPLEMENTARY  = 0x800
-_SKIP_FLAGS = _FLAG_UNMAPPED | _FLAG_MATE_UNMAPPED | _FLAG_SECONDARY | _FLAG_DUPLICATE | _FLAG_SUPPLEMENTARY
+_SKIP_FLAGS_BASE = _FLAG_UNMAPPED | _FLAG_MATE_UNMAPPED | _FLAG_SECONDARY | _FLAG_DUPLICATE
+_SKIP_FLAGS = _SKIP_FLAGS_BASE | _FLAG_SUPPLEMENTARY  # default: skip supplementary too
 
 READ_PAIR_COLUMNS = [
     "chrom",
@@ -293,6 +294,7 @@ def _parse_cell_bam_cpp(
     trim_ends: int = 5,
     mapq_min: int = 30,
     require_proper_pair: bool = False,
+    keep_supplementary: bool = False,
 ) -> pd.DataFrame:
     """Parse a BAM using the C++/htslib backend (fast path)."""
     # The C++ function expects {chrom: (pos_array, ref_base_array)}.
@@ -309,25 +311,27 @@ def _parse_cell_bam_cpp(
         for chrom, arr in context_positions.items()
         if len(arr) > 0
     }
-    # Pass require_proper_pair as keyword; older compiled C++ extensions
-    # may not accept it — fall back to positional call.
+    # Pass require_proper_pair / keep_supplementary as keywords; older
+    # compiled C++ extensions may not accept them.  On TypeError, fall
+    # back to the Python backend (which honors all flags).
     try:
         raw = _bam_parser_core.parse_cell_bam(
             bam_path, cpp_ctx, trim_ends, mapq_min,
             require_proper_pair=require_proper_pair,
+            keep_supplementary=keep_supplementary,
         )
     except TypeError:
-        # Old C++ extension (always requires proper pair).  Warn and
-        # fall through to the Python backend, which honors the flag.
-        if not require_proper_pair:
+        if not require_proper_pair or keep_supplementary:
             logger.warning(
-                "Installed C++ extension does not support "
-                "require_proper_pair=False; falling back to Python backend "
-                "for this cell. Rebuild via 'pip install -e .' to update."
+                "Installed C++ extension is out of date "
+                "(missing require_proper_pair / keep_supplementary kwargs); "
+                "falling back to Python backend for this cell. "
+                "Rebuild via 'pip install -e .' to update."
             )
             return _parse_cell_bam_python(
                 bam_path, context_positions, trim_ends, mapq_min,
-                require_proper_pair=False,
+                require_proper_pair=require_proper_pair,
+                keep_supplementary=keep_supplementary,
             )
         raw = _bam_parser_core.parse_cell_bam(bam_path, cpp_ctx, trim_ends, mapq_min)
 
@@ -354,6 +358,7 @@ def _parse_cell_bam_python(
     trim_ends: int = 5,
     mapq_min: int = 30,
     require_proper_pair: bool = False,
+    keep_supplementary: bool = False,
 ) -> pd.DataFrame:
     """Parse a single cell's BAM using pure Python/pysam (fallback).
 
@@ -363,6 +368,12 @@ def _parse_cell_bam_python(
     For Hi-C data, ``require_proper_pair`` should be ``False`` (default)
     because BWA-MEM flags long-range Hi-C ligation products as
     *improperly paired* (insert size violates short-insert expectation).
+
+    ``keep_supplementary`` (default False) controls whether chimeric-read
+    supplementary alignments are included.  Standard Hi-C practice is to
+    exclude them (they're either redundant with primary or should be
+    handled upstream by pairtools).  Enable only if you suspect bhmem
+    assigns "primary" to the wrong half of a chimera.
     """
     import pysam
     pysam.set_verbosity(0)
@@ -378,7 +389,7 @@ def _parse_cell_bam_python(
     out_dist: list[int] = []
 
     # Local aliases for hot-path speed.
-    skip_flags = _SKIP_FLAGS
+    skip_flags = _SKIP_FLAGS_BASE if keep_supplementary else _SKIP_FLAGS
     proper_flag = _FLAG_PROPER_PAIR
     searchsorted = np.searchsorted
 
@@ -469,6 +480,7 @@ def parse_cell_bam(
     trim_ends: int = 5,
     mapq_min: int = 30,
     require_proper_pair: bool = False,
+    keep_supplementary: bool = False,
 ) -> pd.DataFrame:
     """Parse a single cell's BAM into a DataFrame of read-pair context counts.
 
@@ -491,6 +503,9 @@ def parse_cell_bam(
         For Hi-C data, this should be False — BWA-MEM does NOT flag
         long-range ligation products as proper pairs, so requiring it
         would silently discard most cis Hi-C contacts.
+    keep_supplementary : bool
+        If True, keep supplementary alignments (chimeric-read splits).
+        Default False — standard Hi-C practice to avoid double-counting.
 
     Returns
     -------
@@ -500,10 +515,12 @@ def parse_cell_bam(
         return _parse_cell_bam_cpp(
             bam_path, context_positions, trim_ends, mapq_min,
             require_proper_pair=require_proper_pair,
+            keep_supplementary=keep_supplementary,
         )
     return _parse_cell_bam_python(
         bam_path, context_positions, trim_ends, mapq_min,
         require_proper_pair=require_proper_pair,
+        keep_supplementary=keep_supplementary,
     )
 
 
@@ -515,6 +532,7 @@ def parse_all_cells(
     trim_ends: int = 5,
     mapq_min: int = 30,
     require_proper_pair: bool = False,
+    keep_supplementary: bool = False,
     **_unused_kwargs,
 ) -> dict[str, str]:
     """Parse all cell BAMs in parallel and save per-cell parquet outputs.
@@ -562,6 +580,7 @@ def parse_all_cells(
         df = parse_cell_bam(
             bam, context_positions, trim_ends=trim_ends, mapq_min=mapq_min,
             require_proper_pair=require_proper_pair,
+            keep_supplementary=keep_supplementary,
         )
         parquet_path = str(out_path / f"{cell}.read_pairs.parquet")
         df.to_parquet(parquet_path, index=False)
