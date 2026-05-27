@@ -22,6 +22,85 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Feature normalization (z-score or quantile)
+# ---------------------------------------------------------------------------
+
+
+def _quantile_normalize_per_feature(
+    matrix: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-column rank-based quantile normalization to a uniform target.
+
+    For each column (feature/pair), replaces values with their empirical
+    quantile in [0, 1].  This makes every feature have an identical
+    uniform distribution across cells, making the embedding robust to
+    outliers and matching the bulk-RNA / scATAC-seq QN convention.
+
+    NaN entries (or entries where mask=False) are preserved as NaN.
+    Ranks are computed within observed values only.
+
+    Parameters
+    ----------
+    matrix : ndarray of shape (n_cells, n_features)
+    mask : ndarray of shape (n_cells, n_features), optional
+        True where the value is observed; False/NaN positions are
+        excluded from rank computation.  Defaults to ``~np.isnan(matrix)``.
+
+    Returns
+    -------
+    ndarray of shape (n_cells, n_features)
+        Quantile-normalized values in [0, 1]; NaN preserved.
+    """
+    from scipy.stats import rankdata
+
+    out = np.full_like(matrix, np.nan, dtype=np.float64)
+    if mask is None:
+        mask = ~np.isnan(matrix)
+
+    for j in range(matrix.shape[1]):
+        col = matrix[:, j]
+        col_mask = mask[:, j]
+        n_obs = int(col_mask.sum())
+        if n_obs == 0:
+            continue
+        if n_obs == 1:
+            out[col_mask, j] = 0.5
+            continue
+        ranks = rankdata(col[col_mask], method="average")
+        # Map ranks to (0, 1) uniformly.  rank/(n+1) avoids hitting 0 or 1.
+        out[col_mask, j] = ranks / (n_obs + 1)
+    return out
+
+
+def _normalize_features(
+    matrix: np.ndarray,
+    method: str = "zscore",
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Standardize a (cells x features) matrix per-feature (per column).
+
+    Parameters
+    ----------
+    matrix : ndarray
+    method : "zscore" | "quantile"
+        ``"zscore"`` — per-column z-score via ``StandardScaler``.
+        ``"quantile"`` — per-column rank-based QN to a uniform [0,1] target.
+    mask : ndarray, optional
+        Used only by ``"quantile"`` for handling missing entries.
+    """
+    if method == "zscore":
+        m = StandardScaler(with_mean=True, with_std=True).fit_transform(matrix)
+        return np.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0)
+    if method == "quantile":
+        m = _quantile_normalize_per_feature(matrix, mask=mask)
+        # Center on 0 for PCA stability — QN gives values in (0,1), so subtract 0.5.
+        m = m - 0.5
+        return np.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0)
+    raise ValueError(f"Unknown feature normalization method: {method!r}")
+
+
+# ---------------------------------------------------------------------------
 # Masked-loss PCA via iterative SVD
 # ---------------------------------------------------------------------------
 
@@ -128,6 +207,7 @@ def build_contact_embedding(
     n_neighbors: int = 15,
     min_dist: float = 0.1,
     random_state: int = 42,
+    feature_norm: str = "zscore",
 ) -> dict:
     """Build E_contact embedding from linked-read counts.
 
@@ -136,7 +216,8 @@ def build_contact_embedding(
         u_ij^c = log(1 + n_linked) - log(lambda_c)
 
     where ``lambda_c = sum(n_linked)`` across all pairs for cell *c*.
-    Features are z-scored per pair across cells, then PCA and UMAP are applied.
+    Features are normalised per pair across cells (``feature_norm``),
+    then PCA and UMAP are applied.
 
     Parameters
     ----------
@@ -151,6 +232,11 @@ def build_contact_embedding(
         UMAP parameters.
     random_state : int
         Random seed for reproducibility.
+    feature_norm : "zscore" | "quantile"
+        Per-pair normalisation across cells.  ``"zscore"`` (default) for
+        the classical pipeline; ``"quantile"`` for rank-based QN that
+        matches the user's bulk / scATAC-seq style 250 kb-bin recipe
+        (robust to outliers).
 
     Returns
     -------
@@ -187,11 +273,9 @@ def build_contact_embedding(
 
     matrix = np.log1p(n_linked) - np.log(lambda_c)[:, np.newaxis]
 
-    # Z-score per pair (column) across cells.
-    scaler = StandardScaler(with_mean=True, with_std=True)
-    matrix_z = scaler.fit_transform(matrix)
-    # Replace any NaN/inf from zero-variance columns.
-    matrix_z = np.nan_to_num(matrix_z, nan=0.0, posinf=0.0, neginf=0.0)
+    # Per-pair normalisation across cells.
+    matrix_z = _normalize_features(matrix, method=feature_norm)
+    logger.info(f"E_contact feature normalisation: {feature_norm}")
 
     # PCA.
     n_comp = min(n_pca, matrix_z.shape[0] - 1, matrix_z.shape[1])
@@ -238,6 +322,7 @@ def build_coord_embedding(
     n_neighbors: int = 15,
     min_dist: float = 0.1,
     random_state: int = 42,
+    feature_norm: str = "zscore",
 ) -> dict:
     """Build E_coord embedding from delta-z values.
 
@@ -257,6 +342,11 @@ def build_coord_embedding(
         UMAP parameters.
     random_state : int
         Random seed for reproducibility.
+    feature_norm : "zscore" | "quantile"
+        Per-pair normalisation across cells.  ``"zscore"`` (default) for
+        the classical pipeline.  ``"quantile"`` performs rank-based QN
+        (within observed values per pair) — robust to outliers; matches
+        the user's bulk / scATAC-seq style preprocessing recipe.
 
     Returns
     -------
@@ -284,11 +374,18 @@ def build_coord_embedding(
     if X.shape[1] == 0:
         raise ValueError("All pairs are NaN across all cells; cannot embed.")
 
-    # Standardise observed values per pair (column).
-    col_means = np.nanmean(X, axis=0)
-    col_stds = np.nanstd(X, axis=0)
-    col_stds = np.where(col_stds < 1e-10, 1.0, col_stds)
-    X_std = (X - col_means[np.newaxis, :]) / col_stds[np.newaxis, :]
+    # Per-pair normalisation across cells.
+    if feature_norm == "zscore":
+        col_means = np.nanmean(X, axis=0)
+        col_stds = np.nanstd(X, axis=0)
+        col_stds = np.where(col_stds < 1e-10, 1.0, col_stds)
+        X_std = (X - col_means[np.newaxis, :]) / col_stds[np.newaxis, :]
+    elif feature_norm == "quantile":
+        mask = ~np.isnan(X)
+        X_std = _quantile_normalize_per_feature(X, mask=mask) - 0.5
+    else:
+        raise ValueError(f"Unknown feature_norm: {feature_norm!r}")
+    logger.info(f"E_coord feature normalisation: {feature_norm}")
 
     # PCA.
     n_comp = min(n_pca, X_std.shape[0] - 1, X_std.shape[1])

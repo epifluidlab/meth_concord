@@ -95,6 +95,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pca-method", choices=["masked", "mean_impute"], default="masked",
         help="PCA method for E_coord (default: masked).",
     )
+    parser.add_argument(
+        "--feature-norm", choices=["zscore", "quantile"], default="zscore",
+        help="Per-pair normalisation across cells before PCA (default: zscore). "
+             "Use 'quantile' to match a rank-based bulk / scATAC-seq style "
+             "preprocessing recipe — robust to outliers, useful when "
+             "per-cell global drift dominates the signal.",
+    )
 
     # Execution
     parser.add_argument("--n-threads", type=int, default=4)
@@ -292,6 +299,7 @@ def main(argv: list[str] | None = None) -> int:
         emb_contact = embed_mod.build_contact_embedding(
             pair_counts_stacked, pair_panel,
             n_pca=args.n_pca, random_state=args.random_seed,
+            feature_norm=args.feature_norm,
         )
 
         # E_coord
@@ -303,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
             n_pca=args.n_pca,
             pca_method=args.pca_method,
             random_state=args.random_seed,
+            feature_norm=args.feature_norm,
         )
 
         # E_full
