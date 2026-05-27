@@ -65,6 +65,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Min pairs per bin to compute r (default: 5).")
     parser.add_argument("--min-cell-coverage", type=float, default=0.8,
                         help="Fraction of cells non-NA to retain a bin (default: 0.8).")
+    parser.add_argument(
+        "--concordance-method", choices=["pearson", "betabinom"], default="pearson",
+        help="Per-bin concordance feature.  'pearson' (default): Pearson r of "
+             "paired posteriors per bin.  'betabinom': hierarchical Beta-Binomial "
+             "Δ = E[θ_L|data] − p̂² with EB prior on linked pairs and unlinked "
+             "ends as the independence baseline.",
+    )
+    parser.add_argument(
+        "--matrix-norm", choices=["zscore", "quantile"], default="zscore",
+        help="Per-bin normalization across cells in Step 7.  'zscore' (default) "
+             "for the classical pipeline; 'quantile' for rank-based QN, matching "
+             "the bulk-style preprocessing that's robust to outliers in sparse "
+             "single-cell data.",
+    )
 
     # EM
     parser.add_argument("--em-max-iter", type=int, default=200)
@@ -374,18 +388,37 @@ def run_context(
     # ---- Step 5: Concordance + distance decay -----------------------------
     if 5 in steps:
         logger.info("=" * 60)
-        logger.info(f"Step 5: Computing per-bin concordance for {context}")
+        logger.info(
+            f"Step 5: Computing per-bin concordance for {context} "
+            f"(method={args.concordance_method})"
+        )
         logger.info("=" * 60)
 
-        concordance_raw, pair_counts = concordance_mod.compute_concordance_matrix(
-            posterior_paths, chrom_sizes,
-            bin_size=args.bin_size,
-            min_distance=args.min_distance,
-            min_gch_sites=args.min_gch_sites,
-            min_pairs_per_bin=args.min_pairs_per_bin,
-            n_threads=args.n_threads,
-            output_dir=str(concordance_dir),
-        )
+        if args.concordance_method == "pearson":
+            concordance_raw, pair_counts = concordance_mod.compute_concordance_matrix(
+                posterior_paths, chrom_sizes,
+                bin_size=args.bin_size,
+                min_distance=args.min_distance,
+                min_gch_sites=args.min_gch_sites,
+                min_pairs_per_bin=args.min_pairs_per_bin,
+                n_threads=args.n_threads,
+                output_dir=str(concordance_dir),
+            )
+        elif args.concordance_method == "betabinom":
+            concordance_raw, pair_counts = concordance_mod.compute_betabinom_concordance_matrix(
+                posterior_paths, chrom_sizes,
+                bin_size=args.bin_size,
+                min_distance=args.min_distance,
+                min_gch_sites=args.min_gch_sites,
+                posterior_threshold=args.posterior_threshold,
+                min_pairs_per_bin=args.min_pairs_per_bin,
+                n_threads=args.n_threads,
+                output_dir=str(concordance_dir),
+            )
+        else:
+            raise ValueError(
+                f"Unknown --concordance-method: {args.concordance_method!r}"
+            )
 
         logger.info("Computing concordance vs. distance decay...")
         distance_analysis.concordance_vs_distance(
@@ -410,26 +443,38 @@ def run_context(
         pair_counts = pd.read_parquet(cnt_path)
 
     # ---- Step 6: Shrinkage -----------------------------------------------
+    # For betabinom concordance, EB shrinkage is built into θ_L's Beta posterior.
+    # The Stein-style Pearson-r shrinkage is only meaningful for the
+    # `concordance_method=pearson` branch and would be inappropriate for Δ values.
     if 6 in steps:
         logger.info("=" * 60)
         logger.info(f"Step 6: Shrinkage analysis for {context}")
         logger.info("=" * 60)
 
-        if args.shrinkage_n0 == "auto":
-            shrink_result = shrinkage.estimate_shrinkage_n0(
-                concordance_raw, pair_counts,
-                output_dir=str(concordance_dir),
+        if args.concordance_method == "betabinom":
+            logger.info(
+                "Step 6: Skipping Stein shrinkage — betabinom Δ values are "
+                "already shrunk via the EB Beta prior on θ_L."
             )
-            n0 = shrink_result["n0"]
+            concordance_shrunk = concordance_raw.copy()
+            concordance_shrunk.to_parquet(concordance_dir / "concordance_shrunk.parquet")
+            concordance_shrunk.to_csv(concordance_dir / "concordance_shrunk.tsv", sep="\t")
         else:
-            n0 = float(args.shrinkage_n0)
-            logger.info(f"Using user-supplied shrinkage n0 = {n0}")
-            with open(concordance_dir / "shrinkage_n0.json", "w") as f:
-                json.dump({"n0": n0, "source": "user"}, f, indent=2)
+            if args.shrinkage_n0 == "auto":
+                shrink_result = shrinkage.estimate_shrinkage_n0(
+                    concordance_raw, pair_counts,
+                    output_dir=str(concordance_dir),
+                )
+                n0 = shrink_result["n0"]
+            else:
+                n0 = float(args.shrinkage_n0)
+                logger.info(f"Using user-supplied shrinkage n0 = {n0}")
+                with open(concordance_dir / "shrinkage_n0.json", "w") as f:
+                    json.dump({"n0": n0, "source": "user"}, f, indent=2)
 
-        concordance_shrunk = shrinkage.apply_shrinkage(concordance_raw, pair_counts, n0)
-        concordance_shrunk.to_parquet(concordance_dir / "concordance_shrunk.parquet")
-        concordance_shrunk.to_csv(concordance_dir / "concordance_shrunk.tsv", sep="\t")
+            concordance_shrunk = shrinkage.apply_shrinkage(concordance_raw, pair_counts, n0)
+            concordance_shrunk.to_parquet(concordance_dir / "concordance_shrunk.parquet")
+            concordance_shrunk.to_csv(concordance_dir / "concordance_shrunk.tsv", sep="\t")
     else:
         # Only load step 6 output if step 7 needs it.
         if 7 not in steps:
@@ -464,6 +509,7 @@ def run_context(
             concordance_shrunk,
             min_cell_coverage=args.min_cell_coverage,
             output_dir=str(concordance_dir),
+            matrix_norm=args.matrix_norm,
         )
 
         group_labels = samples.set_index("cell_name")["group"]
