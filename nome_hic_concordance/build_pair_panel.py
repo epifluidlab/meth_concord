@@ -309,12 +309,30 @@ def motifs_to_anchors(
     motifs: pd.DataFrame,
     anchor_size: int,
     chrom_sizes: dict[str, int],
+    collapse_window: int | None = None,
 ) -> pd.DataFrame:
     """
     Convert motif occurrences to fixed-size anchor windows centered on each motif.
 
-    Drops anchors that extend past chromosome boundaries. Deduplicates within-anchor
-    overlaps (keeps highest-scoring motif per anchor center).
+    Drops anchors that extend past chromosome boundaries. Collapses nearby
+    motifs into a single anchor (keeping the highest-scoring one) on a grid
+    of size ``collapse_window`` to avoid duplicate anchors when many motifs
+    cluster together.
+
+    Parameters
+    ----------
+    motifs : DataFrame
+        Motif occurrences with columns ``chrom``, ``start``, ``end``,
+        ``score``.
+    anchor_size : int
+        Size of each anchor window in bp (motif-centered).
+    chrom_sizes : dict
+        Chromosome length lookup for boundary filtering.
+    collapse_window : int, optional
+        Grid size for collapsing nearby motifs into a single anchor.
+        Defaults to ``max(anchor_size // 5, 50)`` — scales with anchor size
+        so that short-range panels (e.g. 200bp anchors) collapse at 50bp
+        granularity instead of the long-range default of ~1kb.
     """
     if len(motifs) == 0:
         return pd.DataFrame(columns=["chrom", "anchor_start", "anchor_end", "motif_score"])
@@ -330,8 +348,12 @@ def motifs_to_anchors(
     motifs = motifs[valid].copy()
     motifs = motifs.drop(columns=["chrom_size", "center"])
 
-    # Collapse motifs into anchors at 1 kb granularity to avoid huge nearby-motif clusters
-    motifs["anchor_bin"] = motifs["anchor_start"] // 1_000
+    # Collapse motifs into anchors on a per-anchor-size grid.  Scales with
+    # anchor_size so short-range panels (200bp anchors) don't lose all
+    # nearby pairs to a fixed 1kb collapse.
+    if collapse_window is None:
+        collapse_window = max(anchor_size // 5, 50)
+    motifs["anchor_bin"] = motifs["anchor_start"] // collapse_window
     best = motifs.sort_values("score", ascending=False).drop_duplicates(
         subset=["chrom", "anchor_bin"], keep="first"
     )
@@ -570,6 +592,14 @@ def build_co_folded_pairs(
 
     out_rows = []
     for band_name, (d_min, d_max) in distance_bands.items():
+        # Skip bands smaller than the cooler resolution — no useful signal there.
+        if d_max < resolution:
+            log.warning(
+                f"  skipping band={band_name} ({d_min:,}-{d_max:,} bp): "
+                f"smaller than cooler resolution ({resolution:,} bp).  "
+                f"co_folded category is not meaningful at this scale."
+            )
+            continue
         log.info(f"  co_folded selection for band={band_name} ({d_min:,}–{d_max:,} bp)")
         per_chrom = []
         for chrom in c.chromnames:
@@ -773,6 +803,19 @@ def main():
              "5000 (default) keeps work to ~10^7 pairs/band genome-wide. "
              "Higher values give denser pairs but slower runtime.",
     )
+    parser.add_argument(
+        "--panel-mode", choices=("long", "short"), default=None,
+        help="Convenience preset. 'long' (default if not set) uses "
+             "5kb anchors and 100kb-5Mb distance bands (3D-folding scale). "
+             "'short' uses 200bp anchors and 200bp-10kb distance bands "
+             "(single-molecule TF coordination scale, Sönmezer-style). "
+             "These presets override anchor_size and distance_bands "
+             "from the YAML config.",
+    )
+    parser.add_argument(
+        "--anchor-size", type=int, default=None,
+        help="Override anchor_size from YAML config (bp).",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -784,14 +827,46 @@ def main():
     with open(args.config) as f:
         raw = yaml.safe_load(f)
     tf_categories = [TFCategoryConfig(**c) for c in raw.get("tf_categories", [])]
+
+    # Apply --panel-mode preset overrides (long / short).
+    PRESET_LONG = {
+        "anchor_size": 5_000,
+        "distance_bands": {
+            "short": [100_000, 500_000],
+            "mid":   [500_000, 2_000_000],
+            "long":  [2_000_000, 5_000_000],
+        },
+    }
+    PRESET_SHORT = {
+        "anchor_size": 200,
+        "distance_bands": {
+            "adjacent":  [200, 500],
+            "local":     [500, 2_000],
+            "extended":  [2_000, 10_000],
+        },
+    }
+    if args.panel_mode == "short":
+        log.info("Panel mode: short (200bp anchors, 200bp-10kb distance bands)")
+        anchor_size = PRESET_SHORT["anchor_size"]
+        distance_bands = {k: tuple(v) for k, v in PRESET_SHORT["distance_bands"].items()}
+    elif args.panel_mode == "long":
+        log.info("Panel mode: long (5kb anchors, 100kb-5Mb distance bands)")
+        anchor_size = PRESET_LONG["anchor_size"]
+        distance_bands = {k: tuple(v) for k, v in PRESET_LONG["distance_bands"].items()}
+    else:
+        # Take from YAML config.
+        anchor_size = raw.get("anchor_size", 5_000)
+        distance_bands = {k: tuple(v) for k, v in raw.get("distance_bands", PRESET_LONG["distance_bands"]).items()}
+
+    # --anchor-size CLI flag overrides the preset/YAML.
+    if args.anchor_size is not None:
+        log.info(f"Overriding anchor_size to {args.anchor_size} (CLI flag)")
+        anchor_size = args.anchor_size
+
     cfg = PanelConfig(
         tf_categories=tf_categories,
-        distance_bands={k: tuple(v) for k, v in raw.get("distance_bands", {
-            "short": [100_000, 500_000],
-            "mid": [500_000, 2_000_000],
-            "long": [2_000_000, 5_000_000],
-        }).items()},
-        anchor_size=raw.get("anchor_size", 5_000),
+        distance_bands=distance_bands,
+        anchor_size=anchor_size,
         random_seed=raw.get("random_seed", 42),
         include_co_folded=raw.get("include_co_folded", True),
         include_random_matched=raw.get("include_random_matched", True),
@@ -799,6 +874,8 @@ def main():
         target_random_per_band=raw.get("target_random_per_band", 3_000),
         chromosomes=raw.get("chromosomes", None),
     )
+    log.info(f"  anchor_size = {cfg.anchor_size} bp")
+    log.info(f"  distance_bands = {cfg.distance_bands}")
 
     chrom_sizes = read_chrom_sizes(Path(args.chrom_sizes))
     chromosomes = cfg.chromosomes or [c for c in chrom_sizes if "_" not in c and c not in ("chrM", "chrY")]

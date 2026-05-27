@@ -1,0 +1,116 @@
+# Example SHORT-RANGE pair-panel config: GM12878 + IMR90 validation panel
+# -------------------------------------------------------------------------
+# Targets single-molecule chromatin coordination at TF-complex-footprint
+# scales (200bp - 10kb), motivated by the SMF literature
+# (Krebs et al. 2017 Mol Cell, Sönmezer et al. 2020 Mol Cell).
+#
+# Use this panel with --min-distance 200 in nome_hic_pair_concordance.
+# Pair with the corresponding LONG-RANGE panel for the full three-step
+# TF-folding model analysis.
+#
+# Same bidirectional TF set as the long-range panel:
+#   B-lymphoid TFs (SPI1/PU.1, EBF1, IRF4) expected to drive GM12878-biased
+#   coordination; fibroblast TFs (TEAD1, SRF, AP1) expected to drive
+#   IMR90-biased coordination; CTCF/RAD21 architectural; NRF1/SP1
+#   housekeeping (falsification controls).
+
+# Small anchors at single-TF-complex scale (footprint + flanking nucleosome).
+anchor_size: 200
+
+# Distance bands at sub-kilobase to fragment scale.
+#   - adjacent (200-500bp): within a single restriction fragment, captures
+#     TF-mediated coordination at adjacent regulatory elements.
+#   - local (500-2kb): nearby regulatory units, often shared chromatin
+#     state via local TF complex binding.
+#   - extended (2-10kb): same regulatory neighborhood, but past the typical
+#     single-complex footprint.
+distance_bands:
+  adjacent:  [200, 500]
+  local:     [500, 2000]
+  extended:  [2000, 10000]
+
+# Run only on autosomes by default.
+chromosomes:
+  - chr1
+  - chr2
+  - chr3
+  - chr4
+  - chr5
+  - chr6
+  - chr7
+  - chr8
+  - chr9
+  - chr10
+  - chr11
+  - chr12
+  - chr13
+  - chr14
+  - chr15
+  - chr16
+  - chr17
+  - chr18
+  - chr19
+  - chr20
+  - chr21
+  - chr22
+
+random_seed: 42
+
+# co_folded is NOT meaningful at short range — pseudobulk cooler resolution
+# (typically 5kb-25kb) is coarser than these distance bands.  Disable it.
+include_co_folded: false
+target_co_folded_per_band: 0
+
+# Random distance-matched controls work fine at short range.
+include_random_matched: true
+target_random_per_band: 3000
+
+tf_categories:
+  # ---------------- B-lymphoid lineage (GM12878-biased) ----------------
+  - category: tf_anchored_SPI1
+    jaspar_ids: ["MA0080.5"]
+    chip_bed: "/data/encode/GM12878/ENCFF000XXX_SPI1.bed"
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_EBF1
+    jaspar_ids: ["MA0154.4"]
+    chip_bed: "/data/encode/GM12878/ENCFF000YYY_EBF1.bed"
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_IRF4
+    jaspar_ids: ["MA1419.1"]
+    chip_bed: "/data/encode/GM12878/ENCFF000ZZZ_IRF4.bed"
+    target_pairs_per_band: 5000
+
+  # ---------------- Fibroblast lineage (IMR90-biased) ----------------
+  - category: tf_anchored_TEAD1
+    jaspar_ids: ["MA0090.3"]
+    chip_bed: "/data/encode/IMR90/ENCFF000AAA_TEAD1.bed"
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_SRF
+    jaspar_ids: ["MA0083.3"]
+    chip_bed: "/data/encode/IMR90/ENCFF000BBB_SRF.bed"
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_AP1
+    jaspar_ids: ["MA0099.3", "MA0488.1"]
+    chip_bed: "/data/encode/IMR90/ENCFF000CCC_JUN.bed"
+    target_pairs_per_band: 5000
+
+  # ---------------- Architectural (both) ----------------
+  - category: tf_anchored_CTCF
+    jaspar_ids: ["MA0139.2"]
+    chip_bed: null
+    target_pairs_per_band: 5000
+
+  # ---------------- Housekeeping (falsification controls) ----------------
+  - category: tf_anchored_NRF1
+    jaspar_ids: ["MA0506.1"]
+    chip_bed: null
+    target_pairs_per_band: 5000
+
+  - category: tf_anchored_SP1
+    jaspar_ids: ["MA0079.5"]
+    chip_bed: null
+    target_pairs_per_band: 5000
