@@ -12,117 +12,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import blacklist as blacklist_mod
 from .utils import ensure_dir
 
 logger = logging.getLogger(__name__)
 
-
-def _infer_bin_size(columns: pd.Index) -> int | None:
-    """Infer bin_size in bp from column labels like ``"chr1:0"``, ``"chr1:250000"``...
-
-    Returns the GCD of all consecutive start-position differences within
-    each chromosome (the only number that consistently divides every gap).
-    Returns ``None`` if there aren't enough labels to infer.
-    """
-    import math
-    from functools import reduce
-
-    starts_by_chrom: dict[str, list[int]] = {}
-    for col in columns:
-        s = str(col)
-        if ":" not in s:
-            continue
-        chrom, start_str = s.split(":", 1)
-        try:
-            starts_by_chrom.setdefault(chrom, []).append(int(start_str))
-        except ValueError:
-            continue
-
-    diffs: list[int] = []
-    for starts in starts_by_chrom.values():
-        unique_sorted = sorted(set(starts))
-        for a, b in zip(unique_sorted, unique_sorted[1:]):
-            d = b - a
-            if d > 0:
-                diffs.append(d)
-    if not diffs:
-        return None
-    return int(reduce(math.gcd, diffs))
-
-
-def _load_blacklist_bed(path: str) -> dict[str, np.ndarray]:
-    """Read a BED file and return ``{chrom: ndarray of shape (n, 2)}``.
-
-    Overlapping intervals on the same chromosome are merged so that the
-    per-chrom array is non-overlapping and sorted by start, which lets
-    bin-overlap checks use a single ``np.searchsorted`` lookup.
-
-    The BED is expected to be plain text or gzipped.  Header / comment /
-    track / browser lines are skipped.  Only the first three columns
-    (chrom, start, end) are read.
-    """
-    import gzip
-    raw: dict[str, list[tuple[int, int]]] = {}
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt") as fh:
-        for ln in fh:
-            if not ln or ln.startswith(("#", "track", "browser")):
-                continue
-            fields = ln.rstrip("\n").split("\t")
-            if len(fields) < 3:
-                continue
-            chrom = fields[0]
-            try:
-                start = int(fields[1])
-                end = int(fields[2])
-            except ValueError:
-                continue
-            if end <= start:
-                continue
-            raw.setdefault(chrom, []).append((start, end))
-
-    merged: dict[str, np.ndarray] = {}
-    n_in, n_out = 0, 0
-    for chrom, ivals in raw.items():
-        ivals.sort()
-        out: list[tuple[int, int]] = []
-        for s, e in ivals:
-            if out and s <= out[-1][1]:
-                out[-1] = (out[-1][0], max(out[-1][1], e))
-            else:
-                out.append((s, e))
-        n_in += len(ivals)
-        n_out += len(out)
-        merged[chrom] = np.array(out, dtype=np.int64)
-    logger.info(
-        f"Loaded blacklist BED: {n_in:,} intervals across {len(merged)} "
-        f"chromosomes, merged to {n_out:,} non-overlapping intervals."
-    )
-    return merged
-
-
-def _bin_overlaps_blacklist(
-    chrom: str, bin_start: int, bin_end: int,
-    blacklist: dict[str, np.ndarray],
-) -> bool:
-    """Return True iff ``[bin_start, bin_end)`` overlaps any interval in ``blacklist[chrom]``.
-
-    Assumes ``blacklist[chrom]`` is sorted and non-overlapping (as produced
-    by ``_load_blacklist_bed``).
-    """
-    ivals = blacklist.get(chrom)
-    if ivals is None or len(ivals) == 0:
-        return False
-    starts = ivals[:, 0]
-    ends = ivals[:, 1]
-    # Index of last interval whose start < bin_end (the only candidate
-    # for overlap, given merged non-overlapping intervals).
-    # side="left" so that an interval starting exactly at bin_end (which
-    # would touch but not overlap) is excluded.
-    idx = int(np.searchsorted(starts, bin_end, side="left") - 1)
-    if idx < 0:
-        return False
-    return bool(ends[idx] > bin_start)
+# Re-exports for backward compatibility with any external callers /
+# tests that imported these private symbols from matrix_ops.
+_infer_bin_size = blacklist_mod.infer_bin_size
+_load_blacklist_bed = blacklist_mod.load_blacklist_bed
+_bin_overlaps_blacklist = blacklist_mod.interval_overlaps_blacklist
 
 
 def _quantile_normalize_per_bin(

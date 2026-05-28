@@ -76,9 +76,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--blacklist-bed", type=str, default=None,
         help="Optional path to a BED file of blacklist regions (e.g. ENCODE). "
-             "Bins whose [start, start+bin_size) interval overlaps any "
-             "record in the BED are dropped in Step 7.  Accepts plain or "
-             "gzipped BED; only the first three columns are read.",
+             "Applied at TWO stages: (1) Step 2 drops any read pair whose "
+             "either end (pos1/pos2) falls inside a blacklist interval, so "
+             "the mixture model / posteriors / concordance never see "
+             "blacklisted reads; (2) Step 7 additionally drops bins whose "
+             "interval overlaps the blacklist (safety net for re-runs that "
+             "skip Step 2).  Accepts plain or gzipped BED; only the first "
+             "three columns are read.",
     )
     parser.add_argument(
         "--concordance-method", choices=["pearson", "betabinom"], default="pearson",
@@ -354,6 +358,7 @@ def run_context(
             trim_ends=args.trim_ends, mapq_min=args.mapq_min,
             require_proper_pair=args.require_proper_pair,
             keep_supplementary=args.keep_supplementary,
+            blacklist_bed=args.blacklist_bed,
         )
     else:
         # Only load step 2 output if a downstream step needs it.

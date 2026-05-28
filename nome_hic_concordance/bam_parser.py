@@ -533,6 +533,7 @@ def parse_all_cells(
     mapq_min: int = 30,
     require_proper_pair: bool = False,
     keep_supplementary: bool = False,
+    blacklist_bed: str | None = None,
     **_unused_kwargs,
 ) -> dict[str, str]:
     """Parse all cell BAMs in parallel and save per-cell parquet outputs.
@@ -560,6 +561,17 @@ def parse_all_cells(
     backend = "C++/htslib" if _CPP_AVAILABLE else "Python/pysam"
     logger.info(f"  BAM parser backend: {backend}")
 
+    # Load the blacklist once if requested; broadcast into the worker
+    # closure so each cell-parse re-uses the same merged interval table.
+    blacklist = None
+    if blacklist_bed:
+        from . import blacklist as _bl_mod
+        blacklist = _bl_mod.load_blacklist_bed(blacklist_bed)
+        logger.info(
+            "  Blacklist read-level filter enabled: dropping read pairs "
+            "where either end falls inside any blacklist interval."
+        )
+
     def _process_one(cell_idx: int, row) -> tuple[str, str, int]:
         import sys
         import time
@@ -582,6 +594,25 @@ def parse_all_cells(
             require_proper_pair=require_proper_pair,
             keep_supplementary=keep_supplementary,
         )
+        n_pre = len(df)
+
+        # Read-level blacklist filter: drop pairs whose either end falls
+        # inside any blacklist interval (on its chromosome).
+        if blacklist:
+            from . import blacklist as _bl_mod
+            df, bl_stats = _bl_mod.filter_read_pairs_blacklist(df, blacklist)
+            if bl_stats["n_dropped_either"] > 0:
+                pct = (
+                    100.0 * bl_stats["n_dropped_either"] / max(bl_stats["n_in"], 1)
+                )
+                print(
+                    f"  [{cell_idx}/{total}] {cell}: blacklist dropped "
+                    f"{bl_stats['n_dropped_either']:,}/{n_pre:,} pairs "
+                    f"({pct:.2f}%; pos1-hit={bl_stats['n_dropped_pos1']:,}, "
+                    f"pos2-hit={bl_stats['n_dropped_pos2']:,})",
+                    file=sys.stderr, flush=True,
+                )
+
         parquet_path = str(out_path / f"{cell}.read_pairs.parquet")
         df.to_parquet(parquet_path, index=False)
         n_pairs = len(df)
