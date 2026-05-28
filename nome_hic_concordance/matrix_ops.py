@@ -17,6 +17,39 @@ from .utils import ensure_dir
 logger = logging.getLogger(__name__)
 
 
+def _infer_bin_size(columns: pd.Index) -> int | None:
+    """Infer bin_size in bp from column labels like ``"chr1:0"``, ``"chr1:250000"``...
+
+    Returns the GCD of all consecutive start-position differences within
+    each chromosome (the only number that consistently divides every gap).
+    Returns ``None`` if there aren't enough labels to infer.
+    """
+    import math
+    from functools import reduce
+
+    starts_by_chrom: dict[str, list[int]] = {}
+    for col in columns:
+        s = str(col)
+        if ":" not in s:
+            continue
+        chrom, start_str = s.split(":", 1)
+        try:
+            starts_by_chrom.setdefault(chrom, []).append(int(start_str))
+        except ValueError:
+            continue
+
+    diffs: list[int] = []
+    for starts in starts_by_chrom.values():
+        unique_sorted = sorted(set(starts))
+        for a, b in zip(unique_sorted, unique_sorted[1:]):
+            d = b - a
+            if d > 0:
+                diffs.append(d)
+    if not diffs:
+        return None
+    return int(reduce(math.gcd, diffs))
+
+
 def _load_blacklist_bed(path: str) -> dict[str, np.ndarray]:
     """Read a BED file and return ``{chrom: ndarray of shape (n, 2)}``.
 
@@ -84,7 +117,9 @@ def _bin_overlaps_blacklist(
     ends = ivals[:, 1]
     # Index of last interval whose start < bin_end (the only candidate
     # for overlap, given merged non-overlapping intervals).
-    idx = int(np.searchsorted(starts, bin_end, side="right") - 1)
+    # side="left" so that an interval starting exactly at bin_end (which
+    # would touch but not overlap) is excluded.
+    idx = int(np.searchsorted(starts, bin_end, side="left") - 1)
     if idx < 0:
         return False
     return bool(ends[idx] > bin_start)
@@ -170,11 +205,37 @@ def process_concordance_matrix(
 
     # Step 1b: drop bins overlapping any blacklist interval (optional).
     if blacklist_bed:
-        if not bin_size:
-            raise ValueError(
-                "process_concordance_matrix: blacklist_bed requires bin_size "
-                "to be set (need the bin's end coordinate for overlap check)."
+        # Infer bin_size from the matrix labels — this is the ground truth.
+        # If the caller also passed bin_size, validate it matches.
+        inferred_bin_size = _infer_bin_size(concordance_shrunk.columns)
+        if inferred_bin_size is None:
+            if not bin_size:
+                raise ValueError(
+                    "process_concordance_matrix: blacklist_bed needs bin_size "
+                    "and could not infer it from the matrix column labels "
+                    "(expected labels like 'chr1:0', 'chr1:250000', ...)."
+                )
+            effective_bin_size = int(bin_size)
+            logger.info(
+                f"Could not infer bin_size from matrix labels; using "
+                f"bin_size={effective_bin_size} from the caller."
             )
+        else:
+            effective_bin_size = inferred_bin_size
+            if bin_size and int(bin_size) != inferred_bin_size:
+                logger.warning(
+                    f"--bin-size={bin_size} disagrees with bin_size inferred "
+                    f"from the matrix labels ({inferred_bin_size}). Using the "
+                    f"inferred value for the blacklist overlap check. (This "
+                    f"typically happens when you re-run --steps 7 without "
+                    f"passing the same --bin-size used to build the matrix.)"
+                )
+            else:
+                logger.info(
+                    f"Blacklist overlap check using bin_size="
+                    f"{effective_bin_size} (inferred from matrix labels)."
+                )
+
         blacklist = _load_blacklist_bed(blacklist_bed)
         bin_blacklisted = []
         for bid in concordance_shrunk.columns:
@@ -182,7 +243,7 @@ def process_concordance_matrix(
             start = int(start_str)
             bin_blacklisted.append(
                 _bin_overlaps_blacklist(
-                    chrom, start, start + int(bin_size), blacklist,
+                    chrom, start, start + effective_bin_size, blacklist,
                 )
             )
         bl_mask = pd.Series(bin_blacklisted, index=concordance_shrunk.columns)
@@ -190,9 +251,9 @@ def process_concordance_matrix(
         n_bl_overlapping_kept = int((bl_mask & retained_mask).sum())
         retained_mask = retained_mask & ~bl_mask
         logger.info(
-            f"Blacklist filter: {n_bl:,} bins overlap blacklist regions "
-            f"(of which {n_bl_overlapping_kept:,} would have passed the "
-            f"coverage filter); dropping all."
+            f"Blacklist filter: {n_bl:,} of {len(concordance_shrunk.columns):,} "
+            f"bins overlap blacklist regions (of which {n_bl_overlapping_kept:,} "
+            f"would have passed the coverage filter); dropping all."
         )
 
     retained_bins = concordance_shrunk.columns[retained_mask].tolist()
