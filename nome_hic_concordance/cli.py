@@ -135,24 +135,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "that otherwise dominate the top SVD component.  "
              "'center': subtract per-cell mean.  "
              "'zscore': subtract mean AND divide by std (more aggressive, "
-             "removes scale as well — recommended when 'center' alone "
-             "still leaves a non-cell-type axis dominant).  "
+             "removes scale as well).  "
              "'rank': replace each cell's row with within-cell ranks in "
              "(-0.5, 0.5) — closest analogue to TF normalisation in "
              "LSI / scATAC-seq, most robust to outliers and structured "
              "noise.  "
-             "'auto' (default): 'zscore' for --concordance-method signed; "
-             "'off' for pearson and betabinom (legacy).",
+             "'auto' (default): 'rank' for --concordance-method signed "
+             "(empirically the most effective on NOMe-HiC data); 'off' "
+             "for pearson and betabinom (legacy).",
     )
     parser.add_argument(
-        "--skip-top-svd", type=int, default=0,
+        "--batch-column", type=str, default=None,
+        help="Column name in --samples that contains the batch label "
+             "for each cell (e.g., 'batch').  When set, the mean "
+             "accessibility matrix is batch-corrected (per --batch-correction "
+             "method) before the RWR k-NN graph is built, so batch "
+             "structure doesn't leak into the cell-cell similarity matrix "
+             "and propagate into Δ_signed.  COL is the column NAME, not "
+             "a positional index.  Cells without a label in the manifest "
+             "are grouped as a synthetic '__unknown_batch__'.",
+    )
+    parser.add_argument(
+        "--batch-correction",
+        choices=["auto", "none", "center", "zscore", "combat", "harmony"],
+        default="auto",
+        help="Batch-correction method applied to the mean accessibility "
+             "matrix when --batch-column is set.  "
+             "'center' = per-batch column-mean subtraction (no deps).  "
+             "'zscore' = per-batch column-mean AND column-std normalization "
+             "(no deps).  "
+             "'combat' = empirical-Bayes batch correction (Johnson 2007) — "
+             "requires `pip install combat` or `pip install inmoose`.  "
+             "'harmony' = iterative cell-batch correction in PC space "
+             "(Korsunsky 2019) — requires `pip install harmonypy`.  "
+             "'auto' (default): 'combat' if --batch-column is set, "
+             "'none' otherwise.",
+    )
+    parser.add_argument(
+        "--skip-top-svd", type=int, default=None,
         help="Drop the top N SVD components before UMAP / clustering.  "
              "Use when per-cell normalization isn't enough to remove a "
              "non-cell-type dominant axis (e.g., k-NN community structure "
-             "from RWR, or a discrete depth-tier split).  Default 0; "
-             "common values: 1 (drop PC0 only).  Strictly orthogonal to "
-             "--n-svd: with --n-svd 5 --skip-top-svd 1, UMAP runs on "
-             "components 1..5 (zero-indexed), giving 5 components.",
+             "from RWR, or a discrete depth-tier split).  Common values: "
+             "1 (drop PC0 only).  Default depends on method: 1 for "
+             "--concordance-method signed (empirically PC0 is a batch / "
+             "technical axis on NOMe-HiC data even after per-cell "
+             "rank normalization), 0 otherwise.  Set explicitly to 0 to "
+             "force-disable.  Strictly orthogonal to --n-svd.",
     )
     parser.add_argument(
         "--posterior-threshold", type=float, default=0.5,
@@ -729,6 +758,30 @@ def run_context(
                 output_dir=str(concordance_dir),
             )
         elif args.concordance_method == "signed":
+            # Resolve batch correction: 'auto' → 'combat' if --batch-column
+            # is set, 'none' otherwise.  Batch labels come from the named
+            # column of samples.tsv.
+            batch_labels = None
+            if args.batch_column is not None:
+                if args.batch_column not in samples.columns:
+                    raise ValueError(
+                        f"--batch-column {args.batch_column!r} is not a "
+                        f"column in {args.samples}. Available columns: "
+                        f"{samples.columns.tolist()}"
+                    )
+                batch_labels = samples.set_index("cell_name")[args.batch_column]
+            if args.batch_correction == "auto":
+                batch_correction = (
+                    "combat" if batch_labels is not None else "none"
+                )
+            else:
+                batch_correction = args.batch_correction
+                if batch_correction != "none" and batch_labels is None:
+                    raise ValueError(
+                        f"--batch-correction {batch_correction!r} was set "
+                        f"but --batch-column was not provided."
+                    )
+
             sig_result = concordance_mod.compute_signed_concordance_matrix(
                 posterior_paths, chrom_sizes,
                 bin_size=args.bin_size,
@@ -744,6 +797,8 @@ def run_context(
                 rwr_max_iter=args.rwr_max_iter,
                 rwr_tol=args.rwr_tol,
                 eb_min_obs=args.eb_min_obs,
+                batch_labels=batch_labels,
+                batch_correction=batch_correction,
                 n_threads=args.n_threads,
                 output_dir=str(concordance_dir),
                 save_outputs=True,
@@ -861,10 +916,19 @@ def run_context(
         elif args.per_cell_center == "off":
             per_cell_norm = "off"
         else:  # both auto
+            # 'rank' default for signed (empirically the most effective on
+            # NOMe-HiC data — see methodology debug log in design doc).
             per_cell_norm = (
-                "zscore" if args.concordance_method == "signed" else "off"
+                "rank" if args.concordance_method == "signed" else "off"
             )
         per_cell_center = per_cell_norm == "center"  # for legacy boolean param
+
+        # Resolve --skip-top-svd auto-default: 1 for signed, 0 otherwise.
+        # User-explicit values (including 0) override the auto-default.
+        if args.skip_top_svd is None:
+            skip_top_svd = 1 if args.concordance_method == "signed" else 0
+        else:
+            skip_top_svd = args.skip_top_svd
 
         matrices = matrix_ops.process_concordance_matrix(
             concordance_shrunk,
@@ -904,13 +968,13 @@ def run_context(
             )
 
             svd_suffix = f"_svd{args.n_svd}" if args.n_svd and args.n_svd > 0 else ""
-            if args.skip_top_svd and args.skip_top_svd > 0:
-                svd_suffix += f"_skip{args.skip_top_svd}"
+            if skip_top_svd and skip_top_svd > 0:
+                svd_suffix += f"_skip{skip_top_svd}"
             svd_title = (
                 f" + SVD-{args.n_svd}" if args.n_svd and args.n_svd > 0 else ""
             )
-            if args.skip_top_svd and args.skip_top_svd > 0:
-                svd_title += f" (skip top {args.skip_top_svd})"
+            if skip_top_svd and skip_top_svd > 0:
+                svd_title += f" (skip top {skip_top_svd})"
 
             visualization.run_umap_and_plot(
                 matrices["imputed"], group_labels,
@@ -918,7 +982,7 @@ def run_context(
                 output_prefix=f"umap_unnormalized{svd_suffix}",
                 output_dir=str(umap_dir),
                 n_svd=args.n_svd,
-                skip_top_svd=args.skip_top_svd,
+                skip_top_svd=skip_top_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
             )
@@ -928,7 +992,7 @@ def run_context(
                 output_prefix=f"{norm_prefix}{svd_suffix}",
                 output_dir=str(umap_dir),
                 n_svd=args.n_svd,
-                skip_top_svd=args.skip_top_svd,
+                skip_top_svd=skip_top_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
             )

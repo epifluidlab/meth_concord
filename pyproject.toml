@@ -30,6 +30,19 @@ dev = [
     "pytest-cov>=4.0",
     "pybind11>=2.10",
 ]
+# Optional batch-correction backends.  Only required if you set
+# --batch-correction combat (combat) or --batch-correction harmony.
+batch-combat = [
+    "combat>=0.3.3",
+]
+batch-harmony = [
+    "harmonypy>=0.0.9",
+]
+# Convenience: both batch backends at once.
+batch = [
+    "combat>=0.3.3",
+    "harmonypy>=0.0.9",
+]
 
 [project.scripts]
 nome_hic_concordance = "nome_hic_concordance.cli:main"

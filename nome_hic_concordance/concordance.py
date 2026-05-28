@@ -868,6 +868,8 @@ def compute_signed_concordance_matrix(
     rwr_max_iter: int = 30,
     rwr_tol: float = 1e-4,
     eb_min_obs: int = 50,
+    batch_labels: pd.Series | None = None,
+    batch_correction: str = "none",
     n_threads: int = 4,
     output_dir: str = "output/05_concordance",
     save_outputs: bool = True,
@@ -991,6 +993,38 @@ def compute_signed_concordance_matrix(
     accessibility_df = accessibility_df.reindex(
         index=cell_names, columns=sorted_bins,
     )
+
+    # ---- Step 3.5: optional batch correction on accessibility ----------
+    # Applied before QN + k-NN so batch structure doesn't leak into the
+    # cell-cell similarity matrix.  Diagnostic batch-ANOVA F-stats are
+    # logged (median per bin) before and after correction so the user
+    # can see whether the chosen method actually neutralised batch.
+    if batch_correction != "none" and batch_labels is not None:
+        from . import batch_correction as _bc_mod
+        # Pre-correction diagnostic.
+        f_pre = _bc_mod.batch_anova_f_per_bin(accessibility_df, batch_labels)
+        logger.info(
+            f"Pre-batch-correction ANOVA F over batches: "
+            f"median = {float(np.nanmedian(f_pre)):.2f}, "
+            f"90th pct = {float(np.nanpercentile(f_pre, 90)):.2f}"
+        )
+        accessibility_df = _bc_mod.apply_batch_correction(
+            accessibility_df, batch_labels, method=batch_correction,
+        )
+        # Post-correction diagnostic.
+        f_post = _bc_mod.batch_anova_f_per_bin(accessibility_df, batch_labels)
+        logger.info(
+            f"Post-batch-correction ANOVA F over batches: "
+            f"median = {float(np.nanmedian(f_post)):.2f}, "
+            f"90th pct = {float(np.nanpercentile(f_post, 90)):.2f}"
+        )
+        if save_outputs and out_path is not None:
+            pd.DataFrame({
+                "bin": accessibility_df.columns,
+                "F_pre":  f_pre.values,
+                "F_post": f_post.values,
+            }).to_csv(out_path / "batch_correction_anova_f.tsv",
+                      sep="\t", index=False)
 
     # ---- Step 4 + 5: RWR (optional) + Layer 2 ----------------------------
     fitted_priors: dict[str, dict] = {}
