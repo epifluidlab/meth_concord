@@ -173,29 +173,42 @@ def run_umap_and_plot(
         )
 
     # Optional TruncatedSVD pre-reduction.
+    # SVD runs whenever EITHER --n-svd > 0 OR --skip-top-svd > 0.
+    # When the user specifies --skip-top-svd without --n-svd, default
+    # the number of retained components to 10 — otherwise the option
+    # would silently no-op.
     X = matrix.values
     n_svd_used = 0
-    if n_svd and n_svd > 0:
+    skip = max(0, int(skip_top_svd or 0))
+    n_svd_requested = int(n_svd or 0)
+    if n_svd_requested > 0 or skip > 0:
         from sklearn.decomposition import TruncatedSVD
-        # Fit enough components to satisfy --n-svd PLUS --skip-top-svd.
-        skip = max(0, int(skip_top_svd))
-        k_total = max(1, min(int(n_svd) + skip, matrix.shape[0] - 1, matrix.shape[1]))
+        # If user only specified --skip-top-svd, retain 10 components by default.
+        effective_n_svd = n_svd_requested if n_svd_requested > 0 else 10
+        # Fit enough components to satisfy retained + skipped.
+        k_total = max(
+            1,
+            min(effective_n_svd + skip, matrix.shape[0] - 1, matrix.shape[1]),
+        )
         svd = TruncatedSVD(n_components=k_total, random_state=random_state)
         emb = svd.fit_transform(X)
         # Drop the top-`skip` components.
         X = emb[:, skip:]
         n_svd_used = X.shape[1]
+        var_explained = float(svd.explained_variance_ratio_[skip:].sum())
         if skip > 0:
             logger.info(
-                f"SVD: dropped top {skip} components "
-                f"(--skip-top-svd); using components {skip}..{k_total - 1} "
-                f"({n_svd_used} components in total)"
+                f"SVD: fitted {k_total} components, dropped top {skip} "
+                f"(--skip-top-svd), retained components {skip}..{k_total - 1} "
+                f"({n_svd_used} components in total; "
+                f"cumulative variance explained by retained: {var_explained:.1%})"
             )
-        var_explained = float(svd.explained_variance_ratio_[skip:].sum())
-        logger.info(
-            f"TruncatedSVD reduced {matrix.shape[1]} bins -> {k} components "
-            f"(cumulative variance explained: {var_explained:.1%})"
-        )
+        else:
+            logger.info(
+                f"TruncatedSVD reduced {matrix.shape[1]} bins → "
+                f"{k_total} components "
+                f"(cumulative variance explained: {var_explained:.1%})"
+            )
 
     logger.info(
         f"Running UMAP on {matrix.shape[0]} cells x {X.shape[1]} "
