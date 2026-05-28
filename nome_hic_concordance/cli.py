@@ -172,6 +172,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'none' otherwise.",
     )
     parser.add_argument(
+        "--post-norm-recenter", choices=["auto", "on", "off"], default="auto",
+        help="Apply per-cell mean re-centering as a FINAL step after "
+             "per-bin normalization in Step 7.  Fixes the per-cell mean "
+             "drift introduced by the non-commutativity of per-cell rank "
+             "and per-bin QN: after rank → QN, the column re-ranking "
+             "shuffles row values and breaks per-cell mean=0, which "
+             "becomes the dominant SVD axis.  One extra row-mean "
+             "subtraction restores per-cell mean=0 without re-disturbing "
+             "per-bin centering (since col means ≈ 0 after QN).  "
+             "Mathematically equivalent to a closed-form double-centering. "
+             "'auto' (default): on for --concordance-method signed, off "
+             "otherwise.  When on, eliminates the need for "
+             "--skip-top-svd 1 (the artifact PC0 it was dropping is "
+             "removed at the source).",
+    )
+    parser.add_argument(
         "--skip-top-svd", type=int, default=None,
         help="Drop the top N SVD components before UMAP / clustering.  "
              "Use when per-cell normalization isn't enough to remove a "
@@ -923,10 +939,22 @@ def run_context(
             )
         per_cell_center = per_cell_norm == "center"  # for legacy boolean param
 
-        # Resolve --skip-top-svd auto-default: 1 for signed, 0 otherwise.
+        # Resolve --post-norm-recenter auto → on for signed.
+        if args.post_norm_recenter == "auto":
+            post_norm_recenter = args.concordance_method == "signed"
+        else:
+            post_norm_recenter = args.post_norm_recenter == "on"
+
+        # Resolve --skip-top-svd auto-default: 1 for signed when
+        # post_norm_recenter is OFF (the artifact PC0 needs dropping),
+        # 0 when post_norm_recenter is ON (the artifact has been removed
+        # at the source so dropping PC0 would discard real signal).
         # User-explicit values (including 0) override the auto-default.
         if args.skip_top_svd is None:
-            skip_top_svd = 1 if args.concordance_method == "signed" else 0
+            if args.concordance_method == "signed" and not post_norm_recenter:
+                skip_top_svd = 1
+            else:
+                skip_top_svd = 0
         else:
             skip_top_svd = args.skip_top_svd
 
@@ -937,6 +965,7 @@ def run_context(
             matrix_norm=args.matrix_norm,
             per_cell_center=per_cell_center,
             per_cell_norm=per_cell_norm,
+            post_norm_recenter=post_norm_recenter,
         )
 
         group_labels = samples.set_index("cell_name")["group"]

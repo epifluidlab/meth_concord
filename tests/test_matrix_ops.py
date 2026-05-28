@@ -157,6 +157,65 @@ def test_per_cell_norm_invalid_raises(tmp_path):
         )
 
 
+def test_post_norm_recenter_removes_residual_per_cell_shift(tmp_path):
+    """post_norm_recenter=True should make per-row means in the normalised
+    matrix exactly 0, even after per-cell rank + per-bin QN."""
+    rng = np.random.default_rng(0)
+    # Cells × bins matrix with per-cell shifts that won't fully wash out
+    # under per-cell rank + per-bin QN alone.
+    raw = rng.normal(size=(40, 30))
+    # Inject a strong per-cell offset.
+    raw += rng.normal(scale=5.0, size=(40, 1))
+    mat = _make_matrix(raw.tolist())
+
+    # Without post-norm recenter: per-row means in the normalised matrix
+    # are NOT exactly 0 (this is the bug we're fixing).
+    result_no_recenter = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path / "a"),
+        matrix_norm="quantile", per_cell_norm="rank",
+        post_norm_recenter=False,
+    )
+    no_recenter_row_means = result_no_recenter["zscore"].mean(axis=1).to_numpy()
+    # The biggest absolute row mean should be nonzero — that's the artifact.
+    assert np.max(np.abs(no_recenter_row_means)) > 1e-3
+
+    # With post-norm recenter: per-row means are exactly 0.
+    result_recenter = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path / "b"),
+        matrix_norm="quantile", per_cell_norm="rank",
+        post_norm_recenter=True,
+    )
+    recenter_row_means = result_recenter["zscore"].mean(axis=1).to_numpy()
+    np.testing.assert_allclose(recenter_row_means, 0.0, atol=1e-10)
+
+
+def test_post_norm_recenter_preserves_per_bin_centering_approximately(tmp_path):
+    """After post_norm_recenter, per-bin (column) means should still be
+    near 0 — since col means were already ≈ 0 after per-bin QN, and we
+    only subtracted small row-mean shifts."""
+    rng = np.random.default_rng(1)
+    mat = _make_matrix(rng.normal(size=(40, 30)).tolist())
+    result = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path),
+        matrix_norm="quantile", per_cell_norm="rank",
+        post_norm_recenter=True,
+    )
+    col_means = result["zscore"].mean(axis=0).to_numpy()
+    # Per-bin means should still be very near 0 (small perturbation only).
+    assert float(np.max(np.abs(col_means))) < 0.05
+
+
+def test_post_norm_recenter_off_by_default(tmp_path):
+    """post_norm_recenter defaults to off for backward compatibility."""
+    mat = _make_matrix([[1.0, 2.0], [3.0, 4.0]])
+    result = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path),
+        matrix_norm="quantile",  # no per_cell_norm, no post_norm_recenter
+    )
+    # Just verify the call works — no per-row mean adjustment was applied.
+    assert "imputed" in result
+
+
 def test_per_cell_center_legacy_alias(tmp_path):
     """Legacy per_cell_center=True is equivalent to per_cell_norm='center'."""
     mat = _make_matrix([

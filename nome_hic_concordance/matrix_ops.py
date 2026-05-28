@@ -60,6 +60,7 @@ def process_concordance_matrix(
     matrix_norm: str = "zscore",
     per_cell_center: bool = False,
     per_cell_norm: str = "off",
+    post_norm_recenter: bool = False,
 ) -> dict[str, object]:
     """Filter bins, impute NaNs, and normalize per bin.
 
@@ -220,6 +221,34 @@ def process_concordance_matrix(
         raise ValueError(
             f"matrix_norm must be 'zscore' or 'quantile', got {matrix_norm!r}"
         )
+
+    # Step 4 (optional): per-cell mean re-centering AFTER per-bin normalization.
+    #
+    # Per-cell rank → per-bin QN doesn't commute: the per-bin QN step
+    # re-ranks values within each column, which shuffles the per-row
+    # distribution and breaks per-cell mean=0.  Empirically this drives
+    # the dominant SVD component on Δ_signed (correlation r = −0.87 with
+    # per-cell median post-normalization), even though batch and other
+    # confounders have been addressed upstream.
+    #
+    # The fix is one additional row-mean subtraction.  Since the matrix
+    # is already per-bin-centered (col means ≈ 0 by construction of QN),
+    # this is exactly the "double centering" formula
+    # ``M' = M - row_means - col_means + grand_mean``
+    # specialised to the case col_means ≈ 0, giving simply
+    # ``M' = M - row_means``.  Closed-form, one shot, ~5 lines.
+    if post_norm_recenter:
+        row_shifts = normalized.mean(axis=1)
+        normalized = normalized.sub(row_shifts, axis=0)
+        logger.info(
+            f"Post-normalization per-cell re-centering: "
+            f"median absolute row shift = {float(row_shifts.abs().median()):.4f}"
+        )
+        # Apply the same to ``imputed`` so the saved imputed matrix
+        # reflects the same row-mean correction (downstream UMAP also
+        # uses this matrix for the 'unnormalized' diagnostic UMAP).
+        imp_row_shifts = imputed.mean(axis=1)
+        imputed = imputed.sub(imp_row_shifts, axis=0)
 
     imputed.to_parquet(out_path / "concordance_imputed.parquet")
     imputed.to_csv(out_path / "concordance_imputed.tsv", sep="\t")
