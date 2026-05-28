@@ -69,6 +69,45 @@ def test_raises_on_empty(tmp_path):
         matrix_ops.process_concordance_matrix(empty, output_dir=str(tmp_path))
 
 
+def test_per_cell_centering_removes_per_cell_shift(tmp_path):
+    """With per_cell_center=True, each cell's row sums to ~0 after centering."""
+    # 4 cells × 3 bins with HUGE per-cell shifts: cell_0 +10, cell_1 +20, etc.
+    mat = _make_matrix([
+        [10.0, 11.0, 12.0],   # cell_0: mean = 11
+        [20.0, 21.0, 22.0],   # cell_1: mean = 21
+        [30.0, 31.0, 32.0],   # cell_2: mean = 31
+        [40.0, 41.0, 42.0],   # cell_3: mean = 41
+    ])
+    result = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path),
+        per_cell_center=True,
+    )
+    # imputed matrix is post-centering, so each row should sum to 0.
+    row_sums = result["imputed"].sum(axis=1)
+    np.testing.assert_allclose(row_sums, 0.0, atol=1e-10)
+    # And the column structure (each row goes [−1, 0, +1] after centering) is preserved.
+    expected = np.array([
+        [-1.0, 0.0, 1.0],
+        [-1.0, 0.0, 1.0],
+        [-1.0, 0.0, 1.0],
+        [-1.0, 0.0, 1.0],
+    ])
+    np.testing.assert_allclose(result["imputed"].to_numpy(), expected, atol=1e-10)
+
+
+def test_per_cell_centering_off_preserves_raw_values(tmp_path):
+    """With per_cell_center=False (default), values are not shifted."""
+    mat = _make_matrix([
+        [10.0, 11.0, 12.0],
+        [20.0, 21.0, 22.0],
+    ])
+    result = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path),
+        per_cell_center=False,
+    )
+    np.testing.assert_allclose(result["imputed"].to_numpy(), mat.to_numpy())
+
+
 def test_zero_variance_column_zscore_is_zero(tmp_path):
     mat = _make_matrix([
         [0.5, 0.1],

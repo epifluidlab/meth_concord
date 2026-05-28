@@ -58,6 +58,7 @@ def process_concordance_matrix(
     min_cell_coverage: float = 0.8,
     output_dir: str = "output/05_concordance",
     matrix_norm: str = "zscore",
+    per_cell_center: bool = False,
 ) -> dict[str, object]:
     """Filter bins, impute NaNs, and normalize per bin.
 
@@ -120,6 +121,26 @@ def process_concordance_matrix(
             f"Imputing {na_count} NaNs ({na_count / total_entries:.1%}) with 0"
         )
     imputed = filtered.fillna(0.0)
+
+    # Step 2.5: optional per-cell centering.
+    # Removes the per-cell mean (a global shift driven by depth /
+    # conversion efficiency / library complexity).  Without this step,
+    # per-bin QN preserves per-cell global shifts; with it, the top
+    # SVD component reflects cross-bin patterns rather than per-cell
+    # absolute level.  Standard scATAC-seq / scRNA-seq preprocessing.
+    # Empirically the dominant fix for GCH-context Δ_signed at 250 kb
+    # (where ~75% of total variance was per-cell mean rather than
+    # cell-type signal).
+    if per_cell_center:
+        cell_means = imputed.mean(axis=1)
+        imputed = imputed.sub(cell_means, axis=0)
+        # Re-do the same centering on `filtered` so the QN path also
+        # sees the centered values.
+        filtered = filtered.sub(cell_means, axis=0)
+        logger.info(
+            f"Per-cell centering applied (mean cell shift = "
+            f"{cell_means.mean():.4f}, std = {cell_means.std():.4f})"
+        )
 
     # Step 3: per-bin normalization.
     if matrix_norm == "zscore":

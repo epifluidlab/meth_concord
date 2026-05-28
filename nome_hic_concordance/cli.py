@@ -119,6 +119,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "single-cell data.",
     )
     parser.add_argument(
+        "--per-cell-center", choices=["auto", "on", "off"], default="auto",
+        help="Subtract the per-cell mean from each cell's row of the "
+             "concordance matrix before per-bin normalization.  Removes "
+             "a global per-cell shift (driven by depth, library "
+             "complexity, conversion efficiency) that otherwise dominates "
+             "the top SVD component.  'auto' (default): on for "
+             "--concordance-method signed (where the per-cell shift "
+             "empirically explains ~75%% of variance for GCH at 250 kb); "
+             "off for pearson and betabinom (legacy default).  Standard "
+             "scATAC-seq / scRNA-seq preprocessing.",
+    )
+    parser.add_argument(
         "--posterior-threshold", type=float, default=0.5,
         help="Posterior cutoff above which a read end is called 'open' "
              "(only used by --concordance-method betabinom; default: 0.5). "
@@ -790,11 +802,18 @@ def run_context(
             )
             return
 
+        # Resolve --per-cell-center auto → on for signed, off otherwise.
+        if args.per_cell_center == "auto":
+            per_cell_center = args.concordance_method == "signed"
+        else:
+            per_cell_center = args.per_cell_center == "on"
+
         matrices = matrix_ops.process_concordance_matrix(
             concordance_shrunk,
             min_cell_coverage=args.min_cell_coverage,
             output_dir=str(concordance_dir),
             matrix_norm=args.matrix_norm,
+            per_cell_center=per_cell_center,
         )
 
         group_labels = samples.set_index("cell_name")["group"]
