@@ -59,6 +59,7 @@ def process_concordance_matrix(
     output_dir: str = "output/05_concordance",
     matrix_norm: str = "zscore",
     per_cell_center: bool = False,
+    per_cell_norm: str = "off",
 ) -> dict[str, object]:
     """Filter bins, impute NaNs, and normalize per bin.
 
@@ -122,24 +123,77 @@ def process_concordance_matrix(
         )
     imputed = filtered.fillna(0.0)
 
-    # Step 2.5: optional per-cell centering.
-    # Removes the per-cell mean (a global shift driven by depth /
-    # conversion efficiency / library complexity).  Without this step,
-    # per-bin QN preserves per-cell global shifts; with it, the top
-    # SVD component reflects cross-bin patterns rather than per-cell
-    # absolute level.  Standard scATAC-seq / scRNA-seq preprocessing.
-    # Empirically the dominant fix for GCH-context Δ_signed at 250 kb
-    # (where ~75% of total variance was per-cell mean rather than
-    # cell-type signal).
-    if per_cell_center:
+    # Step 2.5: optional per-cell normalization.
+    # Removes per-cell global shift / scale effects (driven by depth,
+    # conversion efficiency, library complexity, k-NN connectivity
+    # in the RWR step, etc.) that otherwise dominate the top SVD
+    # component without carrying cell-type information.  Standard
+    # scATAC-seq / scRNA-seq preprocessing trick.
+    #
+    # Modes:
+    #   "off"     — no per-cell normalization (legacy behaviour).
+    #   "center"  — subtract per-cell mean only (location shift).
+    #   "zscore"  — subtract mean AND divide by per-cell std (location + scale).
+    #   "rank"    — replace each cell's row with within-cell ranks scaled
+    #               to (-0.5, 0.5).  Aggressive: removes both location
+    #               and scale and is robust to outliers.  Closest
+    #               analogue to TF-normalisation in LSI / scATAC-seq.
+    #
+    # The legacy ``per_cell_center=True`` parameter is treated as a
+    # shorthand for ``per_cell_norm="center"`` when ``per_cell_norm``
+    # is at its default "off".
+    if per_cell_center and per_cell_norm == "off":
+        per_cell_norm = "center"
+
+    if per_cell_norm == "off":
+        pass
+    elif per_cell_norm == "center":
         cell_means = imputed.mean(axis=1)
         imputed = imputed.sub(cell_means, axis=0)
-        # Re-do the same centering on `filtered` so the QN path also
-        # sees the centered values.
         filtered = filtered.sub(cell_means, axis=0)
         logger.info(
-            f"Per-cell centering applied (mean cell shift = "
-            f"{cell_means.mean():.4f}, std = {cell_means.std():.4f})"
+            f"Per-cell normalization: 'center' "
+            f"(mean shift over cells = {cell_means.mean():.4f}, "
+            f"std = {cell_means.std():.4f})"
+        )
+    elif per_cell_norm == "zscore":
+        cell_means = imputed.mean(axis=1)
+        cell_stds = imputed.std(axis=1).replace(0.0, 1.0)
+        imputed = imputed.sub(cell_means, axis=0).div(cell_stds, axis=0)
+        # Apply the same transform to `filtered` (NaN-safe).
+        filt_means = filtered.mean(axis=1)
+        filt_stds = filtered.std(axis=1).replace(0.0, 1.0)
+        filtered = filtered.sub(filt_means, axis=0).div(filt_stds, axis=0)
+        logger.info(
+            f"Per-cell normalization: 'zscore' "
+            f"(mean cell std = {cell_stds.mean():.4f})"
+        )
+    elif per_cell_norm == "rank":
+        from scipy.stats import rankdata
+        def _rank_row(row: np.ndarray) -> np.ndarray:
+            mask = ~np.isnan(row)
+            out = np.full_like(row, np.nan, dtype=np.float64)
+            if mask.sum() == 0:
+                return out
+            ranks = rankdata(row[mask], method="average")
+            out[mask] = ranks / (mask.sum() + 1) - 0.5
+            return out
+        imputed_arr = np.apply_along_axis(_rank_row, 1, imputed.to_numpy())
+        filtered_arr = np.apply_along_axis(_rank_row, 1, filtered.to_numpy())
+        imputed = pd.DataFrame(
+            np.nan_to_num(imputed_arr, nan=0.0),
+            index=imputed.index, columns=imputed.columns,
+        )
+        filtered = pd.DataFrame(
+            filtered_arr, index=filtered.index, columns=filtered.columns,
+        )
+        logger.info(
+            "Per-cell normalization: 'rank' (within-cell rank scaled to (-0.5, 0.5))"
+        )
+    else:
+        raise ValueError(
+            f"per_cell_norm must be one of 'off', 'center', 'zscore', 'rank'; "
+            f"got {per_cell_norm!r}."
         )
 
     # Step 3: per-bin normalization.

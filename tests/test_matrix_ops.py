@@ -108,6 +108,75 @@ def test_per_cell_centering_off_preserves_raw_values(tmp_path):
     np.testing.assert_allclose(result["imputed"].to_numpy(), mat.to_numpy())
 
 
+def test_per_cell_zscore_removes_mean_and_scale(tmp_path):
+    """per_cell_norm='zscore' should give each row mean=0 and std=1."""
+    # 3 cells, each with a different mean AND different scale.
+    mat = _make_matrix([
+        [10.0, 11.0, 12.0, 13.0, 14.0],   # mean=12, std=√2.5
+        [100.0, 110.0, 120.0, 130.0, 140.0],  # mean=120, std=10*√2.5
+        [-5.0, -2.5, 0.0, 2.5, 5.0],      # mean=0, std=√6.25
+    ])
+    result = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path),
+        per_cell_norm="zscore",
+    )
+    z = result["imputed"]
+    means = z.mean(axis=1).to_numpy()
+    stds = z.std(axis=1).to_numpy()
+    np.testing.assert_allclose(means, 0.0, atol=1e-10)
+    np.testing.assert_allclose(stds, 1.0, atol=1e-10)
+
+
+def test_per_cell_rank_normalisation(tmp_path):
+    """per_cell_norm='rank' replaces each row with rank/(n+1) - 0.5."""
+    mat = _make_matrix([
+        [10.0, 20.0, 30.0, 40.0, 50.0],  # already sorted ascending
+        [50.0, 40.0, 30.0, 20.0, 10.0],  # descending
+    ])
+    result = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path),
+        per_cell_norm="rank",
+    )
+    # For row 0 (ascending), ranks should be [1, 2, 3, 4, 5] / 6 - 0.5
+    expected_ascending = np.array([1, 2, 3, 4, 5]) / 6 - 0.5
+    np.testing.assert_allclose(
+        result["imputed"].iloc[0].to_numpy(), expected_ascending,
+    )
+    # Row 1 (descending), ranks should be [5, 4, 3, 2, 1] / 6 - 0.5.
+    expected_descending = np.array([5, 4, 3, 2, 1]) / 6 - 0.5
+    np.testing.assert_allclose(
+        result["imputed"].iloc[1].to_numpy(), expected_descending,
+    )
+
+
+def test_per_cell_norm_invalid_raises(tmp_path):
+    mat = _make_matrix([[0.5, 0.5], [0.5, 0.5]])
+    with pytest.raises(ValueError, match="per_cell_norm"):
+        matrix_ops.process_concordance_matrix(
+            mat, output_dir=str(tmp_path), per_cell_norm="nope",
+        )
+
+
+def test_per_cell_center_legacy_alias(tmp_path):
+    """Legacy per_cell_center=True is equivalent to per_cell_norm='center'."""
+    mat = _make_matrix([
+        [10.0, 12.0],
+        [20.0, 22.0],
+    ])
+    via_legacy = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path / "a"),
+        per_cell_center=True,
+    )
+    via_new = matrix_ops.process_concordance_matrix(
+        mat, min_cell_coverage=0.5, output_dir=str(tmp_path / "b"),
+        per_cell_norm="center",
+    )
+    np.testing.assert_allclose(
+        via_legacy["imputed"].to_numpy(),
+        via_new["imputed"].to_numpy(),
+    )
+
+
 def test_zero_variance_column_zscore_is_zero(tmp_path):
     mat = _make_matrix([
         [0.5, 0.1],

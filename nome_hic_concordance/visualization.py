@@ -126,6 +126,7 @@ def run_umap_and_plot(
     min_dist: float = 0.1,
     metric: str = "euclidean",
     n_svd: int = 0,
+    skip_top_svd: int = 0,
     n_threads: int = 4,
     random_state: int = 42,
 ) -> pd.DataFrame:
@@ -148,6 +149,11 @@ def run_umap_and_plot(
         If > 0, first reduce the matrix to ``n_svd`` components via
         TruncatedSVD before running UMAP (bulk-RNA / scATAC-seq style).
         0 (default) runs UMAP directly on the bin matrix.
+    skip_top_svd : int
+        Drop the first N SVD components before UMAP.  Useful when the
+        top components carry non-target signal (per-cell depth, batch,
+        k-NN community structure).  Requires ``n_svd > skip_top_svd``.
+        Default 0.
 
     Returns
     -------
@@ -171,11 +177,21 @@ def run_umap_and_plot(
     n_svd_used = 0
     if n_svd and n_svd > 0:
         from sklearn.decomposition import TruncatedSVD
-        k = max(1, min(n_svd, matrix.shape[0] - 1, matrix.shape[1]))
-        n_svd_used = k
-        svd = TruncatedSVD(n_components=k, random_state=random_state)
-        X = svd.fit_transform(X)
-        var_explained = float(svd.explained_variance_ratio_.sum())
+        # Fit enough components to satisfy --n-svd PLUS --skip-top-svd.
+        skip = max(0, int(skip_top_svd))
+        k_total = max(1, min(int(n_svd) + skip, matrix.shape[0] - 1, matrix.shape[1]))
+        svd = TruncatedSVD(n_components=k_total, random_state=random_state)
+        emb = svd.fit_transform(X)
+        # Drop the top-`skip` components.
+        X = emb[:, skip:]
+        n_svd_used = X.shape[1]
+        if skip > 0:
+            logger.info(
+                f"SVD: dropped top {skip} components "
+                f"(--skip-top-svd); using components {skip}..{k_total - 1} "
+                f"({n_svd_used} components in total)"
+            )
+        var_explained = float(svd.explained_variance_ratio_[skip:].sum())
         logger.info(
             f"TruncatedSVD reduced {matrix.shape[1]} bins -> {k} components "
             f"(cumulative variance explained: {var_explained:.1%})"

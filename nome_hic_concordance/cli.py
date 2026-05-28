@@ -120,15 +120,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--per-cell-center", choices=["auto", "on", "off"], default="auto",
-        help="Subtract the per-cell mean from each cell's row of the "
-             "concordance matrix before per-bin normalization.  Removes "
-             "a global per-cell shift (driven by depth, library "
-             "complexity, conversion efficiency) that otherwise dominates "
-             "the top SVD component.  'auto' (default): on for "
-             "--concordance-method signed (where the per-cell shift "
-             "empirically explains ~75%% of variance for GCH at 250 kb); "
-             "off for pearson and betabinom (legacy default).  Standard "
-             "scATAC-seq / scRNA-seq preprocessing.",
+        help="DEPRECATED — use --per-cell-norm instead.  Kept for "
+             "backward compatibility.  'auto' on / off / 'on' / 'off' "
+             "translate to --per-cell-norm {center, off, center, off} "
+             "respectively (with 'auto' resolved per --concordance-method).",
+    )
+    parser.add_argument(
+        "--per-cell-norm",
+        choices=["auto", "off", "center", "zscore", "rank"],
+        default="auto",
+        help="Per-cell normalization applied before per-bin "
+             "normalization in Step 7.  Removes per-cell global shift / "
+             "scale effects (depth, library complexity, RWR connectivity) "
+             "that otherwise dominate the top SVD component.  "
+             "'center': subtract per-cell mean.  "
+             "'zscore': subtract mean AND divide by std (more aggressive, "
+             "removes scale as well — recommended when 'center' alone "
+             "still leaves a non-cell-type axis dominant).  "
+             "'rank': replace each cell's row with within-cell ranks in "
+             "(-0.5, 0.5) — closest analogue to TF normalisation in "
+             "LSI / scATAC-seq, most robust to outliers and structured "
+             "noise.  "
+             "'auto' (default): 'zscore' for --concordance-method signed; "
+             "'off' for pearson and betabinom (legacy).",
+    )
+    parser.add_argument(
+        "--skip-top-svd", type=int, default=0,
+        help="Drop the top N SVD components before UMAP / clustering.  "
+             "Use when per-cell normalization isn't enough to remove a "
+             "non-cell-type dominant axis (e.g., k-NN community structure "
+             "from RWR, or a discrete depth-tier split).  Default 0; "
+             "common values: 1 (drop PC0 only).  Strictly orthogonal to "
+             "--n-svd: with --n-svd 5 --skip-top-svd 1, UMAP runs on "
+             "components 1..5 (zero-indexed), giving 5 components.",
     )
     parser.add_argument(
         "--posterior-threshold", type=float, default=0.5,
@@ -802,11 +826,20 @@ def run_context(
             )
             return
 
-        # Resolve --per-cell-center auto → on for signed, off otherwise.
-        if args.per_cell_center == "auto":
-            per_cell_center = args.concordance_method == "signed"
-        else:
-            per_cell_center = args.per_cell_center == "on"
+        # Resolve --per-cell-norm.  --per-cell-center is the legacy
+        # boolean form; --per-cell-norm wins if both are set explicitly
+        # (i.e., neither at 'auto').
+        if args.per_cell_norm != "auto":
+            per_cell_norm = args.per_cell_norm
+        elif args.per_cell_center == "on":
+            per_cell_norm = "center"
+        elif args.per_cell_center == "off":
+            per_cell_norm = "off"
+        else:  # both auto
+            per_cell_norm = (
+                "zscore" if args.concordance_method == "signed" else "off"
+            )
+        per_cell_center = per_cell_norm == "center"  # for legacy boolean param
 
         matrices = matrix_ops.process_concordance_matrix(
             concordance_shrunk,
@@ -814,6 +847,7 @@ def run_context(
             output_dir=str(concordance_dir),
             matrix_norm=args.matrix_norm,
             per_cell_center=per_cell_center,
+            per_cell_norm=per_cell_norm,
         )
 
         group_labels = samples.set_index("cell_name")["group"]
@@ -845,9 +879,13 @@ def run_context(
             )
 
             svd_suffix = f"_svd{args.n_svd}" if args.n_svd and args.n_svd > 0 else ""
+            if args.skip_top_svd and args.skip_top_svd > 0:
+                svd_suffix += f"_skip{args.skip_top_svd}"
             svd_title = (
                 f" + SVD-{args.n_svd}" if args.n_svd and args.n_svd > 0 else ""
             )
+            if args.skip_top_svd and args.skip_top_svd > 0:
+                svd_title += f" (skip top {args.skip_top_svd})"
 
             visualization.run_umap_and_plot(
                 matrices["imputed"], group_labels,
@@ -855,6 +893,7 @@ def run_context(
                 output_prefix=f"umap_unnormalized{svd_suffix}",
                 output_dir=str(umap_dir),
                 n_svd=args.n_svd,
+                skip_top_svd=args.skip_top_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
             )
@@ -864,6 +903,7 @@ def run_context(
                 output_prefix=f"{norm_prefix}{svd_suffix}",
                 output_dir=str(umap_dir),
                 n_svd=args.n_svd,
+                skip_top_svd=args.skip_top_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
             )
