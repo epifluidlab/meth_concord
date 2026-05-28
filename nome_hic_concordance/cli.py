@@ -74,6 +74,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-cell-coverage", type=float, default=0.8,
                         help="Fraction of cells non-NA to retain a bin (default: 0.8).")
     parser.add_argument(
+        "--blacklist-bed", type=str, default=None,
+        help="Optional path to a BED file of blacklist regions (e.g. ENCODE). "
+             "Bins whose [start, start+bin_size) interval overlaps any "
+             "record in the BED are dropped in Step 7.  Accepts plain or "
+             "gzipped BED; only the first three columns are read.",
+    )
+    parser.add_argument(
         "--concordance-method", choices=["pearson", "betabinom"], default="pearson",
         help="Per-bin concordance feature.  'pearson' (default): Pearson r of "
              "paired posteriors per bin.  'betabinom': hierarchical Beta-Binomial "
@@ -560,6 +567,8 @@ def run_context(
             min_cell_coverage=args.min_cell_coverage,
             output_dir=str(concordance_dir),
             matrix_norm=args.matrix_norm,
+            blacklist_bed=args.blacklist_bed,
+            bin_size=args.bin_size,
         )
 
         group_labels = samples.set_index("cell_name")["group"]

@@ -17,6 +17,79 @@ from .utils import ensure_dir
 logger = logging.getLogger(__name__)
 
 
+def _load_blacklist_bed(path: str) -> dict[str, np.ndarray]:
+    """Read a BED file and return ``{chrom: ndarray of shape (n, 2)}``.
+
+    Overlapping intervals on the same chromosome are merged so that the
+    per-chrom array is non-overlapping and sorted by start, which lets
+    bin-overlap checks use a single ``np.searchsorted`` lookup.
+
+    The BED is expected to be plain text or gzipped.  Header / comment /
+    track / browser lines are skipped.  Only the first three columns
+    (chrom, start, end) are read.
+    """
+    import gzip
+    raw: dict[str, list[tuple[int, int]]] = {}
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as fh:
+        for ln in fh:
+            if not ln or ln.startswith(("#", "track", "browser")):
+                continue
+            fields = ln.rstrip("\n").split("\t")
+            if len(fields) < 3:
+                continue
+            chrom = fields[0]
+            try:
+                start = int(fields[1])
+                end = int(fields[2])
+            except ValueError:
+                continue
+            if end <= start:
+                continue
+            raw.setdefault(chrom, []).append((start, end))
+
+    merged: dict[str, np.ndarray] = {}
+    n_in, n_out = 0, 0
+    for chrom, ivals in raw.items():
+        ivals.sort()
+        out: list[tuple[int, int]] = []
+        for s, e in ivals:
+            if out and s <= out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], e))
+            else:
+                out.append((s, e))
+        n_in += len(ivals)
+        n_out += len(out)
+        merged[chrom] = np.array(out, dtype=np.int64)
+    logger.info(
+        f"Loaded blacklist BED: {n_in:,} intervals across {len(merged)} "
+        f"chromosomes, merged to {n_out:,} non-overlapping intervals."
+    )
+    return merged
+
+
+def _bin_overlaps_blacklist(
+    chrom: str, bin_start: int, bin_end: int,
+    blacklist: dict[str, np.ndarray],
+) -> bool:
+    """Return True iff ``[bin_start, bin_end)`` overlaps any interval in ``blacklist[chrom]``.
+
+    Assumes ``blacklist[chrom]`` is sorted and non-overlapping (as produced
+    by ``_load_blacklist_bed``).
+    """
+    ivals = blacklist.get(chrom)
+    if ivals is None or len(ivals) == 0:
+        return False
+    starts = ivals[:, 0]
+    ends = ivals[:, 1]
+    # Index of last interval whose start < bin_end (the only candidate
+    # for overlap, given merged non-overlapping intervals).
+    idx = int(np.searchsorted(starts, bin_end, side="right") - 1)
+    if idx < 0:
+        return False
+    return bool(ends[idx] > bin_start)
+
+
 def _quantile_normalize_per_bin(
     matrix: np.ndarray,
     mask: np.ndarray | None = None,
@@ -51,6 +124,8 @@ def process_concordance_matrix(
     min_cell_coverage: float = 0.8,
     output_dir: str = "output/05_concordance",
     matrix_norm: str = "zscore",
+    blacklist_bed: str | None = None,
+    bin_size: int | None = None,
 ) -> dict[str, object]:
     """Filter bins, impute NaNs, and normalize per bin.
 
@@ -58,6 +133,7 @@ def process_concordance_matrix(
     ----------
     concordance_shrunk : DataFrame
         cells × bins matrix (Pearson r, shrunk r, or Δ values; NaN-tolerant).
+        Bin column labels must look like ``"chr1:0"``, ``"chr1:250000"``, ...
     min_cell_coverage : float
         Drop bins where < ``min_cell_coverage`` of cells have a value.
     output_dir : str
@@ -66,6 +142,12 @@ def process_concordance_matrix(
         classical pipeline; ``"quantile"`` for rank-based QN to a uniform
         [-0.5, 0.5] target — robust to outliers, matches bulk-RNA /
         scATAC-seq style preprocessing.
+    blacklist_bed : str, optional
+        Path to a BED file of blacklist regions (e.g. ENCODE).  Bins whose
+        ``[start, start+bin_size)`` interval overlaps any blacklist record
+        are dropped.  Requires ``bin_size`` to be set.
+    bin_size : int, optional
+        Bin size in bp.  Only used when ``blacklist_bed`` is given.
 
     Returns
     -------
@@ -80,17 +162,46 @@ def process_concordance_matrix(
     out_path = ensure_dir(output_dir)
     n_cells, n_bins_orig = concordance_shrunk.shape
 
-    # Step 1: filter bins by fraction of non-NA cells.
+    # Step 1a: filter bins by fraction of non-NA cells.
     if n_cells == 0:
         raise ValueError("concordance_shrunk has zero cells")
     coverage_frac = concordance_shrunk.notna().mean(axis=0)
     retained_mask = coverage_frac >= min_cell_coverage
+
+    # Step 1b: drop bins overlapping any blacklist interval (optional).
+    if blacklist_bed:
+        if not bin_size:
+            raise ValueError(
+                "process_concordance_matrix: blacklist_bed requires bin_size "
+                "to be set (need the bin's end coordinate for overlap check)."
+            )
+        blacklist = _load_blacklist_bed(blacklist_bed)
+        bin_blacklisted = []
+        for bid in concordance_shrunk.columns:
+            chrom, start_str = str(bid).split(":", 1)
+            start = int(start_str)
+            bin_blacklisted.append(
+                _bin_overlaps_blacklist(
+                    chrom, start, start + int(bin_size), blacklist,
+                )
+            )
+        bl_mask = pd.Series(bin_blacklisted, index=concordance_shrunk.columns)
+        n_bl = int(bl_mask.sum())
+        n_bl_overlapping_kept = int((bl_mask & retained_mask).sum())
+        retained_mask = retained_mask & ~bl_mask
+        logger.info(
+            f"Blacklist filter: {n_bl:,} bins overlap blacklist regions "
+            f"(of which {n_bl_overlapping_kept:,} would have passed the "
+            f"coverage filter); dropping all."
+        )
+
     retained_bins = concordance_shrunk.columns[retained_mask].tolist()
 
     filtered = concordance_shrunk.loc[:, retained_bins].copy()
     logger.info(
         f"Bin filter: {n_bins_orig} -> {len(retained_bins)} bins "
-        f"(coverage >= {min_cell_coverage:.0%} of cells)"
+        f"(coverage >= {min_cell_coverage:.0%}"
+        f"{', not in blacklist' if blacklist_bed else ''})"
     )
 
     with open(out_path / "retained_bins.txt", "w") as f:
