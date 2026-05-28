@@ -536,18 +536,25 @@ def run_context(
                 "Fewer than 2 cells in the imputed matrix; skipping UMAP."
             )
         else:
+            # Filename/title reflect the actual normalization used.
+            norm_label = {
+                "zscore": ("z-scored", "umap_zscore"),
+                "quantile": ("quantile-normed", "umap_quantile"),
+            }.get(args.matrix_norm, (args.matrix_norm, f"umap_{args.matrix_norm}"))
+            norm_title, norm_prefix = norm_label
+
             visualization.run_umap_and_plot(
                 matrices["imputed"], group_labels,
-                title=f"UMAP (no z-score, {context})",
-                output_prefix="umap_no_zscore",
+                title=f"UMAP (un-normalized, {context})",
+                output_prefix="umap_unnormalized",
                 output_dir=str(umap_dir),
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
             )
             visualization.run_umap_and_plot(
                 matrices["zscore"], group_labels,
-                title=f"UMAP (z-scored, {context})",
-                output_prefix="umap_zscore",
+                title=f"UMAP ({norm_title}, {context})",
+                output_prefix=norm_prefix,
                 output_dir=str(umap_dir),
                 n_threads=args.n_threads,
                 random_state=args.random_seed,

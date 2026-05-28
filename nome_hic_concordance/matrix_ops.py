@@ -133,8 +133,9 @@ def process_concordance_matrix(
 
     imputed.to_parquet(out_path / "concordance_imputed.parquet")
     imputed.to_csv(out_path / "concordance_imputed.tsv", sep="\t")
-    normalized.to_parquet(out_path / "concordance_zscore.parquet")
-    normalized.to_csv(out_path / "concordance_zscore.tsv", sep="\t")
+    # Filename reflects the actual normalization used.
+    normalized.to_parquet(out_path / f"concordance_{matrix_norm}.parquet")
+    normalized.to_csv(out_path / f"concordance_{matrix_norm}.tsv", sep="\t")
 
     return {
         "retained_bins": retained_bins,
