@@ -76,13 +76,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--blacklist-bed", type=str, default=None,
         help="Optional path to a BED file of blacklist regions (e.g. ENCODE). "
-             "Applied at TWO stages: (1) Step 2 drops any read pair whose "
-             "either end (pos1/pos2) falls inside a blacklist interval, so "
-             "the mixture model / posteriors / concordance never see "
-             "blacklisted reads; (2) Step 7 additionally drops bins whose "
-             "interval overlaps the blacklist (safety net for re-runs that "
-             "skip Step 2).  Accepts plain or gzipped BED; only the first "
-             "three columns are read.",
+             "Applied at Step 2 (BAM parsing): any read pair whose either "
+             "end (pos1 or pos2) falls inside a blacklist interval on its "
+             "chromosome is dropped before the per-cell parquet is written, "
+             "so the mixture model / posteriors / concordance never see "
+             "blacklisted reads.  Accepts plain or gzipped BED; only the "
+             "first three columns are read.  Note: to take effect, Step 2 "
+             "must run with this flag — adding it later (e.g. for --steps 7 "
+             "only) is a no-op.",
     )
     parser.add_argument(
         "--concordance-method", choices=["pearson", "betabinom"], default="pearson",
@@ -572,8 +573,6 @@ def run_context(
             min_cell_coverage=args.min_cell_coverage,
             output_dir=str(concordance_dir),
             matrix_norm=args.matrix_norm,
-            blacklist_bed=args.blacklist_bed,
-            bin_size=args.bin_size,
         )
 
         group_labels = samples.set_index("cell_name")["group"]

@@ -58,8 +58,6 @@ def process_concordance_matrix(
     min_cell_coverage: float = 0.8,
     output_dir: str = "output/05_concordance",
     matrix_norm: str = "zscore",
-    blacklist_bed: str | None = None,
-    bin_size: int | None = None,
 ) -> dict[str, object]:
     """Filter bins, impute NaNs, and normalize per bin.
 
@@ -67,7 +65,7 @@ def process_concordance_matrix(
     ----------
     concordance_shrunk : DataFrame
         cells × bins matrix (Pearson r, shrunk r, or Δ values; NaN-tolerant).
-        Bin column labels must look like ``"chr1:0"``, ``"chr1:250000"``, ...
+        Bin column labels look like ``"chr1:0"``, ``"chr1:250000"``, ...
     min_cell_coverage : float
         Drop bins where < ``min_cell_coverage`` of cells have a value.
     output_dir : str
@@ -76,12 +74,6 @@ def process_concordance_matrix(
         classical pipeline; ``"quantile"`` for rank-based QN to a uniform
         [-0.5, 0.5] target — robust to outliers, matches bulk-RNA /
         scATAC-seq style preprocessing.
-    blacklist_bed : str, optional
-        Path to a BED file of blacklist regions (e.g. ENCODE).  Bins whose
-        ``[start, start+bin_size)`` interval overlaps any blacklist record
-        are dropped.  Requires ``bin_size`` to be set.
-    bin_size : int, optional
-        Bin size in bp.  Only used when ``blacklist_bed`` is given.
 
     Returns
     -------
@@ -92,76 +84,28 @@ def process_concordance_matrix(
                       The label "zscore" is kept for backward compatibility
                       regardless of which ``matrix_norm`` was used; check
                       ``matrix_norm`` to know how the values were produced.
+
+    Notes
+    -----
+    Blacklist filtering happens at the *read* level in Step 2 (see
+    :func:`nome_hic_concordance.bam_parser.parse_all_cells`).  There is
+    no longer a bin-level blacklist filter here; if you need it, re-run
+    Step 2 with ``--blacklist-bed``.
     """
     out_path = ensure_dir(output_dir)
     n_cells, n_bins_orig = concordance_shrunk.shape
 
-    # Step 1a: filter bins by fraction of non-NA cells.
+    # Filter bins by fraction of non-NA cells.
     if n_cells == 0:
         raise ValueError("concordance_shrunk has zero cells")
     coverage_frac = concordance_shrunk.notna().mean(axis=0)
     retained_mask = coverage_frac >= min_cell_coverage
-
-    # Step 1b: drop bins overlapping any blacklist interval (optional).
-    if blacklist_bed:
-        # Infer bin_size from the matrix labels — this is the ground truth.
-        # If the caller also passed bin_size, validate it matches.
-        inferred_bin_size = _infer_bin_size(concordance_shrunk.columns)
-        if inferred_bin_size is None:
-            if not bin_size:
-                raise ValueError(
-                    "process_concordance_matrix: blacklist_bed needs bin_size "
-                    "and could not infer it from the matrix column labels "
-                    "(expected labels like 'chr1:0', 'chr1:250000', ...)."
-                )
-            effective_bin_size = int(bin_size)
-            logger.info(
-                f"Could not infer bin_size from matrix labels; using "
-                f"bin_size={effective_bin_size} from the caller."
-            )
-        else:
-            effective_bin_size = inferred_bin_size
-            if bin_size and int(bin_size) != inferred_bin_size:
-                logger.warning(
-                    f"--bin-size={bin_size} disagrees with bin_size inferred "
-                    f"from the matrix labels ({inferred_bin_size}). Using the "
-                    f"inferred value for the blacklist overlap check. (This "
-                    f"typically happens when you re-run --steps 7 without "
-                    f"passing the same --bin-size used to build the matrix.)"
-                )
-            else:
-                logger.info(
-                    f"Blacklist overlap check using bin_size="
-                    f"{effective_bin_size} (inferred from matrix labels)."
-                )
-
-        blacklist = _load_blacklist_bed(blacklist_bed)
-        bin_blacklisted = []
-        for bid in concordance_shrunk.columns:
-            chrom, start_str = str(bid).split(":", 1)
-            start = int(start_str)
-            bin_blacklisted.append(
-                _bin_overlaps_blacklist(
-                    chrom, start, start + effective_bin_size, blacklist,
-                )
-            )
-        bl_mask = pd.Series(bin_blacklisted, index=concordance_shrunk.columns)
-        n_bl = int(bl_mask.sum())
-        n_bl_overlapping_kept = int((bl_mask & retained_mask).sum())
-        retained_mask = retained_mask & ~bl_mask
-        logger.info(
-            f"Blacklist filter: {n_bl:,} of {len(concordance_shrunk.columns):,} "
-            f"bins overlap blacklist regions (of which {n_bl_overlapping_kept:,} "
-            f"would have passed the coverage filter); dropping all."
-        )
-
     retained_bins = concordance_shrunk.columns[retained_mask].tolist()
 
     filtered = concordance_shrunk.loc[:, retained_bins].copy()
     logger.info(
         f"Bin filter: {n_bins_orig} -> {len(retained_bins)} bins "
-        f"(coverage >= {min_cell_coverage:.0%}"
-        f"{', not in blacklist' if blacklist_bed else ''})"
+        f"(coverage >= {min_cell_coverage:.0%})"
     )
 
     with open(out_path / "retained_bins.txt", "w") as f:
