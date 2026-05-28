@@ -661,16 +661,41 @@ def run_context(
         if not ({5, 6, 7} & steps):
             logger.info("Step 4: Skipped (no downstream step requires it)")
             return
+        # Build the candidate cell list from the post-Step-2 filter
+        # (cell_parquets), not the raw manifest.  When the current
+        # --min-linked-pairs-per-cell / --min-gch-sites etc. differ from
+        # the values used in the original run, the filter may keep cells
+        # that don't have posteriors yet (e.g., switching from
+        # --min-gch-sites 3 to 2 makes more pairs qualify, letting some
+        # previously-failing cells pass the current threshold).  We
+        # silently drop such cells with a warning rather than crashing
+        # — the user can re-run --steps 4 explicitly to process them.
         posterior_paths = {
-            row["cell_name"]: str(posterior_dir / f"{row['cell_name']}.posteriors.parquet")
-            for _, row in samples.iterrows()
+            cell: str(posterior_dir / f"{cell}.posteriors.parquet")
+            for cell in cell_parquets.keys()
         }
         missing = [c for c, p in posterior_paths.items() if not Path(p).exists()]
         if missing:
-            raise FileNotFoundError(
-                f"Posterior parquets missing for {len(missing)} cell(s); re-run step 4."
+            logger.warning(
+                f"Step 4: {len(missing)} cell(s) pass the current Step-2.5 "
+                f"filter but have no posterior parquet on disk (likely "
+                f"because the original Step-4 run used different "
+                f"--min-gch-sites / --min-linked-pairs-per-cell). "
+                f"Dropping them from downstream analysis.  To process "
+                f"these cells, re-run --steps 4."
             )
-        logger.info(f"Step 4: Skipped (loading posteriors from {posterior_dir})")
+            posterior_paths = {
+                c: p for c, p in posterior_paths.items() if Path(p).exists()
+            }
+            if not posterior_paths:
+                raise FileNotFoundError(
+                    f"No posterior parquets found in {posterior_dir} after "
+                    f"applying the cell filter; re-run --steps 4."
+                )
+        logger.info(
+            f"Step 4: Skipped (loading {len(posterior_paths)} posteriors "
+            f"from {posterior_dir})"
+        )
 
     # ---- Step 5: Concordance + distance decay -----------------------------
     if 5 in steps:
