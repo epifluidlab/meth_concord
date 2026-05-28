@@ -57,10 +57,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Filtering
     parser.add_argument("--min-distance", type=int, default=20_000,
                         help="Min genomic distance for qualifying pairs (default: 20000).")
-    parser.add_argument("--min-gch-sites", type=int, default=3,
+    parser.add_argument("--min-gch-sites", type=int, default=2,
                         help="Min informative GCH sites per read end "
                              "(only applied when processing context GCH; "
-                             "default: 3).")
+                             "default: 2, design-doc §6 #14 — empirically "
+                             "the sweet spot for NOMe-HiC: 1.48× more pairs "
+                             "than the previous default of 3 with no measurable "
+                             "loss of per-pair sharpness).")
     parser.add_argument("--min-hcg-sites", type=int, default=None,
                         help="Min informative HCG sites per read end "
                              "(only applied when processing context HCG). "
@@ -69,8 +72,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "are typically sparser than GCH.")
     parser.add_argument("--bin-size", type=int, default=5_000_000,
                         help="Genomic bin size in bp (default: 5000000).")
-    parser.add_argument("--min-pairs-per-bin", type=int, default=5,
-                        help="Min pairs per bin to compute r (default: 5).")
+    parser.add_argument("--min-pairs-per-bin", type=int, default=None,
+                        help="Min pairs per bin to compute Δ. "
+                             "Default depends on --concordance-method: "
+                             "1 for 'signed' or 'betabinom' (DM/BB EB "
+                             "shrinkage works with n=1), 5 for 'pearson' "
+                             "(correlation needs ≥5 pairs).")
     parser.add_argument("--min-cell-coverage", type=float, default=0.8,
                         help="Fraction of cells non-NA to retain a bin (default: 0.8).")
     parser.add_argument(
@@ -86,11 +93,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "only) is a no-op.",
     )
     parser.add_argument(
-        "--concordance-method", choices=["pearson", "betabinom"], default="pearson",
-        help="Per-bin concordance feature.  'pearson' (default): Pearson r of "
-             "paired posteriors per bin.  'betabinom': hierarchical Beta-Binomial "
-             "Δ = E[θ_L|data] − p̂² with EB prior on linked pairs and unlinked "
-             "ends as the independence baseline.",
+        "--concordance-method", choices=["pearson", "betabinom", "signed"],
+        default="signed",
+        help="Per-bin concordance feature. 'signed' (default, new): "
+             "Dirichlet-Multinomial signed Δ = (E[π_l_open]−E[π_l_closed]) − "
+             "(E[π_u_open]−E[π_u_closed]) per (cell, bin) using U-3 soft "
+             "counts and a short-range pair baseline. Captures direction "
+             "(active vs silenced). 'betabinom': one-sided Δ_open = "
+             "E[θ_L|data] − p̂² (the v0.2 behaviour; aliased to "
+             "--concordance-statistic open). 'pearson': legacy Pearson r.",
+    )
+    parser.add_argument(
+        "--concordance-statistic", choices=["signed", "open", "both"],
+        default=None,
+        help="Alias / refinement of --concordance-method for the new "
+             "DM-based pipeline. 'signed' = directional Δ (default when "
+             "--concordance-method=signed). 'open' = legacy one-sided Δ. "
+             "'both' = compute and save both matrices in one run.",
     )
     parser.add_argument(
         "--matrix-norm", choices=["zscore", "quantile"], default="zscore",
@@ -102,14 +121,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--posterior-threshold", type=float, default=0.5,
         help="Posterior cutoff above which a read end is called 'open' "
-             "(only used by --concordance-method betabinom; default: 0.5).",
+             "(only used by --concordance-method betabinom; default: 0.5). "
+             "Not used by --concordance-method signed (which uses U-3 soft "
+             "counts with no thresholding).",
     )
+    parser.add_argument(
+        "--posterior-threshold-open", type=float, default=0.6,
+        help="Diagnostic-only threshold for calling an end 'open' "
+             "(default: 0.6, design-doc §6 #1). Used in QC summaries; "
+             "the signed-Δ computation itself uses un-thresholded "
+             "posteriors via U-3 soft counts.",
+    )
+    parser.add_argument(
+        "--posterior-threshold-closed", type=float, default=0.4,
+        help="Diagnostic-only threshold for calling an end 'closed' "
+             "(default: 0.4, design-doc §6 #1). See --posterior-threshold-open.",
+    )
+    parser.add_argument(
+        "--min-linked-pairs-per-cell", type=int, default=100,
+        help="Drop cells with fewer than this many qualifying linked "
+             "pairs (default: 100, design-doc §6 #14). Applied right "
+             "after Step 2 so bad cells don't contaminate the mixture "
+             "model, posterior calls, or downstream matrices. Set to 0 "
+             "to disable.",
+    )
+    parser.add_argument(
+        "--impute", choices=["none", "rwr"], default="rwr",
+        help="Imputation method applied to the soft-count matrices "
+             "before Layer-2 EB shrinkage (design-doc §6 #16). "
+             "'rwr' (default) is required for typical NOMe-HiC data "
+             "sparsity at 250 kb (median n_linked = 1 per (cell, bin) "
+             "is prior-dominated without imputation). 'none' for "
+             "diagnostic / debug. Only applies to --concordance-method "
+             "signed; ignored for pearson and betabinom.",
+    )
+    parser.add_argument("--rwr-k", type=int, default=15,
+                        help="Number of nearest neighbours per cell (default: 15).")
+    parser.add_argument("--rwr-restart-prob", type=float, default=0.5,
+                        help="RWR restart probability r (default: 0.5).")
+    parser.add_argument("--rwr-refine-passes", type=int, default=0,
+                        help="Iterative refinement passes (default: 0). "
+                             "Each pass rebuilds the k-NN from QN(Δ_signed) "
+                             "of the previous pass; RWR always restarts from "
+                             "the original raw soft counts.")
+    parser.add_argument("--rwr-solver", choices=["auto", "direct", "iterative"],
+                        default="auto",
+                        help="RWR linear solver. 'auto' uses direct (closed-"
+                             "form LU) when n_cells <= 5000; iterative otherwise.")
+    parser.add_argument("--rwr-max-iter", type=int, default=30,
+                        help="Max iterations for the iterative RWR solver.")
+    parser.add_argument("--rwr-tol", type=float, default=1e-4,
+                        help="Convergence tolerance for the iterative RWR solver.")
     parser.add_argument(
         "--eb-min-obs", type=int, default=50,
         help="Minimum number of (cell, bin) observations with n_linked>=1 "
              "required to fit the empirical-Bayes prior on θ_L.  If fewer "
-             "are available, falls back to Beta(1, 1).  "
-             "(Only used by --concordance-method betabinom; default: 50).",
+             "are available, falls back to Beta(1, 1) or Dirichlet(1,1,1).  "
+             "Default: 50.",
     )
     parser.add_argument(
         "--n-svd", type=int, default=0,
@@ -295,6 +363,113 @@ def _get_chrom_sizes(reference_path: str) -> dict[str, int]:
         tb.close()
 
 
+def _count_linked_pairs_one_cell(
+    parquet_path: str,
+    cell_name: str,
+    bin_size: int,
+    min_distance: int,
+    min_gch_sites: int,
+) -> tuple[str, int]:
+    """Count qualifying linked pairs in one cell (per-cell parquet from Step 2).
+
+    Used by the cell-coverage filter to decide which cells to drop.  Does
+    NOT require posteriors — only n1, n2, distance, and same-bin check.
+    """
+    df = pd.read_parquet(
+        parquet_path,
+        columns=["chrom", "pos1", "pos2", "n1", "n2", "distance"],
+    )
+    if len(df) == 0:
+        return cell_name, 0
+    pos1 = df["pos1"].to_numpy(dtype=np.int64)
+    pos2 = df["pos2"].to_numpy(dtype=np.int64)
+    bsz = int(bin_size)
+    bin1 = pos1 // bsz
+    bin2 = pos2 // bsz
+    informative = (df["n1"].to_numpy() >= min_gch_sites) & (
+        df["n2"].to_numpy() >= min_gch_sites
+    )
+    same_bin = bin1 == bin2
+    long_range = df["distance"].to_numpy() >= int(min_distance)
+    linked = same_bin & informative & long_range
+    return cell_name, int(linked.sum())
+
+
+def _filter_low_coverage_cells(
+    cell_parquets: dict[str, str],
+    min_linked_pairs: int,
+    min_distance: int,
+    min_gch_sites: int,
+    bin_size: int,
+    n_threads: int,
+    qc_dir,
+) -> dict[str, str]:
+    """Drop cells with fewer than ``min_linked_pairs`` qualifying linked pairs.
+
+    Saves the kept and dropped cell lists with their counts to ``qc_dir``
+    so the user can inspect what was removed.  Returns a new dict
+    containing only the kept cells.
+
+    Design-doc §6 #14.
+    """
+    import numpy as np
+    from joblib import Parallel, delayed
+
+    logger.info(
+        f"Cell coverage filter: dropping cells with < {min_linked_pairs} "
+        f"qualifying linked pairs."
+    )
+
+    items = list(cell_parquets.items())
+    if n_threads > 1 and len(items) > 1:
+        counts = Parallel(n_jobs=n_threads)(
+            delayed(_count_linked_pairs_one_cell)(
+                path, name, bin_size, min_distance, min_gch_sites,
+            )
+            for name, path in items
+        )
+    else:
+        counts = [
+            _count_linked_pairs_one_cell(
+                path, name, bin_size, min_distance, min_gch_sites,
+            )
+            for name, path in items
+        ]
+
+    # Build kept / dropped tables.
+    counts_dict = dict(counts)  # cell_name -> n_linked
+    kept: dict[str, str] = {}
+    dropped_rows: list[tuple[str, int]] = []
+    for name, parquet_path in items:
+        n_linked = counts_dict[name]
+        if n_linked >= min_linked_pairs:
+            kept[name] = parquet_path
+        else:
+            dropped_rows.append((name, n_linked))
+
+    kept_rows = [(name, counts_dict[name]) for name in kept]
+    qc_path = ensure_dir(qc_dir)
+    pd.DataFrame(kept_rows, columns=["cell", "n_linked"]).to_csv(
+        qc_path / "cells_used.tsv", sep="\t", index=False,
+    )
+    if dropped_rows:
+        pd.DataFrame(dropped_rows, columns=["cell", "n_linked"]).to_csv(
+            qc_path / "cells_dropped.tsv", sep="\t", index=False,
+        )
+        logger.warning(
+            f"  Dropped {len(dropped_rows)} of {len(items)} cells "
+            f"(threshold n_linked >= {min_linked_pairs}). "
+            f"Kept {len(kept)} cells. "
+            f"See {qc_path / 'cells_dropped.tsv'} for the dropped cell list."
+        )
+    else:
+        logger.info(
+            f"  All {len(items)} cells pass n_linked >= {min_linked_pairs}."
+        )
+
+    return kept
+
+
 def _get_chrom_sizes_from_bam(bam_path: str) -> dict[str, int]:
     """Read chromosome sizes from a BAM file's @SQ header lines."""
     import pysam
@@ -377,6 +552,21 @@ def run_context(
                 f"Read-pair parquets missing for {len(missing)} cell(s); "
                 f"re-run step 2 or populate {read_pair_dir}."
             )
+
+    # ---- Step 2.5: Low-coverage cell filter ------------------------------
+    # (design-doc §6 #14): drop cells with fewer than min_linked_pairs_per_cell
+    # qualifying linked pairs, applied right after Step 2 so bad cells don't
+    # contaminate the mixture model, posterior calls, or downstream matrices.
+    if args.min_linked_pairs_per_cell > 0 and ({3, 4, 5, 6, 7} & steps):
+        cell_parquets = _filter_low_coverage_cells(
+            cell_parquets,
+            min_linked_pairs=args.min_linked_pairs_per_cell,
+            min_distance=args.min_distance,
+            min_gch_sites=min_sites,
+            bin_size=args.bin_size,
+            n_threads=args.n_threads,
+            qc_dir=ctx_out / "qc",
+        )
 
     # ---- Step 3: Mixture model -------------------------------------------
     if 3 in steps:
@@ -477,6 +667,38 @@ def run_context(
                 n_threads=args.n_threads,
                 output_dir=str(concordance_dir),
             )
+        elif args.concordance_method == "signed":
+            sig_result = concordance_mod.compute_signed_concordance_matrix(
+                posterior_paths, chrom_sizes,
+                bin_size=args.bin_size,
+                min_distance=args.min_distance,
+                min_gch_sites=min_sites,
+                min_pairs_per_bin=args.min_pairs_per_bin,
+                statistic=args.concordance_statistic or "signed",
+                use_rwr=(args.impute == "rwr"),
+                rwr_k=args.rwr_k,
+                rwr_restart_prob=args.rwr_restart_prob,
+                rwr_n_refine_passes=args.rwr_refine_passes,
+                rwr_solver=args.rwr_solver,
+                rwr_max_iter=args.rwr_max_iter,
+                rwr_tol=args.rwr_tol,
+                eb_min_obs=args.eb_min_obs,
+                n_threads=args.n_threads,
+                output_dir=str(concordance_dir),
+                save_outputs=True,
+            )
+            # Headline matrix for Step 6/7 is whichever statistic was selected.
+            stat = args.concordance_statistic or "signed"
+            if stat == "open" and sig_result["delta_open"] is not None:
+                concordance_raw = sig_result["delta_open"]
+            else:
+                concordance_raw = sig_result["delta_signed"]
+            pair_counts = sig_result["pair_counts"]
+            # Also save a "concordance_raw.parquet" symlink/copy for
+            # downstream-step compatibility (Step 6/7 looks for this name).
+            concordance_raw.to_parquet(
+                concordance_dir / "concordance_raw.parquet"
+            )
         else:
             raise ValueError(
                 f"Unknown --concordance-method: {args.concordance_method!r}"
@@ -513,10 +735,10 @@ def run_context(
         logger.info(f"Step 6: Shrinkage analysis for {context}")
         logger.info("=" * 60)
 
-        if args.concordance_method == "betabinom":
+        if args.concordance_method in ("betabinom", "signed"):
             logger.info(
-                "Step 6: Skipping Stein shrinkage — betabinom Δ values are "
-                "already shrunk via the EB Beta prior on θ_L."
+                f"Step 6: Skipping Stein shrinkage — {args.concordance_method} "
+                f"Δ values are already EB-shrunk via the Beta/Dirichlet prior."
             )
             concordance_shrunk = concordance_raw.copy()
             concordance_shrunk.to_parquet(concordance_dir / "concordance_shrunk.parquet")
@@ -633,11 +855,43 @@ def run_context(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
+    # ---- Reconcile --concordance-method and --concordance-statistic ------
+    # Legacy --concordance-method betabinom aliases to the new
+    # --concordance-statistic open with a deprecation warning (design-doc
+    # §6 #10).  --concordance-method signed (the new default) pairs with
+    # --concordance-statistic (default 'signed', or 'both' if user opts in).
+    if args.concordance_statistic is None:
+        if args.concordance_method == "betabinom":
+            args.concordance_statistic = "open"
+        elif args.concordance_method == "signed":
+            args.concordance_statistic = "signed"
+        else:
+            args.concordance_statistic = None  # pearson: not applicable
+
+    if args.concordance_method == "betabinom":
+        # Don't yell yet, but let the user know.
+        pass  # informational logger message goes after setup_logging below.
+
+    # Default --min-pairs-per-bin depends on the method (design-doc §6 #15).
+    if args.min_pairs_per_bin is None:
+        if args.concordance_method == "pearson":
+            args.min_pairs_per_bin = 5
+        else:  # signed or betabinom — both use EB shrinkage that handles n=1
+            args.min_pairs_per_bin = 1
+
     out = ensure_dir(args.output_dir)
     log_file = args.log_file
     if log_file is None:
         log_file = str(out / "pipeline.log")
     setup_logging(logging.INFO, log_file=log_file)
+
+    if args.concordance_method == "betabinom":
+        logger.warning(
+            "--concordance-method betabinom is the legacy one-sided path. "
+            "The new default is --concordance-method signed (Dirichlet-"
+            "Multinomial directional Δ with pre-Layer-2 RWR imputation). "
+            "betabinom remains supported for A/B comparison."
+        )
 
     # Save full config up front.
     config = vars(args).copy()
