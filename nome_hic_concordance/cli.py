@@ -79,6 +79,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "the bulk-style preprocessing that's robust to outliers in sparse "
              "single-cell data.",
     )
+    parser.add_argument(
+        "--posterior-threshold", type=float, default=0.5,
+        help="Posterior cutoff above which a read end is called 'open' "
+             "(only used by --concordance-method betabinom; default: 0.5).",
+    )
+    parser.add_argument(
+        "--eb-min-obs", type=int, default=50,
+        help="Minimum number of (cell, bin) observations with n_linked>=1 "
+             "required to fit the empirical-Bayes prior on θ_L.  If fewer "
+             "are available, falls back to Beta(1, 1).  "
+             "(Only used by --concordance-method betabinom; default: 50).",
+    )
 
     # EM
     parser.add_argument("--em-max-iter", type=int, default=200)
@@ -412,6 +424,7 @@ def run_context(
                 min_gch_sites=args.min_gch_sites,
                 posterior_threshold=args.posterior_threshold,
                 min_pairs_per_bin=args.min_pairs_per_bin,
+                eb_min_obs=args.eb_min_obs,
                 n_threads=args.n_threads,
                 output_dir=str(concordance_dir),
             )
