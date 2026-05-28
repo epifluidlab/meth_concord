@@ -58,7 +58,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-distance", type=int, default=20_000,
                         help="Min genomic distance for qualifying pairs (default: 20000).")
     parser.add_argument("--min-gch-sites", type=int, default=3,
-                        help="Min GCH sites per read end (default: 3).")
+                        help="Min informative GCH sites per read end "
+                             "(only applied when processing context GCH; "
+                             "default: 3).")
+    parser.add_argument("--min-hcg-sites", type=int, default=None,
+                        help="Min informative HCG sites per read end "
+                             "(only applied when processing context HCG). "
+                             "Defaults to --min-gch-sites if not set; "
+                             "consider lowering (e.g. 2) since HCG sites "
+                             "are typically sparser than GCH.")
     parser.add_argument("--bin-size", type=int, default=5_000_000,
                         help="Genomic bin size in bp (default: 5000000).")
     parser.add_argument("--min-pairs-per-bin", type=int, default=5,
@@ -291,6 +299,21 @@ def run_context(
     logger.info(f"Processing context: {context}")
     logger.info("#" * 60)
 
+    # Pick the per-end site threshold for THIS context.  --min-gch-sites
+    # applies when context == GCH; --min-hcg-sites when context == HCG
+    # (falling back to --min-gch-sites if not set).  Any other context
+    # falls back to --min-gch-sites for now.
+    if context == "GCH":
+        min_sites = args.min_gch_sites
+    elif context == "HCG":
+        min_sites = (
+            args.min_hcg_sites if args.min_hcg_sites is not None
+            else args.min_gch_sites
+        )
+    else:
+        min_sites = args.min_gch_sites
+    logger.info(f"Using min sites per end = {min_sites} for context {context}")
+
     ensure_dir(ctx_out)
 
     read_pair_dir = ctx_out / "02_read_pair_counts"
@@ -411,7 +434,7 @@ def run_context(
                 posterior_paths, chrom_sizes,
                 bin_size=args.bin_size,
                 min_distance=args.min_distance,
-                min_gch_sites=args.min_gch_sites,
+                min_gch_sites=min_sites,
                 min_pairs_per_bin=args.min_pairs_per_bin,
                 n_threads=args.n_threads,
                 output_dir=str(concordance_dir),
@@ -421,7 +444,7 @@ def run_context(
                 posterior_paths, chrom_sizes,
                 bin_size=args.bin_size,
                 min_distance=args.min_distance,
-                min_gch_sites=args.min_gch_sites,
+                min_gch_sites=min_sites,
                 posterior_threshold=args.posterior_threshold,
                 min_pairs_per_bin=args.min_pairs_per_bin,
                 eb_min_obs=args.eb_min_obs,
@@ -436,7 +459,7 @@ def run_context(
         logger.info("Computing concordance vs. distance decay...")
         distance_analysis.concordance_vs_distance(
             posterior_paths,
-            min_gch_sites=args.min_gch_sites,
+            min_gch_sites=min_sites,
             n_threads=args.n_threads,
             output_dir=str(concordance_dir),
         )
@@ -511,7 +534,8 @@ def run_context(
             logger.warning(
                 "Concordance matrix is empty (0 cells or 0 bins). "
                 "This usually means no read pairs passed the filters "
-                "(--min-distance, --min-gch-sites). Check that the context "
+                "(--min-distance, --min-gch-sites / --min-hcg-sites). "
+                "Check that the context "
                 "BED positions match the reference used for alignment, and "
                 "that --context-bed-offset is correct. Skipping matrix "
                 "processing and UMAP."
