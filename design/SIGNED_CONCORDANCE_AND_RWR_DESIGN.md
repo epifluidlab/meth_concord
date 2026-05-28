@@ -1,11 +1,22 @@
 # Signed concordance + RWR imputation + comparison framework
 
-## Design document v0.2 — locked decisions
+## Design document v0.3 — locked decisions (RWR pre-Layer 2, QN k-NN basis)
 
-> **Status:** §6 open questions are resolved (decisions listed in §6 below).
-> Layer 2 model is Dirichlet-Multinomial, with U-3 (soft expected counts) for
-> both linked and unlinked end handling. Implementation can proceed in the
-> phase order in §5.
+> **Status:** All §6 decisions locked. Layer 2 = Dirichlet-Multinomial
+> plug-in (no EM); soft counts = U-3 on both linked and unlinked pools;
+> RWR runs **pre-Layer 2** on the soft-count matrices, with the k-NN graph
+> built from the **quantile-normalized mean-accessibility matrix** on the
+> initial pass and rebuilt from `QN(Δ_signed)` on optional refinement
+> passes. Diagnostic results on the user's 288-cell GM12878/IMR90 data
+> confirmed the design choices (see commit `5b38b41` and surrounding
+> diagnostics). Ready for Phase 1 + RWR implementation.
+
+> **Changelog vs v0.2:** §3 entirely rewritten (RWR moves pre-Layer 2,
+> k-NN from QN(mean_accessibility), iterative-pass loop rebuilds k-NN
+> from QN(Δ_signed)). §6 decisions #4, #5b (new), #16 reconciled.
+> Layer-2 inference is plug-in not EM (added §6 #17). Defaults updated
+> from data: `--min-gch-sites 2`, `--min-linked-pairs-per-cell 100`,
+> `--min-pairs-per-bin 1` (§6 #14, #15).
 
 This document covers three coordinated changes to the `nome_hic_concordance` pipeline:
 
@@ -53,15 +64,41 @@ For methods comparison (e.g. an upcoming paper), being able to A/B test the two 
 
 Decision: support **both**, selectable via a CLI flag. Default will be the signed form once we've validated it.
 
-### 1.3 Why RWR imputation
+### 1.3 Why RWR imputation, and why pre-Layer 2
 
-Single-cell concordance is sparsity-limited. For 250 kb bins on typical NOMe-HiC data, many (cell, bin) entries have n_linked < min_pairs_per_bin and end up as NaN, and even non-NaN entries can be noisy because k_open / n_linked is estimated from a small denominator.
+Single-cell concordance at 250 kb is severely sparsity-limited. The
+diagnostic on the user's 288-cell dataset (commit `4299701` / report)
+shows median `n_linked = 1` per (cell, bin) — i.e. most cells have at
+most a single long-range linked pair observed per bin. At that
+density:
 
-The empirical-Bayes prior already shrinks individual entries toward the population mean. But it ignores **cell-cell structure**: a cell's bins should be informed by what similar cells look like at those bins.
+- The empirical-Bayes prior dominates the posterior almost completely.
+  With `α_total ≈ 10` and `n_linked = 1`, the per-(cell, bin) posterior
+  is shifted by at most ~9% off the prior — regardless of what the
+  pair actually says. Cell-to-cell variation in Δ_signed is essentially
+  the prior mean across cells, plus noise.
+- Layer-2 inference improvements (DM vs BB, EM vs plug-in) don't help:
+  they're all prior-dominated in this regime. EM in particular gives
+  no measurable benefit (decision #17).
 
-scHiCluster solved this for raw Hi-C contact matrices by building a k-NN graph across cells and propagating signal via random-walk-with-restart (RWR). The same idea applies to our cells × bins concordance matrix — and arguably *better* than for raw contact matrices, since our cells × bins entries are already partially aggregated (per bin, per cell) so the k-NN graph is operating on a more interpretable feature space.
+What does help is **borrowing strength across similar cells**: scHiCluster's
+approach for sparse single-cell Hi-C. We build a k-NN graph over cells
+using a dense auxiliary feature (mean accessibility, which uses ~100×
+more data per (cell, bin) than concordance), then propagate signal
+across the graph via random-walk-with-restart. For a cell with
+`n_linked = 1` at a bin, RWR blends in evidence from the ~15 nearest
+neighbours, raising the effective sample size to a useful range
+(~15–30) before Layer-2 ever sees the data.
 
-The integration goal: an optional step in our pipeline that takes the Δ matrix (with NaNs) and emits a denoised matrix, with imputation parameters and diagnostics under user control.
+**Placement matters.** Putting RWR *after* Layer 2 (the v0.2 design)
+operates on a matrix that's already prior-dominated — smoothing
+prior-mean values together gives more prior-mean values, no signal
+recovery. RWR has to run **before** Layer 2 so the EB shrinkage sees
+imputed counts dense enough to track per-cell biology.
+
+The integration goal: a default-on pre-Layer-2 step that takes the
+soft-count matrices, applies RWR using a QN-mean-accessibility k-NN
+graph, and feeds the imputed counts into Layer 2.
 
 ---
 
@@ -273,101 +310,198 @@ The `concordance_raw.parquet` filename used by downstream Step 6/7 becomes a sym
 
 ---
 
-## 3. Part B — RWR imputation
+## 3. Part B — RWR imputation (pre-Layer 2)
 
 ### 3.1 Where it fits in the pipeline
 
-A new step inserted between Step 5 (concordance) and Step 6 (Stein shrinkage, which is a no-op for the EB-shrunk betabinom path) / Step 7 (matrix ops + UMAP):
+RWR is **not** a post-processing pass on the Δ matrix. It runs **before
+Layer 2**, on the raw soft-count matrices, so that Layer 2 sees imputed
+counts dense enough for meaningful EB shrinkage. With median
+`n_linked = 1` per (cell, bin) at 250 kb, this is the only mechanism by
+which per-(cell, bin) Δ values can carry signal beyond the global prior
+mean.
+
+The expanded Step 5 looks like this:
 
 ```
-Step 5  concordance              → cells × bins Δ matrix (with NaNs)
-   │
-   ▼
-Step 5.5  RWR imputation         ← NEW, optional
-   │
-   ▼
-Step 6  Stein shrinkage          (skipped for betabinom)
-   │
-   ▼
-Step 7  matrix_ops + UMAP        → final embedding
+Step 5a  per-cell parquets → per-(cell, bin) soft counts (Layer 1 → soft U-3)
+            outputs: k_open, k_closed, k_mixed, n_linked,
+                     k_u_open, k_u_closed, k_u_mixed, n_unlinked
+            plus:    mean_accessibility per (cell, bin)
+                     (dense; uses all informative ends, linked + unlinked)
+
+Step 5b  RWR imputation on the soft-count matrices              ← NEW, default on
+            k-NN graph from QN(mean_accessibility) (initial pass)
+            optional refinement passes rebuild k-NN from QN(Δ_signed)
+            applies same k-NN to ALL soft-count matrices
+
+Step 5c  Layer 2 EB shrinkage on imputed soft counts → cells × bins Δ matrix
+            Dirichlet-Multinomial plug-in (no EM)
+
+Step 6   Stein shrinkage          (skipped for betabinom — already EB-shrunk)
+Step 7   matrix_ops + UMAP        → final embedding
 ```
 
-Optional via flag: `--impute rwr` (default: `none`, no imputation). Other values reserved for future variants (e.g. `knn`, `magic`, …).
+Toggle: `--impute {none, rwr}`, default **`rwr`** (not off). With
+`--impute none` the pipeline behaves as in v0.2: soft counts → Layer 2
+directly, which under the user's data sparsity gives a Δ matrix that's
+essentially the global prior mean. RWR is the unlock, so the default is on.
 
-### 3.2 Algorithm
+### 3.2 Algorithm — initial pass
 
-Given input matrix `F_0 ∈ ℝ^{N × B}` (N cells, B bins; NaN-tolerant), produce smoothed matrix `F ∈ ℝ^{N × B}`.
+Given (a) the dense `mean_accessibility[N, B]` matrix and (b) the stack
+of soft-count matrices `F_raw = {k_open, k_closed, k_mixed, n_linked,
+k_u_open, k_u_closed, k_u_mixed, n_unlinked}`, each of shape `[N, B]`:
 
-**Step 1 — Pre-fill NaNs for distance computation.**
-NaN entries are filled with the column mean (or 0 after centering — we'll use 0 after the QN step). Result: `F_filled`.
-
-**Step 2 — Cell-cell similarity matrix.**
-Two strategies, exposed via `--rwr-neighbor-feature {self, accessibility}`:
-
-- `self` (default): cosine similarity between rows of `F_filled` — i.e. cells are similar if their concordance profiles agree.
-- `accessibility`: cosine similarity on the bin-mean-accessibility matrix (which is much denser than the concordance matrix). Reduces the circularity of using the noisy signal to define neighbours of itself.
-
-Build a k-NN graph: for each cell, keep the top `k` most-similar other cells. Symmetrize (`W = (W + W^T) / 2`), then row-normalize so each row sums to 1 → transition matrix `P`.
-
-**Step 3 — RWR.**
-Closed-form for N ≤ 5000:
+**1) k-NN graph from QN(mean_accessibility).**
 
 ```
-F = r · (I − (1 − r) · P)^(−1) · F_0_filled
+A_qn = quantile_normalize_per_bin(mean_accessibility)
+       # uses the same _quantile_normalize_per_bin helper as matrix_ops,
+       # so QN logic is shared across the pipeline.
+       # NaN entries (rare, only when a cell has 0 informative ends in a bin)
+       # are masked from the rank computation and imputed to the bin centroid
+       # afterward.
+
+D = cosine_similarity(A_qn)        # N × N
+for each cell c:
+    keep top-k neighbours by D[c, ·]
+W = symmetrize(adjacency)           # W = (W + W^T) / 2
+P = row_normalize(W)                # transition matrix
 ```
 
-Iterative for larger N:
+Why QN(mean_accessibility), not raw mean_accessibility: raw matrix has
+highly variable per-bin variance across cells; cosine distance is then
+dominated by the noisiest bins. Per-bin QN equalizes bin contributions
+to the distance, which is the standard treatment in bulk-RNA-seq and
+scATAC-seq preprocessing — and matches the user's validated bin-mean
+→ QN → SVD → UMAP recipe.
+
+Why mean_accessibility (not concordance) as the initial k-NN basis: it
+is **dense** (uses all informative ends, ~100–1000× more data per
+(cell, bin) than concordance), so the k-NN it produces is statistically
+reliable. The concordance matrix at this point is too sparse to define
+neighbourhoods on.
+
+**2) RWR on the soft-count stack.**
+
+For each matrix `F_i ∈ F_raw` (8 matrices), with the same `P`:
+
+Closed-form solver for `N ≤ 5000`:
 
 ```
-F ← F_0_filled
-repeat: F ← (1 − r) · P @ F + r · F_0_filled
-until ‖F − F_prev‖_∞ < tol  or  iter ≥ max_iter
+F_i_imputed = r · (I − (1 − r) · P)⁻¹ · F_i
 ```
 
-**Step 4 — Restore NaNs (optional).**
-By default, NaN entries in the original matrix get the *imputed* value (that's the whole point — we're filling them in). But for safety we record the original NaN mask alongside the imputed matrix, so downstream code can choose to mask them again if needed.
-
-### 3.3 Iterative refinement (optional second pass)
-
-After the first imputation, the matrix has no NaNs. We can re-build the cell-cell similarity on the imputed matrix itself (which is now cleaner than the NaN-filled-with-0 starting point) and re-run RWR. One refinement pass is usually sufficient; we'll expose:
+Iterative solver for larger N:
 
 ```
---rwr-refine-passes  default: 0    (0 = no refinement, just one pass)
+F_i_imputed ← F_i
+repeat:  F_i_imputed ← (1 − r) · P @ F_i_imputed + r · F_i
+until ‖F_i_imputed − F_i_imputed_prev‖_∞ < tol  or  iter ≥ max_iter
 ```
+
+The same `r · (I − (1−r)·P)⁻¹` factor multiplies every soft-count
+matrix, so for closed-form mode we compute it once and apply 8 times.
+That's an `N × N × B × 8` operation — well under a minute for
+typical N ≈ 1000, B ≈ 12000.
+
+**3) Imputed values are the inputs to Layer 2.**
+
+Layer 2 (§2.3) consumes the imputed `(k_open, k_closed, k_mixed,
+n_linked)` for the linked side and `(k_u_open, k_u_closed, k_u_mixed,
+n_unlinked)` for the unlinked side. The Dirichlet-Multinomial MoM EB
+prior is fit on the imputed counts, and per-(cell, bin) Δ is computed
+from the conjugate posterior plug-in formula. Because imputed
+`n_linked` is now substantially larger than raw `n_linked = 1`,
+per-(cell, bin) posteriors carry meaningful data influence rather
+than being prior-dominated.
+
+### 3.3 Iterative refinement passes (optional)
+
+When `--rwr-refine-passes ≥ 1`, after the initial pass we have a
+cells × bins `Δ_signed` matrix that's a closer approximation to the
+true signal than mean accessibility was. Use it to rebuild the k-NN
+for a second pass:
+
+```
+Pass 0 (always):
+    A_qn ← QN(mean_accessibility)
+    k-NN ← cosine k-NN on A_qn
+    F_imputed ← RWR(F_raw, k-NN)
+    Δ_signed_0 ← Layer-2(F_imputed)
+
+For p = 1 .. --rwr-refine-passes:
+    A_qn ← QN(Δ_signed_{p-1})
+    k-NN ← cosine k-NN on A_qn
+    F_imputed ← RWR(F_raw, k-NN)        ← always from ORIGINAL F_raw
+    Δ_signed_p ← Layer-2(F_imputed)
+
+Final Δ matrix = Δ_signed_{final pass}
+```
+
+Two important properties:
+
+- **RWR always starts from the original soft counts, never from the
+  previous pass's imputed values.** Only the k-NN graph evolves between
+  passes. This prevents compound over-smoothing — without this
+  discipline, after a few passes the imputed values would all collapse
+  to the centroid.
+
+- **All soft-count matrices share the same k-NN graph within a pass.**
+  This guarantees the imputed (k_open, k_closed, k_mixed, n_linked)
+  remain on the simplex (sum to imputed n_linked) and gives a coherent
+  per-(cell, bin) joint distribution downstream.
+
+Default: 0 refinement passes (one-shot RWR). With 0 passes, the
+mean-accessibility k-NN is used and the Δ matrix is produced after a
+single Layer-2 fit. With ≥ 1 pass, the k-NN evolves to track the
+concordance signal itself.
 
 ### 3.4 Parameters and defaults
 
 | Parameter | Flag | Default | Notes |
 |---|---|---|---|
-| k for k-NN | `--rwr-k` | 15 | Standard for moderate cell counts; scale to ~√N for very large N |
+| Impute method | `--impute` | `rwr` | `rwr` or `none`. With `none`, Layer 2 sees raw soft counts (prior-dominated for sparse data). |
+| k for k-NN | `--rwr-k` | 15 | scHiCluster convention; scale to ~√N for very large N |
 | restart probability r | `--rwr-restart` | 0.5 | scHiCluster's default |
-| neighbour feature | `--rwr-neighbor-feature` | `self` | or `accessibility` |
-| max iterations | `--rwr-max-iter` | 30 | Only used in iterative mode |
-| convergence tolerance | `--rwr-tol` | 1e-4 | Iterative mode |
-| refinement passes | `--rwr-refine-passes` | 0 | 0–2 useful range |
-| solver | `--rwr-solver` | `auto` | `direct` / `iterative` / `auto` |
+| max iterations | `--rwr-max-iter` | 30 | Only used in iterative-solver mode |
+| convergence tolerance | `--rwr-tol` | 1e-4 | Iterative-solver mode |
+| refinement passes | `--rwr-refine-passes` | 0 | 0–2 useful range; each pass adds one Layer-2 fit |
+| solver | `--rwr-solver` | `auto` | `direct` (closed-form), `iterative`, or `auto` (direct if N ≤ 5000) |
+
+The k-NN basis is **not** a CLI knob anymore — it's fixed to QN(mean_accessibility)
+for pass 0 and QN(Δ_signed) for refinement passes. The v0.2 flag
+`--rwr-neighbor-feature {self, accessibility}` is removed.
 
 ### 3.5 Outputs
 
-In `output/.../06_imputed/` (new dir, parallel to existing `06_umap`):
+In `output/.../05_concordance/` (alongside the existing concordance outputs):
 
 ```
-concordance_signed_imputed.parquet      # cells × bins, RWR-imputed
-concordance_open_imputed.parquet        # cells × bins, if --concordance-statistic both
-cell_knn_graph.npz                       # k-NN adjacency + similarities (sparse)
-rwr_diagnostics.json                     # {N, B, k, r, n_iter_used, converged, ...}
-rwr_pre_post_distance_histogram.png      # QC: distribution of cell-cell distances
-                                         #     before vs after imputation
+soft_counts_raw.parquet                # long-form: cell, bin, k_open, k_closed, ...,
+                                       # n_linked, k_u_*, n_unlinked  (pre-RWR)
+soft_counts_imputed.parquet            # same schema, post-RWR
+accessibility_mean.parquet             # cells × bins, dense (pre-QN)
+cell_knn_graph_pass0.npz               # k-NN adjacency from QN(accessibility)
+cell_knn_graph_pass{p}.npz             # only if --rwr-refine-passes ≥ p
+rwr_diagnostics.json                   # {N, B, k, r, n_iter_used per pass,
+                                       #  converged, pass_count, ...}
+rwr_pre_post_distance_histogram.png    # cell-cell distance distribution
+                                       # before / after RWR (QC)
 ```
+
+The downstream `concordance_signed.parquet` is the Layer-2 output of
+the final pass and looks identical in shape to the v0.2 design.
 
 ### 3.6 Validation diagnostics
 
-To catch over-smoothing or graph degeneracy:
+Same as v0.2 §3.6, with one addition for iterative refinement:
 
-- **Imputation strength per cell:** mean change in cell vector magnitude after RWR. Histogram across cells.
-- **Cell-cell distance distribution shift:** if all cells collapse to the centroid after imputation, distances → 0 (bad). Plot before/after.
-- **k-NN graph connectivity:** number of connected components. Should be 1 for a healthy graph; multiple components mean some cells are isolated.
-- **Optional held-out validation:** mask 10% of non-NaN entries before imputation, then check reconstruction MSE. Optional flag `--rwr-validate` to enable.
+- **Per-pass convergence:** for `--rwr-refine-passes ≥ 1`, plot
+  ‖Δ_signed_p − Δ_signed_{p−1}‖ vs pass number. Should decay; if it
+  oscillates, the k-NN-rebuild loop is unstable and we should fall
+  back to fewer passes.
 
 ---
 
@@ -451,38 +585,72 @@ summary.json                          # all the headline numbers in one place
 
 ## 5. Implementation phases
 
-Proposed staging — each phase is independently mergeable and produces working artefacts:
+The original v0.2 phasing assumed RWR was an optional post-step. With
+RWR now pre-Layer 2 and on by default (decisions #4, #5b, #16), the
+phases are restructured so that the **first user-facing release**
+(Phase 1) ships the complete signed-Δ + RWR pipeline. Splitting Phase 1
+and RWR would only produce intermediate releases where Δ is
+prior-dominated noise — not useful.
 
-### Phase 1 — Signed concordance (in-place changes to Step 5)
-- Add Dirichlet-Multinomial EB prior fit alongside existing Beta-Binomial.
-- Add `--concordance-statistic`, `--posterior-threshold-{open,closed}` flags.
-- Save both matrices and the count diagnostics when `both` is selected.
-- Tests: math correctness of the multinomial posterior, behaviour on the sanity-check table in §2.3.
+### Phase 1 — Signed concordance + RWR (one combined PR)
 
-### Phase 2 — Accessibility byproduct
-- Compute and save `accessibility_mean.parquet` from Step 5's per-cell parquets.
-- ~30 lines, no dependencies, no new flags.
-- Tests: simple per-bin mean recovery.
+The full pre-Layer-2 RWR + Layer-2 DM pipeline. Lands as one logical
+unit so the first testable signed-Δ output is meaningful (post-RWR),
+not prior-dominated (pre-RWR).
 
-### Phase 3 — RWR imputation step
-- New module `nome_hic_concordance/imputation.py` with `rwr_impute(F, k, r, ...)`.
-- New optional Step 5.5 in `cli.py` triggered by `--impute rwr`.
-- Tests: synthetic matrix with known low-rank structure; verify RWR reduces reconstruction error vs the input.
-- Diagnostic plots.
+Files / modules:
 
-### Phase 4 — scHiCluster compartment sibling command
+- **`nome_hic_concordance/accessibility.py`** (new): compute mean
+  accessibility per (cell, bin) from per-cell parquets. Used as the
+  pass-0 k-NN basis. ~80 lines.
+- **`nome_hic_concordance/imputation.py`** (new): k-NN graph builder
+  (cosine on a passed-in feature matrix); RWR closed-form / iterative
+  solver; multi-pass refinement loop. ~250 lines.
+- **`nome_hic_concordance/concordance.py`** (rewrite): U-3 soft
+  expected counts for both linked and short-range unlinked pairs;
+  `_fit_dirichlet_multinomial_eb_prior` (MoM); `compute_signed_concordance_matrix`;
+  keep the one-sided `compute_betabinom_concordance_matrix` path
+  working but route it through the same U-3 count machinery so
+  `--concordance-statistic both` produces both in one run.
+- **`nome_hic_concordance/cli.py`** (changes): new flags
+  (`--concordance-statistic`, `--posterior-threshold-{open,closed}`,
+  `--min-linked-pairs-per-cell`, `--impute`, `--rwr-{k,restart,refine-passes,...}`),
+  update defaults from §6 (#14, #15), alias
+  `--concordance-method betabinom` → `--concordance-statistic open`
+  with deprecation warning, add cell filter immediately after Step 2,
+  save `qc/cells_used.tsv` + `qc/cells_dropped.tsv`.
+- **Tests**:
+  - `tests/test_signed_concordance.py` — math: U-3 soft-count
+    contributions, Dirichlet-Multinomial MoM correctness, sanity-check
+    table from §2.3 (active / silenced / chaos / focal-active), the
+    full pipeline producing the Δ_signed matrix.
+  - `tests/test_imputation.py` — k-NN correctness, RWR convergence and
+    reconstruction of synthetic low-rank matrices, multi-pass
+    refinement stability.
+  - `tests/test_accessibility.py` — mean accessibility per (cell, bin)
+    matches a hand-computed reference.
+  - `tests/test_betabinom_concordance.py` (regression) — existing
+    one-sided path still produces equivalent values when U-3 soft
+    counts converge to hard counts under sharp posteriors.
+
+Approximate size: ~700 lines of new code + ~400 lines of tests.
+
+### Phase 2 — scHiCluster compartment sibling command
 - New entry point `nome_hic_compartments` in `pyproject.toml`.
-- Converter from per-cell parquet → `.scool`.
+- Converter from per-cell parquet → `.scool` (cooler).
 - Wrapper around `schicluster.compartment.compartment_call`.
 - Optional dep: `pip install nome_hic_concordance[compartments]`.
-- Out of scope of this doc otherwise — separate sub-design for the wrapper.
+- Separate sub-design doc when we get to it.
 
-### Phase 5 — Comparison harness
+### Phase 3 — Comparison harness
 - New entry point `nome_hic_compare` in `pyproject.toml`.
-- Implements §4.2.
+- Implements §4.2 analyses: marginal UMAPs, per-bin variance-partition
+  regression, residual UMAP, optional classifier comparison.
 - Tests: end-to-end on synthetic matrices with known relationships.
 
-Each phase is independently useful: Phase 1 alone lets users get the signed concordance; Phase 1+2 lets them compare concordance to accessibility; the full set lets them run the methods comparison.
+Phase 1 is the only piece needed to ship a working signed-Δ pipeline
+on the user's data. Phases 2-3 are methods-comparison infrastructure
+for the paper.
 
 ---
 
@@ -505,15 +673,28 @@ All items below are now locked. Decisions in **bold**.
    scHiCluster + cooler become optional deps via
    `pip install nome_hic_concordance[compartments]`.
 
-4. **RWR k-NN neighbour feature defaults to `self`** (the concordance
-   matrix itself). `--rwr-neighbor-feature accessibility` documented as
-   a fallback when concordance is extremely sparse.
+4. **RWR k-NN graph basis (initial pass) = QN(mean_accessibility).**
+   The mean-accessibility matrix is dense (uses all informative ends,
+   linked + unlinked), so the k-NN it produces is statistically
+   reliable. Per-bin quantile normalization equalizes bin contributions
+   to cosine distance, matching the user's validated bin-mean → QN →
+   SVD → UMAP recipe.
+   *(The v0.2 `--rwr-neighbor-feature {self, accessibility}` flag is
+   removed; the k-NN basis is no longer user-selectable for pass 0.)*
 
-5. **RWR refinement passes default to 0** (one-shot RWR).
+5. **RWR refinement passes default to 0** (one-shot RWR with the
+   QN(mean_accessibility)-derived k-NN).
+
+5b. **For `--rwr-refine-passes ≥ 1`, subsequent passes rebuild the
+    k-NN from QN(Δ_signed) of the previous pass.** RWR always operates
+    on the **original** raw soft-count matrices — only the k-NN graph
+    evolves between passes. This prevents compound over-smoothing and
+    matches scHiCluster's iterative-refinement protocol.
 
 6. **When `--concordance-statistic both`, RWR is applied to both Δ
-   matrices using the same k-NN graph**, derived from the headline
-   (signed) matrix. Keeps the comparison fair.
+   matrices using the same k-NN graph.** All soft-count matrices
+   within a pass share the same k-NN to keep the imputed counts on the
+   simplex (sum to imputed `n_linked`).
 
 7. **Layer-2 model: Dirichlet-Multinomial (Option A).** See §2.3.
 
@@ -559,12 +740,12 @@ All items below are now locked. Decisions in **bold**.
 
 16. **RWR moves to pre-Layer 2.** RWR imputation operates on the
     soft-count matrices (`k_open`, `k_closed`, `k_mixed`, `n_linked`,
-    `k_u_*`, `n_unlinked`) using a single k-NN graph built from the
-    mean-accessibility matrix (computed as a Phase-2 byproduct). Layer
-    2 then runs on imputed counts. With median `n_linked = 1` per
-    (cell, bin), this is the only place where per-(cell, bin) Δ can
-    pick up any signal beyond the global prior. Default:
-    `--impute rwr` (not off).
+    `k_u_open`, `k_u_closed`, `k_u_mixed`, `n_unlinked`) using a single
+    k-NN graph per pass (see #4 / #5b for which matrix the k-NN is
+    built from). Layer 2 then runs on imputed counts. With median
+    `n_linked = 1` per (cell, bin), this is the only place where
+    per-(cell, bin) Δ can pick up any signal beyond the global prior.
+    Default: `--impute rwr` (not off).
 
 17. **EM at Layer 2 dropped.** With median `n_linked = 1` per (cell,
     bin), Layer-2 posteriors are prior-dominated regardless of plug-in
