@@ -945,16 +945,16 @@ def run_context(
         else:
             post_norm_recenter = args.post_norm_recenter == "on"
 
-        # Resolve --skip-top-svd auto-default: 1 for signed when
-        # post_norm_recenter is OFF (the artifact PC0 needs dropping),
-        # 0 when post_norm_recenter is ON (the artifact has been removed
-        # at the source so dropping PC0 would discard real signal).
-        # User-explicit values (including 0) override the auto-default.
+        # Resolve --skip-top-svd auto-default.  Empirically, even with
+        # --post-norm-recenter and --batch-correction, the dominant
+        # SVD axis of post-processed Δ_signed on NOMe-HiC data is a
+        # ~13% variance non-cell-type axis (correlates with per-cell
+        # median; likely cell-cycle or latent technical).  Per-cell
+        # mean centering reduces but does not remove it.  Dropping
+        # PC0 with --skip-top-svd 1 is the empirically validated fix.
+        # User-explicit values (including 0) override.
         if args.skip_top_svd is None:
-            if args.concordance_method == "signed" and not post_norm_recenter:
-                skip_top_svd = 1
-            else:
-                skip_top_svd = 0
+            skip_top_svd = 1 if args.concordance_method == "signed" else 0
         else:
             skip_top_svd = args.skip_top_svd
 
