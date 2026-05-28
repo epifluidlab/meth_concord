@@ -1046,9 +1046,20 @@ def compute_signed_concordance_matrix(
         S_u = pm_u["open"] - pm_u["closed"]
         delta_signed = S_l - S_u
 
-        # NaN out bins where the cell has fewer than min_pairs_per_bin linked.
-        invalid = imputed["n_linked"] < float(min_pairs_per_bin)
-        delta_signed = np.where(invalid, np.nan, delta_signed)
+        # The min_pairs_per_bin filter only makes sense WITHOUT RWR.
+        # With RWR on, every (cell, bin) has an imputed value blended
+        # from neighbours via the QN(accessibility) k-NN graph; those
+        # values carry real cell-type signal even when the cell itself
+        # had raw n_linked = 0.  That's exactly what RWR is for.  And
+        # imputed n_linked is a *fractional* weighted aggregate that
+        # is typically < 1, so using it as the threshold would discard
+        # almost all of the entries RWR was meant to fill in.  Hence:
+        # filter only when RWR is off.  (When use_rwr=False, the
+        # imputed dict is just the raw counts, so the threshold has
+        # its original n>=N meaning.)
+        if not use_rwr:
+            invalid = imputed["n_linked"] < float(min_pairs_per_bin)
+            delta_signed = np.where(invalid, np.nan, delta_signed)
 
         return pd.DataFrame(
             delta_signed, index=cell_names, columns=sorted_bins,
@@ -1104,8 +1115,11 @@ def compute_signed_concordance_matrix(
             np.nan,
         )
         delta_open_arr = pm_l["open"] - p_hat ** 2
-        invalid = imputed_counts["n_linked"] < float(min_pairs_per_bin)
-        delta_open_arr = np.where(invalid, np.nan, delta_open_arr)
+        # Same filter semantics as for delta_signed: only meaningful when
+        # RWR is off (see comment in _layer2 above).
+        if not use_rwr:
+            invalid = imputed_counts["n_linked"] < float(min_pairs_per_bin)
+            delta_open_arr = np.where(invalid, np.nan, delta_open_arr)
         delta_open_df = pd.DataFrame(
             delta_open_arr, index=cell_names, columns=sorted_bins,
         )
