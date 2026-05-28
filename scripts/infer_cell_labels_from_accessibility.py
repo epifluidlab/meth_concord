@@ -97,17 +97,14 @@ def _quantile_normalize_per_bin(matrix: np.ndarray) -> np.ndarray:
     return out
 
 
-def _scatter(coords: pd.DataFrame, color_col: str, title: str, out_path: str):
-    """Save a UMAP scatter plot colored by ``color_col``."""
-    import matplotlib
-    matplotlib.use("Agg")
+def _scatter_one(ax, coords: pd.DataFrame, color_col: str, title: str):
+    """Render a UMAP scatter into a given Axes, colored by ``color_col``."""
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(8, 7))
-    groups = coords[color_col].fillna("unknown").unique()
+    groups = sorted(coords[color_col].fillna("unknown").unique())
     cmap = plt.cm.tab10 if len(groups) <= 10 else plt.cm.tab20
     colors = cmap(np.linspace(0, 1, max(len(groups), 1)))
-    for g, c in zip(sorted(groups), colors):
+    for g, c in zip(groups, colors):
         mask = coords[color_col].fillna("unknown") == g
         ax.scatter(
             coords.loc[mask, "UMAP1"], coords.loc[mask, "UMAP2"],
@@ -117,6 +114,61 @@ def _scatter(coords: pd.DataFrame, color_col: str, title: str, out_path: str):
     ax.set_ylabel("UMAP2")
     ax.set_title(title)
     ax.legend(loc="best", fontsize=8)
+
+
+def _scatter(coords: pd.DataFrame, color_col: str, title: str, out_path: str):
+    """Save a single-panel UMAP scatter colored by ``color_col``."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    _scatter_one(ax, coords, color_col, title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _scatter_combined(
+    coords: pd.DataFrame,
+    title_prefix: str,
+    out_path: str,
+):
+    """3-panel side-by-side comparison: original (claimed) label, predicted
+    label, agreement (correct / incorrect).
+
+    Each panel uses the same UMAP coordinates so spatial structure is
+    directly comparable — only the coloring changes.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(22, 7), sharex=True, sharey=True)
+
+    _scatter_one(
+        axes[0], coords, "claimed_label",
+        title=f"{title_prefix} — original (claimed) label",
+    )
+    _scatter_one(
+        axes[1], coords, "predicted_label",
+        title=f"{title_prefix} — predicted label",
+    )
+
+    # Agreement panel — green for agree, red for disagree.
+    agree_col = coords["agree"].map({1: "agree", 0: "disagree"})
+    for label, color in [("agree", "tab:green"), ("disagree", "tab:red")]:
+        mask = agree_col == label
+        axes[2].scatter(
+            coords.loc[mask, "UMAP1"], coords.loc[mask, "UMAP2"],
+            c=color, label=f"{label} ({int(mask.sum())})",
+            s=15, alpha=0.75, edgecolors="none",
+        )
+    axes[2].set_xlabel("UMAP1")
+    axes[2].set_ylabel("UMAP2")
+    axes[2].set_title(f"{title_prefix} — agreement (claimed vs predicted)")
+    axes[2].legend(loc="best", fontsize=9)
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -265,17 +317,22 @@ def main() -> None:
     coords.to_csv(f"{args.output_prefix}.umap_coords.tsv", sep="\t", index=False)
 
     # --- Plots -------------------------------------------------------------
+    context_name = Path(args.accessibility_parquet).parent.parent.name
     _scatter(
         coords, "claimed_label",
-        title=f"UMAP — colored by claimed label "
-              f"({Path(args.accessibility_parquet).parent.parent.name})",
+        title=f"UMAP — original (claimed) label  [{context_name}]",
         out_path=f"{args.output_prefix}.umap_claimed.png",
     )
     _scatter(
         coords, "predicted_label",
-        title=f"UMAP — colored by predicted label "
-              f"({Path(args.accessibility_parquet).parent.parent.name})",
+        title=f"UMAP — predicted label  [{context_name}]",
         out_path=f"{args.output_prefix}.umap_predicted.png",
+    )
+    # Combined 3-panel comparison (original | predicted | agreement).
+    _scatter_combined(
+        coords,
+        title_prefix=context_name,
+        out_path=f"{args.output_prefix}.umap_combined.png",
     )
 
     # --- Confusion + disagreements -----------------------------------------
@@ -321,8 +378,12 @@ def main() -> None:
         print("     - sample mixture (one well had two cell types)")
 
     print(f"\nOutputs:")
-    for f in (".umap_coords.tsv", ".umap_claimed.png", ".umap_predicted.png",
-              ".confusion.tsv", ".disagreements.tsv"):
+    for f in (".umap_coords.tsv",
+              ".umap_claimed.png",
+              ".umap_predicted.png",
+              ".umap_combined.png",
+              ".confusion.tsv",
+              ".disagreements.tsv"):
         print(f"  {args.output_prefix}{f}")
 
 
