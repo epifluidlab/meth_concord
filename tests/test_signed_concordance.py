@@ -1,0 +1,510 @@
+"""Unit tests for the signed (Dirichlet-Multinomial) concordance pipeline.
+
+Covers U-3 soft-count aggregation, DM EB MoM fit, the Δ_signed posterior
+math from the design-doc §2.3 sanity-check table, and end-to-end
+production of the cells × bins Δ_signed matrix (with and without RWR).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from nome_hic_concordance import concordance
+
+
+def _make_posteriors(records: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(records)
+    for col in ("pos1", "pos2", "distance"):
+        df[col] = df[col].astype(np.int64)
+    for col in ("n1", "n2"):
+        df[col] = df[col].astype(np.int32)
+    for col in ("posterior1", "posterior2"):
+        df[col] = df[col].astype(float)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# U-3 soft-count aggregation
+# ---------------------------------------------------------------------------
+
+
+def test_soft_counts_linked_and_unlinked_split(tmp_path):
+    """Pairs are split into linked (>= min_distance) and unlinked (< min_distance)
+    soft-count pools, with U-3 contributions to all three categories per pair."""
+    # bin_size=1000, min_distance=100, min_gch_sites=2
+    records = [
+        # Pair 1: same bin, distance=200 (linked).  Both ends informative.
+        # p_l=0.9, p_r=0.8 → k_open=0.72, k_closed=0.02, k_mixed=0.26
+        {"chrom": "chr1", "pos1": 100, "pos2": 300, "n1": 3, "n2": 3,
+         "posterior1": 0.9, "posterior2": 0.8, "distance": 200},
+        # Pair 2: same bin, distance=50 (unlinked).  Both ends informative.
+        # p_l=0.6, p_r=0.4 → k_u_open=0.24, k_u_closed=0.24, k_u_mixed=0.52
+        {"chrom": "chr1", "pos1": 400, "pos2": 450, "n1": 3, "n2": 3,
+         "posterior1": 0.6, "posterior2": 0.4, "distance": 50},
+        # Pair 3: same bin, distance=300, but end 2 has n=1 (not informative).
+        # → contributes to NEITHER pool.
+        {"chrom": "chr1", "pos1": 600, "pos2": 900, "n1": 3, "n2": 1,
+         "posterior1": 0.5, "posterior2": 0.7, "distance": 300},
+        # Pair 4: cross-bin (chr1:0 vs chr1:1000).  → excluded entirely.
+        {"chrom": "chr1", "pos1": 500, "pos2": 1500, "n1": 5, "n2": 5,
+         "posterior1": 0.5, "posterior2": 0.5, "distance": 1000},
+    ]
+    p = tmp_path / "cellA.posteriors.parquet"
+    _make_posteriors(records).to_parquet(p)
+
+    cell, counts = concordance._compute_cell_soft_counts(
+        str(p), "cellA", bin_size=1000, min_distance=100, min_gch_sites=2,
+    )
+    assert cell == "cellA"
+    # All counts go into chr1:0 (the only bin with qualifying pairs).
+    rec = counts["chr1:0"]
+
+    # Linked side from pair 1.
+    assert rec["n_linked"] == pytest.approx(1.0)
+    assert rec["k_open"] == pytest.approx(0.9 * 0.8)
+    assert rec["k_closed"] == pytest.approx(0.1 * 0.2)
+    assert rec["k_mixed"] == pytest.approx(0.9 * 0.2 + 0.1 * 0.8)
+
+    # Unlinked side from pair 2.
+    assert rec["n_unlinked"] == pytest.approx(1.0)
+    assert rec["k_u_open"] == pytest.approx(0.6 * 0.4)
+    assert rec["k_u_closed"] == pytest.approx(0.4 * 0.6)
+    assert rec["k_u_mixed"] == pytest.approx(0.6 * 0.6 + 0.4 * 0.4)
+
+    # Pairs 3 and 4 contributed nothing — only one bin in the output.
+    assert set(counts.keys()) == {"chr1:0"}
+
+
+def test_soft_counts_per_pair_sum_to_one(tmp_path):
+    """U-3 invariant: every qualifying pair contributes 1 to n and the three
+    soft-count categories sum to 1 per pair."""
+    records = [
+        # Multiple pairs with various posteriors.
+        {"chrom": "chr1", "pos1": 100, "pos2": 200, "n1": 3, "n2": 3,
+         "posterior1": 0.3, "posterior2": 0.7, "distance": 100},
+        {"chrom": "chr1", "pos1": 300, "pos2": 400, "n1": 3, "n2": 3,
+         "posterior1": 0.95, "posterior2": 0.95, "distance": 100},
+        {"chrom": "chr1", "pos1": 500, "pos2": 600, "n1": 3, "n2": 3,
+         "posterior1": 0.05, "posterior2": 0.05, "distance": 100},
+        {"chrom": "chr1", "pos1": 700, "pos2": 800, "n1": 3, "n2": 3,
+         "posterior1": 0.5, "posterior2": 0.5, "distance": 100},
+    ]
+    p = tmp_path / "cell.posteriors.parquet"
+    _make_posteriors(records).to_parquet(p)
+
+    _, counts = concordance._compute_cell_soft_counts(
+        str(p), "c", bin_size=1000, min_distance=50, min_gch_sites=2,
+    )
+    rec = counts["chr1:0"]
+    assert rec["n_linked"] == pytest.approx(4.0)
+    # k_open + k_closed + k_mixed should equal n_linked.
+    total = rec["k_open"] + rec["k_closed"] + rec["k_mixed"]
+    assert total == pytest.approx(rec["n_linked"])
+
+
+def test_soft_counts_empty_cell(tmp_path):
+    """A cell with no qualifying pairs returns an empty dict."""
+    df = pd.DataFrame({
+        "chrom": pd.Series([], dtype=str),
+        "pos1": pd.Series([], dtype=np.int64),
+        "pos2": pd.Series([], dtype=np.int64),
+        "n1": pd.Series([], dtype=np.int32),
+        "n2": pd.Series([], dtype=np.int32),
+        "distance": pd.Series([], dtype=np.int64),
+        "posterior1": pd.Series([], dtype=float),
+        "posterior2": pd.Series([], dtype=float),
+    })
+    p = tmp_path / "empty.posteriors.parquet"
+    df.to_parquet(p)
+
+    cell, counts = concordance._compute_cell_soft_counts(
+        str(p), "empty", bin_size=1000, min_distance=100, min_gch_sites=2,
+    )
+    assert cell == "empty"
+    assert counts == {}
+
+
+# ---------------------------------------------------------------------------
+# Dirichlet-Multinomial EB MoM fit
+# ---------------------------------------------------------------------------
+
+
+def test_dm_eb_prior_recovers_population_means():
+    """MoM on simulated DM data recovers the true mu_open, mu_closed, mu_mixed."""
+    rng = np.random.default_rng(0)
+    # Simulate 200 (cell, bin) observations from Dirichlet(8, 4, 3) → mu = (8, 4, 3) / 15.
+    alpha_true = np.array([8.0, 4.0, 3.0])
+    n_obs = 200
+    pis = rng.dirichlet(alpha_true, size=n_obs)
+    ns = rng.integers(5, 50, size=n_obs)
+    ks = np.array([
+        rng.multinomial(n_, pi)
+        for n_, pi in zip(ns, pis)
+    ])
+
+    counts_df = pd.DataFrame({
+        "k_open": ks[:, 0].astype(float),
+        "k_closed": ks[:, 1].astype(float),
+        "k_mixed": ks[:, 2].astype(float),
+        "n_linked": ns.astype(float),
+    })
+    alpha_hat, info = concordance._fit_dirichlet_multinomial_eb_prior(
+        counts_df, min_obs=50,
+    )
+    mu_true = alpha_true / alpha_true.sum()
+    mu_hat = np.array([
+        info["mu_hat"]["open"], info["mu_hat"]["closed"], info["mu_hat"]["mixed"],
+    ])
+    np.testing.assert_allclose(mu_hat, mu_true, atol=0.05)
+    assert not info["fallback"]
+    # Sanity: alpha should sum to nu_hat.
+    assert (alpha_hat["open"] + alpha_hat["closed"] + alpha_hat["mixed"]
+            == pytest.approx(info["nu_hat"]))
+
+
+def test_dm_eb_prior_fallback_when_sparse():
+    """Below min_obs, falls back to uniform Dirichlet(1, 1, 1)."""
+    counts_df = pd.DataFrame({
+        "k_open":   [1.0, 2.0],
+        "k_closed": [1.0, 1.0],
+        "k_mixed":  [1.0, 0.0],
+        "n_linked": [3.0, 3.0],
+    })
+    alpha, info = concordance._fit_dirichlet_multinomial_eb_prior(
+        counts_df, min_obs=50,
+    )
+    assert alpha == {"open": 1.0, "closed": 1.0, "mixed": 1.0}
+    assert info["fallback"]
+
+
+# ---------------------------------------------------------------------------
+# Sanity-check table from design-doc §2.3
+# ---------------------------------------------------------------------------
+
+
+def test_delta_signed_sanity_table_focal_active(tmp_path):
+    """Bin with focal active accessibility (p̂=0.5, but pairs cluster open).
+
+    From the design-doc §2.3 sanity table — the row we cared most about,
+    where mean accessibility is moderate but 3D-contact pairs are
+    disproportionately co-open.  Expected Δ_signed ≈ +0.4.
+    """
+    # 20 cells x 1 bin.  Each cell has many linked pairs all both-open
+    # (focal active) and many unlinked pairs of mixed open/closed
+    # (giving p̂ = 0.5 from per-end marginal).
+    rng = np.random.default_rng(42)
+    paths = {}
+    for c in range(10):
+        records = []
+        # 20 linked pairs (long-range), both ends p=0.95 → mostly co-open.
+        for i in range(20):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 100 + i * 2,
+                "pos2": 500 + i * 2,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.95, "posterior2": 0.95,
+                "distance": 400,
+            })
+        # 20 unlinked short-range pairs with one end open and one closed
+        # → soft per-end marginal p̂ ≈ 0.5.
+        for i in range(20):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 700 + i * 2,
+                "pos2": 720 + i * 2,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.95, "posterior2": 0.05,
+                "distance": 20,
+            })
+        path = tmp_path / f"c{c}.posteriors.parquet"
+        _make_posteriors(records).to_parquet(path)
+        paths[f"c{c}"] = str(path)
+
+    result = concordance.compute_signed_concordance_matrix(
+        paths,
+        bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_pairs_per_bin=1,
+        use_rwr=False,  # disable RWR for this synthetic test
+        eb_min_obs=2,
+        n_threads=1,
+        output_dir=str(tmp_path / "out"),
+        save_outputs=False,
+    )
+    delta = result["delta_signed"]
+    assert "chr1:0" in delta.columns
+    # All cells have the same pattern, so Δ_signed should be similar
+    # across cells. Expected ≈ +0.7 (linked S = 1, baseline S_u = 0,
+    # plus EB shrinkage pulling toward population mean which is also
+    # high).
+    cell_deltas = delta["chr1:0"].dropna()
+    assert (cell_deltas > 0.3).all(), (
+        f"Focal active should give strongly positive Δ_signed; "
+        f"got: {cell_deltas.describe()}"
+    )
+
+
+def test_delta_signed_silenced_bin_gives_negative(tmp_path):
+    """Bin with most pairs co-closed → Δ_signed < 0."""
+    paths = {}
+    for c in range(10):
+        records = []
+        # 20 linked pairs, both ends p=0.05 → mostly co-closed.
+        for i in range(20):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 100 + i * 2,
+                "pos2": 500 + i * 2,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.05, "posterior2": 0.05,
+                "distance": 400,
+            })
+        # 20 unlinked short-range, mixed.
+        for i in range(20):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 700 + i * 2,
+                "pos2": 720 + i * 2,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.5, "posterior2": 0.5,
+                "distance": 20,
+            })
+        path = tmp_path / f"c{c}.posteriors.parquet"
+        _make_posteriors(records).to_parquet(path)
+        paths[f"c{c}"] = str(path)
+
+    result = concordance.compute_signed_concordance_matrix(
+        paths,
+        bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_pairs_per_bin=1,
+        use_rwr=False,
+        eb_min_obs=2,
+        n_threads=1,
+        output_dir=str(tmp_path / "out"),
+        save_outputs=False,
+    )
+    delta = result["delta_signed"]
+    cell_deltas = delta["chr1:0"].dropna()
+    assert (cell_deltas < -0.3).all(), (
+        f"Silenced bin should give strongly negative Δ_signed; "
+        f"got: {cell_deltas.describe()}"
+    )
+
+
+def test_delta_signed_chaotic_bin_near_zero(tmp_path):
+    """Bin where linked + unlinked pools both have S ≈ 0 → Δ_signed ≈ 0."""
+    paths = {}
+    for c in range(10):
+        records = []
+        # 20 linked pairs: random mixing — half (0.95, 0.05), half (0.05, 0.95).
+        # → S_linked ≈ 0.
+        for i in range(20):
+            if i % 2 == 0:
+                p1, p2 = 0.95, 0.05
+            else:
+                p1, p2 = 0.05, 0.95
+            records.append({
+                "chrom": "chr1",
+                "pos1": 100 + i * 2,
+                "pos2": 500 + i * 2,
+                "n1": 5, "n2": 5,
+                "posterior1": p1, "posterior2": p2,
+                "distance": 400,
+            })
+        # 20 unlinked: same pattern (also mixed).
+        for i in range(20):
+            if i % 2 == 0:
+                p1, p2 = 0.95, 0.05
+            else:
+                p1, p2 = 0.05, 0.95
+            records.append({
+                "chrom": "chr1",
+                "pos1": 700 + i * 2,
+                "pos2": 720 + i * 2,
+                "n1": 5, "n2": 5,
+                "posterior1": p1, "posterior2": p2,
+                "distance": 20,
+            })
+        path = tmp_path / f"c{c}.posteriors.parquet"
+        _make_posteriors(records).to_parquet(path)
+        paths[f"c{c}"] = str(path)
+
+    result = concordance.compute_signed_concordance_matrix(
+        paths,
+        bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_pairs_per_bin=1,
+        use_rwr=False,
+        eb_min_obs=2,
+        n_threads=1,
+        output_dir=str(tmp_path / "out"),
+        save_outputs=False,
+    )
+    delta = result["delta_signed"]
+    cell_deltas = delta["chr1:0"].dropna()
+    assert cell_deltas.abs().max() < 0.2, (
+        f"Chaotic bin should give Δ_signed near 0; "
+        f"got: {cell_deltas.describe()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end with RWR
+# ---------------------------------------------------------------------------
+
+
+def test_end_to_end_with_rwr(tmp_path):
+    """Two cell types with different bin coordination — Δ_signed
+    differentiates them after RWR."""
+    rng = np.random.default_rng(7)
+    paths = {}
+
+    # Cell type A: 10 cells where chr1:0 is co-open coordinated.
+    for c in range(10):
+        records = []
+        for i in range(10):  # 10 linked pairs per cell
+            records.append({
+                "chrom": "chr1",
+                "pos1": 100 + i * 5,
+                "pos2": 500 + i * 5,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.95, "posterior2": 0.95,
+                "distance": 400,
+            })
+        # 10 unlinked short-range mixed.
+        for i in range(10):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 700 + i * 5,
+                "pos2": 720 + i * 5,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.5, "posterior2": 0.5,
+                "distance": 20,
+            })
+        path = tmp_path / f"typeA_c{c}.posteriors.parquet"
+        _make_posteriors(records).to_parquet(path)
+        paths[f"typeA_c{c}"] = str(path)
+
+    # Cell type B: 10 cells where chr1:0 is co-closed coordinated.
+    for c in range(10):
+        records = []
+        for i in range(10):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 100 + i * 5,
+                "pos2": 500 + i * 5,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.05, "posterior2": 0.05,
+                "distance": 400,
+            })
+        for i in range(10):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 700 + i * 5,
+                "pos2": 720 + i * 5,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.5, "posterior2": 0.5,
+                "distance": 20,
+            })
+        path = tmp_path / f"typeB_c{c}.posteriors.parquet"
+        _make_posteriors(records).to_parquet(path)
+        paths[f"typeB_c{c}"] = str(path)
+
+    result = concordance.compute_signed_concordance_matrix(
+        paths,
+        bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_pairs_per_bin=1,
+        use_rwr=True, rwr_k=5,
+        eb_min_obs=5,
+        n_threads=1,
+        output_dir=str(tmp_path / "out"),
+        save_outputs=True,
+    )
+    delta = result["delta_signed"]
+    type_a_cells = [c for c in delta.index if c.startswith("typeA_")]
+    type_b_cells = [c for c in delta.index if c.startswith("typeB_")]
+    type_a_mean = float(delta.loc[type_a_cells, "chr1:0"].mean())
+    type_b_mean = float(delta.loc[type_b_cells, "chr1:0"].mean())
+
+    assert type_a_mean > type_b_mean, (
+        f"Type A (co-open) should have higher Δ_signed than type B (co-closed); "
+        f"got A={type_a_mean:.3f}, B={type_b_mean:.3f}"
+    )
+    assert type_a_mean > 0, f"Type A mean should be positive; got {type_a_mean}"
+    assert type_b_mean < 0, f"Type B mean should be negative; got {type_b_mean}"
+
+    # Output files saved.
+    out_dir = tmp_path / "out"
+    assert (out_dir / "concordance_signed.parquet").exists()
+    assert (out_dir / "pair_counts_per_bin.parquet").exists()
+    assert (out_dir / "accessibility_mean.parquet").exists()
+    assert (out_dir / "dirichlet_multinomial_prior.json").exists()
+    # RWR artifacts.
+    assert (out_dir / "cell_knn_graph_pass0.npz").exists()
+    assert (out_dir / "rwr_diagnostics.json").exists()
+
+
+def test_both_statistics_in_one_run(tmp_path):
+    """statistic='both' produces both delta_signed and delta_open matrices."""
+    rng = np.random.default_rng(8)
+    paths = {}
+    for c in range(5):
+        records = []
+        for i in range(10):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 100 + i * 5,
+                "pos2": 500 + i * 5,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.9, "posterior2": 0.9,
+                "distance": 400,
+            })
+        for i in range(10):
+            records.append({
+                "chrom": "chr1",
+                "pos1": 700 + i * 5,
+                "pos2": 720 + i * 5,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.5, "posterior2": 0.5,
+                "distance": 20,
+            })
+        path = tmp_path / f"c{c}.posteriors.parquet"
+        _make_posteriors(records).to_parquet(path)
+        paths[f"c{c}"] = str(path)
+
+    result = concordance.compute_signed_concordance_matrix(
+        paths,
+        bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_pairs_per_bin=1, statistic="both",
+        use_rwr=False, eb_min_obs=2,
+        n_threads=1,
+        output_dir=str(tmp_path / "out"),
+        save_outputs=True,
+    )
+    assert result["delta_signed"] is not None
+    assert result["delta_open"] is not None
+    # Both should peak at chr1:0.
+    assert "chr1:0" in result["delta_signed"].columns
+    assert "chr1:0" in result["delta_open"].columns
+    # Files for both should exist.
+    out_dir = tmp_path / "out"
+    assert (out_dir / "concordance_signed.parquet").exists()
+    assert (out_dir / "concordance_open.parquet").exists()
+
+
+def test_invalid_statistic_raises(tmp_path):
+    """statistic must be one of signed / open / both."""
+    df = pd.DataFrame({
+        "chrom": pd.Series([], dtype=str), "pos1": pd.Series([], dtype=np.int64),
+        "pos2": pd.Series([], dtype=np.int64), "n1": pd.Series([], dtype=np.int32),
+        "n2": pd.Series([], dtype=np.int32), "distance": pd.Series([], dtype=np.int64),
+        "posterior1": pd.Series([], dtype=float), "posterior2": pd.Series([], dtype=float),
+    })
+    p = tmp_path / "empty.posteriors.parquet"
+    df.to_parquet(p)
+    with pytest.raises(ValueError, match="statistic"):
+        concordance.compute_signed_concordance_matrix(
+            {"x": str(p)}, statistic="invalid",
+            save_outputs=False, output_dir=str(tmp_path / "out"),
+        )

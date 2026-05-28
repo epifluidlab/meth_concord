@@ -558,3 +558,633 @@ def _sort_bins(bins: set[str], chrom_sizes: dict[str, int] | None) -> list[str]:
         parsed.sort(key=lambda t: (_chrom_key(t[0]), t[1]))
 
     return [t[2] for t in parsed]
+
+
+# ---------------------------------------------------------------------------
+# Signed concordance with U-3 soft counts + Dirichlet-Multinomial Layer 2
+# ---------------------------------------------------------------------------
+#
+# Per design-doc v0.3 §2:
+#
+#   Layer 1 (per-end posterior, already in Step 4): p_i = P(end is open | data)
+#
+#   Layer 2 (per-(cell, bin), this section):
+#     For each PAIR (i, j) with posteriors (p_i, p_j):
+#       contribution to k_open    = p_i · p_j
+#       contribution to k_closed  = (1 − p_i)(1 − p_j)
+#       contribution to k_mixed   = p_i(1 − p_j) + (1 − p_i) p_j
+#
+#     LINKED   = same-bin pairs with distance >= min_distance, both informative
+#     UNLINKED = same-bin pairs with distance <  min_distance, both informative
+#                (short-range pairs in the same bin — the 3-state baseline)
+#
+#     Dirichlet-Multinomial EB prior fit by MoM separately on linked & unlinked.
+#     Δ_signed = (E[π_l_open] − E[π_l_closed]) − (E[π_u_open] − E[π_u_closed])
+#
+#     Pre-Layer-2 RWR (default on) imputes the soft-count matrices using a
+#     k-NN graph built from QN(mean_accessibility); see imputation.py.
+
+
+_SOFT_COUNT_KEYS = (
+    "k_open", "k_closed", "k_mixed", "n_linked",
+    "k_u_open", "k_u_closed", "k_u_mixed", "n_unlinked",
+)
+
+
+def _compute_cell_soft_counts(
+    posteriors_path: str,
+    cell_name: str,
+    bin_size: int,
+    min_distance: int,
+    min_gch_sites: int,
+) -> tuple[str, dict[str, dict[str, float]]]:
+    """For one cell, aggregate per-bin U-3 soft expected counts.
+
+    Each pair contributes its full posterior probabilities (no thresholding)
+    to the three joint outcomes (both-open, both-closed, mixed) for either
+    the linked pool (long-range same-bin pairs) or the unlinked pool
+    (short-range same-bin pairs).
+
+    Returns
+    -------
+    (cell_name, {bin_id: {key: float}}) where ``key`` is one of
+    ``_SOFT_COUNT_KEYS``.  Bins with no contributions are omitted.
+    """
+    df = pd.read_parquet(
+        posteriors_path,
+        columns=["chrom", "pos1", "pos2", "n1", "n2", "distance",
+                 "posterior1", "posterior2"],
+    )
+
+    if len(df) == 0:
+        return cell_name, {}
+
+    chrom = df["chrom"].astype(str).values
+    pos1 = df["pos1"].to_numpy(dtype=np.int64)
+    pos2 = df["pos2"].to_numpy(dtype=np.int64)
+    n1 = df["n1"].to_numpy(dtype=np.int32)
+    n2 = df["n2"].to_numpy(dtype=np.int32)
+    p1 = df["posterior1"].to_numpy(dtype=np.float64, na_value=np.nan)
+    p2 = df["posterior2"].to_numpy(dtype=np.float64, na_value=np.nan)
+    distance = df["distance"].to_numpy(dtype=np.int64)
+
+    bsz = int(bin_size)
+    bin1 = (pos1 // bsz) * bsz
+    bin2 = (pos2 // bsz) * bsz
+
+    # Pair must be informative (both ends pass min_gch_sites AND have a
+    # finite posterior) and same-bin.  Cross-bin pairs are excluded from
+    # both pools (per design-doc §2.1).
+    inf1 = (n1 >= min_gch_sites) & np.isfinite(p1)
+    inf2 = (n2 >= min_gch_sites) & np.isfinite(p2)
+    informative_pair = inf1 & inf2
+    same_bin = bin1 == bin2
+
+    qualify = same_bin & informative_pair
+    if not qualify.any():
+        return cell_name, {}
+
+    # Soft per-pair contributions (U-3) — only computed for qualifying pairs.
+    pq = p1[qualify]
+    qq = p2[qualify]
+    soft_open = pq * qq
+    soft_closed = (1.0 - pq) * (1.0 - qq)
+    soft_mixed = pq * (1.0 - qq) + (1.0 - pq) * qq
+
+    is_linked = (distance[qualify] >= int(min_distance))
+    chrom_q = chrom[qualify]
+    bin_q = bin1[qualify]
+
+    counts: dict[str, dict[str, float]] = {}
+
+    # Vectorised aggregation per (chrom, bin) for linked + unlinked sides.
+    pair_df = pd.DataFrame({
+        "chrom": chrom_q,
+        "bin": bin_q,
+        "is_linked": is_linked,
+        "s_open": soft_open,
+        "s_closed": soft_closed,
+        "s_mixed": soft_mixed,
+    })
+
+    # Linked aggregation.
+    linked_g = pair_df.loc[pair_df["is_linked"]].groupby(
+        ["chrom", "bin"], sort=False,
+    ).agg(
+        n_linked=("s_open", "size"),
+        k_open=("s_open", "sum"),
+        k_closed=("s_closed", "sum"),
+        k_mixed=("s_mixed", "sum"),
+    )
+    # Unlinked (short-range) aggregation.
+    unlinked_g = pair_df.loc[~pair_df["is_linked"]].groupby(
+        ["chrom", "bin"], sort=False,
+    ).agg(
+        n_unlinked=("s_open", "size"),
+        k_u_open=("s_open", "sum"),
+        k_u_closed=("s_closed", "sum"),
+        k_u_mixed=("s_mixed", "sum"),
+    )
+
+    def _bid(c: str, b: int) -> str:
+        return f"{c}:{int(b)}"
+
+    def _empty_entry() -> dict[str, float]:
+        return {k: 0.0 for k in _SOFT_COUNT_KEYS}
+
+    for (c, b), row in linked_g.iterrows():
+        bid = _bid(c, int(b))
+        rec = counts.setdefault(bid, _empty_entry())
+        rec["n_linked"] = float(row["n_linked"])
+        rec["k_open"] = float(row["k_open"])
+        rec["k_closed"] = float(row["k_closed"])
+        rec["k_mixed"] = float(row["k_mixed"])
+
+    for (c, b), row in unlinked_g.iterrows():
+        bid = _bid(c, int(b))
+        rec = counts.setdefault(bid, _empty_entry())
+        rec["n_unlinked"] = float(row["n_unlinked"])
+        rec["k_u_open"] = float(row["k_u_open"])
+        rec["k_u_closed"] = float(row["k_u_closed"])
+        rec["k_u_mixed"] = float(row["k_u_mixed"])
+
+    return cell_name, counts
+
+
+def _fit_dirichlet_multinomial_eb_prior(
+    counts_df: pd.DataFrame,
+    open_col: str = "k_open",
+    closed_col: str = "k_closed",
+    mixed_col: str = "k_mixed",
+    n_col: str = "n_linked",
+    min_obs: int = 50,
+    nu_floor: float = 2.0,
+) -> tuple[dict[str, float], dict]:
+    """Method-of-moments EB prior for the Dirichlet-Multinomial on three categories.
+
+    Pools (cell, bin) observations and fits α = (α_open, α_closed, α_mixed)
+    such that the population-level distribution of soft rates
+    ``(k_i / n)`` matches the DM theoretical variance for some
+    concentration ν = α_total.
+
+    Returns
+    -------
+    (alpha_dict, info) :
+        alpha_dict has keys 'open', 'closed', 'mixed' (floats);
+        info has 'mu_hat' (dict), 'nu_hat' (float), 'n_obs' (int),
+        'fallback' (bool).
+    """
+    df = counts_df.loc[counts_df[n_col] >= 1].copy()
+    n_obs = int(len(df))
+    if n_obs < min_obs:
+        logger.warning(
+            f"Only {n_obs} (cell, bin) observations with {n_col} >= 1 "
+            f"(< {min_obs}); using uniform Dirichlet(1, 1, 1) fallback prior."
+        )
+        return ({"open": 1.0, "closed": 1.0, "mixed": 1.0},
+                {"mu_hat": {"open": 1/3, "closed": 1/3, "mixed": 1/3},
+                 "nu_hat": 3.0, "n_obs": n_obs, "fallback": True})
+
+    n_arr = df[n_col].to_numpy(dtype=np.float64)
+    n_sum = float(n_arr.sum())
+    # Population-level marginal means (across pooled (cell, bin)).
+    mus = {
+        "open":   float(df[open_col].sum()   / n_sum),
+        "closed": float(df[closed_col].sum() / n_sum),
+        "mixed":  float(df[mixed_col].sum()  / n_sum),
+    }
+
+    # Method-of-moments: fit α_total on the category with the largest mean
+    # (most data → tightest variance estimate).  The same α_total applies
+    # to all three categories by Dirichlet symmetry.
+    best_cat, best_mu = max(mus.items(), key=lambda kv: kv[1])
+    best_col = {"open": open_col, "closed": closed_col, "mixed": mixed_col}[best_cat]
+    k_best = df[best_col].to_numpy(dtype=np.float64)
+    rate = k_best / n_arr
+    weights = n_arr / n_sum
+    s2 = float(np.sum(weights * (rate - best_mu) ** 2))
+    n_bar = float(np.sum(weights * n_arr))
+
+    mu1mu = best_mu * (1.0 - best_mu)
+    numer = mu1mu - s2
+    denom = s2 - mu1mu / max(n_bar, 1.0)
+    if denom <= 0:
+        # No detectable over-dispersion → tight prior.
+        nu_hat = 100.0
+    elif numer <= 0:
+        # Empirical variance > max binomial-mixture variance → very wide prior.
+        nu_hat = nu_floor
+    else:
+        nu_hat = max(float(numer / denom), nu_floor)
+
+    alpha = {cat: mu * nu_hat for cat, mu in mus.items()}
+    return alpha, {
+        "mu_hat": mus, "nu_hat": float(nu_hat), "n_obs": n_obs,
+        "fallback": False, "best_cat_for_mom": best_cat,
+    }
+
+
+def _dm_posterior_means(
+    counts: dict[str, np.ndarray],
+    alpha: dict[str, float],
+    k_keys: tuple[str, str, str],
+    n_key: str,
+) -> dict[str, np.ndarray]:
+    """Element-wise Dirichlet-Multinomial conjugate posterior means.
+
+    Per design-doc §2.3 (latent-variable derivation):
+        E[π_i | data] = (α_i + soft_k_i) / (α_total + n)
+    For soft counts, this is the correct posterior mean by linearity of
+    expectation under the latent-state interpretation.
+
+    Parameters
+    ----------
+    counts : dict
+        Maps each of ``k_keys`` and ``n_key`` to a cells × bins matrix.
+    alpha : dict
+        Maps 'open', 'closed', 'mixed' → α_i.
+    k_keys : tuple
+        Length-3 tuple naming the (open, closed, mixed) matrices in
+        ``counts``.
+    n_key : str
+        Name of the n matrix in ``counts``.
+
+    Returns
+    -------
+    dict mapping 'open', 'closed', 'mixed' → cells × bins matrix of
+    posterior means.  NaN where ``n_key`` matrix has zero counts and the
+    prior would require us to divide by zero.
+    """
+    open_k, closed_k, mixed_k = k_keys
+    alpha_total = alpha["open"] + alpha["closed"] + alpha["mixed"]
+    n = counts[n_key]
+    denom = alpha_total + n
+    # When n == 0 AND alpha_total > 0, the posterior is the prior mean.
+    safe_denom = np.where(denom > 0, denom, np.nan)
+    return {
+        "open":   (alpha["open"]   + counts[open_k])   / safe_denom,
+        "closed": (alpha["closed"] + counts[closed_k]) / safe_denom,
+        "mixed":  (alpha["mixed"]  + counts[mixed_k])  / safe_denom,
+    }
+
+
+def _dm_posterior_variance_S(
+    posterior_means: dict[str, np.ndarray],
+    alpha: dict[str, float],
+    n: np.ndarray,
+) -> np.ndarray:
+    """Variance of S = π_open − π_closed under the DM posterior.
+
+    Var(S) = [μ_open + μ_closed − (μ_open − μ_closed)²] / (α_total + n + 1)
+
+    Parameters
+    ----------
+    posterior_means : dict
+        Output of :func:`_dm_posterior_means`.
+    alpha : dict
+        Prior parameters.
+    n : ndarray
+        Cells × bins n_linked (or n_unlinked).
+    """
+    mu_o = posterior_means["open"]
+    mu_c = posterior_means["closed"]
+    alpha_total = alpha["open"] + alpha["closed"] + alpha["mixed"]
+    return (mu_o + mu_c - (mu_o - mu_c) ** 2) / (alpha_total + n + 1.0)
+
+
+def compute_signed_concordance_matrix(
+    cell_posterior_paths: dict[str, str],
+    chrom_sizes: dict[str, int] | None = None,
+    bin_size: int = 250_000,
+    min_distance: int = 1_000,
+    min_gch_sites: int = 2,
+    min_pairs_per_bin: int = 1,
+    statistic: str = "signed",
+    use_rwr: bool = True,
+    rwr_k: int = 15,
+    rwr_restart_prob: float = 0.5,
+    rwr_n_refine_passes: int = 0,
+    rwr_solver: str = "auto",
+    rwr_max_iter: int = 30,
+    rwr_tol: float = 1e-4,
+    eb_min_obs: int = 50,
+    n_threads: int = 4,
+    output_dir: str = "output/05_concordance",
+    save_outputs: bool = True,
+) -> dict[str, object]:
+    """Compute the signed (and optionally one-sided) concordance matrix.
+
+    Implements the full Phase-1 pipeline:
+
+    1.  Aggregate per-(cell, bin) U-3 soft expected counts (linked and
+        short-range unlinked) across cells in parallel.
+    2.  Compute the dense mean-accessibility matrix (needed for the
+        RWR k-NN graph).
+    3.  If ``use_rwr``: run pre-Layer-2 RWR imputation on the eight
+        soft-count matrices, using a k-NN graph built from
+        QN(mean_accessibility) and (optionally) refining via QN(Δ_signed)
+        on subsequent passes.
+    4.  Fit a Dirichlet-Multinomial EB prior on each pool (linked and
+        unlinked) using MoM on the imputed counts.
+    5.  Compute Δ_signed (and optionally Δ_open) per (cell, bin) from
+        the conjugate posterior plug-in formula.
+
+    Parameters
+    ----------
+    cell_posterior_paths : dict
+        ``cell_name -> *.posteriors.parquet`` from Step 4.
+    statistic : {"signed", "open", "both"}
+        Which output matrix to produce as the headline.  "open" still
+        uses U-3 soft counts but reports Δ_open = E[π_l_open] − p̂²
+        (the one-sided variant).  "both" returns both matrices.
+    use_rwr : bool
+        Whether to run pre-Layer-2 RWR imputation.  Default True;
+        decision-doc §6 #16 — without RWR, per-(cell, bin) Δ is
+        prior-dominated for the typical NOMe-HiC data sparsity.
+    rwr_k, rwr_restart_prob, rwr_n_refine_passes, rwr_solver,
+    rwr_max_iter, rwr_tol :
+        RWR parameters; see :mod:`nome_hic_concordance.imputation`.
+    eb_min_obs : int
+        Min (cell, bin) observations for DM MoM fit; below this, a
+        uniform Dirichlet fallback is used.
+
+    Returns
+    -------
+    dict with keys:
+        - 'delta_signed' : DataFrame (cells × bins) or None
+        - 'delta_open'   : DataFrame (cells × bins) or None
+        - 'pair_counts'  : DataFrame (cells × bins) of n_linked
+        - 'accessibility': DataFrame (cells × bins) of mean accessibility
+        - 'imputed_counts' : dict of 8 cells × bins arrays (post-RWR
+                             if use_rwr; raw soft counts otherwise)
+        - 'priors'       : dict of fitted DM prior parameters
+        - 'rwr_diagnostics' : dict (or None if use_rwr=False)
+    """
+    from joblib import Parallel, delayed
+
+    from . import accessibility as _accessibility_mod
+    from . import imputation as _imputation_mod
+
+    if statistic not in ("signed", "open", "both"):
+        raise ValueError(
+            f"statistic must be 'signed', 'open', or 'both'; got {statistic!r}."
+        )
+
+    out_path = ensure_dir(output_dir) if save_outputs else None
+    items = list(cell_posterior_paths.items())
+
+    # ---- Step 1: aggregate soft counts per cell -------------------------
+    logger.info(
+        f"Aggregating per-(cell, bin) U-3 soft counts for {len(items)} cells "
+        f"(bin_size={bin_size:,}, min_distance={min_distance:,}, "
+        f"min_gch_sites={min_gch_sites})"
+    )
+    if n_threads > 1 and len(items) > 1:
+        per_cell = Parallel(n_jobs=n_threads)(
+            delayed(_compute_cell_soft_counts)(
+                path, cell_name, bin_size, min_distance, min_gch_sites,
+            )
+            for cell_name, path in items
+        )
+    else:
+        per_cell = [
+            _compute_cell_soft_counts(
+                path, cell_name, bin_size, min_distance, min_gch_sites,
+            )
+            for cell_name, path in items
+        ]
+
+    # ---- Step 2: assemble cells × bins soft-count matrices --------------
+    all_bins: set[str] = set()
+    for _, c in per_cell:
+        all_bins.update(c.keys())
+    sorted_bins = _sort_bins(all_bins, chrom_sizes)
+
+    cell_names = [c for c, _ in per_cell]
+    n_cells = len(cell_names)
+    n_bins = len(sorted_bins)
+    bin_to_col = {b: i for i, b in enumerate(sorted_bins)}
+
+    raw_counts: dict[str, np.ndarray] = {
+        k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in _SOFT_COUNT_KEYS
+    }
+    for row_idx, (_, c) in enumerate(per_cell):
+        for bid, entry in c.items():
+            j = bin_to_col[bid]
+            for k in _SOFT_COUNT_KEYS:
+                raw_counts[k][row_idx, j] = entry[k]
+
+    logger.info(
+        f"Soft-count matrices: {n_cells} cells × {n_bins} bins. "
+        f"Total linked pairs across all cells: {raw_counts['n_linked'].sum():.0f}. "
+        f"Total unlinked (short-range) pairs: {raw_counts['n_unlinked'].sum():.0f}."
+    )
+
+    # ---- Step 3: mean accessibility for the RWR k-NN basis --------------
+    accessibility_df, _ = _accessibility_mod.compute_accessibility_matrix(
+        cell_posterior_paths, chrom_sizes=chrom_sizes, bin_size=bin_size,
+        min_gch_sites=min_gch_sites, n_threads=n_threads,
+        output_dir=output_dir, save_outputs=save_outputs,
+    )
+    # Align accessibility row + column order to the soft-count matrices so
+    # the RWR k-NN graph is built in the same cell order.
+    accessibility_df = accessibility_df.reindex(
+        index=cell_names, columns=sorted_bins,
+    )
+
+    # ---- Step 4 + 5: RWR (optional) + Layer 2 ----------------------------
+    fitted_priors: dict[str, dict] = {}
+
+    def _layer2(imputed: dict[str, np.ndarray]) -> pd.DataFrame:
+        """Layer-2 callback used by run_rwr_pipeline (or called directly
+        when use_rwr=False).  Fits DM priors and computes the headline
+        Δ_signed matrix.  Side effect: populates ``fitted_priors``.
+        """
+        # Build long-format DataFrames for the prior fits.
+        n_l_flat = imputed["n_linked"].ravel()
+        long_linked = pd.DataFrame({
+            "k_open":   imputed["k_open"].ravel(),
+            "k_closed": imputed["k_closed"].ravel(),
+            "k_mixed":  imputed["k_mixed"].ravel(),
+            "n_linked": n_l_flat,
+        })
+        alpha_l, info_l = _fit_dirichlet_multinomial_eb_prior(
+            long_linked,
+            open_col="k_open", closed_col="k_closed",
+            mixed_col="k_mixed", n_col="n_linked",
+            min_obs=eb_min_obs,
+        )
+
+        n_u_flat = imputed["n_unlinked"].ravel()
+        long_unlinked = pd.DataFrame({
+            "k_open":   imputed["k_u_open"].ravel(),
+            "k_closed": imputed["k_u_closed"].ravel(),
+            "k_mixed":  imputed["k_u_mixed"].ravel(),
+            "n_linked": n_u_flat,    # column name is just for the helper
+        })
+        alpha_u, info_u = _fit_dirichlet_multinomial_eb_prior(
+            long_unlinked,
+            open_col="k_open", closed_col="k_closed",
+            mixed_col="k_mixed", n_col="n_linked",
+            min_obs=eb_min_obs,
+        )
+
+        fitted_priors["linked"] = {"alpha": alpha_l, "info": info_l}
+        fitted_priors["unlinked"] = {"alpha": alpha_u, "info": info_u}
+
+        # Compute posterior means and Δ_signed per (cell, bin).
+        pm_l = _dm_posterior_means(
+            imputed, alpha_l, ("k_open", "k_closed", "k_mixed"), "n_linked",
+        )
+        pm_u = _dm_posterior_means(
+            {"k_open": imputed["k_u_open"], "k_closed": imputed["k_u_closed"],
+             "k_mixed": imputed["k_u_mixed"], "n_unlinked": imputed["n_unlinked"]},
+            alpha_u, ("k_open", "k_closed", "k_mixed"), "n_unlinked",
+        )
+
+        S_l = pm_l["open"] - pm_l["closed"]
+        S_u = pm_u["open"] - pm_u["closed"]
+        delta_signed = S_l - S_u
+
+        # NaN out bins where the cell has fewer than min_pairs_per_bin linked.
+        invalid = imputed["n_linked"] < float(min_pairs_per_bin)
+        delta_signed = np.where(invalid, np.nan, delta_signed)
+
+        return pd.DataFrame(
+            delta_signed, index=cell_names, columns=sorted_bins,
+        )
+
+    rwr_diagnostics = None
+    if use_rwr and n_cells >= 2:
+        logger.info(
+            f"Running pre-Layer-2 RWR imputation "
+            f"(k={rwr_k}, restart={rwr_restart_prob}, "
+            f"refine_passes={rwr_n_refine_passes})"
+        )
+        imputed_counts, delta_signed_df, rwr_diagnostics = (
+            _imputation_mod.run_rwr_pipeline(
+                soft_count_matrices=raw_counts,
+                initial_feature_matrix=accessibility_df.fillna(np.nan),
+                layer2_fn=_layer2,
+                n_refine_passes=rwr_n_refine_passes,
+                k=rwr_k, restart_prob=rwr_restart_prob,
+                solver=rwr_solver, max_iter=rwr_max_iter, tol=rwr_tol,
+                output_dir=output_dir if save_outputs else None,
+            )
+        )
+    else:
+        if use_rwr and n_cells < 2:
+            logger.warning(
+                f"Skipping RWR: only {n_cells} cell(s); RWR requires >= 2."
+            )
+        # Run Layer 2 directly on the raw soft counts.
+        imputed_counts = raw_counts
+        delta_signed_df = _layer2(imputed_counts)
+
+    # ---- Optionally compute the one-sided Δ_open -------------------------
+    delta_open_df = None
+    if statistic in ("open", "both"):
+        # One-sided Δ_open uses per-end marginal p̂ for the independence
+        # baseline (not the pair-based unlinked DM).  This matches the
+        # existing one-sided convention so users can compare with the
+        # legacy --concordance-method betabinom output.
+        alpha_l = fitted_priors["linked"]["alpha"]
+        pm_l = _dm_posterior_means(
+            imputed_counts, alpha_l, ("k_open", "k_closed", "k_mixed"),
+            "n_linked",
+        )
+        n_u = imputed_counts["n_unlinked"]
+        # p̂ from the per-end-rate identity:
+        # sum_pairs (p_l + p_r) = 2 · k_u_open + k_u_mixed
+        # p̂ = sum_pairs (p_l + p_r) / (2 · n_unlinked)
+        p_hat = np.where(
+            n_u > 0,
+            (2.0 * imputed_counts["k_u_open"] + imputed_counts["k_u_mixed"])
+            / (2.0 * n_u),
+            np.nan,
+        )
+        delta_open_arr = pm_l["open"] - p_hat ** 2
+        invalid = imputed_counts["n_linked"] < float(min_pairs_per_bin)
+        delta_open_arr = np.where(invalid, np.nan, delta_open_arr)
+        delta_open_df = pd.DataFrame(
+            delta_open_arr, index=cell_names, columns=sorted_bins,
+        )
+
+    # ---- pair_counts (n_linked from raw, integer) ------------------------
+    pair_counts_df = pd.DataFrame(
+        raw_counts["n_linked"].astype(np.int64),
+        index=cell_names, columns=sorted_bins,
+    )
+    pair_counts_df.columns.name = "bin"
+    pair_counts_df.index.name = "cell"
+
+    # Final pretty-up.
+    delta_signed_df.columns.name = "bin"
+    delta_signed_df.index.name = "cell"
+    if delta_open_df is not None:
+        delta_open_df.columns.name = "bin"
+        delta_open_df.index.name = "cell"
+
+    # ---- Save outputs ----------------------------------------------------
+    if save_outputs and out_path is not None:
+        # Headline matrix (whichever statistic the user asked for).
+        if statistic == "signed":
+            delta_signed_df.to_parquet(out_path / "concordance_signed.parquet")
+            delta_signed_df.to_csv(out_path / "concordance_signed.tsv", sep="\t")
+        elif statistic == "open":
+            assert delta_open_df is not None
+            delta_open_df.to_parquet(out_path / "concordance_open.parquet")
+            delta_open_df.to_csv(out_path / "concordance_open.tsv", sep="\t")
+        else:  # both
+            delta_signed_df.to_parquet(out_path / "concordance_signed.parquet")
+            delta_open_df.to_parquet(out_path / "concordance_open.parquet")
+            delta_signed_df.to_csv(out_path / "concordance_signed.tsv", sep="\t")
+            delta_open_df.to_csv(out_path / "concordance_open.tsv", sep="\t")
+
+        pair_counts_df.to_parquet(out_path / "pair_counts_per_bin.parquet")
+        pair_counts_df.to_csv(out_path / "pair_counts_per_bin.tsv", sep="\t")
+
+        # Soft counts + priors for diagnostics / reproducibility.
+        soft_long = []
+        for row_idx, cell in enumerate(cell_names):
+            for j, bid in enumerate(sorted_bins):
+                if raw_counts["n_linked"][row_idx, j] == 0 and \
+                        raw_counts["n_unlinked"][row_idx, j] == 0:
+                    continue
+                soft_long.append({
+                    "cell": cell, "bin": bid,
+                    **{k: float(raw_counts[k][row_idx, j]) for k in _SOFT_COUNT_KEYS},
+                })
+        if soft_long:
+            pd.DataFrame(soft_long).to_parquet(
+                out_path / "soft_counts_raw.parquet", index=False,
+            )
+
+        import json
+        with open(out_path / "dirichlet_multinomial_prior.json", "w") as fh:
+            json.dump(fitted_priors, fh, indent=2, default=_json_safe)
+
+    logger.info(
+        f"Signed concordance matrix: {n_cells} cells × {n_bins} bins "
+        f"({delta_signed_df.notna().sum().sum():,} non-NA entries)"
+    )
+
+    return {
+        "delta_signed":   delta_signed_df,
+        "delta_open":     delta_open_df,
+        "pair_counts":    pair_counts_df,
+        "accessibility":  accessibility_df,
+        "imputed_counts": imputed_counts,
+        "priors":         fitted_priors,
+        "rwr_diagnostics": rwr_diagnostics,
+    }
+
+
+def _json_safe(obj):
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Unserializable: {type(obj).__name__}")
