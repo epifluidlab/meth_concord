@@ -539,6 +539,39 @@ All items below are now locked. Decisions in **bold**.
     other imputation methods (`--impute knn`, `--impute magic`, ...) in
     the future without renaming files.
 
+14. **Low-coverage cell filter at the cell level.** New CLI flag
+    `--min-linked-pairs-per-cell N` (default: derived from data via
+    `scripts/check_linked_pair_density.py` knee detection; suggested
+    floor 100 for typical NOMe-HiC depth). Applied right after Step 2
+    (before Step 3 mixture model and downstream steps) — bad cells
+    don't contaminate the mixture fit, posterior calls, or the cells ×
+    bins matrix. Filtered cells are logged with their `n_linked_total`
+    for traceability, and the survivor list is saved as
+    `output/.../qc/cells_used.tsv`.
+
+15. **Default `--min-pairs-per-bin` for the signed/open statistics
+    drops to 1.** The previous default of 5 was a Pearson-r artefact;
+    for Beta-Binomial / Dirichlet-Multinomial shrinkage every (cell,
+    bin) with `n_linked >= 1` is a valid observation. Per the §6
+    item-14 sparsity discussion, dropping bins at `n=5` removes ~93%
+    of the matrix for typical NOMe-HiC data and is too aggressive.
+    Backward compat: `--concordance-method pearson` keeps default 5.
+
+16. **RWR moves to pre-Layer 2.** RWR imputation operates on the
+    soft-count matrices (`k_open`, `k_closed`, `k_mixed`, `n_linked`,
+    `k_u_*`, `n_unlinked`) using a single k-NN graph built from the
+    mean-accessibility matrix (computed as a Phase-2 byproduct). Layer
+    2 then runs on imputed counts. With median `n_linked = 1` per
+    (cell, bin), this is the only place where per-(cell, bin) Δ can
+    pick up any signal beyond the global prior. Default:
+    `--impute rwr` (not off).
+
+17. **EM at Layer 2 dropped.** With median `n_linked = 1` per (cell,
+    bin), Layer-2 posteriors are prior-dominated regardless of plug-in
+    vs EM. EM offers no measurable benefit while adding significant
+    implementation complexity. Layer 2 uses Dirichlet-Multinomial
+    plug-in (signed) or Beta-Binomial plug-in (open).
+
 ---
 
 ## 7. Non-goals
