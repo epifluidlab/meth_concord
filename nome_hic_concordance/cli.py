@@ -99,6 +99,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "are available, falls back to Beta(1, 1).  "
              "(Only used by --concordance-method betabinom; default: 50).",
     )
+    parser.add_argument(
+        "--n-svd", type=int, default=0,
+        help="If > 0, reduce the normalized matrix to N components via "
+             "TruncatedSVD before running UMAP (bulk-RNA / scATAC-seq "
+             "style).  0 (default) runs UMAP directly on the bin matrix.  "
+             "A scree plot is always emitted to help pick this value.",
+    )
+    parser.add_argument(
+        "--svd-scree-max", type=int, default=50,
+        help="Number of top SVD components to fit for the scree-plot "
+             "diagnostic (default: 50). Clamped to min(this, n_cells-1, "
+             "n_bins).",
+    )
 
     # EM
     parser.add_argument("--em-max-iter", type=int, default=200)
@@ -567,19 +580,36 @@ def run_context(
             }.get(args.matrix_norm, (args.matrix_norm, f"umap_{args.matrix_norm}"))
             norm_title, norm_prefix = norm_label
 
+            # SVD scree-plot diagnostic on the normalized matrix.
+            # Always produced so the user can pick --n-svd from the elbow.
+            visualization.run_svd_scree(
+                matrices["zscore"],
+                max_components=args.svd_scree_max,
+                output_prefix=f"svd_scree_{args.matrix_norm}",
+                output_dir=str(umap_dir),
+                random_state=args.random_seed,
+            )
+
+            svd_suffix = f"_svd{args.n_svd}" if args.n_svd and args.n_svd > 0 else ""
+            svd_title = (
+                f" + SVD-{args.n_svd}" if args.n_svd and args.n_svd > 0 else ""
+            )
+
             visualization.run_umap_and_plot(
                 matrices["imputed"], group_labels,
-                title=f"UMAP (un-normalized, {context})",
-                output_prefix="umap_unnormalized",
+                title=f"UMAP (un-normalized{svd_title}, {context})",
+                output_prefix=f"umap_unnormalized{svd_suffix}",
                 output_dir=str(umap_dir),
+                n_svd=args.n_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
             )
             visualization.run_umap_and_plot(
                 matrices["zscore"], group_labels,
-                title=f"UMAP ({norm_title}, {context})",
-                output_prefix=norm_prefix,
+                title=f"UMAP ({norm_title}{svd_title}, {context})",
+                output_prefix=f"{norm_prefix}{svd_suffix}",
                 output_dir=str(umap_dir),
+                n_svd=args.n_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
             )
