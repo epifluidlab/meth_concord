@@ -147,24 +147,34 @@ def process_cell(
     }
 
 
-def _knee_index(sorted_ascending: np.ndarray) -> int:
-    """Find the 'knee' of an ascending curve as the point of maximum distance
-    below the chord from start to end (a simple kneedle-style heuristic).
+def _knee_index(sorted_ascending: np.ndarray) -> tuple[int, float]:
+    """Find the LOWER knee of an ascending coverage curve.
 
-    Returns 0 if no clear knee can be identified.
+    For a sorted-ascending per-cell coverage distribution, the "lower knee"
+    is the elbow where the curve transitions from very-low-coverage outliers
+    to the bulk of cells — i.e., the point furthest *above* the diagonal
+    chord (in log space) when normalized to [0, 1].
+
+    Returns ``(knee_idx, strength)`` where ``strength = y_norm - x_norm`` at
+    the knee.  A strength below ~0.05 means the curve has no clear elbow
+    (the distribution is smoothly concave) and the caller should fall back
+    to a percentile-based threshold.
     """
     n = len(sorted_ascending)
     if n < 4:
-        return 0
-    # Use log to make the knee meaningful on highly-skewed coverage distributions.
+        return 0, 0.0
+    # log makes the knee meaningful on highly-skewed coverage distributions.
     y = np.log10(np.asarray(sorted_ascending, dtype=np.float64) + 1.0)
     x = np.arange(n, dtype=np.float64)
     y_norm = (y - y.min()) / max(y.max() - y.min(), 1e-12)
     x_norm = x / (n - 1)
-    # Chord from (0, 0) to (1, 1).  Concave curves (slow start, fast end) have
-    # the knee at the point furthest BELOW the chord.
-    below_chord = x_norm - y_norm
-    return int(below_chord.argmax())
+    # Lower knee: maximum of (y_norm - x_norm) — point where the curve has
+    # already risen disproportionately above x, marking the end of the
+    # low-coverage tail.
+    above_chord = y_norm - x_norm
+    knee_idx = int(above_chord.argmax())
+    strength = float(above_chord[knee_idx])
+    return knee_idx, strength
 
 
 def _suggest_cutoffs(per_cell_df: pd.DataFrame, metric: str = "n_linked_total") -> dict:
@@ -176,7 +186,7 @@ def _suggest_cutoffs(per_cell_df: pd.DataFrame, metric: str = "n_linked_total") 
     median = float(np.median(sorted_asc))
     mad = float(np.median(np.abs(sorted_asc - median)))
 
-    knee_idx = _knee_index(sorted_asc)
+    knee_idx, knee_strength = _knee_index(sorted_asc)
     knee_value = float(sorted_asc[knee_idx]) if n > 0 else 0.0
 
     candidates = {
@@ -190,7 +200,12 @@ def _suggest_cutoffs(per_cell_df: pd.DataFrame, metric: str = "n_linked_total") 
         "100":                     100.0,
         "500":                     500.0,
     }
-    return {"sorted": sorted_asc, "candidates": candidates, "knee_idx": knee_idx}
+    return {
+        "sorted": sorted_asc,
+        "candidates": candidates,
+        "knee_idx": knee_idx,
+        "knee_strength": knee_strength,
+    }
 
 
 def main() -> None:
@@ -417,21 +432,33 @@ def main() -> None:
         marker = "  ← knee" if name == "knee detection (log)" else ""
         print(f"  {name:24s} {value:10.0f} {n_dropped:12d} {n_kept:10d}{marker}")
 
+    knee_strength = suggest["knee_strength"]
     print(f"\n  (knee at sorted-ascending index {knee_idx} of {n_cells} cells = "
-          f"value {sorted_asc[knee_idx]:.0f})")
+          f"value {sorted_asc[knee_idx]:.0f}; strength = {knee_strength:.3f})")
+    if knee_strength < 0.05:
+        print("  Strength < 0.05 means the curve is smoothly concave with no "
+              "clear elbow — distribution is continuous, not bimodal.")
+
     print("\nRecommended starting point:")
     knee_value = float(sorted_asc[knee_idx])
-    knee_kept = n_cells - int((sorted_asc < knee_value).sum())
-    if knee_value >= 100:
-        print(f"  --min-linked-pairs-per-cell {int(knee_value)}  "
-              f"(keeps {knee_kept}/{n_cells} cells; from knee detection)")
+    # A clear knee needs both strength (deviation from chord >= 0.10) and a
+    # sensible absolute value (>= 100 pairs).  Otherwise fall back to a
+    # percentile + minimum floor.
+    if knee_strength >= 0.10 and knee_value >= 100:
+        cutoff = int(knee_value)
+        reason = "knee detection"
     else:
-        # Fall back to a sensible floor if the knee is too low to be meaningful.
-        fallback = max(100, int(np.quantile(sorted_asc, 0.05)))
-        fallback_kept = n_cells - int((sorted_asc < fallback).sum())
-        print(f"  --min-linked-pairs-per-cell {fallback}  "
-              f"(keeps {fallback_kept}/{n_cells} cells; 5th percentile / 100 floor — "
-              f"knee was too low to be a clear elbow)")
+        # Distribution is smooth — pick the larger of (5th percentile, 100)
+        # so we always drop the obvious failed cells but don't over-aggressively
+        # trim cells from a smooth coverage distribution.
+        cutoff = max(100, int(np.quantile(sorted_asc, 0.05)))
+        reason = (
+            f"no clear knee (strength={knee_strength:.3f}); using max(5th "
+            f"percentile, 100) as a conservative floor"
+        )
+    kept = n_cells - int((sorted_asc < cutoff).sum())
+    print(f"  --min-linked-pairs-per-cell {cutoff}  "
+          f"(keeps {kept}/{n_cells} cells; reason: {reason})")
 
     if args.output_prefix:
         per_cell_df.to_csv(
