@@ -176,12 +176,24 @@ def main():
     print(f"\nLeave-one-out kNN (k={args.knn_k}, cosine, SVD-{n_comp}) "
           f"cell-type accuracy: {acc:.3f}  ({int(mis.sum())} misclassified)")
 
-    # ---- covariates ----
+    # ---- covariates (all PRE-imputation / pre-batch, like --min-linked-
+    # pairs-per-cell) ----
     cov_df = pd.DataFrame(index=keep)
     pair_path = cdir / "pair_counts_per_bin.parquet"
     if pair_path.exists():
-        pc = pd.read_parquet(pair_path)
+        pc = pd.read_parquet(pair_path)  # raw n_linked per (cell, bin)
+        # Depth: total raw linked pairs (== --min-linked-pairs-per-cell metric).
         cov_df["coverage"] = pc.sum(axis=1).reindex(keep)
+        # Breadth: number of bins with any linked pair (a deep-but-narrow cell
+        # may mis-impute even at high depth).
+        cov_df["breadth_bins"] = (pc > 0).sum(axis=1).reindex(keep)
+    # Unlinked depth: short-range baseline that feeds S_u (from soft counts).
+    soft_path = cdir / "soft_counts_raw.parquet"
+    if soft_path.exists():
+        soft = pd.read_parquet(soft_path, columns=["cell", "n_unlinked"])
+        cov_df["unlinked_depth"] = (
+            soft.groupby("cell")["n_unlinked"].sum().reindex(keep)
+        )
     acc_path = cdir / "accessibility_mean.parquet"
     if acc_path.exists():
         am = pd.read_parquet(acc_path)
@@ -199,6 +211,10 @@ def main():
     cov_p = None
     if "coverage" in cov_df:
         cov_p = _compare("coverage", cov_df["coverage"], mis)
+    if "breadth_bins" in cov_df:
+        _compare("breadth_bins", cov_df["breadth_bins"], mis)
+    if "unlinked_depth" in cov_df:
+        _compare("unlinked_depth", cov_df["unlinked_depth"], mis)
     if "mean_accessibility" in cov_df:
         _compare("mean_accessibility", cov_df["mean_accessibility"], mis)
     # PC0 boundary check: do misclassified cells sit near PC0=median?
