@@ -281,6 +281,49 @@ def test_run_rwr_pipeline_with_refinement():
     # Refinement passes carry a delta-change measurement.
     assert "mean_abs_delta_change" in diag["passes"][1]
     assert "mean_abs_delta_change" in diag["passes"][2]
+    # Fixed mode (default) does not auto-select.
+    assert diag["auto_select_passes"] is False
+
+
+def test_run_rwr_pipeline_auto_select_passes():
+    """auto_select_passes returns the eigengap-peak refined pass (never 0)
+    and records the selection in diagnostics, stopping early on a drop."""
+    rng = np.random.default_rng(101)
+    n_cells, n_bins = 30, 12
+    soft_counts = {
+        k: rng.uniform(low=0.1, high=1.0, size=(n_cells, n_bins))
+        for k in ["k_open", "k_closed", "k_mixed", "n_linked",
+                  "k_u_open", "k_u_closed", "k_u_mixed", "n_unlinked"]
+    }
+    accessibility = pd.DataFrame(
+        rng.normal(size=(n_cells, n_bins)),
+        index=[f"c{i}" for i in range(n_cells)],
+        columns=[f"bin_{j}" for j in range(n_bins)],
+    )
+
+    def _mle_l2(imp):
+        Sl = (imp["k_open"] - imp["k_closed"]) / np.where(
+            imp["n_linked"] > 0, imp["n_linked"], 1.0)
+        return pd.DataFrame(np.nan_to_num(Sl),
+                            index=accessibility.index,
+                            columns=accessibility.columns)
+
+    _, delta, diag = imputation.run_rwr_pipeline(
+        soft_counts, accessibility, _mle_l2,
+        auto_select_passes=True, max_auto_passes=4, k=5,
+        refinement_basis="postnorm",
+    )
+
+    assert diag["auto_select_passes"] is True
+    sel = diag["auto_selected_pass"]
+    assert sel >= 1  # pass 0 (confound) is never selected
+    # Selected pass has the max eigengap among refined passes that ran.
+    egs = {p["pass"]: p["eigengap"] for p in diag["passes"] if "eigengap" in p}
+    assert egs  # eigengaps were recorded for refined passes
+    assert sel == max(egs, key=egs.get)
+    # Early stop: at most max_auto_passes refined passes (+ pass 0).
+    assert len(diag["passes"]) <= 5
+    assert delta.shape == (n_cells, n_bins)
 
 
 def test_post_norm_for_knn_strips_per_cell_shift():

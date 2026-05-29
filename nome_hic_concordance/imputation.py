@@ -328,6 +328,25 @@ def rwr_impute_matrices(
 # ---------------------------------------------------------------------------
 
 
+def _top_eigengap(M: np.ndarray, top_k: int = 10) -> float:
+    """Ratio of the top two SVD eigenvalue shares of ``M``.
+
+    Used as the label-free criterion for auto-selecting the number of
+    refinement passes: among *refined* passes it peaks when the single
+    cell-type axis is most dominant, before over-smoothing spreads
+    variance back out.  (Pass 0 is excluded by the caller because its
+    dominant axis is the accessibility/batch confound, not cell type.)
+    """
+    from sklearn.decomposition import TruncatedSVD
+
+    k = min(top_k, M.shape[0] - 1, M.shape[1])
+    if k < 2:
+        return float("inf")
+    svd = TruncatedSVD(n_components=k, random_state=0).fit(M)
+    vr = svd.explained_variance_ratio_
+    return float(vr[0] / vr[1]) if vr[1] > 0 else float("inf")
+
+
 def run_rwr_pipeline(
     soft_count_matrices: dict[str, np.ndarray],
     initial_feature_matrix: pd.DataFrame,
@@ -340,6 +359,8 @@ def run_rwr_pipeline(
     tol: float = 1e-4,
     output_dir: str | None = None,
     refinement_basis: str = "raw",
+    auto_select_passes: bool = False,
+    max_auto_passes: int = 5,
 ) -> tuple[dict[str, np.ndarray], pd.DataFrame, dict]:
     """Orchestrate the full RWR + (optional) refinement loop.
 
@@ -377,6 +398,15 @@ def run_rwr_pipeline(
         per-cell shift is stripped before the graph is built.  See
         :func:`nome_hic_concordance.concordance.compute_signed_concordance_matrix`
         for when to use each.
+    auto_select_passes : bool
+        If True, ignore ``n_refine_passes`` as a fixed count and instead
+        run up to ``max_auto_passes`` refinement passes, returning the one
+        whose post-norm Δ has the largest top SVD eigengap (label-free;
+        validated to track cell-type separation among refined passes).
+        Stops early once the eigengap drops (patience 1).  Pass 0 is never
+        selected (its dominant axis is the accessibility/batch confound).
+    max_auto_passes : int
+        Upper bound on refinement passes when ``auto_select_passes`` is True.
 
     Returns
     -------
@@ -430,8 +460,23 @@ def run_rwr_pipeline(
         out = ensure_dir(output_dir)
         sp.save_npz(out / "cell_knn_graph_pass0.npz", W)
 
+    # Auto-stop: run up to ``max_auto_passes`` refinement passes and keep the
+    # one whose post-norm Δ has the largest top eigengap (the label-free
+    # proxy validated to track cell-type AUC among *refined* passes).  Pass 0
+    # is never a candidate — its dominant axis is the accessibility/batch
+    # confound, which inflates the eigengap without carrying cell type.
+    total_passes = max_auto_passes if auto_select_passes else n_refine_passes
+    all_diagnostics["auto_select_passes"] = bool(auto_select_passes)
+
+    best_eg = -np.inf
+    best_imputed: dict[str, np.ndarray] | None = None
+    best_delta: pd.DataFrame | None = None
+    best_pass = 0
+    no_improve = 0
+    patience = 1  # stop after this many consecutive non-improving passes
+
     prev_delta = delta_df.copy()
-    for pass_idx in range(1, n_refine_passes + 1):
+    for pass_idx in range(1, total_passes + 1):
         # Rebuild k-NN from the previous pass's Δ_signed.  Two bases:
         #   "raw"      — per-column-rank(Δ) only (legacy).  Keeps any
         #                per-cell shift that survived into Δ, which under
@@ -464,17 +509,51 @@ def run_rwr_pipeline(
         delta_change = float(
             np.nanmean(np.abs(delta_df.to_numpy() - prev_delta.to_numpy()))
         )
-        all_diagnostics["passes"].append({
+        pass_diag = {
             "pass": pass_idx,
             "knn_basis": basis_label,
             "mean_abs_delta_change": delta_change,
             "rwr": rwr_diag,
-        })
+        }
+
+        if auto_select_passes:
+            eg = _top_eigengap(
+                post_norm_for_knn(delta_df.to_numpy(dtype=np.float64))
+            )
+            pass_diag["eigengap"] = float(eg)
+            improved = eg > best_eg
+            if improved:
+                best_eg = eg
+                best_imputed = {k_: v_.copy() for k_, v_ in imputed.items()}
+                best_delta = delta_df.copy()
+                best_pass = pass_idx
+                no_improve = 0
+            else:
+                no_improve += 1
+            logger.info(
+                f"  pass {pass_idx} eigengap={eg:.3f} "
+                f"(best={best_eg:.3f} at pass {best_pass})"
+            )
+
+        all_diagnostics["passes"].append(pass_diag)
         if output_dir is not None:
             sp.save_npz(
                 ensure_dir(output_dir) / f"cell_knn_graph_pass{pass_idx}.npz", W,
             )
         prev_delta = delta_df.copy()
+
+        if auto_select_passes and no_improve >= patience:
+            logger.info(
+                f"RWR auto-stop: eigengap peaked at pass {best_pass} "
+                f"(={best_eg:.3f}); stopping after pass {pass_idx}."
+            )
+            break
+
+    if auto_select_passes and best_imputed is not None:
+        all_diagnostics["auto_selected_pass"] = int(best_pass)
+        all_diagnostics["auto_selected_eigengap"] = float(best_eg)
+        logger.info(f"RWR auto-selected refinement pass {best_pass}.")
+        imputed, delta_df = best_imputed, best_delta
 
     if output_dir is not None:
         with open(ensure_dir(output_dir) / "rwr_diagnostics.json", "w") as fh:

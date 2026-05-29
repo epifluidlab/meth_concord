@@ -265,13 +265,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Number of nearest neighbours per cell (default: 15).")
     parser.add_argument("--rwr-restart-prob", type=float, default=0.5,
                         help="RWR restart probability r (default: 0.5).")
-    parser.add_argument("--rwr-refine-passes", type=int, default=None,
-                        help="Iterative refinement passes.  Each pass rebuilds "
-                             "the k-NN from the previous pass's Δ_signed (see "
+    parser.add_argument("--rwr-refine-passes", type=str, default=None,
+                        help="Iterative refinement passes: an integer (fixed "
+                             "count) or 'auto'.  Each pass rebuilds the k-NN "
+                             "from the previous pass's Δ_signed (see "
                              "--refinement-basis); RWR always restarts from the "
-                             "original raw soft counts.  Default 'auto': 1 for "
-                             "--concordance-method signed (MLE needs one refine "
-                             "pass to lift cell-type onto PC0), 0 otherwise.")
+                             "original raw soft counts.  'auto' runs up to "
+                             "--rwr-max-auto-passes and keeps the pass whose "
+                             "post-norm Δ has the largest top SVD eigengap (a "
+                             "label-free proxy for cell-type separation, "
+                             "validated to peak with the cell-type AUC among "
+                             "refined passes).  Default (unset): 'auto' for "
+                             "--concordance-method signed, 0 otherwise.")
+    parser.add_argument("--rwr-max-auto-passes", type=int, default=5,
+                        help="Upper bound on refinement passes when "
+                             "--rwr-refine-passes auto (default: 5).")
     parser.add_argument("--rwr-solver", choices=["auto", "direct", "iterative"],
                         default="auto",
                         help="RWR linear solver. 'auto' uses direct (closed-"
@@ -842,13 +850,29 @@ def run_context(
                 "postnorm" if args.refinement_basis == "auto"
                 else args.refinement_basis
             )
-            rwr_refine_passes = (
-                1 if args.rwr_refine_passes is None else args.rwr_refine_passes
-            )
+            # Resolve --rwr-refine-passes: 'auto' (or unset, for signed) →
+            # eigengap auto-stop; an integer → fixed count.
+            rp = args.rwr_refine_passes
+            if rp is None:
+                rp = "auto" if args.concordance_method == "signed" else "0"
+            if str(rp).lower() == "auto":
+                auto_select_passes = True
+                rwr_refine_passes = 0  # ignored when auto_select_passes=True
+                passes_desc = f"auto (≤{args.rwr_max_auto_passes})"
+            else:
+                try:
+                    rwr_refine_passes = int(rp)
+                except ValueError:
+                    raise ValueError(
+                        f"--rwr-refine-passes must be an integer or 'auto'; "
+                        f"got {rp!r}."
+                    )
+                auto_select_passes = False
+                passes_desc = str(rwr_refine_passes)
             logger.info(
                 f"Signed estimator: formula={concordance_formula}, "
                 f"refinement_basis={refinement_basis}, "
-                f"refine_passes={rwr_refine_passes}"
+                f"refine_passes={passes_desc}"
             )
 
             sig_result = concordance_mod.compute_signed_concordance_matrix(
@@ -864,6 +888,8 @@ def run_context(
                 rwr_restart_prob=args.rwr_restart_prob,
                 rwr_n_refine_passes=rwr_refine_passes,
                 rwr_refinement_basis=refinement_basis,
+                rwr_auto_select_passes=auto_select_passes,
+                rwr_max_auto_passes=args.rwr_max_auto_passes,
                 rwr_solver=args.rwr_solver,
                 rwr_max_iter=args.rwr_max_iter,
                 rwr_tol=args.rwr_tol,

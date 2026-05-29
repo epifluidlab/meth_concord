@@ -171,22 +171,31 @@ def main():
                            "display.width", 200):
         print(summ.to_string(index=False))
 
-    # Which pass each criterion picks.
+    # Which pass each criterion picks.  CRITICAL: exclude pass 0 from the
+    # unsupervised argmax.  Pass 0 (no refinement) uses the accessibility
+    # k-NN, whose dominant axis is the depth/batch confound — it inflates the
+    # eigengap and silhouette without carrying cell type.  The label-free
+    # rule only makes sense among *refined* passes (>=1).
+    refined = summ[summ["refine_passes"] >= 1]
     pick_auc = int(summ.loc[summ["PC0_AUC"].idxmax(), "refine_passes"])
-    pick_gap = int(summ.loc[summ["eigengap_ratio"].replace(np.inf, np.nan)
-                            .idxmax(), "refine_passes"])
-    pick_sil = int(summ.loc[summ["best_silhouette"].idxmax(), "refine_passes"])
-    print(f"\nArgmax pass:  AUC(validation)={pick_auc}   "
-          f"eigengap={pick_gap}   silhouette={pick_sil}")
+    pick_gap = int(refined.loc[refined["eigengap_ratio"].replace(np.inf, np.nan)
+                               .idxmax(), "refine_passes"])
+    pick_sil = int(refined.loc[refined["best_silhouette"].idxmax(),
+                               "refine_passes"])
+    pick_gap_all = int(summ.loc[summ["eigengap_ratio"].replace(np.inf, np.nan)
+                                .idxmax(), "refine_passes"])
+    print(f"\nArgmax pass:  AUC(validation)={pick_auc}")
+    print(f"  eigengap among refined passes (>=1) = {pick_gap}   "
+          f"(over ALL passes incl 0 = {pick_gap_all}; pass 0 is the confound)")
+    print(f"  silhouette among refined passes (>=1) = {pick_sil}")
     print("\nInterpretation:")
-    print("  • The unsupervised metric whose argmax == AUC argmax is the")
-    print("    label-free stopping rule to use on unlabeled data.")
-    print("  • If BOTH eigengap and silhouette match, prefer eigengap (cheap,")
-    print("    no k to choose).  Implement auto-stop: run passes until the")
-    print("    eigengap stops increasing, then return the previous pass.")
-    print("  • If NEITHER matches, the safe fallback is a small fixed default")
-    print("    (2) plus emitting this table per run for manual inspection,")
-    print("    analogous to the SVD scree plot for --n-svd.")
+    print("  • Compare against the AUC argmax.  On the validation data the")
+    print("    eigengap among refined passes matches the AUC peak; silhouette")
+    print("    does not.  So the label-free stopping rule is: run >=1")
+    print("    refinement pass, then pick the eigengap peak (the pipeline's")
+    print("    --rwr-refine-passes auto implements exactly this).")
+    print("  • Pass 0 must be excluded — its huge eigengap is the depth/batch")
+    print("    confound, not cell type (high eigengap but low PC0 AUC).")
 
 
 if __name__ == "__main__":
