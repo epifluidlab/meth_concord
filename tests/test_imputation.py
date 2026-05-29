@@ -283,6 +283,64 @@ def test_run_rwr_pipeline_with_refinement():
     assert "mean_abs_delta_change" in diag["passes"][2]
 
 
+def test_post_norm_for_knn_strips_per_cell_shift():
+    """post_norm_for_knn output has per-row means ~0 (recenter applied)."""
+    rng = np.random.default_rng(7)
+    # Matrix with a strong per-cell additive shift that 'raw' QN would keep.
+    base = rng.normal(size=(15, 8))
+    shifted = base + rng.normal(scale=5.0, size=(15, 1))
+    out = imputation.post_norm_for_knn(shifted)
+    np.testing.assert_allclose(out.mean(axis=1), 0.0, atol=1e-12)
+    # NaN entries are imputed (no NaN in output).
+    assert not np.isnan(out).any()
+
+
+def test_run_rwr_pipeline_refinement_basis_postnorm_label():
+    """With refinement_basis='postnorm', the per-pass diagnostic records the
+    postnorm basis label and the run still produces a valid Δ matrix."""
+    rng = np.random.default_rng(21)
+    n_cells, n_bins = 20, 6
+    soft_counts = {
+        "k_open":   rng.uniform(size=(n_cells, n_bins)),
+        "k_closed": rng.uniform(size=(n_cells, n_bins)),
+        "k_mixed":  rng.uniform(size=(n_cells, n_bins)),
+        "n_linked": rng.uniform(low=1, high=5, size=(n_cells, n_bins)),
+    }
+    accessibility = pd.DataFrame(
+        rng.normal(size=(n_cells, n_bins)),
+        index=[f"c{i}" for i in range(n_cells)],
+        columns=[f"bin_{j}" for j in range(n_bins)],
+    )
+
+    _, delta, diag = imputation.run_rwr_pipeline(
+        soft_counts, accessibility, _identity_layer2,
+        n_refine_passes=1, k=5, refinement_basis="postnorm",
+    )
+    assert diag["refinement_basis"] == "postnorm"
+    assert diag["passes"][1]["knn_basis"] == "postnorm(Δ_signed_pass_0)"
+    assert delta.shape == (n_cells, n_bins)
+
+
+def test_run_rwr_pipeline_invalid_refinement_basis_raises():
+    rng = np.random.default_rng(22)
+    soft_counts = {
+        "k_open":   rng.uniform(size=(6, 3)),
+        "k_closed": rng.uniform(size=(6, 3)),
+        "k_mixed":  rng.uniform(size=(6, 3)),
+        "n_linked": rng.uniform(low=1, high=5, size=(6, 3)),
+    }
+    accessibility = pd.DataFrame(
+        rng.normal(size=(6, 3)),
+        index=[f"c{i}" for i in range(6)],
+        columns=[f"bin_{j}" for j in range(3)],
+    )
+    with pytest.raises(ValueError, match="refinement_basis"):
+        imputation.run_rwr_pipeline(
+            soft_counts, accessibility, _identity_layer2,
+            n_refine_passes=1, k=3, refinement_basis="nope",
+        )
+
+
 def test_run_rwr_pipeline_refinement_uses_original_raw_counts():
     """Critical invariant: each pass re-imputes from ORIGINAL soft counts,
     not from the previous pass's imputed values (design-doc §6 #5b)."""

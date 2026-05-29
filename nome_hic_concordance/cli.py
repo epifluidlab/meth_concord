@@ -112,11 +112,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'both' = compute and save both matrices in one run.",
     )
     parser.add_argument(
-        "--matrix-norm", choices=["zscore", "quantile"], default="zscore",
-        help="Per-bin normalization across cells in Step 7.  'zscore' (default) "
+        "--matrix-norm", choices=["auto", "zscore", "quantile"], default="auto",
+        help="Per-bin normalization across cells in Step 7.  'zscore' "
              "for the classical pipeline; 'quantile' for rank-based QN, matching "
              "the bulk-style preprocessing that's robust to outliers in sparse "
-             "single-cell data.",
+             "single-cell data.  'auto' (default): 'quantile' for "
+             "--concordance-method signed, 'zscore' otherwise.",
+    )
+    parser.add_argument(
+        "--concordance-formula", choices=["auto", "dm", "mle"], default="auto",
+        help="Per-(cell, bin) rate estimator for --concordance-method signed. "
+             "'dm' = Dirichlet-Multinomial posterior mean (k+α)/(n+α_total): "
+             "calibrated, but on post-RWR counts it double-shrinks (RWR already "
+             "pooled the cell graph) and the MoM concentration is inflated by "
+             "RWR's variance reduction, crushing cell-type signal onto a thin "
+             "PC.  'mle' = plug-in k/n: preserves RWR's cell-type-aware "
+             "smoothing and lifts the cell-type axis onto the dominant SVD "
+             "component (no --skip-top-svd needed).  'auto' (default): 'mle' "
+             "for signed, 'dm' otherwise.",
+    )
+    parser.add_argument(
+        "--refinement-basis", choices=["auto", "raw", "postnorm"], default="auto",
+        help="For RWR refinement passes (--rwr-refine-passes >= 1): which form "
+             "of the previous pass's Δ_signed to build the next k-NN graph "
+             "from.  'raw' = per-column-rank(Δ) only (legacy).  'postnorm' = "
+             "apply the Step-7 normalization (per-cell rank → per-bin QN → row "
+             "recenter) first, stripping per-cell shifts from the basis so "
+             "depth/accessibility community structure isn't re-injected into "
+             "the refined graph.  'postnorm' helps under --concordance-formula "
+             "mle; it's a no-op gain (or slight loss) under dm.  'auto' "
+             "(default): 'postnorm' for signed, 'raw' otherwise.",
     )
     parser.add_argument(
         "--per-cell-center", choices=["auto", "on", "off"], default="auto",
@@ -240,11 +265,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Number of nearest neighbours per cell (default: 15).")
     parser.add_argument("--rwr-restart-prob", type=float, default=0.5,
                         help="RWR restart probability r (default: 0.5).")
-    parser.add_argument("--rwr-refine-passes", type=int, default=0,
-                        help="Iterative refinement passes (default: 0). "
-                             "Each pass rebuilds the k-NN from QN(Δ_signed) "
-                             "of the previous pass; RWR always restarts from "
-                             "the original raw soft counts.")
+    parser.add_argument("--rwr-refine-passes", type=int, default=None,
+                        help="Iterative refinement passes.  Each pass rebuilds "
+                             "the k-NN from the previous pass's Δ_signed (see "
+                             "--refinement-basis); RWR always restarts from the "
+                             "original raw soft counts.  Default 'auto': 1 for "
+                             "--concordance-method signed (MLE needs one refine "
+                             "pass to lift cell-type onto PC0), 0 otherwise.")
     parser.add_argument("--rwr-solver", choices=["auto", "direct", "iterative"],
                         default="auto",
                         help="RWR linear solver. 'auto' uses direct (closed-"
@@ -798,6 +825,28 @@ def run_context(
                         f"but --batch-column was not provided."
                     )
 
+            # Resolve signed-method auto-defaults.  These ship as a coherent
+            # bundle: MLE keeps RWR's cell-type-aware smoothing intact (vs DM
+            # double-shrinkage), the post-norm refinement basis strips per-cell
+            # shifts from the refined k-NN graph, and one refine pass is needed
+            # for MLE to lift cell-type onto the dominant PC0.
+            concordance_formula = (
+                "mle" if args.concordance_formula == "auto"
+                else args.concordance_formula
+            )
+            refinement_basis = (
+                "postnorm" if args.refinement_basis == "auto"
+                else args.refinement_basis
+            )
+            rwr_refine_passes = (
+                1 if args.rwr_refine_passes is None else args.rwr_refine_passes
+            )
+            logger.info(
+                f"Signed estimator: formula={concordance_formula}, "
+                f"refinement_basis={refinement_basis}, "
+                f"refine_passes={rwr_refine_passes}"
+            )
+
             sig_result = concordance_mod.compute_signed_concordance_matrix(
                 posterior_paths, chrom_sizes,
                 bin_size=args.bin_size,
@@ -805,10 +854,12 @@ def run_context(
                 min_gch_sites=min_sites,
                 min_pairs_per_bin=args.min_pairs_per_bin,
                 statistic=args.concordance_statistic or "signed",
+                concordance_formula=concordance_formula,
                 use_rwr=(args.impute == "rwr"),
                 rwr_k=args.rwr_k,
                 rwr_restart_prob=args.rwr_restart_prob,
-                rwr_n_refine_passes=args.rwr_refine_passes,
+                rwr_n_refine_passes=rwr_refine_passes,
+                rwr_refinement_basis=refinement_basis,
                 rwr_solver=args.rwr_solver,
                 rwr_max_iter=args.rwr_max_iter,
                 rwr_tol=args.rwr_tol,
@@ -945,16 +996,26 @@ def run_context(
         else:
             post_norm_recenter = args.post_norm_recenter == "on"
 
-        # Resolve --skip-top-svd auto-default.  Empirically, even with
-        # --post-norm-recenter and --batch-correction, the dominant
-        # SVD axis of post-processed Δ_signed on NOMe-HiC data is a
-        # ~13% variance non-cell-type axis (correlates with per-cell
-        # median; likely cell-cycle or latent technical).  Per-cell
-        # mean centering reduces but does not remove it.  Dropping
-        # PC0 with --skip-top-svd 1 is the empirically validated fix.
-        # User-explicit values (including 0) override.
+        # Resolve --matrix-norm auto → quantile for signed (rank-based QN
+        # is the validated Step-7 normalization for Δ_signed), zscore
+        # otherwise (the classical pipeline).
+        if args.matrix_norm == "auto":
+            matrix_norm = (
+                "quantile" if args.concordance_method == "signed" else "zscore"
+            )
+        else:
+            matrix_norm = args.matrix_norm
+
+        # Resolve --skip-top-svd auto-default.  Under the signed MLE
+        # estimator (the auto default), the cell-type axis is the dominant
+        # PC0 — no skip needed.  Under the DM estimator a non-cell-type
+        # confounder still dominates PC0, so skip 1 there.  Non-signed
+        # methods never skip.  User-explicit values (including 0) override.
         if args.skip_top_svd is None:
-            skip_top_svd = 1 if args.concordance_method == "signed" else 0
+            if args.concordance_method == "signed" and args.concordance_formula == "dm":
+                skip_top_svd = 1
+            else:
+                skip_top_svd = 0
         else:
             skip_top_svd = args.skip_top_svd
 
@@ -962,7 +1023,7 @@ def run_context(
             concordance_shrunk,
             min_cell_coverage=args.min_cell_coverage,
             output_dir=str(concordance_dir),
-            matrix_norm=args.matrix_norm,
+            matrix_norm=matrix_norm,
             per_cell_center=per_cell_center,
             per_cell_norm=per_cell_norm,
             post_norm_recenter=post_norm_recenter,
@@ -983,7 +1044,7 @@ def run_context(
             norm_label = {
                 "zscore": ("z-scored", "umap_zscore"),
                 "quantile": ("quantile-normed", "umap_quantile"),
-            }.get(args.matrix_norm, (args.matrix_norm, f"umap_{args.matrix_norm}"))
+            }.get(matrix_norm, (matrix_norm, f"umap_{matrix_norm}"))
             norm_title, norm_prefix = norm_label
 
             # SVD scree-plot diagnostic on the normalized matrix.
@@ -991,7 +1052,7 @@ def run_context(
             visualization.run_svd_scree(
                 matrices["zscore"],
                 max_components=args.svd_scree_max,
-                output_prefix=f"svd_scree_{args.matrix_norm}",
+                output_prefix=f"svd_scree_{matrix_norm}",
                 output_dir=str(umap_dir),
                 random_state=args.random_seed,
             )

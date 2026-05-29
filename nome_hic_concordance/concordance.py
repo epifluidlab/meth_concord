@@ -860,10 +860,12 @@ def compute_signed_concordance_matrix(
     min_gch_sites: int = 2,
     min_pairs_per_bin: int = 1,
     statistic: str = "signed",
+    concordance_formula: str = "dm",
     use_rwr: bool = True,
     rwr_k: int = 15,
     rwr_restart_prob: float = 0.5,
     rwr_n_refine_passes: int = 0,
+    rwr_refinement_basis: str = "raw",
     rwr_solver: str = "auto",
     rwr_max_iter: int = 30,
     rwr_tol: float = 1e-4,
@@ -899,6 +901,23 @@ def compute_signed_concordance_matrix(
         Which output matrix to produce as the headline.  "open" still
         uses U-3 soft counts but reports Δ_open = E[π_l_open] − p̂²
         (the one-sided variant).  "both" returns both matrices.
+    concordance_formula : {"dm", "mle"}
+        Estimator for the per-(cell, bin) rates feeding Δ.  "dm" (default)
+        uses the Dirichlet-Multinomial posterior mean
+        ``(k_i + α_i) / (n + α_total)`` — calibrated but, on POST-RWR
+        counts, double-shrinks (RWR already pooled the cell graph, and the
+        MoM concentration is inflated by RWR's variance reduction).  "mle"
+        uses the plug-in ``k_i / n``, preserving RWR's cell-type-aware
+        smoothing; empirically lifts the cell-type axis onto the dominant
+        SVD component so ``--skip-top-svd`` is unnecessary.
+    rwr_refinement_basis : {"raw", "postnorm"}
+        For refinement passes (``rwr_n_refine_passes >= 1``): which form of
+        the previous pass's Δ_signed to build the next k-NN graph from.
+        "raw" (default) uses per-column-rank(Δ); "postnorm" first applies
+        the Step-7 normalization (per-cell rank → per-bin QN → row
+        recenter), removing per-cell shifts from the basis.  "postnorm"
+        helps under ``concordance_formula="mle"``; it is a no-op gain (or
+        slight loss) under "dm".
     use_rwr : bool
         Whether to run pre-Layer-2 RWR imputation.  Default True;
         decision-doc §6 #16 — without RWR, per-(cell, bin) Δ is
@@ -930,6 +949,10 @@ def compute_signed_concordance_matrix(
     if statistic not in ("signed", "open", "both"):
         raise ValueError(
             f"statistic must be 'signed', 'open', or 'both'; got {statistic!r}."
+        )
+    if concordance_formula not in ("dm", "mle"):
+        raise ValueError(
+            f"concordance_formula must be 'dm' or 'mle'; got {concordance_formula!r}."
         )
 
     out_path = ensure_dir(output_dir) if save_outputs else None
@@ -1066,19 +1089,51 @@ def compute_signed_concordance_matrix(
         fitted_priors["linked"] = {"alpha": alpha_l, "info": info_l}
         fitted_priors["unlinked"] = {"alpha": alpha_u, "info": info_u}
 
-        # Compute posterior means and Δ_signed per (cell, bin).
-        pm_l = _dm_posterior_means(
-            imputed, alpha_l, ("k_open", "k_closed", "k_mixed"), "n_linked",
-        )
-        pm_u = _dm_posterior_means(
-            {"k_open": imputed["k_u_open"], "k_closed": imputed["k_u_closed"],
-             "k_mixed": imputed["k_u_mixed"], "n_unlinked": imputed["n_unlinked"]},
-            alpha_u, ("k_open", "k_closed", "k_mixed"), "n_unlinked",
-        )
-
-        S_l = pm_l["open"] - pm_l["closed"]
-        S_u = pm_u["open"] - pm_u["closed"]
-        delta_signed = S_l - S_u
+        # Compute the per-(cell, bin) Δ_signed.  Two estimators:
+        #
+        #   "dm"  — Dirichlet-Multinomial posterior plug-in:
+        #             E[π_i] = (k_i + α_i) / (n + α_total).
+        #           Shrinks each rate toward the global prior mean.  This
+        #           is the classical, calibrated estimator — but on
+        #           POST-RWR counts it double-shrinks: RWR already pooled
+        #           evidence across the cell graph (cell-type-aware), and
+        #           the MoM-fit concentration (α_total ~ 100) is inflated
+        #           because RWR reduced the very cross-cell variance MoM
+        #           reads.  With fractional imputed n (often < 1), the
+        #           posterior is ~99% prior, crushing cell-type signal
+        #           onto a thin PC.
+        #
+        #   "mle" — maximum-likelihood plug-in: E[π_i] = k_i / n.
+        #           Keeps RWR's cell-type-aware smoothing intact instead
+        #           of layering a cell-type-blind global shrinkage on top.
+        #           Empirically lifts the cell-type axis onto the dominant
+        #           SVD component (no --skip-top-svd needed).  Robust to
+        #           the small-n variance blow-up via the downstream
+        #           per-cell rank normalization in Step 7.  Entries with
+        #           n == 0 contribute 0 to their side (matches the
+        #           independence-baseline convention).
+        if concordance_formula == "mle":
+            def _mle_signed(k_open, k_closed, n):
+                safe_n = np.where(n > 0, n, np.nan)
+                s = (k_open - k_closed) / safe_n
+                return np.nan_to_num(s, nan=0.0)
+            S_l = _mle_signed(imputed["k_open"], imputed["k_closed"],
+                              imputed["n_linked"])
+            S_u = _mle_signed(imputed["k_u_open"], imputed["k_u_closed"],
+                              imputed["n_unlinked"])
+            delta_signed = S_l - S_u
+        else:
+            pm_l = _dm_posterior_means(
+                imputed, alpha_l, ("k_open", "k_closed", "k_mixed"), "n_linked",
+            )
+            pm_u = _dm_posterior_means(
+                {"k_open": imputed["k_u_open"], "k_closed": imputed["k_u_closed"],
+                 "k_mixed": imputed["k_u_mixed"], "n_unlinked": imputed["n_unlinked"]},
+                alpha_u, ("k_open", "k_closed", "k_mixed"), "n_unlinked",
+            )
+            S_l = pm_l["open"] - pm_l["closed"]
+            S_u = pm_u["open"] - pm_u["closed"]
+            delta_signed = S_l - S_u
 
         # The min_pairs_per_bin filter only makes sense WITHOUT RWR.
         # With RWR on, every (cell, bin) has an imputed value blended
@@ -1112,6 +1167,7 @@ def compute_signed_concordance_matrix(
                 initial_feature_matrix=accessibility_df.fillna(np.nan),
                 layer2_fn=_layer2,
                 n_refine_passes=rwr_n_refine_passes,
+                refinement_basis=rwr_refinement_basis,
                 k=rwr_k, restart_prob=rwr_restart_prob,
                 solver=rwr_solver, max_iter=rwr_max_iter, tol=rwr_tol,
                 output_dir=output_dir if save_outputs else None,
@@ -1134,10 +1190,16 @@ def compute_signed_concordance_matrix(
         # existing one-sided convention so users can compare with the
         # legacy --concordance-method betabinom output.
         alpha_l = fitted_priors["linked"]["alpha"]
-        pm_l = _dm_posterior_means(
-            imputed_counts, alpha_l, ("k_open", "k_closed", "k_mixed"),
-            "n_linked",
-        )
+        if concordance_formula == "mle":
+            n_l = imputed_counts["n_linked"]
+            safe_n_l = np.where(n_l > 0, n_l, np.nan)
+            pm_l = {"open": np.nan_to_num(
+                imputed_counts["k_open"] / safe_n_l, nan=0.0)}
+        else:
+            pm_l = _dm_posterior_means(
+                imputed_counts, alpha_l, ("k_open", "k_closed", "k_mixed"),
+                "n_linked",
+            )
         n_u = imputed_counts["n_unlinked"]
         # p̂ from the per-end-rate identity:
         # sum_pairs (p_l + p_r) = 2 · k_u_open + k_u_mixed

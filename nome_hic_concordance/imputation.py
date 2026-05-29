@@ -62,6 +62,37 @@ def quantile_normalize_for_knn(matrix: np.ndarray) -> np.ndarray:
     return np.nan_to_num(qn - 0.5, nan=0.0)
 
 
+def post_norm_for_knn(matrix: np.ndarray) -> np.ndarray:
+    """Step-7-style normalization applied to a Δ_signed matrix for k-NN.
+
+    Mirrors :func:`matrix_ops.process_concordance_matrix` with
+    ``per_cell_norm='rank'``, ``matrix_norm='quantile'`` and
+    ``post_norm_recenter=True``:
+
+        1. per-cell rank  — each row → rank/(n_bins+1) − 0.5
+        2. per-bin QN     — each col → rank/(n_cells+1) − 0.5
+        3. row recenter   — subtract per-row mean
+
+    Used as the refinement-pass k-NN basis when
+    ``refinement_basis='postnorm'``.  Removing the per-cell shift from the
+    basis stops accessibility-level / depth community structure from being
+    re-injected into the refined graph.  NaN entries are imputed to 0
+    before ranking (matches the Step-7 default).
+    """
+    from scipy.stats import rankdata
+
+    X = np.nan_to_num(matrix.astype(np.float64), nan=0.0)
+    n_cells, n_bins = X.shape
+    # 1. per-cell rank.
+    pc = np.empty_like(X)
+    for i in range(n_cells):
+        pc[i] = rankdata(X[i], method="average") / (n_bins + 1) - 0.5
+    # 2. per-bin QN (rank to uniform, centered).
+    qn = _quantile_normalize_per_bin(pc, mask=np.ones_like(pc, dtype=bool)) - 0.5
+    # 3. row recenter.
+    return qn - qn.mean(axis=1, keepdims=True)
+
+
 # ---------------------------------------------------------------------------
 # k-NN graph construction
 # ---------------------------------------------------------------------------
@@ -308,6 +339,7 @@ def run_rwr_pipeline(
     max_iter: int = 30,
     tol: float = 1e-4,
     output_dir: str | None = None,
+    refinement_basis: str = "raw",
 ) -> tuple[dict[str, np.ndarray], pd.DataFrame, dict]:
     """Orchestrate the full RWR + (optional) refinement loop.
 
@@ -337,6 +369,14 @@ def run_rwr_pipeline(
         RWR parameters (see :func:`rwr_impute_matrices`).
     output_dir : str, optional
         If provided, saves the k-NN graph and diagnostics to disk.
+    refinement_basis : {"raw", "postnorm"}
+        How to derive the refinement-pass k-NN basis from the previous
+        pass's Δ_signed.  "raw" (default): per-column-rank(Δ) only.
+        "postnorm": apply Step-7 normalization (per-cell rank → per-bin
+        QN → row recenter) via :func:`post_norm_for_knn` first, so the
+        per-cell shift is stripped before the graph is built.  See
+        :func:`nome_hic_concordance.concordance.compute_signed_concordance_matrix`
+        for when to use each.
 
     Returns
     -------
@@ -352,12 +392,17 @@ def run_rwr_pipeline(
         raise ValueError(
             f"run_rwr_pipeline needs >= 2 cells; got {n_cells}."
         )
+    if refinement_basis not in ("raw", "postnorm"):
+        raise ValueError(
+            f"refinement_basis must be 'raw' or 'postnorm'; got {refinement_basis!r}."
+        )
 
     all_diagnostics: dict = {
         "n_cells": int(n_cells),
         "k": int(k),
         "restart_prob": float(restart_prob),
         "n_refine_passes": int(n_refine_passes),
+        "refinement_basis": refinement_basis,
         "solver_requested": solver,
         "passes": [],
     }
@@ -387,10 +432,23 @@ def run_rwr_pipeline(
 
     prev_delta = delta_df.copy()
     for pass_idx in range(1, n_refine_passes + 1):
-        # Rebuild k-NN from QN(prev_delta).
-        qn_delta = quantile_normalize_for_knn(prev_delta.to_numpy(dtype=np.float64))
+        # Rebuild k-NN from the previous pass's Δ_signed.  Two bases:
+        #   "raw"      — per-column-rank(Δ) only (legacy).  Keeps any
+        #                per-cell shift that survived into Δ, which under
+        #                MLE re-injects depth/accessibility community
+        #                structure into the refined graph.
+        #   "postnorm" — apply the Step-7 normalization (per-cell rank →
+        #                per-bin QN → row recenter) first, stripping the
+        #                per-cell shift before the graph is built.
+        prev_arr = prev_delta.to_numpy(dtype=np.float64)
+        if refinement_basis == "postnorm":
+            qn_delta = quantile_normalize_for_knn(post_norm_for_knn(prev_arr))
+            basis_label = f"postnorm(Δ_signed_pass_{pass_idx - 1})"
+        else:
+            qn_delta = quantile_normalize_for_knn(prev_arr)
+            basis_label = f"QN(Δ_signed_pass_{pass_idx - 1})"
         logger.info(
-            f"RWR pass {pass_idx}: rebuilding k-NN graph from QN(Δ_signed pass {pass_idx - 1})"
+            f"RWR pass {pass_idx}: rebuilding k-NN graph from {basis_label}"
         )
         W, P = build_knn_graph(qn_delta, k=k)
         # IMPORTANT: re-impute from the ORIGINAL raw soft counts, not
@@ -408,7 +466,7 @@ def run_rwr_pipeline(
         )
         all_diagnostics["passes"].append({
             "pass": pass_idx,
-            "knn_basis": f"QN(Δ_signed_pass_{pass_idx - 1})",
+            "knn_basis": basis_label,
             "mean_abs_delta_change": delta_change,
             "rwr": rwr_diag,
         })

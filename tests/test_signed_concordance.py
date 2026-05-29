@@ -246,6 +246,81 @@ def test_delta_signed_sanity_table_focal_active(tmp_path):
     )
 
 
+def _focal_active_paths(tmp_path, n_cells=10):
+    """Shared fixture: focal-active bin (linked co-open, unlinked p̂≈0.5)."""
+    paths = {}
+    for c in range(n_cells):
+        records = []
+        for i in range(20):
+            records.append({
+                "chrom": "chr1", "pos1": 100 + i * 2, "pos2": 500 + i * 2,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.95, "posterior2": 0.95, "distance": 400,
+            })
+        for i in range(20):
+            records.append({
+                "chrom": "chr1", "pos1": 700 + i * 2, "pos2": 720 + i * 2,
+                "n1": 5, "n2": 5,
+                "posterior1": 0.95, "posterior2": 0.05, "distance": 20,
+            })
+        path = tmp_path / f"c{c}.posteriors.parquet"
+        _make_posteriors(records).to_parquet(path)
+        paths[f"c{c}"] = str(path)
+    return paths
+
+
+def test_concordance_formula_mle_matches_unshrunk_rate(tmp_path):
+    """MLE Δ_signed on the focal-active bin equals the plug-in rate (≈0.9),
+    with no shrinkage toward the population mean.
+
+    Linked: 20 pairs both p=0.95 → S_l = (k_open−k_closed)/n ≈ 0.9.
+    Unlinked: 20 pairs p=(0.95, 0.05) → S_u ≈ 0.  Δ ≈ 0.9.
+    """
+    paths = _focal_active_paths(tmp_path)
+    result = concordance.compute_signed_concordance_matrix(
+        paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_pairs_per_bin=1, concordance_formula="mle",
+        use_rwr=False, eb_min_obs=2, n_threads=1,
+        output_dir=str(tmp_path / "out"), save_outputs=False,
+    )
+    cell_deltas = result["delta_signed"]["chr1:0"].dropna()
+    # soft_open = 0.95^2 = 0.9025, soft_closed = 0.05^2 = 0.0025 per linked
+    # pair → S_l = (0.9025 − 0.0025) = 0.9 exactly; S_u = 0.
+    np.testing.assert_allclose(cell_deltas.to_numpy(), 0.9, atol=1e-9)
+
+
+def test_concordance_formula_mle_more_extreme_than_dm(tmp_path):
+    """MLE (no prior) should give a Δ_signed at least as extreme as DM
+    (which shrinks toward the population mean) on the same input."""
+    paths = _focal_active_paths(tmp_path)
+    common = dict(
+        bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_pairs_per_bin=1, use_rwr=False, eb_min_obs=2, n_threads=1,
+        save_outputs=False,
+    )
+    dm = concordance.compute_signed_concordance_matrix(
+        paths, concordance_formula="dm",
+        output_dir=str(tmp_path / "dm"), **common,
+    )["delta_signed"]["chr1:0"].dropna()
+    mle = concordance.compute_signed_concordance_matrix(
+        paths, concordance_formula="mle",
+        output_dir=str(tmp_path / "mle"), **common,
+    )["delta_signed"]["chr1:0"].dropna()
+    # Both strongly positive; MLE not shrunk, so >= DM here.
+    assert (mle >= dm - 1e-9).all()
+    assert mle.mean() >= dm.mean()
+
+
+def test_concordance_formula_invalid_raises(tmp_path):
+    paths = _focal_active_paths(tmp_path, n_cells=3)
+    with pytest.raises(ValueError, match="concordance_formula"):
+        concordance.compute_signed_concordance_matrix(
+            paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+            concordance_formula="nope", use_rwr=False, eb_min_obs=2,
+            n_threads=1, output_dir=str(tmp_path / "x"), save_outputs=False,
+        )
+
+
 def test_delta_signed_silenced_bin_gives_negative(tmp_path):
     """Bin with most pairs co-closed → Δ_signed < 0."""
     paths = {}
