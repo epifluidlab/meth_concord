@@ -20,10 +20,14 @@ pipeline functions; loads one run's saved accessibility + soft counts.
 
 Usage
 -----
+    # Evaluate on the WHOLE sample's experimental labels (all cells), which
+    # is required for a full-set assessment — the HCG-derived labels only
+    # cover the high-coverage subset and would re-introduce the bias.
     python scripts/dm_vs_mle_fullset_diagnostic.py \\
         --concordance-dir output/signed_250kb_rwr_v3/context_GCH/05_concordance \\
-        --samples samples.filtered.tsv --batch-column batch \\
-        --hcg-labels output/signed_250kb_rwr/context_HCG/hcg_labels.umap_coords.tsv
+        --samples samples.filtered.with_batches.tsv --batch-column batch
+        # samples file columns: 'cell' (name), 'group' (label), 'batch'.
+        # --hcg-labels is OPTIONAL and only adds a high-cov-subset breakdown.
 """
 
 from __future__ import annotations
@@ -52,7 +56,12 @@ def _load_samples(path):
     df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "cell_name" not in df.columns:
-        df = df.rename(columns={df.columns[0]: "cell_name"})
+        # Accept 'cell' (e.g. samples.filtered.with_batches.tsv) or fall back
+        # to the first column.
+        if "cell" in df.columns:
+            df = df.rename(columns={"cell": "cell_name"})
+        else:
+            df = df.rename(columns={df.columns[0]: "cell_name"})
     return df
 
 
@@ -117,10 +126,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--concordance-dir", required=True)
-    ap.add_argument("--samples", required=True, help="claimed labels (all cells)")
+    ap.add_argument("--samples", required=True,
+                    help="Whole-sample labels for ALL cells, e.g. "
+                         "samples.filtered.with_batches.tsv with columns "
+                         "'cell','group' (label),'batch'.  Used for the "
+                         "headline full-set kNN accuracy.")
     ap.add_argument("--batch-column", default=None)
     ap.add_argument("--hcg-labels", default=None,
-                    help="optional: also report on the HCG-labeled subset")
+                    help="OPTIONAL high-coverage-subset breakdown only (e.g. "
+                         "hcg_labels.umap_coords.tsv).  Do NOT use this as the "
+                         "ground truth — it covers only high-cov cells and "
+                         "biases toward the easy subset.  Omit for a clean "
+                         "full-set assessment.")
     ap.add_argument("--k", type=int, default=15)
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")

@@ -77,6 +77,8 @@ def _load_samples(path: str) -> pd.DataFrame:
         df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
         if "cellname" in df.columns:
             df = df.rename(columns={"cellname": "cell_name"})
+        if "cell" in df.columns and "cell_name" not in df.columns:
+            df = df.rename(columns={"cell": "cell_name"})
         if "sample" in df.columns and "cell_name" not in df.columns:
             df = df.rename(columns={"sample": "cell_name"})
     else:
