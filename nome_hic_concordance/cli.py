@@ -142,9 +142,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "pooled the cell graph) and the MoM concentration is inflated by "
              "RWR's variance reduction, crushing cell-type signal onto a thin "
              "PC.  'mle' = plug-in k/n: preserves RWR's cell-type-aware "
-             "smoothing and lifts the cell-type axis onto the dominant SVD "
-             "component (no --skip-top-svd needed).  'auto' (default): 'mle' "
-             "for signed, 'dm' otherwise.",
+             "smoothing.  NOTE: a full-set comparison (kNN cell-type accuracy "
+             "on all cells) found DM beats MLE (DM+skip1 0.937 vs MLE best "
+             "0.930; MLE collapses without harmony); the earlier MLE win was "
+             "an artifact of validating on the high-coverage labeled subset.  "
+             "'auto' (default): 'dm' for signed, 'dm' otherwise.",
     )
     parser.add_argument(
         "--refinement-basis", choices=["auto", "raw", "postnorm"], default="auto",
@@ -211,11 +213,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "WARNING: center/zscore/combat subtract a per-batch mean, which "
              "removes the cell-type axis when cell-type composition is "
              "imbalanced across batches (empirically PC0 AUC 0.91→0.60).  "
-             "Harmony is 'protected' (removes batch within soft cell-type "
-             "clusters) and was the only method to preserve cell type AND "
-             "reduce residual batch.  "
-             "'auto' (default): 'harmony' if --batch-column is set, "
-             "'none' otherwise.",
+             "Harmony is 'protected' but, in the full-set comparison, did not "
+             "improve cell-type clustering under the DM default (DM+harmony"
+             "+skip1 0.926 vs DM+none+skip1 0.937); its lone marginal win "
+             "needs --skip-top-svd 0.  "
+             "'auto' (default): 'none' (correction off; opt into 'harmony' "
+             "with --skip-top-svd 0 if a within-cell-type batch effect must "
+             "be removed for downstream use).",
     )
     parser.add_argument(
         "--post-norm-recenter", choices=["auto", "on", "off"], default="auto",
@@ -834,19 +838,16 @@ def run_context(
                 output_dir=str(concordance_dir),
             )
         elif args.concordance_method == "signed":
-            # Resolve batch correction: 'auto' → 'harmony' if --batch-column
-            # is set, 'none' otherwise.  Batch labels come from the named
-            # column of samples.tsv.
-            #
-            # Harmony (not ComBat) is the protected default: when cell-type
-            # composition is imbalanced across batches (the common case),
-            # the per-batch mean subtraction in ComBat / center / zscore
-            # removes the cell-type axis along with batch — empirically
-            # PC0 cell-type AUC collapsed 0.91→0.60 while *raising* residual
-            # batch.  Harmony soft-clusters cells (clusters ≈ cell types) and
-            # removes batch *within* each cluster, so it preserved cell type
-            # (AUC 0.91) AND reduced residual batch (the only method to beat
-            # 'none' on both).  Requires the optional `harmonypy` dependency.
+            # Resolve batch correction: 'auto' → 'none'.  In the full-set
+            # comparison, batch correction did NOT improve cell-type
+            # clustering under the DM default: DM+none+skip1 = 0.937 vs
+            # DM+harmony+skip1 = 0.926 (harmony + skip double-handle the
+            # confound).  The lone marginal win was DM+harmony+skip0 = 0.940
+            # (≈1 cell over none+skip1), not worth the harmonypy dependency.
+            # ComBat/center/zscore remain harmful under composition imbalance
+            # (they delete the cell-type axis).  So 'auto' leaves correction
+            # off; opt into 'harmony' (with --skip-top-svd 0) explicitly if a
+            # within-cell-type batch effect must be removed for downstream use.
             batch_labels = None
             if args.batch_column is not None:
                 if args.batch_column not in samples.columns:
@@ -857,9 +858,7 @@ def run_context(
                     )
                 batch_labels = samples.set_index("cell_name")[args.batch_column]
             if args.batch_correction == "auto":
-                batch_correction = (
-                    "harmony" if batch_labels is not None else "none"
-                )
+                batch_correction = "none"
             else:
                 batch_correction = args.batch_correction
                 if batch_correction != "none" and batch_labels is None:
@@ -873,8 +872,15 @@ def run_context(
             # double-shrinkage), the post-norm refinement basis strips per-cell
             # shifts from the refined k-NN graph, and one refine pass is needed
             # for MLE to lift cell-type onto the dominant PC0.
+            # DM is the signed default.  A full-set comparison (kNN cell-type
+            # accuracy on ALL cells, claimed labels) showed DM beats MLE:
+            # DM+skip1 = 0.937 and DM+harmony+skip0 = 0.940, vs MLE's best
+            # 0.930 (and MLE collapses to ~0.80 without harmony).  The earlier
+            # MLE win was an artifact of validating on the high-coverage
+            # labeled subset, where PC0 is always cell type; on the full set
+            # the low-coverage cells put a confound on PC0 for MLE too.
             concordance_formula = (
-                "mle" if args.concordance_formula == "auto"
+                "dm" if args.concordance_formula == "auto"
                 else args.concordance_formula
             )
             refinement_basis = (
@@ -1069,13 +1075,18 @@ def run_context(
         else:
             matrix_norm = args.matrix_norm
 
-        # Resolve --skip-top-svd auto-default.  Under the signed MLE
-        # estimator (the auto default), the cell-type axis is the dominant
-        # PC0 — no skip needed.  Under the DM estimator a non-cell-type
-        # confounder still dominates PC0, so skip 1 there.  Non-signed
+        # Resolve --skip-top-svd auto-default.  On the FULL cell set the
+        # dominant PC0 of Δ_signed is a non-cell-type confound (the
+        # low-coverage cells), with cell type on PC1 — for BOTH estimators.
+        # So signed defaults to skip 1 (drop the confound; full-set kNN
+        # 0.884 → 0.937 for DM).  The exception is explicit MLE, where skip
+        # didn't help (kNN ~flat), so leave it at 0 there.  Non-signed
         # methods never skip.  User-explicit values (including 0) override.
+        _signed_formula = (
+            "mle" if args.concordance_formula == "mle" else "dm"
+        )
         if args.skip_top_svd is None:
-            if args.concordance_method == "signed" and args.concordance_formula == "dm":
+            if args.concordance_method == "signed" and _signed_formula == "dm":
                 skip_top_svd = 1
             else:
                 skip_top_svd = 0
