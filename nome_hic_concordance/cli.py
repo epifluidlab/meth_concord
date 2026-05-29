@@ -291,8 +291,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--n-svd", type=int, default=0,
         help="If > 0, reduce the normalized matrix to N components via "
              "TruncatedSVD before running UMAP (bulk-RNA / scATAC-seq "
-             "style).  0 (default) runs UMAP directly on the bin matrix.  "
-             "A scree plot is always emitted to help pick this value.",
+             "style).  0 runs UMAP directly on the bin matrix.  Auto-default: "
+             "10 for --concordance-method signed (the cell-type axis is PC0 "
+             "under MLE but only a few %% of variance, so the full bin matrix "
+             "swamps it; 10 components matches what signed used pre-MLE via "
+             "--skip-top-svd), 0 otherwise.  A scree plot is always emitted "
+             "to help tune this; an explicit value overrides the default.",
     )
     parser.add_argument(
         "--svd-scree-max", type=int, default=50,
@@ -1019,6 +1023,22 @@ def run_context(
         else:
             skip_top_svd = args.skip_top_svd
 
+        # Resolve --n-svd auto-default for the UMAP pre-reduction.  SVD only
+        # runs when n_svd>0 OR skip>0 (see visualization.run_umap_and_plot).
+        # Under signed MLE, skip resolves to 0, so without an n_svd default
+        # UMAP would run on the full ~10k-bin matrix and the cell-type PC0
+        # signal (a few % variance) would be swamped by noise dimensions.
+        # Default signed to 10 components — exactly the count signed used
+        # before (skip=1 fit 11, dropped the top → 10), but now keeping PC0
+        # since MLE puts cell type there.  The scree plot is always emitted
+        # for tuning; user-explicit --n-svd overrides.
+        if args.n_svd and args.n_svd > 0:
+            n_svd = args.n_svd
+        elif args.concordance_method == "signed":
+            n_svd = 10
+        else:
+            n_svd = 0
+
         matrices = matrix_ops.process_concordance_matrix(
             concordance_shrunk,
             min_cell_coverage=args.min_cell_coverage,
@@ -1057,11 +1077,11 @@ def run_context(
                 random_state=args.random_seed,
             )
 
-            svd_suffix = f"_svd{args.n_svd}" if args.n_svd and args.n_svd > 0 else ""
+            svd_suffix = f"_svd{n_svd}" if n_svd and n_svd > 0 else ""
             if skip_top_svd and skip_top_svd > 0:
                 svd_suffix += f"_skip{skip_top_svd}"
             svd_title = (
-                f" + SVD-{args.n_svd}" if args.n_svd and args.n_svd > 0 else ""
+                f" + SVD-{n_svd}" if n_svd and n_svd > 0 else ""
             )
             if skip_top_svd and skip_top_svd > 0:
                 svd_title += f" (skip top {skip_top_svd})"
@@ -1071,7 +1091,7 @@ def run_context(
                 title=f"UMAP (un-normalized{svd_title}, {context})",
                 output_prefix=f"umap_unnormalized{svd_suffix}",
                 output_dir=str(umap_dir),
-                n_svd=args.n_svd,
+                n_svd=n_svd,
                 skip_top_svd=skip_top_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
@@ -1081,7 +1101,7 @@ def run_context(
                 title=f"UMAP ({norm_title}{svd_title}, {context})",
                 output_prefix=f"{norm_prefix}{svd_suffix}",
                 output_dir=str(umap_dir),
-                n_svd=args.n_svd,
+                n_svd=n_svd,
                 skip_top_svd=skip_top_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
