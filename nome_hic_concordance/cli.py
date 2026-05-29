@@ -193,7 +193,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "requires `pip install combat` or `pip install inmoose`.  "
              "'harmony' = iterative cell-batch correction in PC space "
              "(Korsunsky 2019) — requires `pip install harmonypy`.  "
-             "'auto' (default): 'combat' if --batch-column is set, "
+             "WARNING: center/zscore/combat subtract a per-batch mean, which "
+             "removes the cell-type axis when cell-type composition is "
+             "imbalanced across batches (empirically PC0 AUC 0.91→0.60).  "
+             "Harmony is 'protected' (removes batch within soft cell-type "
+             "clusters) and was the only method to preserve cell type AND "
+             "reduce residual batch.  "
+             "'auto' (default): 'harmony' if --batch-column is set, "
              "'none' otherwise.",
     )
     parser.add_argument(
@@ -813,9 +819,19 @@ def run_context(
                 output_dir=str(concordance_dir),
             )
         elif args.concordance_method == "signed":
-            # Resolve batch correction: 'auto' → 'combat' if --batch-column
+            # Resolve batch correction: 'auto' → 'harmony' if --batch-column
             # is set, 'none' otherwise.  Batch labels come from the named
             # column of samples.tsv.
+            #
+            # Harmony (not ComBat) is the protected default: when cell-type
+            # composition is imbalanced across batches (the common case),
+            # the per-batch mean subtraction in ComBat / center / zscore
+            # removes the cell-type axis along with batch — empirically
+            # PC0 cell-type AUC collapsed 0.91→0.60 while *raising* residual
+            # batch.  Harmony soft-clusters cells (clusters ≈ cell types) and
+            # removes batch *within* each cluster, so it preserved cell type
+            # (AUC 0.91) AND reduced residual batch (the only method to beat
+            # 'none' on both).  Requires the optional `harmonypy` dependency.
             batch_labels = None
             if args.batch_column is not None:
                 if args.batch_column not in samples.columns:
@@ -827,7 +843,7 @@ def run_context(
                 batch_labels = samples.set_index("cell_name")[args.batch_column]
             if args.batch_correction == "auto":
                 batch_correction = (
-                    "combat" if batch_labels is not None else "none"
+                    "harmony" if batch_labels is not None else "none"
                 )
             else:
                 batch_correction = args.batch_correction
