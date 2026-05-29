@@ -48,6 +48,7 @@ batch = [
 nome_hic_concordance = "nome_hic_concordance.cli:main"
 nome_hic_pair_concordance = "nome_hic_concordance.pair_concordance.cli:main"
 nome_hic_compare = "nome_hic_concordance.comparison_cli:main"
+nome_hic_compartments = "nome_hic_concordance.compartments_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["nome_hic_concordance*"]
