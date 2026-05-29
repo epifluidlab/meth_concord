@@ -249,8 +249,19 @@ def _harmony_correction(
 
     meta = pd.DataFrame({"batch": batch_labels.values}, index=matrix.index)
     harmony_out = hm.run_harmony(pcs, meta, "batch")
-    # harmonypy stores corrected coordinates in ho.Z_corr (shape: components × cells).
-    corrected_pcs = harmony_out.Z_corr.T  # cells × n_comp
+    # harmonypy's Z_corr orientation varies across versions: older releases
+    # return (n_components, n_cells), newer ones (n_cells, n_components).
+    # Orient robustly to (n_cells, n_comp) before reconstructing.
+    n_cells = matrix.shape[0]
+    Z = np.asarray(harmony_out.Z_corr)
+    if Z.shape == (n_comp, n_cells):
+        Z = Z.T
+    elif Z.shape != (n_cells, n_comp):
+        raise ValueError(
+            f"Unexpected harmonypy Z_corr shape {Z.shape}; "
+            f"expected ({n_cells}, {n_comp}) or ({n_comp}, {n_cells})."
+        )
+    corrected_pcs = Z  # (n_cells, n_comp)
 
     # Reconstruct cells × bins.
     reconstructed = corrected_pcs @ pca.components_ + pca.mean_
