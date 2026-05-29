@@ -81,6 +81,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-cell-coverage", type=float, default=0.8,
                         help="Fraction of cells non-NA to retain a bin (default: 0.8).")
     parser.add_argument(
+        "--min-cell-pairs", type=int, default=0,
+        help="Signed method only: pre-imputation cell QC.  Drop cells whose "
+             "total informative pairs (linked + unlinked, summed over bins) "
+             "is below this, BEFORE building the RWR graph.  Sparse cells get "
+             "imputation-dominated Δ and can form spurious UMAP islands / "
+             "inject noise into the lower SVD components.  Default 0 (off); "
+             "use scripts/umap_residual_mixing_diagnostic.py to pick a "
+             "threshold from the coverage of mis-separated cells.")
+    parser.add_argument(
+        "--min-bin-coverage", type=float, default=0.0,
+        help="Signed method only: pre-imputation bin QC.  Drop bins where the "
+             "fraction of cells with any raw pair is below this, BEFORE RWR. "
+             "Default 0.0 (off).  (Distinct from --min-cell-coverage, which "
+             "filters the post-imputation Δ matrix in Step 7.)")
+    parser.add_argument(
         "--blacklist-bed", type=str, default=None,
         help="Optional path to a BED file of blacklist regions (e.g. ENCODE). "
              "Applied at Step 2 (BAM parsing): any read pair whose either "
@@ -897,6 +912,8 @@ def run_context(
                 min_distance=args.min_distance,
                 min_gch_sites=min_sites,
                 min_pairs_per_bin=args.min_pairs_per_bin,
+                min_cell_pairs=args.min_cell_pairs,
+                min_bin_coverage=args.min_bin_coverage,
                 statistic=args.concordance_statistic or "signed",
                 concordance_formula=concordance_formula,
                 use_rwr=(args.impute == "rwr"),

@@ -321,6 +321,64 @@ def test_concordance_formula_invalid_raises(tmp_path):
         )
 
 
+def test_min_cell_pairs_drops_sparse_cells(tmp_path):
+    """Pre-imputation cell QC drops cells below the informative-pair floor."""
+    paths = dict(_focal_active_paths(tmp_path, n_cells=4))  # 40 pairs each
+    # One near-empty cell with a single informative pair.
+    sparse = [{
+        "chrom": "chr1", "pos1": 100, "pos2": 500, "n1": 5, "n2": 5,
+        "posterior1": 0.9, "posterior2": 0.9, "distance": 400,
+    }]
+    sp = tmp_path / "sparse.posteriors.parquet"
+    _make_posteriors(sparse).to_parquet(sp)
+    paths["sparse"] = str(sp)
+
+    result = concordance.compute_signed_concordance_matrix(
+        paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_cell_pairs=5, concordance_formula="mle",
+        use_rwr=False, eb_min_obs=2, n_threads=1,
+        output_dir=str(tmp_path / "out"), save_outputs=False,
+    )
+    cells = list(result["delta_signed"].index)
+    assert "sparse" not in cells
+    assert len(cells) == 4
+
+
+def test_min_bin_coverage_drops_sparse_bins(tmp_path):
+    """Pre-imputation bin QC drops bins seen in too few cells."""
+    paths = {}
+    for c in range(4):
+        records = []
+        # All 4 cells share a dense bin around chr1:0.
+        for i in range(20):
+            records.append({
+                "chrom": "chr1", "pos1": 100 + i * 2, "pos2": 500 + i * 2,
+                "n1": 5, "n2": 5, "posterior1": 0.9, "posterior2": 0.9,
+                "distance": 400,
+            })
+        # Only cell 0 has any pair in a far bin (chr1:1,000,000).
+        if c == 0:
+            records.append({
+                "chrom": "chr1", "pos1": 1_000_100, "pos2": 1_000_600,
+                "n1": 5, "n2": 5, "posterior1": 0.9, "posterior2": 0.9,
+                "distance": 500,
+            })
+        p = tmp_path / f"c{c}.posteriors.parquet"
+        _make_posteriors(records).to_parquet(p)
+        paths[f"c{c}"] = str(p)
+
+    result = concordance.compute_signed_concordance_matrix(
+        paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+        min_bin_coverage=0.5, concordance_formula="mle",
+        use_rwr=False, eb_min_obs=2, n_threads=1,
+        output_dir=str(tmp_path / "out"), save_outputs=False,
+    )
+    # The far bin (present in 1/4 = 25% < 50%) is dropped; the shared bin stays.
+    bins = list(result["delta_signed"].columns)
+    assert "chr1:1000000" not in bins
+    assert "chr1:0" in bins
+
+
 def test_delta_signed_silenced_bin_gives_negative(tmp_path):
     """Bin with most pairs co-closed → Δ_signed < 0."""
     paths = {}

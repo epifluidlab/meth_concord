@@ -859,6 +859,8 @@ def compute_signed_concordance_matrix(
     min_distance: int = 1_000,
     min_gch_sites: int = 2,
     min_pairs_per_bin: int = 1,
+    min_cell_pairs: int = 0,
+    min_bin_coverage: float = 0.0,
     statistic: str = "signed",
     concordance_formula: str = "dm",
     use_rwr: bool = True,
@@ -1006,6 +1008,56 @@ def compute_signed_concordance_matrix(
         f"Total linked pairs across all cells: {raw_counts['n_linked'].sum():.0f}. "
         f"Total unlinked (short-range) pairs: {raw_counts['n_unlinked'].sum():.0f}."
     )
+
+    # ---- Step 2.5: pre-imputation sparsity QC ---------------------------
+    # Drop very sparse cells and bins BEFORE building the RWR graph.  A
+    # near-empty cell has almost no raw pairs, so its Δ is dominated by
+    # imputation; if its (noisy) accessibility profile links it to the
+    # wrong neighbours it lands as a spurious island and injects noise
+    # into the lower SVD components that fragment the UMAP.  Sparse bins
+    # likewise add noise dimensions.  Both filters default OFF (0); set
+    # via --min-cell-pairs / --min-bin-coverage.  Filtered here so the
+    # accessibility matrix, batch labels, and Δ outputs all inherit the
+    # same cell/bin set (accessibility is reindexed to cell_names below).
+    if min_cell_pairs and min_cell_pairs > 0:
+        total_pairs = (raw_counts["n_linked"] + raw_counts["n_unlinked"]).sum(axis=1)
+        keep_cell = total_pairs >= float(min_cell_pairs)
+        n_drop = int((~keep_cell).sum())
+        if n_drop:
+            logger.info(
+                f"Pre-imputation cell QC: dropping {n_drop}/{n_cells} cells with "
+                f"< {min_cell_pairs} informative pairs "
+                f"(kept median = {float(np.median(total_pairs[keep_cell])):.0f}, "
+                f"dropped max = {float(total_pairs[~keep_cell].max()) if n_drop else 0:.0f})."
+            )
+            cell_names = [c for c, keep in zip(cell_names, keep_cell) if keep]
+            raw_counts = {k: v[keep_cell] for k, v in raw_counts.items()}
+            n_cells = len(cell_names)
+
+    if min_bin_coverage and min_bin_coverage > 0.0:
+        has_pair = (raw_counts["n_linked"] + raw_counts["n_unlinked"]) > 0
+        bin_cov = has_pair.mean(axis=0)
+        keep_bin = bin_cov >= float(min_bin_coverage)
+        n_drop = int((~keep_bin).sum())
+        if n_drop:
+            logger.info(
+                f"Pre-imputation bin QC: dropping {n_drop}/{n_bins} bins with "
+                f"raw coverage < {min_bin_coverage:.0%} of cells."
+            )
+            sorted_bins = [b for b, keep in zip(sorted_bins, keep_bin) if keep]
+            raw_counts = {k: v[:, keep_bin] for k, v in raw_counts.items()}
+            n_bins = len(sorted_bins)
+
+    if n_cells < 2:
+        raise ValueError(
+            f"After sparsity QC only {n_cells} cell(s) remain; "
+            f"lower --min-cell-pairs (was {min_cell_pairs})."
+        )
+    if n_bins == 0:
+        raise ValueError(
+            f"After sparsity QC no bins remain; lower --min-bin-coverage "
+            f"(was {min_bin_coverage})."
+        )
 
     # ---- Step 3: mean accessibility for the RWR k-NN basis --------------
     accessibility_df, _ = _accessibility_mod.compute_accessibility_matrix(
