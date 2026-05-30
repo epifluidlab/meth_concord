@@ -188,14 +188,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--batch-column", type=str, default=None,
-        help="Column name in --samples that contains the batch label "
-             "for each cell (e.g., 'batch').  When set, the mean "
-             "accessibility matrix is batch-corrected (per --batch-correction "
-             "method) before the RWR k-NN graph is built, so batch "
-             "structure doesn't leak into the cell-cell similarity matrix "
-             "and propagate into Δ_signed.  COL is the column NAME, not "
-             "a positional index.  Cells without a label in the manifest "
-             "are grouped as a synthetic '__unknown_batch__'.",
+        help="Column name(s) in --samples holding batch labels.  Accepts a "
+             "single column (e.g. 'batch') or a COMMA-SEPARATED list of "
+             "several batch sources (e.g. "
+             "'culture_batch,libprep_batch,seq_batch').  When set, the mean "
+             "accessibility matrix is batch-corrected (per --batch-correction) "
+             "before the RWR k-NN graph is built.  With multiple columns, "
+             "--batch-correction harmony harmonizes over all of them jointly "
+             "(Harmony's native multi-covariate vars_use); center/zscore/"
+             "combat collapse them to a single composite (cartesian-product) "
+             "batch.  Names, not positional indices.  Cells lacking a label "
+             "are pooled into '__unknown_batch__'.",
     )
     parser.add_argument(
         "--batch-correction",
@@ -850,13 +853,21 @@ def run_context(
             # within-cell-type batch effect must be removed for downstream use.
             batch_labels = None
             if args.batch_column is not None:
-                if args.batch_column not in samples.columns:
+                # One or more comma-separated batch columns (e.g. cell-culture
+                # + library-prep + sequencing batch).  Harmony harmonizes over
+                # all of them jointly; the other methods use the composite.
+                batch_cols = [c.strip() for c in args.batch_column.split(",")
+                              if c.strip()]
+                missing = [c for c in batch_cols if c not in samples.columns]
+                if missing:
                     raise ValueError(
-                        f"--batch-column {args.batch_column!r} is not a "
-                        f"column in {args.samples}. Available columns: "
-                        f"{samples.columns.tolist()}"
+                        f"--batch-column {missing} not in {args.samples}. "
+                        f"Available columns: {samples.columns.tolist()}"
                     )
-                batch_labels = samples.set_index("cell_name")[args.batch_column]
+                # Single column -> Series; multiple -> DataFrame.
+                idx = samples.set_index("cell_name")
+                batch_labels = (idx[batch_cols[0]] if len(batch_cols) == 1
+                                else idx[batch_cols])
             if args.batch_correction == "auto":
                 batch_correction = "none"
             else:

@@ -72,7 +72,7 @@ def test_unlabeled_cells_become_unknown_batch(caplog):
         out = bc.apply_batch_correction(mat, batches, method="center")
     # Output still has the same shape.
     assert out.shape == mat.shape
-    assert "no batch label" in caplog.text.lower()
+    assert "__unknown_batch__" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -224,3 +224,76 @@ def test_batch_anova_f_zero_for_identical_batches():
     f_stats = bc.batch_anova_f_per_bin(mat, batches)
     # Random data with no shift → F ~ Fisher distribution centred around 1.
     assert float(np.nanmedian(f_stats)) < 5.0
+
+
+# ---------------------------------------------------------------------------
+# Multiple batch variables (cell-culture / library-prep / sequencing batch)
+# ---------------------------------------------------------------------------
+
+
+def _make_two_factor(n_per=15, n_bins=24, shift=6.0, seed=0):
+    """Matrix where the (factorA, factorB) COMBINATION sets the per-bin shift."""
+    rng = np.random.default_rng(seed)
+    groups = [("a0", "b0"), ("a0", "b1"), ("a1", "b0"), ("a1", "b1")]
+    blocks, fa, fb, names = [], [], [], []
+    k = 0
+    for gi, (a, b) in enumerate(groups):
+        blocks.append(rng.normal(size=(n_per, n_bins)) + (gi + 1) * shift)
+        for _ in range(n_per):
+            fa.append(a); fb.append(b); names.append(f"c{k:03d}"); k += 1
+    mat = pd.DataFrame(np.vstack(blocks), index=names,
+                       columns=[f"chr1:{j * 250_000}" for j in range(n_bins)])
+    bdf = pd.DataFrame({"culture": fa, "libprep": fb}, index=names)
+    return mat, bdf
+
+
+def test_coerce_batch_df_series_and_frame():
+    mat, bdf = _make_two_factor()
+    # Series -> single-column frame.
+    s = bdf["culture"]
+    df1 = bc._coerce_batch_df(s, mat.index)
+    assert list(df1.columns) == ["culture"] and len(df1) == len(mat)
+    # DataFrame -> passthrough (both columns), str-typed.
+    df2 = bc._coerce_batch_df(bdf, mat.index)
+    assert list(df2.columns) == ["culture", "libprep"]
+    assert df2["culture"].dtype == object
+
+
+def test_composite_label_is_cartesian_product():
+    _, bdf = _make_two_factor()
+    comp = bc._composite_label(bdf)
+    assert set(comp.unique()) == {"a0|b0", "a0|b1", "a1|b0", "a1|b1"}
+
+
+def test_multi_batch_center_removes_composite_mean():
+    """center with a 2-column DataFrame removes the per-composite-group mean."""
+    mat, bdf = _make_two_factor()
+    out = bc.apply_batch_correction(mat, bdf, method="center")
+    comp = bdf.agg("|".join, axis=1)
+    for g, cells in comp.groupby(comp).groups.items():
+        grp_mean = out.loc[cells].mean(axis=0).abs().max()
+        assert grp_mean < 1e-9, f"group {g} not centered"
+
+
+def test_multi_batch_anova_f_accepts_dataframe():
+    mat, bdf = _make_two_factor(n_bins=20)
+    f_stats = bc.batch_anova_f_per_bin(mat, bdf)   # composite ANOVA
+    assert isinstance(f_stats, pd.Series) and len(f_stats) == 20
+    # Strong composite-group shifts -> large F before correction.
+    assert float(np.nanmedian(f_stats)) > 10.0
+
+
+def test_multi_batch_all_constant_is_noop(caplog):
+    mat, bdf = _make_two_factor()
+    const = pd.DataFrame({"x": ["one"] * len(mat), "y": ["k"] * len(mat)},
+                         index=mat.index)
+    out = bc.apply_batch_correction(mat, const, method="center")
+    np.testing.assert_array_equal(out.to_numpy(), mat.to_numpy())
+
+
+@pytest.mark.skipif(not _have_harmony(), reason="harmonypy not installed")
+def test_harmony_accepts_multiple_batch_vars():
+    """Harmony harmonizes over several batch variables jointly (vars_use)."""
+    mat, bdf = _make_two_factor(n_per=20, n_bins=40, shift=8.0)
+    out = bc.apply_batch_correction(mat, bdf, method="harmony")
+    assert out.shape == mat.shape

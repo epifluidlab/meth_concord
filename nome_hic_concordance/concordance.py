@@ -874,7 +874,7 @@ def compute_signed_concordance_matrix(
     rwr_max_iter: int = 30,
     rwr_tol: float = 1e-4,
     eb_min_obs: int = 50,
-    batch_labels: pd.Series | None = None,
+    batch_labels: pd.Series | pd.DataFrame | None = None,
     batch_correction: str = "none",
     n_threads: int = 4,
     output_dir: str = "output/05_concordance",

@@ -34,9 +34,51 @@ logger = logging.getLogger(__name__)
 VALID_METHODS = ("none", "center", "zscore", "combat", "harmony")
 
 
+_UNKNOWN = "__unknown_batch__"
+
+
+def _coerce_batch_df(batch_labels, index: pd.Index) -> pd.DataFrame:
+    """Normalize batch labels to a cells × batch-variables DataFrame.
+
+    Accepts a Series (one batch variable) or a DataFrame (several batch
+    variables, e.g. cell-culture / library-prep / sequencing batch).
+    Reindexes to ``index``, fills missing labels with ``__unknown_batch__``
+    per column, and casts to str.
+    """
+    if isinstance(batch_labels, pd.Series):
+        df = batch_labels.to_frame(name=(batch_labels.name or "batch"))
+    else:
+        df = pd.DataFrame(batch_labels)
+    df = df.reindex(index)
+    for c in df.columns:
+        n_na = int(df[c].isna().sum())
+        if n_na:
+            logger.warning(
+                f"{n_na} of {len(index)} cells have no '{c}' label; "
+                f"grouping them as '{_UNKNOWN}'.")
+        df[c] = df[c].fillna(_UNKNOWN).astype(str)
+    return df
+
+
+def _composite_label(batch_df: pd.DataFrame) -> pd.Series:
+    """Cartesian-product label across batch variables (for single-factor
+    methods center/zscore/combat, which model one categorical batch)."""
+    if batch_df.shape[1] == 1:
+        return batch_df.iloc[:, 0]
+    comp = batch_df.astype(str).agg("|".join, axis=1)
+    n_groups = comp.nunique()
+    small = int((comp.value_counts() < 3).sum())
+    logger.info(
+        f"Combined {list(batch_df.columns)} into {n_groups} composite batch "
+        f"groups for single-factor correction "
+        f"({small} group(s) have < 3 cells — consider harmony, which models "
+        f"the batch variables jointly rather than as a product).")
+    return comp
+
+
 def apply_batch_correction(
     matrix: pd.DataFrame,
-    batch_labels: pd.Series,
+    batch_labels,
     method: str = "combat",
 ) -> pd.DataFrame:
     """Apply batch correction to a cells × bins matrix.
@@ -47,9 +89,14 @@ def apply_batch_correction(
         Cells × bins (e.g., mean accessibility per (cell, bin)).
         NaNs are allowed and propagated through the simpler methods;
         ComBat / Harmony require NaN-free inputs (caller should impute).
-    batch_labels : Series
-        ``cell_name -> batch_label``.  Cells without a label are grouped
-        into a synthetic ``"__unknown_batch__"`` batch with a warning.
+    batch_labels : Series | DataFrame
+        ``cell_name -> batch_label`` (one batch variable), OR a cells ×
+        batch-variables DataFrame for MULTIPLE batch sources (e.g.
+        cell-culture batch + library-prep batch + sequencing batch).
+        Harmony harmonizes over all variables jointly (its native
+        ``vars_use`` list); center/zscore/combat collapse them to a
+        single composite (cartesian-product) batch.  Cells without a
+        label are pooled into ``"__unknown_batch__"`` with a warning.
     method : str
         One of :data:`VALID_METHODS`.
 
@@ -65,37 +112,32 @@ def apply_batch_correction(
     if method == "none":
         return matrix
 
-    # Align batch labels to matrix index.
-    batch_labels = pd.Series(batch_labels).reindex(matrix.index)
-    n_na = int(batch_labels.isna().sum())
-    if n_na > 0:
+    batch_df = _coerce_batch_df(batch_labels, matrix.index)
+    levels = {c: int(batch_df[c].nunique()) for c in batch_df.columns}
+    if all(v < 2 for v in levels.values()):
         logger.warning(
-            f"{n_na} of {len(matrix)} cells have no batch label; "
-            f"grouping them as '__unknown_batch__'."
-        )
-        batch_labels = batch_labels.fillna("__unknown_batch__")
-
-    n_batches = batch_labels.nunique()
-    if n_batches < 2:
-        logger.warning(
-            f"Only {n_batches} unique batch label(s) found "
-            f"({batch_labels.unique().tolist()}); batch correction is a no-op."
-        )
+            f"No batch variable has >= 2 levels ({levels}); "
+            f"batch correction is a no-op.")
         return matrix
 
     logger.info(
-        f"Applying batch correction (method='{method}', {n_batches} batches, "
+        f"Applying batch correction (method='{method}', "
+        f"variables={list(batch_df.columns)}, levels={levels}, "
         f"{len(matrix)} cells, {matrix.shape[1]:,} bins)"
     )
 
-    if method == "center":
-        return _per_batch_center(matrix, batch_labels)
-    if method == "zscore":
-        return _per_batch_zscore(matrix, batch_labels)
-    if method == "combat":
-        return _combat_correction(matrix, batch_labels)
     if method == "harmony":
-        return _harmony_correction(matrix, batch_labels)
+        # Harmony models the batch variables jointly.
+        return _harmony_correction(matrix, batch_df)
+
+    # Single-factor methods: collapse to one composite batch.
+    composite = _composite_label(batch_df)
+    if method == "center":
+        return _per_batch_center(matrix, composite)
+    if method == "zscore":
+        return _per_batch_zscore(matrix, composite)
+    if method == "combat":
+        return _combat_correction(matrix, composite)
     raise ValueError(f"unreachable: method={method!r}")
 
 
@@ -209,7 +251,7 @@ def _try_import_pycombat():
 
 
 def _harmony_correction(
-    matrix: pd.DataFrame, batch_labels: pd.Series,
+    matrix: pd.DataFrame, batch_df: pd.DataFrame,
     n_components: int = 50,
 ) -> pd.DataFrame:
     """Harmony iterative batch correction (Korsunsky et al. 2019).
@@ -218,7 +260,10 @@ def _harmony_correction(
 
     1. PCA → top ``n_components`` components of ``matrix``.
     2. Harmony iteratively soft-clusters cells across batches and
-       computes per-cluster batch offsets, correcting each cell.
+       computes per-cluster batch offsets, correcting each cell.  When
+       ``batch_df`` has multiple columns (e.g. cell-culture + library-prep
+       + sequencing batch), all are passed to Harmony's ``vars_use`` and
+       harmonized jointly.
     3. Reconstruct cells × bins from the corrected PC scores.
 
     Note: reconstruction is approximate (lossy in the principal
@@ -247,8 +292,10 @@ def _harmony_correction(
     pca = PCA(n_components=n_comp, random_state=42)
     pcs = pca.fit_transform(matrix.to_numpy(dtype=np.float64))
 
-    meta = pd.DataFrame({"batch": batch_labels.values}, index=matrix.index)
-    harmony_out = hm.run_harmony(pcs, meta, "batch")
+    # Harmony aligns meta rows positionally with the PCA rows (matrix order).
+    meta = batch_df.reset_index(drop=True)
+    vars_use = list(batch_df.columns)
+    harmony_out = hm.run_harmony(pcs, meta, vars_use)
     # harmonypy's Z_corr orientation varies across versions: older releases
     # return (n_components, n_cells), newer ones (n_cells, n_components).
     # Orient robustly to (n_cells, n_comp) before reconstructing.
@@ -276,12 +323,15 @@ def _harmony_correction(
 
 
 def batch_anova_f_per_bin(
-    matrix: pd.DataFrame, batch_labels: pd.Series,
+    matrix: pd.DataFrame, batch_labels,
 ) -> pd.Series:
     """Per-bin one-way ANOVA F-statistic across batches.
 
     High F values indicate strong residual batch effect at that bin;
-    near-1 values indicate negligible batch effect.
+    near-1 values indicate negligible batch effect.  Accepts a Series
+    (one batch variable) or a DataFrame (several); a DataFrame is
+    collapsed to a composite (cartesian-product) batch for the one-way
+    test.
 
     Returns
     -------
@@ -289,7 +339,8 @@ def batch_anova_f_per_bin(
     """
     import scipy.stats as ss
 
-    batch_labels = pd.Series(batch_labels).reindex(matrix.index)
+    batch_df = _coerce_batch_df(batch_labels, matrix.index)
+    batch_labels = _composite_label(batch_df)
     f_stats = np.full(matrix.shape[1], np.nan)
     cols = matrix.to_numpy()
     batch_values = batch_labels.values
