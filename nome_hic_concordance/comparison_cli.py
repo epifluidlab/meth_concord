@@ -64,6 +64,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="cells × bins mean-accessibility parquet (baseline).")
     p.add_argument("--compartment-matrix", default=None,
                    help="cells × bins scHi-C compartment-score parquet (baseline).")
+    p.add_argument("--baseline-matrix", action="append", default=[],
+                   metavar="NAME=PATH",
+                   help="Additional baseline matrix as NAME=PATH (repeatable). "
+                        "Use to add e.g. mean HCG methylation "
+                        "(hcg_mean=.../context_HCG/05_concordance/accessibility_mean.parquet) "
+                        "so concordance must beat methylation LEVEL, not just "
+                        "accessibility — the coordination-vs-level control.")
     p.add_argument("--concordance-matrix", action="append", default=[],
                    metavar="NAME=PATH",
                    help="cells × bins concordance parquet to test, as "
@@ -104,6 +111,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.compartment_matrix:
         matrices["compartment"] = pd.read_parquet(args.compartment_matrix)
         baseline_names.append("compartment")
+    for spec in args.baseline_matrix:
+        name, path = _parse_named(spec)
+        matrices[name] = pd.read_parquet(path)
+        baseline_names.append(name)
     for spec in args.concordance_matrix:
         name, path = _parse_named(spec)
         matrices[name] = pd.read_parquet(path)
