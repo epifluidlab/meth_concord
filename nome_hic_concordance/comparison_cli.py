@@ -85,6 +85,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--n-svd", type=int, default=10)
     p.add_argument("--min-cell-coverage", type=float, default=0.5)
     p.add_argument("--n-folds", type=int, default=5)
+    p.add_argument("--level-control", choices=["linear", "quadratic"],
+                   default="linear",
+                   help="Variance-partition regression of concordance on the "
+                        "baselines.  'quadratic' adds squares + interactions so "
+                        "the residual is cleansed of NONLINEAR level dependence "
+                        "— the conservative control for 'does concordance carry "
+                        "structure beyond marginal levels?'.")
     p.add_argument("--random-seed", type=int, default=42)
     p.add_argument("--log-level", default="INFO")
     return p.parse_args(argv)
@@ -140,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         min_cell_coverage=args.min_cell_coverage,
         n_folds=args.n_folds,
         random_state=args.random_seed,
+        level_control=args.level_control,
     )
 
     # Headline to stdout.

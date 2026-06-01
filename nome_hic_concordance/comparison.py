@@ -203,17 +203,54 @@ def marginal_analysis(
 # (b) Per-bin variance-partition regression + (c) residual UMAP
 # ---------------------------------------------------------------------------
 
+def _design_matrix(Xcols: np.ndarray, level_control: str) -> np.ndarray:
+    """Per-bin regression design from predictor columns (n_cells × n_pred).
+
+    Predictors are standardized (center + scale) for numerical stability —
+    this leaves OLS fitted values / R² / residuals unchanged vs raw
+    predictors (only coefficients rescale), so 'linear' reproduces the
+    plain OLS exactly.  'quadratic' adds the squares + pairwise
+    interactions, removing any *nonlinear* dependence on the levels so the
+    residual cannot retain a curved level relationship masquerading as
+    independent coordination signal.
+    """
+    n, p = Xcols.shape
+    parts = [np.ones((n, 1))]
+    if p == 0:
+        return parts[0]
+    mu = Xcols.mean(axis=0, keepdims=True)
+    sd = Xcols.std(axis=0, ddof=0, keepdims=True)
+    sd = np.where(sd < 1e-12, 1.0, sd)
+    Z = (Xcols - mu) / sd
+    parts.append(Z)
+    if level_control == "quadratic":
+        parts.append(Z ** 2)
+        for a in range(p):
+            for b in range(a + 1, p):
+                parts.append((Z[:, a] * Z[:, b]).reshape(-1, 1))
+    elif level_control != "linear":
+        raise ValueError(
+            f"level_control must be 'linear' or 'quadratic'; got {level_control!r}")
+    return np.column_stack(parts)
+
+
 def variance_partition(
     target: pd.DataFrame,
     predictors: dict[str, pd.DataFrame],
     target_name: str,
     output_dir: str,
+    level_control: str = "linear",
 ) -> pd.DataFrame:
     """Per-bin OLS of ``target`` on ``predictors`` (aligned to target grid).
 
     Writes regression_R2_per_bin_{target}.parquet, the R² histogram, and
     delta_residual_{target}.parquet.  Returns the residual matrix
     (cells × bins) — target minus its fit from the predictors.
+
+    ``level_control='quadratic'`` expands each bin's design with the
+    predictors' squares + pairwise interactions, so the residual is
+    cleansed of *nonlinear* level dependence (the conservative control a
+    reviewer will ask for).
     """
     out = ensure_dir(output_dir)
     cells = target.index
@@ -239,9 +276,12 @@ def variance_partition(
         X = np.column_stack(cols) if cols else np.empty((n_cells, 0))
         # Drop cells with any NaN in y or X for this bin.
         good = np.isfinite(y) & np.all(np.isfinite(X), axis=1) if X.size else np.isfinite(y)
-        if good.sum() < (X.shape[1] + 2) or np.nanstd(y[good]) < 1e-12:
+        if np.nanstd(y[good]) < 1e-12:
             continue
-        Xg = np.column_stack([np.ones(good.sum()), X[good]])
+        Xg = _design_matrix(X[good] if X.size else np.empty((int(good.sum()), 0)),
+                            level_control)
+        if good.sum() < Xg.shape[1] + 1:
+            continue
         yg = y[good]
         beta, *_ = np.linalg.lstsq(Xg, yg, rcond=None)
         yhat = Xg @ beta
@@ -263,8 +303,8 @@ def variance_partition(
     _r2_hist(r2, target_name, out)
     med = float(np.nanmedian(r2))
     logger.info(
-        f"[variance-partition] {target_name} ~ {'+'.join(predictors)}: "
-        f"median R² = {med:.3f} "
+        f"[variance-partition] {target_name} ~ {'+'.join(predictors)} "
+        f"({level_control}): median R² = {med:.3f} "
         f"(low R² ⇒ concordance is NOT explained by the baselines)."
     )
     return residual_df
@@ -415,6 +455,7 @@ def run_comparison(
     min_cell_coverage: float = 0.5,
     n_folds: int = 5,
     random_state: int = 42,
+    level_control: str = "linear",
 ) -> dict:
     """Run the full §4.2 suite; write summary.json; return the headline dict."""
     out = ensure_dir(output_dir)
@@ -452,7 +493,8 @@ def run_comparison(
                 continue
             tnorm = _prep_matrix(matrices[cn], cn, output_dir, matrix_norm,
                                  min_cell_coverage)
-            resid = variance_partition(tnorm, base_norm, cn, output_dir)
+            resid = variance_partition(tnorm, base_norm, cn, output_dir,
+                                       level_control=level_control)
             summary["residual"][cn] = residual_umap(
                 resid, labels, cn, output_dir, matrix_norm, n_svd,
                 min_cell_coverage, random_state)

@@ -134,6 +134,50 @@ def test_run_comparison_end_to_end_smoke(tmp_path):
     assert loaded["n_cells"] == 40
 
 
+def test_quadratic_level_control_removes_nonlinear_dependence(tmp_path):
+    """When concordance is a NONLINEAR (quadratic) function of the level,
+    linear control under-removes it (residual retains structure, R²<1) but
+    quadratic control removes it (R²≈1, residual≈0)."""
+    rng = np.random.default_rng(5)
+    n, nb = 50, 12
+    cells = _cells(n)
+    bins = _bins(nb, 250_000)
+    level = rng.normal(size=(n, nb))
+    # concordance = pure quadratic function of the level (+ tiny noise).
+    target_raw = level ** 2 + rng.normal(0, 1e-3, size=(n, nb))
+    level_df = pd.DataFrame(level, index=cells, columns=bins)
+    target_df = pd.DataFrame(target_raw, index=cells, columns=bins)
+    base = comparison._prep_matrix(level_df, "lvl", str(tmp_path), "zscore", 0.5)
+    tgt = comparison._prep_matrix(target_df, "tgt", str(tmp_path), "zscore", 0.5)
+
+    comparison.variance_partition(tgt, {"lvl": base}, "lin", str(tmp_path),
+                                  level_control="linear")
+    comparison.variance_partition(tgt, {"lvl": base}, "quad", str(tmp_path),
+                                  level_control="quadratic")
+    r2_lin = pd.read_parquet(tmp_path / "regression_R2_per_bin_lin.parquet")["R2"]
+    r2_quad = pd.read_parquet(tmp_path / "regression_R2_per_bin_quad.parquet")["R2"]
+    # Quadratic explains the nonlinear level dependence much better.
+    assert np.nanmedian(r2_quad) > np.nanmedian(r2_lin) + 0.2
+    assert np.nanmedian(r2_quad) > 0.9
+
+
+def test_design_matrix_linear_matches_plain_ols():
+    """'linear' design (standardized) gives the same fit as raw-predictor OLS."""
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(40, 2))
+    y = 2.0 + 1.5 * X[:, 0] - 0.7 * X[:, 1] + rng.normal(0, 0.1, 40)
+    D = comparison._design_matrix(X, "linear")
+    Draw = np.column_stack([np.ones(40), X])
+    yhat_std = D @ np.linalg.lstsq(D, y, rcond=None)[0]
+    yhat_raw = Draw @ np.linalg.lstsq(Draw, y, rcond=None)[0]
+    np.testing.assert_allclose(yhat_std, yhat_raw, atol=1e-8)
+
+
+def test_design_matrix_invalid_level_control_raises():
+    with pytest.raises(ValueError, match="level_control"):
+        comparison._design_matrix(np.zeros((5, 2)), "cubic")
+
+
 def test_run_comparison_requires_shared_cells(tmp_path):
     a = pd.DataFrame(np.zeros((2, 4)), index=["x", "y"], columns=_bins(4, 250_000))
     b = pd.DataFrame(np.zeros((2, 4)), index=["p", "q"], columns=_bins(4, 250_000))
