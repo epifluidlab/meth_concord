@@ -197,6 +197,42 @@ committing to the build, measure on existing data:
 
 ---
 
+## 9b. Phase J0 findings (feasibility result, GM12878/IMR90, 40-cell sample)
+
+Per-end modality (≥2 sites = informative):
+
+| modality | fraction of ends |
+|---|---|
+| both GCH + HCG | 15.5% |
+| GCH only | 69.4% |
+| HCG only | 0.7% |
+| neither | 14.4% |
+
+- **GCH observed at ~85% of ends; HCG at only ~16%.** HCG-without-GCH is
+  ~0.7%, so **HCG observation ⊂ GCH observation** — methylation is the
+  hard limiting modality (~5× sparser).
+- **Strict mode is infeasible:** long-range (≥1 kb) both-modality-both-ends
+  pairs have **median 0** per (cell, bin). Drop strict as a realistic mode.
+- **Lenient mode is count-viable** (median 2 linked pairs / (cell, bin) —
+  the same regime the single-context method already handles via RWR) **but
+  methylation-starved:** with HCG real at ~16% of ends, the methylation
+  axis is prior-imputed for ~84% of ends, so the methylation-dependent
+  channels (poised, active-methylated, and closed-vs-poised) would be
+  largely prior-driven and likely cancel against the unlinked baseline.
+
+**Decision — gate the build on a cheaper test.** Before implementing
+J1–J4, determine whether long-range **HCG concordance carries any
+cell-type signal standalone**: run the existing signed pipeline on
+`context_HCG` and compare GCH- vs HCG-concordance (vs accessibility,
+scHi-C) with `nome_hic_compare`. If HCG concordance is uninformative
+(expected, given the sparsity), the joint method cannot add methylation
+signal the reads don't contain — a legitimate negative result that avoids
+the heavy build. If it *is* informative, proceed to J1, likely with a
+**coarsened HCG resolution** (wider per-end CpG window / coarser
+methylation bins) to lift the 16% observation rate.
+
+---
+
 ## 9. Locked decisions
 
 1. **4 co-state channels** (open / closed / poised / active-methylated);
