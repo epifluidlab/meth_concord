@@ -220,3 +220,44 @@ def test_knn_purity_chance_reflects_imbalance():
     assert abs(cb - 0.5) < 1e-9
     assert abs(ci - (0.8 ** 2 + 0.2 ** 2)) < 1e-9    # 0.68
     assert ci > cb
+
+
+def _matrix(cells, bins, fn, seed):
+    rng = np.random.default_rng(seed)
+    data = np.array([[fn(c, b, rng) for b in range(bins)] for c in range(len(cells))])
+    return pd.DataFrame(data, index=cells, columns=[f"chr1:{b*1000}" for b in range(bins)])
+
+
+def test_pairwise_finds_headroom_where_aggregate_ceilings():
+    """3 classes: baselines separate A/B/C-vs-rest at ceiling EXCEPT the A|B
+    pair, which only concordance resolves → aggregate gain ~0 but pairwise
+    shows a positive gain on the confusable A|B pair."""
+    n = 60
+    cells = [f"c{i}" for i in range(n)]
+    lab = pd.Series((["A"] * 20 + ["B"] * 20 + ["C"] * 20), index=cells)
+    grp = np.array([0] * 20 + [1] * 20 + [2] * 20)
+    # Baseline: separates C from {A,B} strongly, but A and B are identical
+    # (baseline cannot tell them apart → A|B AUC ~ chance).
+    def base_fn(c, b, rng):
+        center = 6.0 if grp[c] == 2 else 0.0
+        return center + rng.normal(0, 0.5)
+    # Concordance: cleanly separates A from B (orthogonal axis).
+    def conc_fn(c, b, rng):
+        center = 5.0 if grp[c] == 0 else (-5.0 if grp[c] == 1 else 0.0)
+        return center + rng.normal(0, 0.5)
+    base = _matrix(cells, 12, base_fn, 1)
+    conc = _matrix(cells, 12, conc_fn, 2)
+    pw = comparison.classifier_comparison_pairwise(
+        {"accessibility": base, "gch": conc}, lab,
+        baseline_names=["accessibility"], concordance_names=["gch"],
+        output_dir=None if False else _tmp(), matrix_norm="zscore",
+        n_svd=5, min_cell_coverage=0.0, n_folds=3, random_state=0,
+        min_class_cells=5)
+    ab = pw[pw["pair"] == "A|B"].iloc[0]
+    assert ab["baseline_auc"] < 0.9            # baselines confuse A vs B
+    assert ab["gain_gch"] > 0.05               # concordance rescues it
+
+
+import tempfile
+def _tmp():
+    return tempfile.mkdtemp()

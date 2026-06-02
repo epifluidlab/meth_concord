@@ -160,6 +160,26 @@ def main(argv: list[str] | None = None) -> int:
         if gain_path.exists():
             print("\n=== AUC gain of concordance over baselines ===")
             print(pd.read_csv(gain_path, sep="\t").to_string(index=False))
+
+    pw_path = out / "classifier_pairwise_auc.tsv"
+    if pw_path.exists():
+        pw = pd.read_csv(pw_path, sep="\t")
+        gain_cols = [c for c in pw.columns if c.startswith("gain_")]
+        print("\n=== one-vs-one AUC: hardest cell-type pairs (headroom test) ===")
+        with pd.option_context("display.float_format", lambda x: f"{x:.3f}"):
+            print(pw.head(8).to_string(index=False))
+        # Mean concordance gain on the CONFUSABLE pairs (where baselines miss).
+        conf = pw[pw["baseline_auc"] < 0.9]
+        if len(conf) and gain_cols:
+            print(f"\n  confusable pairs (baseline_auc < 0.9): {len(conf)} of {len(pw)}")
+            for gc in gain_cols:
+                cn = gc[len("gain_"):]
+                print(f"    mean gain on confusable pairs [{cn}]: "
+                      f"{conf[gc].mean():+.4f}  "
+                      f"(pairs improved: {(conf[gc] > 0.01).sum()}/{len(conf)})")
+        else:
+            print("  (no pairs with baseline_auc < 0.9 — baselines separate "
+                  "all pairs; no headroom on this dataset.)")
     return 0
 
 

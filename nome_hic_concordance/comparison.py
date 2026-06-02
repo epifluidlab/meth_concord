@@ -473,6 +473,14 @@ def classifier_comparison(
     for cn in concordance_names:
         if cn in matrices and present_baselines:
             _add(f"baselines+{cn}", present_baselines + [cn])
+    # Concordance added to the 3D-genome baseline ALONE — scHi-C compartments
+    # are typically far from ceiling, so this isolates "does concordance add
+    # cell-type info beyond scHi-C?" with real headroom (unlike the
+    # level-saturated full-baseline gain).
+    if "compartment" in matrices:
+        for cn in concordance_names:
+            if cn in matrices:
+                _add(f"compartment+{cn}", ["compartment", cn])
     # All matrices.
     if len(matrices) > 1:
         _add("all", list(matrices.keys()))
@@ -492,6 +500,88 @@ def classifier_comparison(
                 out / "classifier_auc_gain.tsv", sep="\t", index=False)
     tab.to_csv(out / "classifier_comparison.tsv", sep="\t", index=False)
     logger.info(f"[classifier] wrote {out / 'classifier_comparison.tsv'}")
+    return tab
+
+
+def classifier_comparison_pairwise(
+    matrices: dict[str, pd.DataFrame],
+    group_labels: pd.Series,
+    baseline_names: list[str],
+    concordance_names: list[str],
+    output_dir: str,
+    matrix_norm: str,
+    n_svd: int,
+    min_cell_coverage: float,
+    n_folds: int,
+    random_state: int,
+    min_class_cells: int = 6,
+) -> pd.DataFrame:
+    """One-vs-one CV AUC: baselines vs baselines+concordance, per cell-type
+    PAIR — the headroom-sensitive, leakage-robust version of (d).
+
+    When marginal levels saturate the aggregate AUC (ceiling), concordance
+    cannot show a gain there even if it carries unique information.  This
+    restricts to each pair of cell types and asks whether concordance lifts
+    the AUC of the pairs the baselines *confuse*.  Improving a pair the
+    baselines already fail on is the additional-info signal the aggregate
+    hides — and it is largely leakage-robust: structure leaked into
+    concordance from a baseline's smoothing graph cannot separate cells that
+    baseline itself cannot separate.
+
+    Writes classifier_pairwise_auc.tsv (one row per pair, sorted by baseline
+    difficulty) and returns it.
+    """
+    import itertools
+    out = ensure_dir(output_dir)
+    common = group_labels.index
+    for df in matrices.values():
+        common = common.intersection(df.index)
+    common = sorted(common)
+    labels = group_labels.loc[common]
+    cells_index = pd.Index(common)
+
+    # Per-matrix SVD blocks on the full common set (same feature space as the
+    # aggregate run); rows are subset per pair below.
+    blocks: dict[str, pd.DataFrame] = {}
+    for name, df in matrices.items():
+        norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage)
+        scores, _ = _svd_scores(norm.loc[common], n_svd)
+        blocks[name] = pd.DataFrame(scores, index=cells_index)
+
+    present_baselines = [b for b in baseline_names if b in matrices]
+    conc = [c for c in concordance_names if c in matrices]
+    if not present_baselines or not conc:
+        return pd.DataFrame()
+    classes = sorted(pd.unique(labels))
+
+    rows = []
+    for g1, g2 in itertools.combinations(classes, 2):
+        sel = labels[labels.isin([g1, g2])].index
+        y = labels.loc[sel].to_numpy()
+        cnt = pd.Series(y).value_counts()
+        if cnt.min() < min_class_cells:
+            continue
+
+        def _auc(names):
+            X = np.concatenate([blocks[n].loc[sel].to_numpy() for n in names],
+                               axis=1)
+            return _cv_auc(X, y, n_folds=n_folds, random_state=random_state)
+
+        b_mean, _ = _auc(present_baselines)
+        row = {"pair": f"{g1}|{g2}", "n1": int(cnt.get(g1, 0)),
+               "n2": int(cnt.get(g2, 0)), "baseline_auc": b_mean}
+        for cn in conc:
+            m, _ = _auc(present_baselines + [cn])
+            row[f"auc_with_{cn}"] = m
+            row[f"gain_{cn}"] = (m - b_mean if np.isfinite(m)
+                                 and np.isfinite(b_mean) else float("nan"))
+        rows.append(row)
+
+    tab = pd.DataFrame(rows)
+    if len(tab):
+        tab = tab.sort_values("baseline_auc").reset_index(drop=True)
+        tab.to_csv(out / "classifier_pairwise_auc.tsv", sep="\t", index=False)
+        logger.info(f"[classifier] wrote {out / 'classifier_pairwise_auc.tsv'}")
     return tab
 
 
@@ -562,6 +652,15 @@ def run_comparison(
             matrices, labels, baseline_names, concordance_names, output_dir,
             matrix_norm, n_svd, min_cell_coverage, n_folds, random_state)
         summary["classifier"] = tab.to_dict(orient="records")
+        # (d2) One-vs-one pairwise AUC — headroom-sensitive when the aggregate
+        # is ceiling-limited by saturating marginal levels.
+        if labels.nunique() > 2:
+            ptab = classifier_comparison_pairwise(
+                matrices, labels, baseline_names, concordance_names,
+                output_dir, matrix_norm, n_svd, min_cell_coverage, n_folds,
+                random_state)
+            if len(ptab):
+                summary["pairwise"] = ptab.to_dict(orient="records")
     else:
         logger.warning("No --samples group labels; skipping classifier + metrics.")
 
