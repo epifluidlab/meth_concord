@@ -249,6 +249,32 @@ def _svd_reduce(X: np.ndarray, n_svd: int) -> np.ndarray:
     return TruncatedSVD(n_components=k, random_state=0).fit_transform(X)
 
 
+def _zcols(X: np.ndarray) -> np.ndarray:
+    """Per-column z-score; constant columns (std≈0) → all zeros (no influence)."""
+    Xc = np.nan_to_num(X - np.nanmean(X, axis=0, keepdims=True))
+    sd = Xc.std(axis=0, keepdims=True)
+    return np.where(sd < 1e-12, 0.0, Xc / np.where(sd < 1e-12, 1.0, sd))
+
+
+def _residualize(D: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """Per-region (per-column) residual of Δ (D) on the marginal (M).
+
+    The O/E controls the marginal at the pair level, but imperfectly — and
+    when the marginal AUC is near 1.0 even a small residual correlation makes
+    Δ classify cell type.  This removes the linear Δ–marginal relationship in
+    each region, so a surviving AUC is marginal-INDEPENDENT coordination and a
+    collapsing AUC means the Δ signal was residual marginal leakage.
+
+    Done in standardized space so the coefficient is a bounded per-column
+    correlation b∈[-1,1] (robust when a region's marginal has tiny variance —
+    a plain cov/var would blow up and destroy real signal there).  A constant
+    marginal column → b=0 → Δ passes through unchanged.
+    """
+    Ds, Ms = _zcols(D), _zcols(M)
+    b = (Ds * Ms).mean(axis=0)            # per-column correlation, in [-1, 1]
+    return Ds - b[None, :] * Ms
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -310,8 +336,24 @@ def main() -> None:
     if keep.sum() < 10:
         sys.exit("Too few labeled cells.")
 
-    print(f"\n{'granularity':>12} {'n_regions':>10} {'med_pairs/reg':>13} "
-          f"{'Δ_concord AUC':>16} {'perm_null':>10} {'p':>7} {'marginal AUC':>14}")
+    y = y_all[keep].to_numpy()
+
+    def _auc_perm(X):
+        mean, std = _cv_auc(X, y, n_folds=args.n_folds,
+                            random_state=args.random_seed)
+        p = np.nan
+        if args.n_perm > 0:
+            prng = np.random.default_rng(args.random_seed)
+            null = np.array([_cv_auc(X, prng.permutation(y), n_folds=args.n_folds,
+                                     random_state=args.random_seed)[0]
+                             for _ in range(int(args.n_perm))])
+            null = null[np.isfinite(null)]
+            if null.size:
+                p = float((np.sum(null >= mean) + 1) / (null.size + 1))
+        return mean, std, p
+
+    print(f"\n{'granularity':>11} {'n_reg':>6} {'pairs/reg':>9} "
+          f"{'Δ AUC':>12} {'p':>6} {'Δ|marg AUC':>12} {'p':>6} {'marg AUC':>10}")
     rows = []
     for gran in grans:
         gk = str(gran)
@@ -328,39 +370,36 @@ def main() -> None:
                 D[i, j] = delta; Mg[i, j] = marg
                 if n_o > 0:
                     npairs.append(n_o)
-        y = y_all[keep].to_numpy()
-        Xc = _svd_reduce(_standardize(pd.DataFrame(D).iloc[keep]), args.n_svd)
-        Xm = _svd_reduce(_standardize(pd.DataFrame(Mg).iloc[keep]), args.n_svd)
-        cmean, cstd = _cv_auc(Xc, y, n_folds=args.n_folds,
-                              random_state=args.random_seed)
+        Dk, Mk = D[keep], Mg[keep]
+        Xc = _svd_reduce(_standardize(pd.DataFrame(Dk)), args.n_svd)
+        Xm = _svd_reduce(_standardize(pd.DataFrame(Mk)), args.n_svd)
+        # Marginal-residualized concordance: the leakage control.
+        Xr = _svd_reduce(_standardize(pd.DataFrame(_residualize(Dk, Mk))),
+                         args.n_svd)
+        cmean, cstd, cp = _auc_perm(Xc)
+        rmean, rstd, rp = _auc_perm(Xr)
         mmean, mstd = _cv_auc(Xm, y, n_folds=args.n_folds,
                               random_state=args.random_seed)
-        perm_null, perm_p = np.nan, np.nan
-        if args.n_perm > 0:
-            prng = np.random.default_rng(args.random_seed)
-            null = np.array([_cv_auc(Xc, prng.permutation(y),
-                                     n_folds=args.n_folds,
-                                     random_state=args.random_seed)[0]
-                             for _ in range(int(args.n_perm))])
-            null = null[np.isfinite(null)]
-            if null.size:
-                perm_null = float(null.mean())
-                perm_p = float((np.sum(null >= cmean) + 1) / (null.size + 1))
         med = int(np.median(npairs)) if npairs else 0
-        print(f"{gk:>12} {len(all_regions):>10} {med:>13} "
-              f"{cmean:>10.3f}±{cstd:.3f} {perm_null:>10.3f} {perm_p:>7.3f} "
-              f"{mmean:>8.3f}±{mstd:.3f}")
+        print(f"{gk:>11} {len(all_regions):>6} {med:>9} "
+              f"{cmean:>7.3f}±{cstd:.2f} {cp:>6.3f} "
+              f"{rmean:>7.3f}±{rstd:.2f} {rp:>6.3f} {mmean:>10.3f}")
         rows.append({"granularity": gk, "n_regions": len(all_regions),
                      "median_pairs_per_region": med,
                      "concordance_auc": cmean, "concordance_auc_std": cstd,
-                     "concordance_perm_null": perm_null,
-                     "concordance_perm_p": perm_p,
+                     "concordance_perm_p": cp,
+                     "concordance_resid_auc": rmean,
+                     "concordance_resid_std": rstd,
+                     "concordance_resid_perm_p": rp,
                      "marginal_auc": mmean, "marginal_auc_std": mstd})
 
-    print("\n  Read: Δ_concord AUC > perm_null (p<0.05) at any granularity")
-    print("  => real, marginal-independent E–P coordination signal exists.")
-    print("  Δ_concord AUC ≈ perm_null everywhere => no detectable signal even")
-    print("  when richly pooled (the RWR result was an imputation artifact).")
+    print("\n  Δ AUC      = pooled-O/E concordance (marginal-controlled at the")
+    print("               pair level).  Δ|marg AUC = Δ after ALSO regressing out")
+    print("               the per-region marginal (the leakage control).")
+    print("  Δ AUC high but Δ|marg AUC -> its null  => the signal was residual")
+    print("               marginal leakage (NOT coordination).")
+    print("  Δ|marg AUC stays high (p<0.05)         => REAL marginal-independent")
+    print("               long-range coordination signal.")
     if args.output_prefix:
         out = f"{args.output_prefix}.ep_existence.csv"
         pd.DataFrame(rows).to_csv(out, index=False)
