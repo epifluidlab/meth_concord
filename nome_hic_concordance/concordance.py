@@ -766,6 +766,55 @@ def _dm_expected_for_bin(
     return float(k_o), float(k_c), float(k_m), int(contact_dists.size)
 
 
+def _pooled_expected_for_bin(
+    epos: np.ndarray, ep: np.ndarray,
+    contact_pairs: list[tuple[int, int]], n_contacts: int,
+    min_distance: int, max_ends: int, seed: int,
+) -> tuple[float, float, float, int]:
+    """Distance-POOLED expected co-state for one bin's contacts.
+
+    Like ``_dm_expected_for_bin`` it re-pairs the bin's read ends into a
+    non-contact null, but instead of matching each observed contact's
+    distance it pools **all** synthetic end-pairs with separation
+    >= ``min_distance`` into a single mean expected rate (excluding any
+    pair that coincides with an observed contact).  This trades the
+    distance control of the distance-matched null for many more pairs, so
+    the per-bin expected is far less noisy ("more reads for the
+    estimation").
+
+    To stay a drop-in sibling of the distance-matched expected, the result
+    is scaled so that ``n_dm == n_contacts`` and the per-state rate
+    ``k_*/n_dm`` equals the pooled mean soft co-state — identical
+    downstream DM / log2(O/E) handling.  The pooling benefit is realised
+    purely through a less-noisy mean (the reported n, and hence the DM
+    shrinkage, matches the distance-matched convention).
+    """
+    m = epos.shape[0]
+    if m < 2 or n_contacts == 0:
+        return 0.0, 0.0, 0.0, 0
+    if m > max_ends:                       # subsample the end pool for speed
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(m, size=max_ends, replace=False)
+        epos, ep = epos[idx], ep[idx]
+        m = max_ends
+    iu, ju = np.triu_indices(m, k=1)       # all unordered end-pairs (i<j)
+    d = np.abs(epos[iu] - epos[ju])
+    keep = d >= int(min_distance)          # long-range pairs only
+    if contact_pairs:                      # exclude the observed (linked) pairs
+        lo = np.minimum(epos[iu], epos[ju])
+        hi = np.maximum(epos[iu], epos[ju])
+        for c_lo, c_hi in contact_pairs:
+            keep &= ~((lo == int(c_lo)) & (hi == int(c_hi)))
+    if not keep.any():
+        return 0.0, 0.0, 0.0, 0
+    pa, pb = ep[iu][keep], ep[ju][keep]
+    mean_o = float((pa * pb).mean())
+    mean_c = float(((1.0 - pa) * (1.0 - pb)).mean())
+    mean_m = float((pa * (1.0 - pb) + (1.0 - pa) * pb).mean())
+    nc = int(n_contacts)
+    return mean_o * nc, mean_c * nc, mean_m * nc, nc
+
+
 def _compute_cell_dm_expected(
     posteriors_path: str,
     cell_name: str,
@@ -775,13 +824,25 @@ def _compute_cell_dm_expected(
     dm_window_bins: int = 0,
     dm_dist_bin: int = 10_000,
     dm_max_ends: int = 400,
+    mode: str = "matched",
 ) -> tuple[str, dict[str, dict[str, float]]]:
-    """Per-(cell, bin) distance-matched expected soft counts (``_DM_KEYS``).
+    """Per-(cell, bin) expected soft counts (``_DM_KEYS``) from a non-contact
+    end-pair null.
 
     The null pool for a bin is its own informative read ends (those of any
     pair, regardless of partner location); with ``dm_window_bins > 0`` it is
-    pooled over ±that many neighbouring bins (a smoother expected at long
-    distances where a single bin's end-pairs thin out).
+    pooled over ±that many neighbouring bins (more end-pairs at long
+    distances where a single bin's pairs thin out).
+
+    ``mode`` selects how the expected rate is formed from that pool:
+
+    - ``"matched"`` (distance-matched): for each observed contact, the mean
+      soft co-state of null end-pairs at the contact's distance bucket
+      (``_dm_expected_for_bin``).  Controls distance + bin-marginal.
+    - ``"pooled"`` (distance-pooled): the mean soft co-state of *all* null
+      end-pairs with separation >= ``min_distance`` (excluding the observed
+      contacts; ``_pooled_expected_for_bin``).  Drops distance control for
+      many more pairs → a less-noisy expected.
     """
     df = pd.read_parquet(
         posteriors_path,
@@ -818,6 +879,7 @@ def _compute_cell_dm_expected(
     obs = pd.DataFrame({
         "chrom": chrom[linked], "bin": (pos1[linked] // bsz),
         "distance": distance[linked],
+        "pos1": pos1[linked], "pos2": pos2[linked],
     })
 
     counts: dict[str, dict[str, float]] = {}
@@ -832,13 +894,26 @@ def _compute_cell_dm_expected(
             ep_df = ends_by_bin.get((c, int(b)))
         if ep_df is None or len(ep_df) < 2:
             continue
-        k_o, k_c, k_m, n_dm = _dm_expected_for_bin(
-            ep_df["pos"].to_numpy(dtype=np.int64),
-            ep_df["p"].to_numpy(dtype=np.float64),
-            og["distance"].to_numpy(dtype=np.int64),
-            dist_bin=int(dm_dist_bin), max_ends=int(dm_max_ends),
-            seed=seed_base + int(b),
-        )
+        if mode == "pooled":
+            p1c = og["pos1"].to_numpy(dtype=np.int64)
+            p2c = og["pos2"].to_numpy(dtype=np.int64)
+            contact_pairs = list(zip(np.minimum(p1c, p2c).tolist(),
+                                     np.maximum(p1c, p2c).tolist()))
+            k_o, k_c, k_m, n_dm = _pooled_expected_for_bin(
+                ep_df["pos"].to_numpy(dtype=np.int64),
+                ep_df["p"].to_numpy(dtype=np.float64),
+                contact_pairs, n_contacts=len(og),
+                min_distance=int(min_distance), max_ends=int(dm_max_ends),
+                seed=seed_base + int(b),
+            )
+        else:
+            k_o, k_c, k_m, n_dm = _dm_expected_for_bin(
+                ep_df["pos"].to_numpy(dtype=np.int64),
+                ep_df["p"].to_numpy(dtype=np.float64),
+                og["distance"].to_numpy(dtype=np.int64),
+                dist_bin=int(dm_dist_bin), max_ends=int(dm_max_ends),
+                seed=seed_base + int(b),
+            )
         counts[f"{c}:{int(b) * bsz}"] = {
             "k_dm_open": k_o, "k_dm_closed": k_c, "k_dm_mixed": k_m,
             "n_dm": float(n_dm),
@@ -1102,10 +1177,14 @@ def compute_signed_concordance_matrix(
     # short-range *contacts*, not non-contacts (the old name was a misnomer).
     if baseline == "unlinked":
         baseline = "short-range"
-    if baseline not in ("short-range", "distance-matched"):
+    if baseline not in ("short-range", "distance-matched", "distance-pooled"):
         raise ValueError(
-            f"baseline must be 'short-range' (alias 'unlinked') or "
-            f"'distance-matched'; got {baseline!r}.")
+            f"baseline must be 'short-range' (alias 'unlinked'), "
+            f"'distance-matched', or 'distance-pooled'; got {baseline!r}.")
+    # Both non-contact end-pair nulls populate the expected (_DM_KEYS) pool
+    # and share the downstream O/E handling; they differ only in how each
+    # bin's expected RATE is formed (see _compute_cell_dm_expected mode).
+    uses_expected = baseline in ("distance-matched", "distance-pooled")
     if concordance_combine not in ("signed-diff", "log2-ratio"):
         raise ValueError(
             f"concordance_combine must be 'signed-diff' or 'log2-ratio'; "
@@ -1135,18 +1214,26 @@ def compute_signed_concordance_matrix(
             for cell_name, path in items
         ]
 
-    # ---- Step 1b: distance-matched expected (O/E baseline), optional -----
-    if baseline == "distance-matched":
+    # ---- Step 1b: non-contact end-pair expected (O/E baseline), optional --
+    if uses_expected:
+        dm_mode = "pooled" if baseline == "distance-pooled" else "matched"
         dm_window_bins = int(round((dm_window_mb * 1_000_000) / bin_size))
-        logger.info(
-            f"Distance-matched expected baseline: window=±{dm_window_bins} bins "
-            f"({dm_window_mb} Mb), dist-bin={dm_dist_bin:,} bp"
-        )
+        if dm_mode == "pooled":
+            logger.info(
+                f"Distance-pooled expected baseline: window=±{dm_window_bins} "
+                f"bins ({dm_window_mb} Mb), all null pairs with sep "
+                f">= {min_distance:,} bp pooled per bin"
+            )
+        else:
+            logger.info(
+                f"Distance-matched expected baseline: window=±{dm_window_bins} "
+                f"bins ({dm_window_mb} Mb), dist-bin={dm_dist_bin:,} bp"
+            )
         if n_threads > 1 and len(items) > 1:
             per_cell_dm = Parallel(n_jobs=n_threads)(
                 delayed(_compute_cell_dm_expected)(
                     path, cell_name, bin_size, min_distance, min_gch_sites,
-                    dm_window_bins, dm_dist_bin,
+                    dm_window_bins, dm_dist_bin, 400, dm_mode,
                 )
                 for cell_name, path in items
             )
@@ -1154,7 +1241,7 @@ def compute_signed_concordance_matrix(
             per_cell_dm = [
                 _compute_cell_dm_expected(
                     path, cell_name, bin_size, min_distance, min_gch_sites,
-                    dm_window_bins, dm_dist_bin,
+                    dm_window_bins, dm_dist_bin, 400, dm_mode,
                 )
                 for cell_name, path in items
             ]
@@ -1176,7 +1263,7 @@ def compute_signed_concordance_matrix(
     bin_to_col = {b: i for i, b in enumerate(sorted_bins)}
 
     matrix_keys = list(_SOFT_COUNT_KEYS) + (
-        list(_DM_KEYS) if baseline == "distance-matched" else [])
+        list(_DM_KEYS) if uses_expected else [])
     raw_counts: dict[str, np.ndarray] = {
         k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in matrix_keys
     }
@@ -1326,9 +1413,9 @@ def compute_signed_concordance_matrix(
         fitted_priors["linked"] = {"alpha": alpha_l, "info": info_l}
         fitted_priors["unlinked"] = {"alpha": alpha_u, "info": info_u}
 
-        # Distance-matched expected pool (only when baseline='distance-matched').
+        # Non-contact expected pool (distance-matched or distance-pooled).
         alpha_dm = None
-        if baseline == "distance-matched" and "k_dm_open" in imputed:
+        if uses_expected and "k_dm_open" in imputed:
             long_dm = pd.DataFrame({
                 "k_open":   imputed["k_dm_open"].ravel(),
                 "k_closed": imputed["k_dm_closed"].ravel(),
@@ -1380,8 +1467,9 @@ def compute_signed_concordance_matrix(
             imputed["k_open"], imputed["k_closed"], imputed["k_mixed"],
             imputed["n_linked"], alpha_l)
 
-        # Baseline (E): short-range 'unlinked' pool, or distance-matched expected.
-        if baseline == "distance-matched":
+        # Baseline (E): short-range pool, or non-contact expected
+        # (distance-matched / distance-pooled) pool.
+        if uses_expected:
             e_open, e_closed = _side_rates(
                 imputed["k_dm_open"], imputed["k_dm_closed"],
                 imputed["k_dm_mixed"], imputed["n_dm"], alpha_dm)

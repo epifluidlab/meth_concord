@@ -363,6 +363,65 @@ def test_signed_distance_matched_baseline_log2ratio(tmp_path):
     assert "dm_expected" in result["priors"]
 
 
+def test_pooled_expected_for_bin_known_values():
+    """Distance-pooled expected = mean soft co-state of ALL null end-pairs
+    with sep >= min_distance, excluding the observed contacts, scaled by the
+    contact count."""
+    epos = np.array([0, 1000, 2000, 3000], dtype=np.int64)
+    ep = np.array([0.9, 0.8, 0.1, 0.2], dtype=np.float64)
+    # Pairs with |Δ| >= 1500: (0,2000), (0,3000), (1000,3000).  Exclude the
+    # observed contact (0,2000).  Remaining: (0,3000) [po=.18,pc=.08,pm=.74]
+    # and (1000,3000) [po=.16,pc=.16,pm=.68].  Means: .17/.12/.71, ×2 contacts.
+    k_o, k_c, k_m, n = concordance._pooled_expected_for_bin(
+        epos, ep, contact_pairs=[(0, 2000)], n_contacts=2,
+        min_distance=1500, max_ends=400, seed=0)
+    assert n == 2
+    assert abs(k_o - 0.34) < 1e-9
+    assert abs(k_c - 0.24) < 1e-9
+    assert abs(k_m - 1.42) < 1e-9
+    # Rate (k/n) sums to 1 across the three co-states.
+    assert abs((k_o + k_c + k_m) / n - 1.0) < 1e-9
+
+
+def test_pooled_expected_for_bin_excludes_short_and_contacts():
+    """No pair survives the min_distance filter → empty expected."""
+    epos = np.array([0, 100, 200], dtype=np.int64)
+    ep = np.array([0.9, 0.8, 0.1], dtype=np.float64)
+    k_o, k_c, k_m, n = concordance._pooled_expected_for_bin(
+        epos, ep, contact_pairs=[], n_contacts=3,
+        min_distance=1000, max_ends=400, seed=0)
+    assert (k_o, k_c, k_m, n) == (0.0, 0.0, 0.0, 0)
+
+
+def test_compute_cell_dm_expected_pooled_mode(tmp_path):
+    paths = _focal_active_paths(tmp_path, n_cells=1)
+    cell, counts = concordance._compute_cell_dm_expected(
+        paths["c0"], "c0", bin_size=1000, min_distance=100, min_gch_sites=2,
+        dm_window_bins=0, dm_dist_bin=100, dm_max_ends=400, mode="pooled")
+    assert "chr1:0" in counts
+    rec = counts["chr1:0"]
+    assert set(rec) == set(concordance._DM_KEYS)
+    # 20 long-range contacts in bin chr1:0 → n_dm scaled to the contact count.
+    assert rec["n_dm"] == 20
+    assert rec["k_dm_open"] >= 0
+
+
+def test_signed_distance_pooled_baseline_log2ratio(tmp_path):
+    """End-to-end: baseline='distance-pooled' + log2-ratio produces a finite
+    Δ matrix and fits an expected-pool prior."""
+    paths = _focal_active_paths(tmp_path, n_cells=8)
+    result = concordance.compute_signed_concordance_matrix(
+        paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+        baseline="distance-pooled", concordance_combine="log2-ratio",
+        concordance_formula="dm", use_rwr=False, eb_min_obs=2, n_threads=1,
+        output_dir=str(tmp_path / "out"), save_outputs=False,
+    )
+    delta = result["delta_signed"]
+    assert delta.shape[0] == 8 and "chr1:0" in delta.columns
+    assert np.isfinite(delta["chr1:0"].to_numpy()).all()
+    assert "dm_expected" in result["priors"]
+
+
 def test_baseline_unlinked_alias_equals_short_range(tmp_path):
     """'unlinked' is a deprecated alias for 'short-range' — same result."""
     paths = _focal_active_paths(tmp_path, n_cells=5)

@@ -149,7 +149,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'auto' (default): 'dm' for signed, 'dm' otherwise.",
     )
     parser.add_argument(
-        "--baseline", choices=["short-range", "unlinked", "distance-matched"],
+        "--baseline",
+        choices=["short-range", "unlinked", "distance-matched",
+                 "distance-pooled"],
         default="short-range",
         help="Baseline E that the long-range observed concordance O is "
              "compared against (signed method).  'short-range' = the "
@@ -159,7 +161,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'distance-matched' = the expected co-state of random "
              "NON-contact end-pairs at the SAME distance within the bin (an "
              "O/E null from the bin's ~hundreds of read ends), controlling "
-             "distance + bin-marginal.",
+             "distance + bin-marginal.  'distance-pooled' = the same "
+             "non-contact end-pair null but pooling ALL pairs with sep "
+             ">= min-distance (excluding the observed contacts), no distance "
+             "matching — many more pairs → a less-noisy expected, at the "
+             "cost of distance control.",
     )
     parser.add_argument(
         "--concordance-combine", choices=["auto", "signed-diff", "log2-ratio"],
@@ -168,15 +174,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "(O_open−O_closed)−(E_open−E_closed) (legacy).  'log2-ratio' = "
              "log2(O_open/E_open)−log2(O_closed/E_closed) (symmetric, "
              "scale-free, Hi-C O/E convention).  'auto' (default): "
-             "'log2-ratio' when --baseline distance-matched, 'signed-diff' "
-             "otherwise (preserves the validated default).",
+             "'log2-ratio' for the distance-matched / distance-pooled O/E "
+             "baselines, 'signed-diff' otherwise (preserves the validated "
+             "default).",
     )
     parser.add_argument(
         "--dm-window-mb", type=float, default=0.0,
-        help="For --baseline distance-matched: pool the null end-pool over "
-             "±this many Mb of neighbouring bins (default 0 = the bin's own "
-             "ends only).  Set e.g. 1.0 for a smoother expected at long "
-             "distances where a single bin's end-pairs thin out.",
+        help="For --baseline distance-matched / distance-pooled: pool the "
+             "null end-pool over ±this many Mb of neighbouring bins "
+             "(default 0 = the bin's own ends only).  Set e.g. 1.0 for a "
+             "smoother expected at long distances where a single bin's "
+             "end-pairs thin out.",
     )
     parser.add_argument(
         "--dm-dist-bin-bp", type=int, default=10_000,
@@ -930,10 +938,12 @@ def run_context(
                 else args.concordance_formula
             )
             # Resolve --concordance-combine: auto → log2-ratio for the
-            # distance-matched O/E baseline, signed-diff for the legacy
-            # unlinked baseline (preserves the validated default).
+            # non-contact O/E baselines (distance-matched / distance-pooled),
+            # signed-diff for the legacy short-range baseline (preserves the
+            # validated default).
             concordance_combine = (
-                ("log2-ratio" if args.baseline == "distance-matched"
+                ("log2-ratio"
+                 if args.baseline in ("distance-matched", "distance-pooled")
                  else "signed-diff") if args.concordance_combine == "auto"
                 else args.concordance_combine
             )

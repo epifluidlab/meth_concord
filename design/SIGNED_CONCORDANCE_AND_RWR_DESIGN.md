@@ -10,6 +10,21 @@
 > built from *random non-contact* end-pairs at the matched distance, which
 > — unlike the short-range pool — controls for distance and the bin
 > marginal. See the distance-matched baseline section below.
+>
+> **Baseline update (v0.5).** A third option, `--baseline distance-pooled`,
+> joins the two above. It uses the **same** non-contact end-pair null as
+> `distance-matched`, but instead of matching each observed contact's
+> distance it **pools every null end-pair with separation
+> `>= min_distance`** (excluding the observed contacts) into a single mean
+> expected per bin. This trades the distance control of
+> `distance-matched` for **many more pairs → a much less-noisy expected**
+> ("more reads for the estimation"). Mechanically it is a drop-in sibling:
+> it fills the same expected (`_DM_KEYS`) pool with `n == #contacts` and
+> rate `= the pooled mean`, so the downstream DM / `log2(O/E)` handling and
+> the `--concordance-combine auto → log2-ratio` default are identical.
+> Use `distance-pooled` when the per-bin distance-matched expected is too
+> sparse/noisy and bin-marginal control suffices; use `distance-matched`
+> when you must also hold genomic distance fixed.
 
 ## Design document v0.3 — locked decisions (RWR pre-Layer 2, QN k-NN basis)
 
