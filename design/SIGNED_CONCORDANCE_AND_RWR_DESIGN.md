@@ -574,6 +574,35 @@ Output:
 
 Output: `classifier_comparison.tsv` with mean AUC and SD per feature set.
 
+**(e) Magnitude vs cell-type-information (a separate axis).** All of
+(a)–(d) ask whether concordance **varies across cells in a cell-type way**.
+They are deliberately **blind to the average magnitude** of concordance:
+the embedding/normalization stack (per-cell rank → per-bin QN → recenter)
+strips location and scale, so a signal that is **real and strong but
+cell-type-invariant** (high mean, low cross-cell variance) is normalized to
+near-zero and shows weak kNN/silhouette. "Weak cell-type information" is
+therefore **not** the same as "weak long-range concordance."
+
+To test magnitude directly, aggregate the **soft agreement**
+(`co-open + co-closed = 1 − mixed`) — *not* the signed open-vs-closed
+direction — as a population statistic, stratified by genomic distance, for
+three pools that a single `--baseline distance-matched` run already
+contains: **linked** contacts, **short-range** local pairs, and the
+**distance-matched random** end-pair null. Two magnitude questions follow:
+
+- *Is it real?* per-cell distance-matched **excess** `A_long − A_rand > 0`
+  (paired test across cells; `log2(A_long/A_rand) > 0`).
+- *How strong?* `A_long` vs `A_short` — does 3-D contact restore
+  near-local concordance? (Compare excess-over-random at each distance, as
+  the short-range absolute level is inflated by genomic proximity.)
+
+A positive, consistent excess with near-zero clustering is the signature of
+a **real but constitutive** long-range concordance (the expected GCH
+accessibility story — co-accessible contacts as a general chromatin
+property), as opposed to a cell-type-specific one (the HCG methylation
+story). `scripts/concordance_magnitude_diagnostic.py` reports the per-cell
+excess test and the distance-decay curves (O vs E vs local).
+
 ### 4.3 CLI
 
 A new sub-command — concretely a separate entry point `nome_hic_compare` so the comparison scope stays separate from the heavy concordance pipeline:
