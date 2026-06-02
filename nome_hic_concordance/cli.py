@@ -57,6 +57,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Filtering
     parser.add_argument("--min-distance", type=int, default=20_000,
                         help="Min genomic distance for qualifying pairs (default: 20000).")
+    parser.add_argument("--max-distance", type=int, default=0,
+                        help="Max genomic distance for the long-range (linked) "
+                             "pool (signed method).  Default 0 = no upper bound. "
+                             "Set e.g. 200000 to focus the 20–200 kb "
+                             "enhancer–promoter regulatory band; pairs beyond it "
+                             "are excluded from the linked pool (the short-range "
+                             "baseline pool, < min-distance, is unaffected).")
     parser.add_argument("--min-gch-sites", type=int, default=2,
                         help="Min informative GCH sites per read end "
                              "(only applied when processing context GCH; "
@@ -980,6 +987,7 @@ def run_context(
                 posterior_paths, chrom_sizes,
                 bin_size=args.bin_size,
                 min_distance=args.min_distance,
+                max_distance=args.max_distance,
                 min_gch_sites=min_sites,
                 min_pairs_per_bin=args.min_pairs_per_bin,
                 min_cell_pairs=args.min_cell_pairs,

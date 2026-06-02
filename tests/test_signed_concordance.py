@@ -771,3 +771,26 @@ def test_invalid_statistic_raises(tmp_path):
             {"x": str(p)}, statistic="invalid",
             save_outputs=False, output_dir=str(tmp_path / "out"),
         )
+
+
+def test_max_distance_caps_linked_pool(tmp_path):
+    """--max-distance restricts the linked pool to a band; short-range pool
+    (< min_distance) is unaffected; pairs beyond max fall into NEITHER."""
+    recs = []
+    for i in range(3):                       # in-band linked (d=400)
+        recs.append(dict(chrom="chr1", pos1=100 + i, pos2=500 + i, n1=5, n2=5,
+                         posterior1=0.9, posterior2=0.9, distance=400))
+    for i in range(2):                       # beyond-band (d=800)
+        recs.append(dict(chrom="chr1", pos1=100 + i, pos2=900 + i, n1=5, n2=5,
+                         posterior1=0.9, posterior2=0.9, distance=800))
+    for i in range(2):                       # short-range (d=50)
+        recs.append(dict(chrom="chr1", pos1=100 + i, pos2=150 + i, n1=5, n2=5,
+                         posterior1=0.9, posterior2=0.1, distance=50))
+    p = tmp_path / "c.posteriors.parquet"
+    _make_posteriors(recs).to_parquet(p)
+    _, c0 = concordance._compute_cell_soft_counts(str(p), "c", 1000, 100, 2, 0)
+    assert c0["chr1:0"]["n_linked"] == 5     # no cap: 3 + 2
+    assert c0["chr1:0"]["n_unlinked"] == 2
+    _, c1 = concordance._compute_cell_soft_counts(str(p), "c", 1000, 100, 2, 500)
+    assert c1["chr1:0"]["n_linked"] == 3     # cap 500: d=800 dropped
+    assert c1["chr1:0"]["n_unlinked"] == 2   # short-range unchanged

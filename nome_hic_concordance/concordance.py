@@ -604,6 +604,7 @@ def _compute_cell_soft_counts(
     bin_size: int,
     min_distance: int,
     min_gch_sites: int,
+    max_distance: int = 0,
 ) -> tuple[str, dict[str, dict[str, float]]]:
     """For one cell, aggregate per-bin U-3 soft expected counts.
 
@@ -658,7 +659,15 @@ def _compute_cell_soft_counts(
     soft_closed = (1.0 - pq) * (1.0 - qq)
     soft_mixed = pq * (1.0 - qq) + (1.0 - pq) * qq
 
-    is_linked = (distance[qualify] >= int(min_distance))
+    # Linked = long-range (>= min_distance), optionally capped at max_distance
+    # (>0) to focus a distance band, e.g. the 20–200 kb E–P regulatory scale.
+    # Short-range (< min_distance) is the baseline pool.  Pairs beyond
+    # max_distance fall into NEITHER pool.
+    dq = distance[qualify]
+    is_short = dq < int(min_distance)
+    is_linked = dq >= int(min_distance)
+    if max_distance and int(max_distance) > 0:
+        is_linked = is_linked & (dq <= int(max_distance))
     chrom_q = chrom[qualify]
     bin_q = bin1[qualify]
 
@@ -669,6 +678,7 @@ def _compute_cell_soft_counts(
         "chrom": chrom_q,
         "bin": bin_q,
         "is_linked": is_linked,
+        "is_short": is_short,
         "s_open": soft_open,
         "s_closed": soft_closed,
         "s_mixed": soft_mixed,
@@ -684,7 +694,7 @@ def _compute_cell_soft_counts(
         k_mixed=("s_mixed", "sum"),
     )
     # Unlinked (short-range) aggregation.
-    unlinked_g = pair_df.loc[~pair_df["is_linked"]].groupby(
+    unlinked_g = pair_df.loc[pair_df["is_short"]].groupby(
         ["chrom", "bin"], sort=False,
     ).agg(
         n_unlinked=("s_open", "size"),
@@ -769,7 +779,7 @@ def _dm_expected_for_bin(
 def _pooled_expected_for_bin(
     epos: np.ndarray, ep: np.ndarray,
     contact_pairs: list[tuple[int, int]], n_contacts: int,
-    min_distance: int, max_ends: int, seed: int,
+    min_distance: int, max_ends: int, seed: int, max_distance: int = 0,
 ) -> tuple[float, float, float, int]:
     """Distance-POOLED expected co-state for one bin's contacts.
 
@@ -800,6 +810,8 @@ def _pooled_expected_for_bin(
     iu, ju = np.triu_indices(m, k=1)       # all unordered end-pairs (i<j)
     d = np.abs(epos[iu] - epos[ju])
     keep = d >= int(min_distance)          # long-range pairs only
+    if max_distance and int(max_distance) > 0:   # cap to the distance band
+        keep &= d <= int(max_distance)
     if contact_pairs:                      # exclude the observed (linked) pairs
         lo = np.minimum(epos[iu], epos[ju])
         hi = np.maximum(epos[iu], epos[ju])
@@ -825,6 +837,7 @@ def _compute_cell_dm_expected(
     dm_dist_bin: int = 10_000,
     dm_max_ends: int = 400,
     mode: str = "matched",
+    max_distance: int = 0,
 ) -> tuple[str, dict[str, dict[str, float]]]:
     """Per-(cell, bin) expected soft counts (``_DM_KEYS``) from a non-contact
     end-pair null.
@@ -871,9 +884,12 @@ def _compute_cell_dm_expected(
     ends = pd.DataFrame({"chrom": e_chrom, "bin": e_bin, "pos": e_pos, "p": e_p})
     ends_by_bin = {key: g for key, g in ends.groupby(["chrom", "bin"], sort=False)}
 
-    # Observed long-range contacts (same-bin, informative, linked).
+    # Observed long-range contacts (same-bin, informative, linked); optionally
+    # capped at max_distance to focus a distance band (e.g. 20–200 kb E–P).
     same_bin = (pos1 // bsz) == (pos2 // bsz)
     linked = same_bin & inf1 & inf2 & (distance >= int(min_distance))
+    if max_distance and int(max_distance) > 0:
+        linked = linked & (distance <= int(max_distance))
     if not linked.any():
         return cell_name, {}
     obs = pd.DataFrame({
@@ -904,7 +920,7 @@ def _compute_cell_dm_expected(
                 ep_df["p"].to_numpy(dtype=np.float64),
                 contact_pairs, n_contacts=len(og),
                 min_distance=int(min_distance), max_ends=int(dm_max_ends),
-                seed=seed_base + int(b),
+                seed=seed_base + int(b), max_distance=int(max_distance),
             )
         else:
             k_o, k_c, k_m, n_dm = _dm_expected_for_bin(
@@ -1067,6 +1083,7 @@ def compute_signed_concordance_matrix(
     chrom_sizes: dict[str, int] | None = None,
     bin_size: int = 250_000,
     min_distance: int = 1_000,
+    max_distance: int = 0,
     min_gch_sites: int = 2,
     min_pairs_per_bin: int = 1,
     min_cell_pairs: int = 0,
@@ -1203,6 +1220,7 @@ def compute_signed_concordance_matrix(
         per_cell = Parallel(n_jobs=n_threads)(
             delayed(_compute_cell_soft_counts)(
                 path, cell_name, bin_size, min_distance, min_gch_sites,
+                max_distance,
             )
             for cell_name, path in items
         )
@@ -1210,6 +1228,7 @@ def compute_signed_concordance_matrix(
         per_cell = [
             _compute_cell_soft_counts(
                 path, cell_name, bin_size, min_distance, min_gch_sites,
+                max_distance,
             )
             for cell_name, path in items
         ]
@@ -1233,7 +1252,7 @@ def compute_signed_concordance_matrix(
             per_cell_dm = Parallel(n_jobs=n_threads)(
                 delayed(_compute_cell_dm_expected)(
                     path, cell_name, bin_size, min_distance, min_gch_sites,
-                    dm_window_bins, dm_dist_bin, 400, dm_mode,
+                    dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
                 )
                 for cell_name, path in items
             )
@@ -1241,7 +1260,7 @@ def compute_signed_concordance_matrix(
             per_cell_dm = [
                 _compute_cell_dm_expected(
                     path, cell_name, bin_size, min_distance, min_gch_sites,
-                    dm_window_bins, dm_dist_bin, 400, dm_mode,
+                    dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
                 )
                 for cell_name, path in items
             ]
