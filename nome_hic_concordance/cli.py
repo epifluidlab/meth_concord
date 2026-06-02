@@ -149,15 +149,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'auto' (default): 'dm' for signed, 'dm' otherwise.",
     )
     parser.add_argument(
-        "--baseline", choices=["unlinked", "distance-matched"],
-        default="unlinked",
+        "--baseline", choices=["short-range", "unlinked", "distance-matched"],
+        default="short-range",
         help="Baseline E that the long-range observed concordance O is "
-             "compared against (signed method).  'unlinked' = the short-range "
-             "(<min-distance) same-bin pool (legacy; does NOT control "
-             "distance).  'distance-matched' = the expected co-state of "
-             "random non-contact end-pairs at the SAME distance within the "
-             "bin (an O/E null built from the bin's ~hundreds of read ends), "
-             "controlling distance + bin-marginal.",
+             "compared against (signed method).  'short-range' = the "
+             "short-distance (<min-distance) same-bin pool (legacy; these are "
+             "real short-range *contacts*, not non-contacts — so it does NOT "
+             "control distance.  'unlinked' is a deprecated alias).  "
+             "'distance-matched' = the expected co-state of random "
+             "NON-contact end-pairs at the SAME distance within the bin (an "
+             "O/E null from the bin's ~hundreds of read ends), controlling "
+             "distance + bin-marginal.",
     )
     parser.add_argument(
         "--concordance-combine", choices=["auto", "signed-diff", "log2-ratio"],

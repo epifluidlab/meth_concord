@@ -998,7 +998,7 @@ def compute_signed_concordance_matrix(
     min_bin_coverage: float = 0.0,
     statistic: str = "signed",
     concordance_formula: str = "dm",
-    baseline: str = "unlinked",
+    baseline: str = "short-range",
     concordance_combine: str = "signed-diff",
     dm_window_mb: float = 0.0,
     dm_dist_bin: int = 10_000,
@@ -1097,9 +1097,15 @@ def compute_signed_concordance_matrix(
         raise ValueError(
             f"concordance_formula must be 'dm' or 'mle'; got {concordance_formula!r}."
         )
-    if baseline not in ("unlinked", "distance-matched"):
+    # 'unlinked' is a deprecated alias for 'short-range' — the baseline pool
+    # is short-distance (< min_distance) same-bin read pairs, which are real
+    # short-range *contacts*, not non-contacts (the old name was a misnomer).
+    if baseline == "unlinked":
+        baseline = "short-range"
+    if baseline not in ("short-range", "distance-matched"):
         raise ValueError(
-            f"baseline must be 'unlinked' or 'distance-matched'; got {baseline!r}.")
+            f"baseline must be 'short-range' (alias 'unlinked') or "
+            f"'distance-matched'; got {baseline!r}.")
     if concordance_combine not in ("signed-diff", "log2-ratio"):
         raise ValueError(
             f"concordance_combine must be 'signed-diff' or 'log2-ratio'; "

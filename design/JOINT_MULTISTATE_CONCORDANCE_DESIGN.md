@@ -82,8 +82,8 @@ state distribution is correctly *less committed*, not wrongly committed.
   rate) is an **option** (more accurate for CpG-islands vs gene bodies).
 - **Shared-prior artifact safeguard.** Imputing a shared prior could create
   spurious agreement between two prior-imputed ends. This is a per-locus
-  property present equally in linked and unlinked pairs, so it **cancels in
-  the linked − unlinked subtraction** (§4), provided missingness is
+  property present equally in linked and short-range pairs, so it **cancels in
+  the linked − short-range subtraction** (§4), provided missingness is
   distance-independent within a bin. A QC field records the
   fully-observed vs partially-observed pair fraction per (cell, bin).
 
@@ -103,7 +103,7 @@ mixed  = 1 − Σ_s co_s
 
 Aggregate the soft counts per **(cell, 250-kb bin)** separately for the
 **linked** pool (genomic distance ≥ d0 ≈ 20 kb; long-range) and the
-**unlinked** pool (< d0; local baseline), giving
+**short-range** pool (< d0; local baseline), giving
 `k_co_open, k_co_closed, k_co_poised, k_co_am, k_mixed, n` for each pool.
 
 ---
@@ -120,7 +120,7 @@ DM on RWR-smoothed counts was more robust on the full dataset.)
 generalization of the signed scalar):
 
 ```
-Δ_s = π_s(linked) − π_s(unlinked)   for s ∈ {co-open, co-closed, co-poised, co-active-methylated}
+Δ_s = π_s(linked) − π_s(short-range)   for s ∈ {co-open, co-closed, co-poised, co-active-methylated}
 ```
 
 - **Four channels** (drop "mixed" — it is the redundant residual; the four
@@ -134,7 +134,7 @@ The feature object is a tensor: **cells × bins × 4 channels**.
 
 ## 5. RWR denoising — both modalities
 
-- **Matrices smoothed:** all four co-state channels × {linked, unlinked}.
+- **Matrices smoothed:** all four co-state channels × {linked, short-range}.
 - **k-NN graph (pass 0):** built from **both** modalities —
   `QN(mean GCH accessibility) ⊕ QN(mean HCG methylation)` per cell (or the
   per-cell mean over the four joint states). Refinement passes rebuild the
@@ -218,7 +218,7 @@ Per-end modality (≥2 sites = informative):
   methylation-starved:** with HCG real at ~16% of ends, the methylation
   axis is prior-imputed for ~84% of ends, so the methylation-dependent
   channels (poised, active-methylated, and closed-vs-poised) would be
-  largely prior-driven and likely cancel against the unlinked baseline.
+  largely prior-driven and likely cancel against the short-range baseline.
 
 **Decision — gate the build on a cheaper test.** Before implementing
 J1–J4, determine whether long-range **HCG concordance carries any
@@ -241,7 +241,7 @@ methylation bins) to lift the 16% observation rate.
 3. **Global mixture prior by default**; locally-informed per-region prior
    optional.
 4. **DM estimation** over the 5 categories.
-5. **Linked − unlinked subtraction** per channel (also cancels the
+5. **Linked − short-range subtraction** per channel (also cancels the
    shared-prior artifact).
 6. **RWR over both modalities** (graph from GCH ⊕ HCG; all channels smoothed).
 7. **Per-channel SVD embedding by default**; **tensor decomposition optional**.

@@ -1,5 +1,16 @@
 # Signed concordance + RWR imputation + comparison framework
 
+> **Terminology note (v0.4).** Throughout this document the baseline pool
+> is called **"unlinked."** That name is a **misnomer**: the pool is the
+> set of **short-range** same-bin read pairs (genomic distance
+> `< min_distance`) — which are *real short-range contacts*, not
+> non-contacts. Read "unlinked" as **"short-range"** everywhere. The CLI
+> now exposes it as `--baseline short-range` (with `unlinked` kept as a
+> deprecated alias), and adds `--baseline distance-matched`, an O/E null
+> built from *random non-contact* end-pairs at the matched distance, which
+> — unlike the short-range pool — controls for distance and the bin
+> marginal. See the distance-matched baseline section below.
+
 ## Design document v0.3 — locked decisions (RWR pre-Layer 2, QN k-NN basis)
 
 > **Status:** All §6 decisions locked. Layer 2 = Dirichlet-Multinomial

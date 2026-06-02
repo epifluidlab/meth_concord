@@ -363,6 +363,21 @@ def test_signed_distance_matched_baseline_log2ratio(tmp_path):
     assert "dm_expected" in result["priors"]
 
 
+def test_baseline_unlinked_alias_equals_short_range(tmp_path):
+    """'unlinked' is a deprecated alias for 'short-range' — same result."""
+    paths = _focal_active_paths(tmp_path, n_cells=5)
+    common = dict(bin_size=1000, min_distance=100, min_gch_sites=2,
+                  concordance_formula="mle", use_rwr=False, eb_min_obs=2,
+                  n_threads=1, save_outputs=False)
+    a = concordance.compute_signed_concordance_matrix(
+        paths, baseline="short-range", output_dir=str(tmp_path / "sr"),
+        **common)["delta_signed"]
+    b = concordance.compute_signed_concordance_matrix(
+        paths, baseline="unlinked", output_dir=str(tmp_path / "ul"),
+        **common)["delta_signed"]
+    np.testing.assert_allclose(a.to_numpy(), b.to_numpy())
+
+
 def test_baseline_and_combine_invalid_raise(tmp_path):
     paths = _focal_active_paths(tmp_path, n_cells=3)
     with pytest.raises(ValueError, match="baseline"):
