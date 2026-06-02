@@ -149,6 +149,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'auto' (default): 'dm' for signed, 'dm' otherwise.",
     )
     parser.add_argument(
+        "--baseline", choices=["unlinked", "distance-matched"],
+        default="unlinked",
+        help="Baseline E that the long-range observed concordance O is "
+             "compared against (signed method).  'unlinked' = the short-range "
+             "(<min-distance) same-bin pool (legacy; does NOT control "
+             "distance).  'distance-matched' = the expected co-state of "
+             "random non-contact end-pairs at the SAME distance within the "
+             "bin (an O/E null built from the bin's ~hundreds of read ends), "
+             "controlling distance + bin-marginal.",
+    )
+    parser.add_argument(
+        "--concordance-combine", choices=["auto", "signed-diff", "log2-ratio"],
+        default="auto",
+        help="How O and E are combined.  'signed-diff' = "
+             "(O_open−O_closed)−(E_open−E_closed) (legacy).  'log2-ratio' = "
+             "log2(O_open/E_open)−log2(O_closed/E_closed) (symmetric, "
+             "scale-free, Hi-C O/E convention).  'auto' (default): "
+             "'log2-ratio' when --baseline distance-matched, 'signed-diff' "
+             "otherwise (preserves the validated default).",
+    )
+    parser.add_argument(
+        "--dm-window-mb", type=float, default=0.0,
+        help="For --baseline distance-matched: pool the null end-pool over "
+             "±this many Mb of neighbouring bins (default 0 = the bin's own "
+             "ends only).  Set e.g. 1.0 for a smoother expected at long "
+             "distances where a single bin's end-pairs thin out.",
+    )
+    parser.add_argument(
+        "--dm-dist-bin-bp", type=int, default=10_000,
+        help="Distance-bin width (bp) for the distance-matched expected "
+             "(default 10 kb).",
+    )
+    parser.add_argument(
         "--refinement-basis", choices=["auto", "raw", "postnorm"], default="auto",
         help="For RWR refinement passes (--rwr-refine-passes >= 1): which form "
              "of the previous pass's Δ_signed to build the next k-NN graph "
@@ -894,6 +927,14 @@ def run_context(
                 "dm" if args.concordance_formula == "auto"
                 else args.concordance_formula
             )
+            # Resolve --concordance-combine: auto → log2-ratio for the
+            # distance-matched O/E baseline, signed-diff for the legacy
+            # unlinked baseline (preserves the validated default).
+            concordance_combine = (
+                ("log2-ratio" if args.baseline == "distance-matched"
+                 else "signed-diff") if args.concordance_combine == "auto"
+                else args.concordance_combine
+            )
             refinement_basis = (
                 "postnorm" if args.refinement_basis == "auto"
                 else args.refinement_basis
@@ -933,6 +974,10 @@ def run_context(
                 min_bin_coverage=args.min_bin_coverage,
                 statistic=args.concordance_statistic or "signed",
                 concordance_formula=concordance_formula,
+                baseline=args.baseline,
+                concordance_combine=concordance_combine,
+                dm_window_mb=args.dm_window_mb,
+                dm_dist_bin=args.dm_dist_bin_bp,
                 use_rwr=(args.impute == "rwr"),
                 rwr_k=args.rwr_k,
                 rwr_restart_prob=args.rwr_restart_prob,

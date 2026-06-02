@@ -590,6 +590,13 @@ _SOFT_COUNT_KEYS = (
     "k_u_open", "k_u_closed", "k_u_mixed", "n_unlinked",
 )
 
+# Distance-matched expected (O/E baseline) soft counts — emitted only when
+# baseline='distance-matched'.  For each observed long-range contact we add
+# the *expected* co-state of random, distance-matched end-pairs at the same
+# distance, so n_dm == n_linked and the per-(cell,bin) expected RATE is
+# distance-matched to the observed contacts.
+_DM_KEYS = ("k_dm_open", "k_dm_closed", "k_dm_mixed", "n_dm")
+
 
 def _compute_cell_soft_counts(
     posteriors_path: str,
@@ -708,6 +715,134 @@ def _compute_cell_soft_counts(
         rec["k_u_closed"] = float(row["k_u_closed"])
         rec["k_u_mixed"] = float(row["k_u_mixed"])
 
+    return cell_name, counts
+
+
+def _dm_expected_for_bin(
+    epos: np.ndarray, ep: np.ndarray, contact_dists: np.ndarray,
+    dist_bin: int, max_ends: int, seed: int,
+) -> tuple[float, float, float, int]:
+    """Distance-matched expected co-state for one bin's contacts.
+
+    ``epos``/``ep`` are the positions and open-posteriors of the bin's read
+    ends (the null pool).  Forms all (or a capped sample of) end-pairs,
+    bins their separation into ``dist_bin``-bp buckets, and for each
+    observed contact looks up the mean soft co-state of random end-pairs at
+    the contact's distance bucket (falling back to the pooled mean when a
+    bucket is empty).  Returns summed expected (k_dm_open, k_dm_closed,
+    k_dm_mixed, n_dm) over the contacts.
+    """
+    m = epos.shape[0]
+    if m < 2 or contact_dists.size == 0:
+        return 0.0, 0.0, 0.0, 0
+    if m > max_ends:                      # subsample the end pool for speed
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(m, size=max_ends, replace=False)
+        epos, ep = epos[idx], ep[idx]
+        m = max_ends
+    iu, ju = np.triu_indices(m, k=1)      # all unordered end-pairs (i<j)
+    d = np.abs(epos[iu] - epos[ju])
+    pa, pb = ep[iu], ep[ju]
+    po = pa * pb
+    pc = (1.0 - pa) * (1.0 - pb)
+    pm = pa * (1.0 - pb) + (1.0 - pa) * pb
+    bucket = (d // dist_bin).astype(np.int64)
+    nb = int(bucket.max()) + 1
+    cnt = np.bincount(bucket, minlength=nb).astype(np.float64)
+    sum_o = np.bincount(bucket, weights=po, minlength=nb)
+    sum_c = np.bincount(bucket, weights=pc, minlength=nb)
+    sum_m = np.bincount(bucket, weights=pm, minlength=nb)
+    safe = np.where(cnt > 0, cnt, 1.0)
+    exp_o, exp_c, exp_m = sum_o / safe, sum_c / safe, sum_m / safe
+    pooled_o = po.mean(); pooled_c = pc.mean(); pooled_m = pm.mean()
+
+    cb = (contact_dists // dist_bin).astype(np.int64)
+    k_o = k_c = k_m = 0.0
+    for b in cb:
+        if b < nb and cnt[b] > 0:
+            k_o += exp_o[b]; k_c += exp_c[b]; k_m += exp_m[b]
+        else:                              # empty bucket → pooled fallback
+            k_o += pooled_o; k_c += pooled_c; k_m += pooled_m
+    return float(k_o), float(k_c), float(k_m), int(contact_dists.size)
+
+
+def _compute_cell_dm_expected(
+    posteriors_path: str,
+    cell_name: str,
+    bin_size: int,
+    min_distance: int,
+    min_gch_sites: int,
+    dm_window_bins: int = 0,
+    dm_dist_bin: int = 10_000,
+    dm_max_ends: int = 400,
+) -> tuple[str, dict[str, dict[str, float]]]:
+    """Per-(cell, bin) distance-matched expected soft counts (``_DM_KEYS``).
+
+    The null pool for a bin is its own informative read ends (those of any
+    pair, regardless of partner location); with ``dm_window_bins > 0`` it is
+    pooled over ±that many neighbouring bins (a smoother expected at long
+    distances where a single bin's end-pairs thin out).
+    """
+    df = pd.read_parquet(
+        posteriors_path,
+        columns=["chrom", "pos1", "pos2", "n1", "n2", "distance",
+                 "posterior1", "posterior2"],
+    )
+    if len(df) == 0:
+        return cell_name, {}
+    chrom = df["chrom"].astype(str).values
+    pos1 = df["pos1"].to_numpy(dtype=np.int64)
+    pos2 = df["pos2"].to_numpy(dtype=np.int64)
+    n1 = df["n1"].to_numpy(dtype=np.int32)
+    n2 = df["n2"].to_numpy(dtype=np.int32)
+    p1 = df["posterior1"].to_numpy(dtype=np.float64, na_value=np.nan)
+    p2 = df["posterior2"].to_numpy(dtype=np.float64, na_value=np.nan)
+    distance = df["distance"].to_numpy(dtype=np.int64)
+    bsz = int(bin_size)
+    inf1 = (n1 >= min_gch_sites) & np.isfinite(p1)
+    inf2 = (n2 >= min_gch_sites) & np.isfinite(p2)
+
+    # End pool: every informative end, by (chrom, bin).
+    e_chrom = np.concatenate([chrom[inf1], chrom[inf2]])
+    e_pos = np.concatenate([pos1[inf1], pos2[inf2]])
+    e_p = np.concatenate([p1[inf1], p2[inf2]])
+    e_bin = (e_pos // bsz)
+    ends = pd.DataFrame({"chrom": e_chrom, "bin": e_bin, "pos": e_pos, "p": e_p})
+    ends_by_bin = {key: g for key, g in ends.groupby(["chrom", "bin"], sort=False)}
+
+    # Observed long-range contacts (same-bin, informative, linked).
+    same_bin = (pos1 // bsz) == (pos2 // bsz)
+    linked = same_bin & inf1 & inf2 & (distance >= int(min_distance))
+    if not linked.any():
+        return cell_name, {}
+    obs = pd.DataFrame({
+        "chrom": chrom[linked], "bin": (pos1[linked] // bsz),
+        "distance": distance[linked],
+    })
+
+    counts: dict[str, dict[str, float]] = {}
+    seed_base = abs(hash(cell_name)) % (2 ** 31)
+    for (c, b), og in obs.groupby(["chrom", "bin"], sort=False):
+        # Assemble the (optionally windowed) end pool for this bin.
+        if dm_window_bins > 0:
+            pool = [ends_by_bin[(c, bb)] for bb in range(int(b) - dm_window_bins,
+                    int(b) + dm_window_bins + 1) if (c, bb) in ends_by_bin]
+            ep_df = pd.concat(pool) if pool else None
+        else:
+            ep_df = ends_by_bin.get((c, int(b)))
+        if ep_df is None or len(ep_df) < 2:
+            continue
+        k_o, k_c, k_m, n_dm = _dm_expected_for_bin(
+            ep_df["pos"].to_numpy(dtype=np.int64),
+            ep_df["p"].to_numpy(dtype=np.float64),
+            og["distance"].to_numpy(dtype=np.int64),
+            dist_bin=int(dm_dist_bin), max_ends=int(dm_max_ends),
+            seed=seed_base + int(b),
+        )
+        counts[f"{c}:{int(b) * bsz}"] = {
+            "k_dm_open": k_o, "k_dm_closed": k_c, "k_dm_mixed": k_m,
+            "n_dm": float(n_dm),
+        }
     return cell_name, counts
 
 
@@ -863,6 +998,10 @@ def compute_signed_concordance_matrix(
     min_bin_coverage: float = 0.0,
     statistic: str = "signed",
     concordance_formula: str = "dm",
+    baseline: str = "unlinked",
+    concordance_combine: str = "signed-diff",
+    dm_window_mb: float = 0.0,
+    dm_dist_bin: int = 10_000,
     use_rwr: bool = True,
     rwr_k: int = 15,
     rwr_restart_prob: float = 0.5,
@@ -958,6 +1097,13 @@ def compute_signed_concordance_matrix(
         raise ValueError(
             f"concordance_formula must be 'dm' or 'mle'; got {concordance_formula!r}."
         )
+    if baseline not in ("unlinked", "distance-matched"):
+        raise ValueError(
+            f"baseline must be 'unlinked' or 'distance-matched'; got {baseline!r}.")
+    if concordance_combine not in ("signed-diff", "log2-ratio"):
+        raise ValueError(
+            f"concordance_combine must be 'signed-diff' or 'log2-ratio'; "
+            f"got {concordance_combine!r}.")
 
     out_path = ensure_dir(output_dir) if save_outputs else None
     items = list(cell_posterior_paths.items())
@@ -983,6 +1129,35 @@ def compute_signed_concordance_matrix(
             for cell_name, path in items
         ]
 
+    # ---- Step 1b: distance-matched expected (O/E baseline), optional -----
+    if baseline == "distance-matched":
+        dm_window_bins = int(round((dm_window_mb * 1_000_000) / bin_size))
+        logger.info(
+            f"Distance-matched expected baseline: window=±{dm_window_bins} bins "
+            f"({dm_window_mb} Mb), dist-bin={dm_dist_bin:,} bp"
+        )
+        if n_threads > 1 and len(items) > 1:
+            per_cell_dm = Parallel(n_jobs=n_threads)(
+                delayed(_compute_cell_dm_expected)(
+                    path, cell_name, bin_size, min_distance, min_gch_sites,
+                    dm_window_bins, dm_dist_bin,
+                )
+                for cell_name, path in items
+            )
+        else:
+            per_cell_dm = [
+                _compute_cell_dm_expected(
+                    path, cell_name, bin_size, min_distance, min_gch_sites,
+                    dm_window_bins, dm_dist_bin,
+                )
+                for cell_name, path in items
+            ]
+        # Merge dm entries into the soft-count entries (same bin ids).
+        dm_by_cell = {cn: d for cn, d in per_cell_dm}
+        for cn, c in per_cell:
+            for bid, dm_entry in dm_by_cell.get(cn, {}).items():
+                c.setdefault(bid, {k: 0.0 for k in _SOFT_COUNT_KEYS}).update(dm_entry)
+
     # ---- Step 2: assemble cells × bins soft-count matrices --------------
     all_bins: set[str] = set()
     for _, c in per_cell:
@@ -994,14 +1169,16 @@ def compute_signed_concordance_matrix(
     n_bins = len(sorted_bins)
     bin_to_col = {b: i for i, b in enumerate(sorted_bins)}
 
+    matrix_keys = list(_SOFT_COUNT_KEYS) + (
+        list(_DM_KEYS) if baseline == "distance-matched" else [])
     raw_counts: dict[str, np.ndarray] = {
-        k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in _SOFT_COUNT_KEYS
+        k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in matrix_keys
     }
     for row_idx, (_, c) in enumerate(per_cell):
         for bid, entry in c.items():
             j = bin_to_col[bid]
-            for k in _SOFT_COUNT_KEYS:
-                raw_counts[k][row_idx, j] = entry[k]
+            for k in matrix_keys:
+                raw_counts[k][row_idx, j] = entry.get(k, 0.0)
 
     logger.info(
         f"Soft-count matrices: {n_cells} cells × {n_bins} bins. "
@@ -1143,6 +1320,21 @@ def compute_signed_concordance_matrix(
         fitted_priors["linked"] = {"alpha": alpha_l, "info": info_l}
         fitted_priors["unlinked"] = {"alpha": alpha_u, "info": info_u}
 
+        # Distance-matched expected pool (only when baseline='distance-matched').
+        alpha_dm = None
+        if baseline == "distance-matched" and "k_dm_open" in imputed:
+            long_dm = pd.DataFrame({
+                "k_open":   imputed["k_dm_open"].ravel(),
+                "k_closed": imputed["k_dm_closed"].ravel(),
+                "k_mixed":  imputed["k_dm_mixed"].ravel(),
+                "n_linked": imputed["n_dm"].ravel(),
+            })
+            alpha_dm, info_dm = _fit_dirichlet_multinomial_eb_prior(
+                long_dm, open_col="k_open", closed_col="k_closed",
+                mixed_col="k_mixed", n_col="n_linked", min_obs=eb_min_obs,
+            )
+            fitted_priors["dm_expected"] = {"alpha": alpha_dm, "info": info_dm}
+
         # Compute the per-(cell, bin) Δ_signed.  Two estimators:
         #
         #   "dm"  — Dirichlet-Multinomial posterior plug-in:
@@ -1166,28 +1358,42 @@ def compute_signed_concordance_matrix(
         #           per-cell rank normalization in Step 7.  Entries with
         #           n == 0 contribute 0 to their side (matches the
         #           independence-baseline convention).
-        if concordance_formula == "mle":
-            def _mle_signed(k_open, k_closed, n):
-                safe_n = np.where(n > 0, n, np.nan)
-                s = (k_open - k_closed) / safe_n
-                return np.nan_to_num(s, nan=0.0)
-            S_l = _mle_signed(imputed["k_open"], imputed["k_closed"],
-                              imputed["n_linked"])
-            S_u = _mle_signed(imputed["k_u_open"], imputed["k_u_closed"],
-                              imputed["n_unlinked"])
-            delta_signed = S_l - S_u
+        # Per-pool (open, closed) rates under the chosen estimator.
+        def _side_rates(ko, kc, km, n, alpha):
+            if concordance_formula == "mle":
+                safe = np.where(n > 0, n, np.nan)
+                return (np.nan_to_num(ko / safe, nan=0.0),
+                        np.nan_to_num(kc / safe, nan=0.0))
+            pm = _dm_posterior_means(
+                {"k_open": ko, "k_closed": kc, "k_mixed": km, "n": n},
+                alpha, ("k_open", "k_closed", "k_mixed"), "n")
+            return pm["open"], pm["closed"]
+
+        # Observed = the long-range (linked) contacts.
+        o_open, o_closed = _side_rates(
+            imputed["k_open"], imputed["k_closed"], imputed["k_mixed"],
+            imputed["n_linked"], alpha_l)
+
+        # Baseline (E): short-range 'unlinked' pool, or distance-matched expected.
+        if baseline == "distance-matched":
+            e_open, e_closed = _side_rates(
+                imputed["k_dm_open"], imputed["k_dm_closed"],
+                imputed["k_dm_mixed"], imputed["n_dm"], alpha_dm)
         else:
-            pm_l = _dm_posterior_means(
-                imputed, alpha_l, ("k_open", "k_closed", "k_mixed"), "n_linked",
-            )
-            pm_u = _dm_posterior_means(
-                {"k_open": imputed["k_u_open"], "k_closed": imputed["k_u_closed"],
-                 "k_mixed": imputed["k_u_mixed"], "n_unlinked": imputed["n_unlinked"]},
-                alpha_u, ("k_open", "k_closed", "k_mixed"), "n_unlinked",
-            )
-            S_l = pm_l["open"] - pm_l["closed"]
-            S_u = pm_u["open"] - pm_u["closed"]
-            delta_signed = S_l - S_u
+            e_open, e_closed = _side_rates(
+                imputed["k_u_open"], imputed["k_u_closed"],
+                imputed["k_u_mixed"], imputed["n_unlinked"], alpha_u)
+
+        # Combine observed (O) and expected (E).
+        if concordance_combine == "log2-ratio":
+            # log2(O/E) per co-state, then the open-vs-closed contrast.  DM
+            # keeps rates strictly in (0,1); for MLE we floor with a tiny eps.
+            eps = 1e-6
+            log2 = lambda x: np.log2(np.clip(x, eps, None))
+            delta_signed = (log2(o_open) - log2(e_open)) \
+                - (log2(o_closed) - log2(e_closed))
+        else:  # 'signed-diff' (legacy): (O_open−O_closed) − (E_open−E_closed)
+            delta_signed = (o_open - o_closed) - (e_open - e_closed)
 
         # The min_pairs_per_bin filter only makes sense WITHOUT RWR.
         # With RWR on, every (cell, bin) has an imputed value blended

@@ -321,6 +321,62 @@ def test_concordance_formula_invalid_raises(tmp_path):
         )
 
 
+def test_dm_expected_for_bin_known_values():
+    """Distance-matched expected = mean soft co-state of end-pairs at the
+    contact's distance bucket."""
+    epos = np.array([0, 1000, 2000], dtype=np.int64)
+    ep = np.array([0.9, 0.9, 0.1], dtype=np.float64)
+    # End-pairs: (0,1000) d=1000 po=0.81; (1000,2000) d=1000 po=0.09;
+    # (0,2000) d=2000.  Bucket d=1000 → mean co-open = (0.81+0.09)/2 = 0.45.
+    k_o, k_c, k_m, n = concordance._dm_expected_for_bin(
+        epos, ep, np.array([1000]), dist_bin=1000, max_ends=400, seed=0)
+    assert n == 1
+    assert abs(k_o - 0.45) < 1e-9
+    # co-closed at d=1000: ((1-.9)(1-.9)=0.01 + (1-.9)(1-.1)=0.09)/2 = 0.05
+    assert abs(k_c - 0.05) < 1e-9
+
+
+def test_compute_cell_dm_expected_returns_counts(tmp_path):
+    paths = _focal_active_paths(tmp_path, n_cells=1)
+    cell, counts = concordance._compute_cell_dm_expected(
+        paths["c0"], "c0", bin_size=1000, min_distance=100, min_gch_sites=2,
+        dm_window_bins=0, dm_dist_bin=100)
+    assert "chr1:0" in counts
+    rec = counts["chr1:0"]
+    assert set(rec) == set(concordance._DM_KEYS)
+    assert rec["n_dm"] > 0 and rec["k_dm_open"] >= 0
+
+
+def test_signed_distance_matched_baseline_log2ratio(tmp_path):
+    """End-to-end: baseline='distance-matched' + log2-ratio produces a finite
+    Δ matrix and fits a dm-expected prior."""
+    paths = _focal_active_paths(tmp_path, n_cells=8)
+    result = concordance.compute_signed_concordance_matrix(
+        paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+        baseline="distance-matched", concordance_combine="log2-ratio",
+        concordance_formula="dm", use_rwr=False, eb_min_obs=2, n_threads=1,
+        output_dir=str(tmp_path / "out"), save_outputs=False,
+    )
+    delta = result["delta_signed"]
+    assert delta.shape[0] == 8 and "chr1:0" in delta.columns
+    assert np.isfinite(delta["chr1:0"].to_numpy()).all()
+    assert "dm_expected" in result["priors"]
+
+
+def test_baseline_and_combine_invalid_raise(tmp_path):
+    paths = _focal_active_paths(tmp_path, n_cells=3)
+    with pytest.raises(ValueError, match="baseline"):
+        concordance.compute_signed_concordance_matrix(
+            paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+            baseline="nope", use_rwr=False, eb_min_obs=2, n_threads=1,
+            output_dir=str(tmp_path / "a"), save_outputs=False)
+    with pytest.raises(ValueError, match="concordance_combine"):
+        concordance.compute_signed_concordance_matrix(
+            paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+            concordance_combine="nope", use_rwr=False, eb_min_obs=2,
+            n_threads=1, output_dir=str(tmp_path / "b"), save_outputs=False)
+
+
 def test_min_cell_pairs_drops_sparse_cells(tmp_path):
     """Pre-imputation cell QC drops cells below the informative-pair floor."""
     paths = dict(_focal_active_paths(tmp_path, n_cells=4))  # 40 pairs each
