@@ -80,6 +80,14 @@ def _prep_matrix(
     return res["zscore"]
 
 
+# A feature matrix needs at least this many bins (after the coverage filter)
+# to be usable for SVD/UMAP/classification.  Concordance computed WITHOUT RWR
+# imputation at fine resolution is so sparse that almost no bin clears the
+# coverage filter (e.g. 100-kb no-RWR concordance → 1–28 bins), which would
+# otherwise crash TruncatedSVD; such matrices are skipped with a warning.
+_MIN_BINS = 2
+
+
 def _svd_scores(normalized: pd.DataFrame, n_svd: int) -> tuple[np.ndarray, np.ndarray]:
     """Column-standardize then TruncatedSVD; return (scores, var_ratio)."""
     from sklearn.decomposition import TruncatedSVD
@@ -223,6 +231,16 @@ def marginal_analysis(
     for name, df in matrices.items():
         logger.info(f"[marginal] {name}: {df.shape}")
         norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage)
+        if norm.shape[1] < _MIN_BINS:
+            logger.warning(
+                f"[marginal] {name}: only {norm.shape[1]} bin(s) survive the "
+                f"coverage filter — skipping SVD/UMAP/metrics.  This matrix is "
+                f"too sparse to analyze (typical of concordance without "
+                f"--impute rwr at fine resolution; use coarser bins).")
+            metrics[name] = {"n_cells": int(norm.shape[0]),
+                             "n_bins": int(norm.shape[1]),
+                             "skipped": "too_few_bins_after_coverage_filter"}
+            continue
         visualization.run_svd_scree(
             norm, output_prefix=f"svd_scree_{name}",
             output_dir=str(out), random_state=random_state,
@@ -393,6 +411,10 @@ def residual_umap(
     out = ensure_dir(output_dir)
     norm = _prep_matrix(residual, f"residual_{target_name}", output_dir,
                         matrix_norm, min_cell_coverage)
+    if norm.shape[1] < _MIN_BINS:
+        logger.warning(f"[residual] {target_name}: {norm.shape[1]} bin(s) — "
+                       f"skipping residual UMAP/metrics.")
+        return {"n_bins": int(norm.shape[1]), "skipped": "too_few_bins"}
     _safe_umap(
         norm, group_labels, title=f"UMAP (residual: {target_name} | baselines)",
         output_prefix=f"umap_residual_{target_name}", output_dir=str(out),
@@ -445,6 +467,11 @@ def classifier_comparison(
     blocks: dict[str, np.ndarray] = {}
     for name, df in matrices.items():
         norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage)
+        if norm.shape[1] < _MIN_BINS:
+            logger.warning(
+                f"[classifier] {name}: only {norm.shape[1]} bin(s) after "
+                f"coverage filter — excluding from classification (too sparse).")
+            continue
         scores, _ = _svd_scores(norm.loc[common], n_svd)
         blocks[name] = scores
 
@@ -461,35 +488,37 @@ def classifier_comparison(
                          blocks[n].shape[1] for n in names)})
         return mean
 
-    # Individual matrices.
-    for name in matrices:
+    # Individual matrices (only those that survived).
+    for name in blocks:
         _add(name, [name])
     # Baselines combined (if >1 baseline present).
-    present_baselines = [b for b in baseline_names if b in matrices]
+    present_baselines = [b for b in baseline_names if b in blocks]
     base_auc = None
     if present_baselines:
         base_auc = _add("baselines", present_baselines)
     # Baselines + each concordance.
     for cn in concordance_names:
-        if cn in matrices and present_baselines:
+        if cn in blocks and present_baselines:
             _add(f"baselines+{cn}", present_baselines + [cn])
     # Concordance added to the 3D-genome baseline ALONE — scHi-C compartments
     # are typically far from ceiling, so this isolates "does concordance add
     # cell-type info beyond scHi-C?" with real headroom (unlike the
     # level-saturated full-baseline gain).
-    if "compartment" in matrices:
+    if "compartment" in blocks:
         for cn in concordance_names:
-            if cn in matrices:
+            if cn in blocks:
                 _add(f"compartment+{cn}", ["compartment", cn])
     # All matrices.
-    if len(matrices) > 1:
-        _add("all", list(matrices.keys()))
+    if len(blocks) > 1:
+        _add("all", list(blocks.keys()))
 
     tab = pd.DataFrame(rows)
     # Gain of each concordance over the baselines.
     if base_auc is not None:
         gains = []
         for cn in concordance_names:
+            if cn not in blocks:
+                continue
             row = tab.loc[tab["feature_set"] == f"baselines+{cn}"]
             if len(row):
                 gains.append({"concordance": cn,
@@ -545,11 +574,13 @@ def classifier_comparison_pairwise(
     blocks: dict[str, pd.DataFrame] = {}
     for name, df in matrices.items():
         norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage)
+        if norm.shape[1] < _MIN_BINS:
+            continue                              # too sparse — skip (warned elsewhere)
         scores, _ = _svd_scores(norm.loc[common], n_svd)
         blocks[name] = pd.DataFrame(scores, index=cells_index)
 
-    present_baselines = [b for b in baseline_names if b in matrices]
-    conc = [c for c in concordance_names if c in matrices]
+    present_baselines = [b for b in baseline_names if b in blocks]
+    conc = [c for c in concordance_names if c in blocks]
     if not present_baselines or not conc:
         return pd.DataFrame()
     classes = sorted(pd.unique(labels))
@@ -630,21 +661,35 @@ def run_comparison(
     # (b)+(c) Variance partition + residual UMAP for each concordance matrix.
     present_baselines = [b for b in baseline_names if b in matrices]
     summary["residual"] = {}
-    if present_baselines:
-        base_norm = {b: _prep_matrix(matrices[b], b, output_dir, matrix_norm,
-                                     min_cell_coverage) for b in present_baselines}
+    # Drop baselines too sparse to use as regressors.
+    base_norm = {}
+    for b in present_baselines:
+        bn = _prep_matrix(matrices[b], b, output_dir, matrix_norm, min_cell_coverage)
+        if bn.shape[1] < _MIN_BINS:
+            logger.warning(f"[residual] baseline {b}: {bn.shape[1]} bin(s) — "
+                           f"excluding from the variance-partition regression.")
+            continue
+        base_norm[b] = bn
+    if base_norm:
         for cn in concordance_names:
             if cn not in matrices:
                 continue
             tnorm = _prep_matrix(matrices[cn], cn, output_dir, matrix_norm,
                                  min_cell_coverage)
+            if tnorm.shape[1] < _MIN_BINS:
+                logger.warning(f"[residual] {cn}: {tnorm.shape[1]} bin(s) after "
+                               f"coverage filter — skipping residual analysis "
+                               f"(too sparse; e.g. no-RWR concordance at fine "
+                               f"resolution).")
+                summary["residual"][cn] = {"skipped": "too_few_bins"}
+                continue
             resid = variance_partition(tnorm, base_norm, cn, output_dir,
                                        level_control=level_control)
             summary["residual"][cn] = residual_umap(
                 resid, labels, cn, output_dir, matrix_norm, n_svd,
                 min_cell_coverage, random_state)
     else:
-        logger.warning("No baseline matrices present; skipping (b)/(c).")
+        logger.warning("No usable baseline matrices; skipping (b)/(c).")
 
     # (d) Classifier comparison.
     if labels is not None:
