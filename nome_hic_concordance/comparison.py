@@ -120,6 +120,51 @@ def _knn_purity(scores: np.ndarray, labels: pd.Series, k: int = 15) -> float:
     return float(same.mean())
 
 
+def _knn_purity_stats(
+    scores: np.ndarray, labels: pd.Series, k: int = 15,
+    n_perm: int = 500, seed: int = 0,
+) -> dict:
+    """kNN-purity WITH its null, so an absolute value is interpretable.
+
+    A raw purity is meaningless without a reference: under random neighbour
+    assignment the expected purity is ``chance = Σ_g p_g²`` (= 0.5 only for a
+    balanced 2-class problem; higher when imbalanced, lower with more
+    classes).  We also run a label-permutation null on the *fixed* neighbour
+    graph (relabel only — no refit) to get a calibrated p-value and z-score.
+
+    Returns {purity, chance, perm_mean, perm_sd, z, perm_p, excess}.
+    ``perm_p`` is one-sided (P[null purity >= observed]); ``excess`` is
+    ``purity − chance``.
+    """
+    from sklearn.neighbors import NearestNeighbors
+    nan = float("nan")
+    y = labels.to_numpy()
+    n = scores.shape[0]
+    if n < 3 or len(np.unique(y)) < 2:
+        return {"purity": nan, "chance": nan, "perm_mean": nan,
+                "perm_sd": nan, "z": nan, "perm_p": nan, "excess": nan}
+    k_eff = min(k, n - 1)
+    nn = NearestNeighbors(n_neighbors=k_eff + 1).fit(scores)
+    _, idx = nn.kneighbors(scores)
+    idx = idx[:, 1:]                                  # drop self
+    obs = float((y[idx] == y[:, None]).mean())
+    _, counts = np.unique(y, return_counts=True)
+    p = counts / counts.sum()
+    chance = float(np.sum(p * p))
+    rng = np.random.default_rng(seed)
+    null = np.empty(int(n_perm), dtype=np.float64)
+    for t in range(int(n_perm)):
+        yp = rng.permutation(y)                       # reuse fixed graph
+        null[t] = (yp[idx] == yp[:, None]).mean()
+    perm_mean = float(null.mean())
+    perm_sd = float(null.std(ddof=1)) if n_perm > 1 else nan
+    z = float((obs - perm_mean) / perm_sd) if perm_sd and perm_sd > 0 else nan
+    perm_p = float((np.sum(null >= obs) + 1) / (int(n_perm) + 1))
+    return {"purity": obs, "chance": chance, "perm_mean": perm_mean,
+            "perm_sd": perm_sd, "z": z, "perm_p": perm_p,
+            "excess": obs - chance}
+
+
 # ---------------------------------------------------------------------------
 # Bin-grid alignment (broadcast a coarser predictor onto a finer target)
 # ---------------------------------------------------------------------------
@@ -193,7 +238,12 @@ def marginal_analysis(
             scores, vr = _svd_scores(norm.loc[common], n_svd)
             lab = group_labels.loc[common]
             m["silhouette"] = _silhouette(scores, lab)
-            m["knn_purity"] = _knn_purity(scores, lab)
+            ks = _knn_purity_stats(scores, lab)
+            m["knn_purity"] = ks["purity"]
+            m["knn_chance"] = ks["chance"]
+            m["knn_excess"] = ks["excess"]
+            m["knn_z"] = ks["z"]
+            m["knn_perm_p"] = ks["perm_p"]
             m["top_svd_var_frac"] = float(vr[0])
         metrics[name] = m
     return metrics
@@ -354,7 +404,12 @@ def residual_umap(
         scores, _ = _svd_scores(norm.loc[common], n_svd)
         lab = group_labels.loc[common]
         m["silhouette"] = _silhouette(scores, lab)
-        m["knn_purity"] = _knn_purity(scores, lab)
+        ks = _knn_purity_stats(scores, lab)
+        m["knn_purity"] = ks["purity"]
+        m["knn_chance"] = ks["chance"]
+        m["knn_excess"] = ks["excess"]
+        m["knn_z"] = ks["z"]
+        m["knn_perm_p"] = ks["perm_p"]
     return m
 
 

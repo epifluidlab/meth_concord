@@ -185,3 +185,38 @@ def test_run_comparison_requires_shared_cells(tmp_path):
         comparison.run_comparison(
             {"a": a, "b": b}, None, baseline_names=["a"],
             concordance_names=["b"], output_dir=str(tmp_path))
+
+
+def test_knn_purity_stats_separated_vs_random():
+    """Null-aware kNN purity: separated clusters beat chance (small perm_p);
+    random embedding sits at chance (large perm_p)."""
+    rng = np.random.default_rng(0)
+    n = 60
+    labels = pd.Series(["A"] * (n // 2) + ["B"] * (n // 2),
+                       index=[f"c{i}" for i in range(n)])
+    # Two clearly separated Gaussian blobs.
+    sep = np.vstack([rng.normal(-5, 0.3, size=(n // 2, 4)),
+                     rng.normal(+5, 0.3, size=(n // 2, 4))])
+    s = comparison._knn_purity_stats(sep, labels, k=10, n_perm=200, seed=1)
+    assert s["purity"] > 0.95
+    assert abs(s["chance"] - 0.5) < 1e-9          # balanced 2-class
+    assert s["perm_p"] < 0.05 and s["z"] > 3
+
+    # Random embedding: purity ~ chance, not significant.
+    rnd = rng.normal(0, 1, size=(n, 4))
+    s2 = comparison._knn_purity_stats(rnd, labels, k=10, n_perm=200, seed=1)
+    assert abs(s2["purity"] - s2["chance"]) < 0.12
+    assert s2["perm_p"] > 0.05
+
+
+def test_knn_purity_chance_reflects_imbalance():
+    """Analytic chance = Σ p_g² rises with class imbalance (not fixed at 0.5)."""
+    idx = [f"c{i}" for i in range(50)]
+    bal = pd.Series(["A"] * 25 + ["B"] * 25, index=idx)
+    imb = pd.Series(["A"] * 40 + ["B"] * 10, index=idx)
+    scores = np.random.default_rng(0).normal(0, 1, size=(50, 3))
+    cb = comparison._knn_purity_stats(scores, bal, n_perm=50)["chance"]
+    ci = comparison._knn_purity_stats(scores, imb, n_perm=50)["chance"]
+    assert abs(cb - 0.5) < 1e-9
+    assert abs(ci - (0.8 ** 2 + 0.2 ** 2)) < 1e-9    # 0.68
+    assert ci > cb
