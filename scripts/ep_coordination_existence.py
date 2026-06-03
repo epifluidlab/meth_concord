@@ -434,11 +434,12 @@ def main() -> None:
                 p = float((np.sum(null >= mean) + 1) / (null.size + 1))
         return mean, std, p
 
-    print(f"\n[classifier={method}]  Δ|m = Δ residualized on marginal; "
-          f"Δ|m+cov = on marginal+marginal²+coverage (fuller leakage control)")
+    print(f"\n[classifier={method}]  Δ|m = Δ resid. on marginal; Δ|m+cov = on "
+          f"marginal+marginal²+coverage;  miss = AUC of the contact-PRESENCE "
+          f"mask (scHi-C-like reference)")
     print(f"{'granularity':>11} {'n_reg':>6} {'pairs/reg':>9} "
-          f"{'Δ AUC':>10} {'p':>6} {'Δ|m AUC':>10} {'p':>6} "
-          f"{'Δ|m+cov':>10} {'p':>6} {'marg':>7}")
+          f"{'Δ AUC':>8} {'p':>6} {'Δ|m':>7} {'p':>6} "
+          f"{'Δ|m+cov':>8} {'p':>6} {'miss':>6} {'marg':>6}")
     rows = []
     for gran in grans:
         gk = str(gran)
@@ -458,8 +459,14 @@ def main() -> None:
                     npairs.append(n_o)
         Dk, Mk = D[keep], Mg[keep]
         Covk = np.log1p(np.nan_to_num(Cov[keep], nan=0.0))
+        # Missingness mask: which (cell, region) have a Δ at all (contact
+        # PRESENCE, scHi-C-like).  A reference benchmark: if the residual AUC
+        # ≈ the missingness AUC, the "signal" is just which regions a cell has
+        # contacts in (coverage/contact-map), NOT epigenetic concordance.
+        Miss = np.isfinite(Dk).astype(np.float64)
         Xc = _prep(_standardize(pd.DataFrame(Dk)))
         Xm = _prep(_standardize(pd.DataFrame(Mk)))
+        Xmiss = _prep(_standardize(pd.DataFrame(Miss)))
         # Leakage controls: linear marginal, then marginal+marginal²+coverage.
         Xr = _prep(_standardize(pd.DataFrame(_residualize(Dk, Mk))))
         Xr2 = _prep(_standardize(pd.DataFrame(
@@ -468,10 +475,11 @@ def main() -> None:
         rmean, rstd, rp = _auc_perm(Xr)
         r2mean, r2std, r2p = _auc_perm(Xr2)
         mmean, mstd = _score(Xm, y)
+        missmean, _ = _score(Xmiss, y)
         med = int(np.median(npairs)) if npairs else 0
         print(f"{gk:>11} {len(all_regions):>6} {med:>9} "
               f"{cmean:>7.3f} {cp:>6.3f} {rmean:>7.3f} {rp:>6.3f} "
-              f"{r2mean:>7.3f} {r2p:>6.3f} {mmean:>7.3f}")
+              f"{r2mean:>7.3f} {r2p:>6.3f} {missmean:>6.3f} {mmean:>6.3f}")
         rows.append({"classifier": method,
                      "granularity": gk, "n_regions": len(all_regions),
                      "median_pairs_per_region": med,
@@ -483,16 +491,17 @@ def main() -> None:
                      "concordance_resid_full_auc": r2mean,
                      "concordance_resid_full_std": r2std,
                      "concordance_resid_full_perm_p": r2p,
+                     "missingness_auc": missmean,
                      "marginal_auc": mmean, "marginal_auc_std": mstd})
 
-    print("\n  Δ        = pooled-O/E concordance (marginal-controlled at the pair")
-    print("             level).  Δ|m = also regress out the per-region marginal.")
-    print("             Δ|m+cov = also regress out marginal² + coverage (the")
-    print("             fuller control: nonlinear-marginal + sparsity/coverage).")
-    print("  Δ|m+cov stays high (p<0.05)  => REAL marginal- AND coverage-")
-    print("             independent long-range coordination signal.")
-    print("  Δ|m+cov -> its null          => the Δ|m signal was nonlinear")
-    print("             marginal leak or a coverage/sparsity artifact.")
+    print("\n  Δ|m+cov stays high (p<0.05) AND clearly > miss  => REAL")
+    print("            marginal-, coverage- and presence-independent coordination.")
+    print("  Δ|m+cov -> its null          => nonlinear-marginal leak or a")
+    print("            coverage/sparsity artifact.")
+    print("  Δ|m+cov ≈ miss (both high)    => the 'signal' is just contact")
+    print("            PRESENCE (which regions a cell has data in; scHi-C-like),")
+    print("            NOT epigenetic concordance.  Definitive test: held-out")
+    print("            genomic split (train even chr, test odd chr).")
     if args.output_prefix:
         out = f"{args.output_prefix}.ep_existence.csv"
         pd.DataFrame(rows).to_csv(out, index=False)
