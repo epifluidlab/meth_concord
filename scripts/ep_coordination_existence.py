@@ -305,6 +305,31 @@ def _residualize(D: np.ndarray, M: np.ndarray) -> np.ndarray:
     return Ds - b[None, :] * Ms
 
 
+def _residualize_multi(D: np.ndarray, covars: list) -> np.ndarray:
+    """Per-region residual of Δ on MULTIPLE covariates (each cells × regions).
+
+    Fuller leakage control: regress each region's Δ across cells on
+    [marginal, marginal², coverage] and keep the residual.  Removes nonlinear
+    marginal dependence (Δ=log2(O/E) is nonlinear in the mean-openness
+    marginal) and the coverage/sparsity confound (a few-pair Δ estimate's
+    bias/noise tracks the per-region pair count, which itself differs by cell
+    type).  Vectorized per-column OLS in standardized space (ridge 1e-6).
+    """
+    Ds = _zcols(D)
+    Cs = [_zcols(C) for C in covars]
+    if not Cs:
+        return Ds
+    K, R = len(Cs), Ds.shape[1]
+    A = np.stack(Cs, axis=1)                       # cells × K × regions
+    AtA = np.einsum("ikr,ilr->klr", A, A)          # K × K × regions
+    Atd = np.einsum("ikr,ir->kr", A, Ds)           # K × regions
+    AtA_b = np.moveaxis(AtA, 2, 0) + 1e-6 * np.eye(K)     # regions × K × K
+    Atd_b = np.moveaxis(Atd, 1, 0)[:, :, None]           # regions × K × 1
+    beta = np.linalg.solve(AtA_b, Atd_b)[:, :, 0]        # regions × K
+    fit = np.einsum("ikr,rk->ir", A, beta)               # cells × regions
+    return Ds - fit
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -406,9 +431,11 @@ def main() -> None:
                 p = float((np.sum(null >= mean) + 1) / (null.size + 1))
         return mean, std, p
 
-    print(f"\n[classifier={method}]  "
-          f"{'granularity':>11} {'n_reg':>6} {'pairs/reg':>9} "
-          f"{'Δ AUC':>12} {'p':>6} {'Δ|marg AUC':>12} {'p':>6} {'marg AUC':>10}")
+    print(f"\n[classifier={method}]  Δ|m = Δ residualized on marginal; "
+          f"Δ|m+cov = on marginal+marginal²+coverage (fuller leakage control)")
+    print(f"{'granularity':>11} {'n_reg':>6} {'pairs/reg':>9} "
+          f"{'Δ AUC':>10} {'p':>6} {'Δ|m AUC':>10} {'p':>6} "
+          f"{'Δ|m+cov':>10} {'p':>6} {'marg':>7}")
     rows = []
     for gran in grans:
         gk = str(gran)
@@ -418,25 +445,30 @@ def main() -> None:
         ridx = {r: j for j, r in enumerate(all_regions)}
         D = np.full((len(cells), len(all_regions)), np.nan)
         Mg = np.full((len(cells), len(all_regions)), np.nan)
+        Cov = np.full((len(cells), len(all_regions)), np.nan)
         npairs = []
         for i, (_, d) in enumerate(results):
             for r, (delta, marg, n_o) in d.get(gk, {}).items():
                 j = ridx[r]
-                D[i, j] = delta; Mg[i, j] = marg
+                D[i, j] = delta; Mg[i, j] = marg; Cov[i, j] = n_o
                 if n_o > 0:
                     npairs.append(n_o)
         Dk, Mk = D[keep], Mg[keep]
+        Covk = np.log1p(np.nan_to_num(Cov[keep], nan=0.0))
         Xc = _prep(_standardize(pd.DataFrame(Dk)))
         Xm = _prep(_standardize(pd.DataFrame(Mk)))
-        # Marginal-residualized concordance: the leakage control.
+        # Leakage controls: linear marginal, then marginal+marginal²+coverage.
         Xr = _prep(_standardize(pd.DataFrame(_residualize(Dk, Mk))))
+        Xr2 = _prep(_standardize(pd.DataFrame(
+            _residualize_multi(Dk, [Mk, Mk * Mk, Covk]))))
         cmean, cstd, cp = _auc_perm(Xc)
         rmean, rstd, rp = _auc_perm(Xr)
+        r2mean, r2std, r2p = _auc_perm(Xr2)
         mmean, mstd = _score(Xm, y)
         med = int(np.median(npairs)) if npairs else 0
         print(f"{gk:>11} {len(all_regions):>6} {med:>9} "
-              f"{cmean:>7.3f}±{cstd:.2f} {cp:>6.3f} "
-              f"{rmean:>7.3f}±{rstd:.2f} {rp:>6.3f} {mmean:>10.3f}")
+              f"{cmean:>7.3f} {cp:>6.3f} {rmean:>7.3f} {rp:>6.3f} "
+              f"{r2mean:>7.3f} {r2p:>6.3f} {mmean:>7.3f}")
         rows.append({"classifier": method,
                      "granularity": gk, "n_regions": len(all_regions),
                      "median_pairs_per_region": med,
@@ -445,15 +477,19 @@ def main() -> None:
                      "concordance_resid_auc": rmean,
                      "concordance_resid_std": rstd,
                      "concordance_resid_perm_p": rp,
+                     "concordance_resid_full_auc": r2mean,
+                     "concordance_resid_full_std": r2std,
+                     "concordance_resid_full_perm_p": r2p,
                      "marginal_auc": mmean, "marginal_auc_std": mstd})
 
-    print("\n  Δ AUC      = pooled-O/E concordance (marginal-controlled at the")
-    print("               pair level).  Δ|marg AUC = Δ after ALSO regressing out")
-    print("               the per-region marginal (the leakage control).")
-    print("  Δ AUC high but Δ|marg AUC -> its null  => the signal was residual")
-    print("               marginal leakage (NOT coordination).")
-    print("  Δ|marg AUC stays high (p<0.05)         => REAL marginal-independent")
-    print("               long-range coordination signal.")
+    print("\n  Δ        = pooled-O/E concordance (marginal-controlled at the pair")
+    print("             level).  Δ|m = also regress out the per-region marginal.")
+    print("             Δ|m+cov = also regress out marginal² + coverage (the")
+    print("             fuller control: nonlinear-marginal + sparsity/coverage).")
+    print("  Δ|m+cov stays high (p<0.05)  => REAL marginal- AND coverage-")
+    print("             independent long-range coordination signal.")
+    print("  Δ|m+cov -> its null          => the Δ|m signal was nonlinear")
+    print("             marginal leak or a coverage/sparsity artifact.")
     if args.output_prefix:
         out = f"{args.output_prefix}.ep_existence.csv"
         pd.DataFrame(rows).to_csv(out, index=False)
