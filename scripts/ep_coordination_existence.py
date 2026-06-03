@@ -424,54 +424,59 @@ def _plot_roc(roc_data: dict, classifier: str, output: str) -> None:
     plt.close(fig)
 
 
-def _fmt_dist(x: float, pos=None) -> str:
-    """Human-readable genomic distance for axis ticks."""
-    if x >= 1e6:
-        return f"{x / 1e6:g}Mb"
-    if x >= 1e3:
-        return f"{x / 1e3:g}kb"
-    return f"{x:g}"
+def _decade_fmt(x: float, pos=None) -> str:
+    """Tick label = log10 exponent + human distance, e.g. '5 (100kb)'."""
+    e = int(round(np.log10(x)))
+    human = {3: "1kb", 4: "10kb", 5: "100kb", 6: "1Mb", 7: "10Mb",
+             8: "100Mb"}.get(e, f"1e{e}")
+    return f"{e} ({human})"
 
 
-def _plot_distance_decay(dbins: np.ndarray, per_group: dict, pooled: dict,
-                         output: str) -> None:
+def _decade_ticks(ax):
+    from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
+    ax.set_xscale("log")
+    ax.xaxis.set_major_locator(FixedLocator([10.0 ** e for e in range(3, 9)]))
+    ax.xaxis.set_major_formatter(FuncFormatter(_decade_fmt))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="x", labelbottom=True)
+    ax.set_xlabel("log10(distance between ends)  —  exponent (distance)")
+
+
+def _plot_distance_decay(mid: np.ndarray, curves: dict, E_mean: np.ndarray,
+                         E_se: np.ndarray, dbins: np.ndarray, output: str) -> None:
+    """Hi-C-style distance decay with 95% CI shading (mean ± 1.96·SE across
+    cells; cells are the independent unit)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
-    mid = np.sqrt(dbins[:-1] * dbins[1:])         # geometric mid of each log bin
 
-    def rate(d, key):
-        s, c = d[key + "_sum"], d[key + "_cnt"]
-        return np.divide(s, c, out=np.full(len(s), np.nan), where=c > 0)
-
-    # explicit, human-readable distance ticks within the plotted range
-    cand = [1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6, 2e6, 5e6, 1e7, 2e7]
-    ticks = [t for t in cand if dbins[0] <= t <= dbins[-1]]
+    def band(ax, m, se, **kw):
+        ax.plot(mid, m, "-o", ms=3, lw=1.3, **kw)
+        col = ax.lines[-1].get_color()
+        lo, hi = m - 1.96 * se, m + 1.96 * se
+        ax.fill_between(mid, lo, hi, where=np.isfinite(se), color=col, alpha=0.2,
+                        linewidth=0)
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8))
-    for g, d in sorted(per_group.items()):
-        ax1.plot(mid, rate(d, "O"), "-o", ms=3, lw=1.3, label=f"contacts (O) — {g}")
-    ax1.plot(mid, rate(pooled, "E"), "k--", lw=1.3,
-             label="distance-matched random (E)")
+    for g in sorted(curves):
+        band(ax1, curves[g]["O_mean"], curves[g]["O_se"],
+             label=f"contacts (O) — {g}")
+    ax1.plot(mid, E_mean, "k--", lw=1.3, label="distance-matched random (E)")
+    ax1.fill_between(mid, E_mean - 1.96 * E_se, E_mean + 1.96 * E_se,
+                     where=np.isfinite(E_se), color="grey", alpha=0.15, linewidth=0)
     ax1.set_ylabel("concordance  (soft agreement)")
-    ax1.set_title("Concordance vs genomic distance (Hi-C-style)")
+    ax1.set_title("Concordance vs genomic distance (Hi-C-style; 95% CI)")
     ax1.legend(fontsize=8)
-    for g, d in sorted(per_group.items()):
-        ax2.plot(mid, rate(d, "O") - rate(d, "E"), "-o", ms=3, lw=1.3,
-                 label=f"O − E — {g}")
+    for g in sorted(curves):
+        band(ax2, curves[g]["resid_mean"], curves[g]["resid_se"],
+             label=f"O − E — {g}")
     ax2.axhline(0.0, color="grey", lw=0.8)
     ax2.set_ylabel("residual concordance  (O − E)")
-    ax2.set_title("Residual concordance (contacts vs distance-matched random)")
+    ax2.set_title("Residual concordance (contacts vs distance-matched random; 95% CI)")
     ax2.legend(fontsize=8)
-    for ax in (ax1, ax2):                          # explicit log-distance ticks
-        ax.set_xscale("log")
+    for ax in (ax1, ax2):
         ax.set_xlim(dbins[0], dbins[-1])
-        ax.xaxis.set_major_locator(FixedLocator(ticks))
-        ax.xaxis.set_major_formatter(FuncFormatter(_fmt_dist))
-        ax.xaxis.set_minor_formatter(NullFormatter())
-        ax.tick_params(axis="x", labelbottom=True)
-        ax.set_xlabel("genomic distance between ends (log scale)")
+        _decade_ticks(ax)
     fig.tight_layout()
     fig.savefig(output)
     plt.close(fig)
@@ -721,46 +726,63 @@ def main() -> None:
             print(f"[ep-existence] ROC plot skipped ({e})")
 
         # ---- Distance-decay (Hi-C-style): concordance & residual vs dist --
-        keys = ("O_sum", "O_cnt", "E_sum", "E_cnt")
+        # Aggregate PER CELL (cells = independent unit), so the 95% CI band is
+        # mean ± 1.96·SE across cells within each cell type.
         nb = len(dbins) - 1
-        pooled = {k: np.zeros(nb) for k in keys}
-        per_group: dict = {}
+        mid = np.sqrt(dbins[:-1] * dbins[1:])
         groups = y_all.to_numpy()
+
+        def _cell_rate(dec, key):
+            s, c = dec[key + "_sum"], dec[key + "_cnt"]
+            return np.divide(s, c, out=np.full(nb, np.nan), where=c > 0)
+
+        def _mean_se(arrs):
+            A = np.vstack(arrs)
+            n = np.sum(np.isfinite(A), axis=0)
+            with np.errstate(invalid="ignore"):
+                m = np.nanmean(A, axis=0)
+                sd = np.nanstd(A, axis=0, ddof=1)
+            se = np.where(n >= 2, sd / np.sqrt(np.maximum(n, 1)), np.nan)
+            return m, se
+
+        gO: dict = {}; gR: dict = {}; allE = []
         for (_, _, dec), g in zip(results, groups):
             if dec is None:
                 continue
-            for k in keys:
-                pooled[k] += dec[k]
-            if isinstance(g, str):                   # valid cell-type label
-                pg = per_group.setdefault(g, {k: np.zeros(nb) for k in keys})
-                for k in keys:
-                    pg[k] += dec[k]
-        if per_group:
-            # Write the underlying curve VALUES (x = distance bin, y = each
-            # curve) so the plot can be checked / re-labelled.
-            mid = np.sqrt(dbins[:-1] * dbins[1:])
-
-            def _rate(d, key):
-                s, c = d[key + "_sum"], d[key + "_cnt"]
-                return np.divide(s, c, out=np.full(len(s), np.nan), where=c > 0)
-
+            o = _cell_rate(dec, "O"); e = _cell_rate(dec, "E")
+            allE.append(e)
+            if isinstance(g, str):
+                gO.setdefault(g, []).append(o)
+                gR.setdefault(g, []).append(o - e)
+        if gO and allE:
+            curves = {}
+            for g in gO:
+                om, ose = _mean_se(gO[g]); rm, rse = _mean_se(gR[g])
+                curves[g] = dict(O_mean=om, O_se=ose, resid_mean=rm, resid_se=rse)
+            E_mean, E_se = _mean_se(allE)
+            # values CSV (x = dist_mid_bp; y = mean + 95% CI per curve)
             dd = pd.DataFrame({
                 "dist_lo_bp": dbins[:-1].astype(np.int64),
                 "dist_hi_bp": dbins[1:].astype(np.int64),
-                "dist_mid_bp": mid.astype(np.int64),          # x-axis value
-                "E_random_pooled": _rate(pooled, "E"),
-                "n_random_pooled": pooled["E_cnt"].astype(np.int64),
+                "dist_mid_bp": mid.astype(np.int64),
+                "log10_dist_mid": np.log10(mid),
+                "E_mean": E_mean, "E_ci_lo": E_mean - 1.96 * E_se,
+                "E_ci_hi": E_mean + 1.96 * E_se,
             })
-            for g, dct in sorted(per_group.items()):
-                dd[f"O_{g}"] = _rate(dct, "O")                 # y-axis (contacts)
-                dd[f"residual_{g}"] = _rate(dct, "O") - _rate(dct, "E")
-                dd[f"n_O_{g}"] = dct["O_cnt"].astype(np.int64)
+            for g in sorted(curves):
+                c = curves[g]
+                dd[f"O_{g}_mean"] = c["O_mean"]
+                dd[f"O_{g}_ci_lo"] = c["O_mean"] - 1.96 * c["O_se"]
+                dd[f"O_{g}_ci_hi"] = c["O_mean"] + 1.96 * c["O_se"]
+                dd[f"residual_{g}_mean"] = c["resid_mean"]
+                dd[f"residual_{g}_ci_lo"] = c["resid_mean"] - 1.96 * c["resid_se"]
+                dd[f"residual_{g}_ci_hi"] = c["resid_mean"] + 1.96 * c["resid_se"]
             dd_csv = f"{args.output_prefix}.distance_decay.values.csv"
             dd.to_csv(dd_csv, index=False)
             print(f"[ep-existence] wrote {dd_csv}")
             try:
                 dd_out = f"{args.output_prefix}.distance_decay.pdf"
-                _plot_distance_decay(dbins, per_group, pooled, dd_out)
+                _plot_distance_decay(mid, curves, E_mean, E_se, dbins, dd_out)
                 print(f"[ep-existence] wrote {dd_out}")
             except Exception as e:                   # pragma: no cover
                 print(f"[ep-existence] distance-decay plot skipped ({e})")
