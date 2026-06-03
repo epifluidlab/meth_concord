@@ -133,7 +133,7 @@ def _agg(ids: np.ndarray, weights: list) -> tuple:
 
 
 def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
-                 min_gch: int, cap: int, seed: int, dbins: np.ndarray = None):
+                 min_gch: int, cap: int, seed: int, decay_dbins: np.ndarray = None):
     """Per-(region) Δ_signed (log2 O/E) + mean openness for one cell, at each
     granularity.  Fully vectorized.  Returns (cell, {gran: {region:(Δ,marg,n_o)}},
     decay) where ``decay`` holds distance-binned soft-agreement sums/counts for
@@ -187,19 +187,39 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
         e_closed = np.empty(0); e_codes = np.empty(0, np.int64); e_dist = np.empty(0)
     m_codes = code_of(e_chrom)
 
-    # Distance-decay accumulators (Hi-C-style): soft agreement (= co-open +
-    # co-closed) summed over log-distance bins, for contacts (O) and null (E).
+    # Distance-decay accumulators (Hi-C-style), over the SEPARATE decay range
+    # [decay_dbins[0], decay_dbins[-1]] using ALL informative pairs in that
+    # range (independent of the analysis --min/--max-distance band).  Soft
+    # agreement (= co-open + co-closed) summed over log-distance bins for
+    # contacts (O) and the distance-matched random null (E).
     decay = None
-    if dbins is not None:
-        nb = len(dbins) - 1
+    if decay_dbins is not None:
+        dmin, dmax = float(decay_dbins[0]), float(decay_dbins[-1])
+        nb = len(decay_dbins) - 1
+
         def _dacc(dist, agree):
             if dist.size == 0:
                 return np.zeros(nb), np.zeros(nb)
-            bi = np.clip(np.searchsorted(dbins, dist, side="right") - 1, 0, nb - 1)
+            bi = np.clip(np.searchsorted(decay_dbins, dist, side="right") - 1,
+                         0, nb - 1)
             return (np.bincount(bi, weights=agree, minlength=nb),
                     np.bincount(bi, minlength=nb).astype(float))
-        o_s, o_c = _dacc(sep[cm], o_open + o_closed)
-        e_s, e_c = _dacc(e_dist, e_open + e_closed)
+
+        # O: every informative pair with separation in the decay range.
+        dm = inf1 & inf2 & (sep >= dmin) & (sep <= dmax)
+        o_s, o_c = _dacc(sep[dm],
+                         (p1 * p2 + (1 - p1) * (1 - p2))[dm])
+        # E: windowed non-contact null over the decay range, per chromosome.
+        e_ag_l, e_d_l = [], []
+        for c in uniq_chroms:
+            sel = e_chrom == c
+            _, eo, ec, ed = _window_pairs(e_pos[sel], e_p[sel], dmin, dmax,
+                                          cap, rng)
+            if ed.size:
+                e_ag_l.append(eo + ec); e_d_l.append(ed)
+        e_ag = np.concatenate(e_ag_l) if e_ag_l else np.empty(0)
+        e_dd = np.concatenate(e_d_l) if e_d_l else np.empty(0, np.int64)
+        e_s, e_c = _dacc(e_dd, e_ag)
         decay = {"O_sum": o_s, "O_cnt": o_c, "E_sum": e_s, "E_cnt": e_c}
 
     eps = 1e-6
@@ -450,26 +470,31 @@ def _plot_distance_decay(mid: np.ndarray, curves: dict, E_mean: np.ndarray,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    def band(ax, m, se, **kw):
-        ax.plot(mid, m, "-o", ms=3, lw=1.3, **kw)
+    def band(ax, m, se, allcells=False, **kw):
+        style = dict(lw=2.4, color="black", zorder=5) if allcells \
+            else dict(lw=1.3, marker="o", ms=3)
+        ax.plot(mid, m, **style, **kw)
         col = ax.lines[-1].get_color()
         lo, hi = m - 1.96 * se, m + 1.96 * se
-        ax.fill_between(mid, lo, hi, where=np.isfinite(se), color=col, alpha=0.2,
-                        linewidth=0)
+        ax.fill_between(mid, lo, hi, where=np.isfinite(se), color=col,
+                        alpha=0.12 if allcells else 0.2, linewidth=0)
 
+    # plot per-cell-type first, then the pooled 'all cells' on top (black)
+    order = [g for g in sorted(curves) if g != "all cells"] + \
+            (["all cells"] if "all cells" in curves else [])
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8))
-    for g in sorted(curves):
+    for g in order:
         band(ax1, curves[g]["O_mean"], curves[g]["O_se"],
-             label=f"contacts (O) — {g}")
+             allcells=(g == "all cells"), label=f"contacts (O) — {g}")
     ax1.plot(mid, E_mean, "k--", lw=1.3, label="distance-matched random (E)")
     ax1.fill_between(mid, E_mean - 1.96 * E_se, E_mean + 1.96 * E_se,
                      where=np.isfinite(E_se), color="grey", alpha=0.15, linewidth=0)
     ax1.set_ylabel("concordance  (soft agreement)")
     ax1.set_title("Concordance vs genomic distance (Hi-C-style; 95% CI)")
     ax1.legend(fontsize=8)
-    for g in sorted(curves):
+    for g in order:
         band(ax2, curves[g]["resid_mean"], curves[g]["resid_se"],
-             label=f"O − E — {g}")
+             allcells=(g == "all cells"), label=f"O − E — {g}")
     ax2.axhline(0.0, color="grey", lw=0.8)
     ax2.set_ylabel("residual concordance  (O − E)")
     ax2.set_title("Residual concordance (contacts vs distance-matched random; 95% CI)")
@@ -523,6 +548,15 @@ def main() -> None:
                          "NaN for the classifier to exploit, so a surviving "
                          "Δ|m+cov AUC is genuine concordance, not contact "
                          "presence.")
+    ap.add_argument("--decay-min-distance", type=int, default=1000,
+                    help="Distance-decay plot ONLY: lower bound (default 1 kb). "
+                         "Independent of --min-distance; uses ALL read pairs in "
+                         "[--decay-min-distance, --decay-max-distance].")
+    ap.add_argument("--decay-max-distance", type=int, default=10_000_000,
+                    help="Distance-decay plot ONLY: upper bound (default 10 Mb).")
+    ap.add_argument("--decay-bins", type=int, default=40,
+                    help="Number of log-spaced distance bins for the decay plot "
+                         "(default 40 ≈ 10 per decade → smooth Hi-C-style curve).")
     ap.add_argument("--split-half", action="store_true",
                     help="Genomic split-half consistency: classify Δ|m+cov on "
                          "even- vs odd-indexed chromosomes independently. If "
@@ -550,9 +584,12 @@ def main() -> None:
           f"{n_classes} cell types | grans={grans} | "
           f"classifier={args.classifier} → {feat}")
 
-    # Log-spaced distance bins for the Hi-C-style distance-decay plot.
-    dbins = np.logspace(np.log10(max(args.min_distance, 1)),
-                        np.log10(max(args.max_distance, args.min_distance + 1)), 31)
+    # Log-spaced distance bins for the Hi-C-style distance-decay plot — over
+    # its OWN range (default 1 kb–10 Mb), independent of the analysis band.
+    dbins = np.logspace(np.log10(max(args.decay_min_distance, 1)),
+                        np.log10(max(args.decay_max_distance,
+                                     args.decay_min_distance + 1)),
+                        int(args.decay_bins) + 1)
 
     if args.n_threads > 1 and len(files) > 1:
         from joblib import Parallel, delayed
@@ -726,8 +763,9 @@ def main() -> None:
             print(f"[ep-existence] ROC plot skipped ({e})")
 
         # ---- Distance-decay (Hi-C-style): concordance & residual vs dist --
-        # Aggregate PER CELL (cells = independent unit), so the 95% CI band is
-        # mean ± 1.96·SE across cells within each cell type.
+        # Curve = POOLED over all reads (Σsum/Σcnt) → smooth, Hi-C-like.
+        # 95% CI band = ±1.96·SE across CELLS (the independent unit).  An
+        # "all cells" line (pooled over every cell, not split by type) is added.
         nb = len(dbins) - 1
         mid = np.sqrt(dbins[:-1] * dbins[1:])
         groups = y_all.to_numpy()
@@ -736,30 +774,40 @@ def main() -> None:
             s, c = dec[key + "_sum"], dec[key + "_cnt"]
             return np.divide(s, c, out=np.full(nb, np.nan), where=c > 0)
 
-        def _mean_se(arrs):
-            A = np.vstack(arrs)
+        def _pooled(decs, key):                       # Σsum/Σcnt over reads
+            s = np.sum([d[key + "_sum"] for d in decs], axis=0)
+            c = np.sum([d[key + "_cnt"] for d in decs], axis=0)
+            return np.divide(s, c, out=np.full(nb, np.nan), where=c > 0)
+
+        def _se_across_cells(rate_arrs):              # SE of per-cell rates
+            A = np.vstack(rate_arrs)
             n = np.sum(np.isfinite(A), axis=0)
             with np.errstate(invalid="ignore"):
-                m = np.nanmean(A, axis=0)
                 sd = np.nanstd(A, axis=0, ddof=1)
-            se = np.where(n >= 2, sd / np.sqrt(np.maximum(n, 1)), np.nan)
-            return m, se
+            return np.where(n >= 2, sd / np.sqrt(np.maximum(n, 1)), np.nan)
 
-        gO: dict = {}; gR: dict = {}; allE = []
+        decs_by_g: dict = {}
+        decs_all = []
         for (_, _, dec), g in zip(results, groups):
             if dec is None:
                 continue
-            o = _cell_rate(dec, "O"); e = _cell_rate(dec, "E")
-            allE.append(e)
+            decs_all.append(dec)
             if isinstance(g, str):
-                gO.setdefault(g, []).append(o)
-                gR.setdefault(g, []).append(o - e)
-        if gO and allE:
+                decs_by_g.setdefault(g, []).append(dec)
+        if decs_all:
+            groups_plot = dict(sorted(decs_by_g.items()))
+            groups_plot["all cells"] = decs_all       # the extra pooled line
             curves = {}
-            for g in gO:
-                om, ose = _mean_se(gO[g]); rm, rse = _mean_se(gR[g])
-                curves[g] = dict(O_mean=om, O_se=ose, resid_mean=rm, resid_se=rse)
-            E_mean, E_se = _mean_se(allE)
+            for g, decs in groups_plot.items():
+                Ocurve = _pooled(decs, "O")
+                Ecurve = _pooled(decs, "E")
+                o_rates = [_cell_rate(d, "O") for d in decs]
+                r_rates = [_cell_rate(d, "O") - _cell_rate(d, "E") for d in decs]
+                curves[g] = dict(O_mean=Ocurve, O_se=_se_across_cells(o_rates),
+                                 resid_mean=Ocurve - Ecurve,
+                                 resid_se=_se_across_cells(r_rates))
+            E_mean = _pooled(decs_all, "E")
+            E_se = _se_across_cells([_cell_rate(d, "E") for d in decs_all])
             # values CSV (x = dist_mid_bp; y = mean + 95% CI per curve)
             dd = pd.DataFrame({
                 "dist_lo_bp": dbins[:-1].astype(np.int64),
@@ -771,12 +819,13 @@ def main() -> None:
             })
             for g in sorted(curves):
                 c = curves[g]
-                dd[f"O_{g}_mean"] = c["O_mean"]
-                dd[f"O_{g}_ci_lo"] = c["O_mean"] - 1.96 * c["O_se"]
-                dd[f"O_{g}_ci_hi"] = c["O_mean"] + 1.96 * c["O_se"]
-                dd[f"residual_{g}_mean"] = c["resid_mean"]
-                dd[f"residual_{g}_ci_lo"] = c["resid_mean"] - 1.96 * c["resid_se"]
-                dd[f"residual_{g}_ci_hi"] = c["resid_mean"] + 1.96 * c["resid_se"]
+                gs = g.replace(" ", "_")             # column-safe label
+                dd[f"O_{gs}_mean"] = c["O_mean"]
+                dd[f"O_{gs}_ci_lo"] = c["O_mean"] - 1.96 * c["O_se"]
+                dd[f"O_{gs}_ci_hi"] = c["O_mean"] + 1.96 * c["O_se"]
+                dd[f"residual_{gs}_mean"] = c["resid_mean"]
+                dd[f"residual_{gs}_ci_lo"] = c["resid_mean"] - 1.96 * c["resid_se"]
+                dd[f"residual_{gs}_ci_hi"] = c["resid_mean"] + 1.96 * c["resid_se"]
             dd_csv = f"{args.output_prefix}.distance_decay.values.csv"
             dd.to_csv(dd_csv, index=False)
             print(f"[ep-existence] wrote {dd_csv}")
