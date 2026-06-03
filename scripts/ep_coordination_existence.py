@@ -424,33 +424,54 @@ def _plot_roc(roc_data: dict, classifier: str, output: str) -> None:
     plt.close(fig)
 
 
+def _fmt_dist(x: float, pos=None) -> str:
+    """Human-readable genomic distance for axis ticks."""
+    if x >= 1e6:
+        return f"{x / 1e6:g}Mb"
+    if x >= 1e3:
+        return f"{x / 1e3:g}kb"
+    return f"{x:g}"
+
+
 def _plot_distance_decay(dbins: np.ndarray, per_group: dict, pooled: dict,
                          output: str) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
     mid = np.sqrt(dbins[:-1] * dbins[1:])         # geometric mid of each log bin
 
     def rate(d, key):
         s, c = d[key + "_sum"], d[key + "_cnt"]
         return np.divide(s, c, out=np.full(len(s), np.nan), where=c > 0)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8), sharex=True)
+    # explicit, human-readable distance ticks within the plotted range
+    cand = [1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6, 2e6, 5e6, 1e7, 2e7]
+    ticks = [t for t in cand if dbins[0] <= t <= dbins[-1]]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8))
     for g, d in sorted(per_group.items()):
         ax1.plot(mid, rate(d, "O"), "-o", ms=3, lw=1.3, label=f"contacts (O) — {g}")
     ax1.plot(mid, rate(pooled, "E"), "k--", lw=1.3,
              label="distance-matched random (E)")
-    ax1.set_xscale("log"); ax1.set_ylabel("concordance  (soft agreement)")
+    ax1.set_ylabel("concordance  (soft agreement)")
     ax1.set_title("Concordance vs genomic distance (Hi-C-style)")
     ax1.legend(fontsize=8)
     for g, d in sorted(per_group.items()):
         ax2.plot(mid, rate(d, "O") - rate(d, "E"), "-o", ms=3, lw=1.3,
                  label=f"O − E — {g}")
     ax2.axhline(0.0, color="grey", lw=0.8)
-    ax2.set_xscale("log"); ax2.set_xlabel("genomic distance between ends (bp, log)")
     ax2.set_ylabel("residual concordance  (O − E)")
     ax2.set_title("Residual concordance (contacts vs distance-matched random)")
     ax2.legend(fontsize=8)
+    for ax in (ax1, ax2):                          # explicit log-distance ticks
+        ax.set_xscale("log")
+        ax.set_xlim(dbins[0], dbins[-1])
+        ax.xaxis.set_major_locator(FixedLocator(ticks))
+        ax.xaxis.set_major_formatter(FuncFormatter(_fmt_dist))
+        ax.xaxis.set_minor_formatter(NullFormatter())
+        ax.tick_params(axis="x", labelbottom=True)
+        ax.set_xlabel("genomic distance between ends (log scale)")
     fig.tight_layout()
     fig.savefig(output)
     plt.close(fig)
@@ -715,6 +736,28 @@ def main() -> None:
                 for k in keys:
                     pg[k] += dec[k]
         if per_group:
+            # Write the underlying curve VALUES (x = distance bin, y = each
+            # curve) so the plot can be checked / re-labelled.
+            mid = np.sqrt(dbins[:-1] * dbins[1:])
+
+            def _rate(d, key):
+                s, c = d[key + "_sum"], d[key + "_cnt"]
+                return np.divide(s, c, out=np.full(len(s), np.nan), where=c > 0)
+
+            dd = pd.DataFrame({
+                "dist_lo_bp": dbins[:-1].astype(np.int64),
+                "dist_hi_bp": dbins[1:].astype(np.int64),
+                "dist_mid_bp": mid.astype(np.int64),          # x-axis value
+                "E_random_pooled": _rate(pooled, "E"),
+                "n_random_pooled": pooled["E_cnt"].astype(np.int64),
+            })
+            for g, dct in sorted(per_group.items()):
+                dd[f"O_{g}"] = _rate(dct, "O")                 # y-axis (contacts)
+                dd[f"residual_{g}"] = _rate(dct, "O") - _rate(dct, "E")
+                dd[f"n_O_{g}"] = dct["O_cnt"].astype(np.int64)
+            dd_csv = f"{args.output_prefix}.distance_decay.values.csv"
+            dd.to_csv(dd_csv, index=False)
+            print(f"[ep-existence] wrote {dd_csv}")
             try:
                 dd_out = f"{args.output_prefix}.distance_decay.pdf"
                 _plot_distance_decay(dbins, per_group, pooled, dd_out)
