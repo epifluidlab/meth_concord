@@ -591,13 +591,17 @@ def main() -> None:
     ap.add_argument("--decay-bins", type=int, default=40,
                     help="Number of log-spaced distance bins for the decay plot "
                          "(default 40 ≈ 10 per decade → smooth Hi-C-style curve).")
-    ap.add_argument("--batch-column", default=None,
-                    help="Column in --samples holding a per-cell batch label. "
-                         "If set, residualize Δ ALSO against batch (one-hot, on "
-                         "top of marginal+coverage) → a Δ|m+cov+batch AUC. "
-                         "Survives => the signal is batch-independent; collapses "
-                         "=> it was a batch effect.  (split-half can't catch "
-                         "batch — it's a global per-cell confound.)")
+    ap.add_argument("--batch-column", action="append", default=[],
+                    metavar="COLUMN",
+                    help="Per-cell batch column(s) in --samples (e.g. exp_batch, "
+                         "lib_batch).  Repeatable AND comma-separated: "
+                         "'--batch-column exp_batch --batch-column lib_batch' or "
+                         "'--batch-column exp_batch,lib_batch'.  Residualizes Δ "
+                         "ALSO against the UNION of their one-hots (additive — "
+                         "removes each factor's per-batch offsets), on top of "
+                         "marginal+coverage → a Δ|m+cov+batch AUC.  Survives => "
+                         "batch-independent; collapses => a batch effect. "
+                         "(split-half can't catch batch — it's global per-cell.)")
     ap.add_argument("--split-half", action="store_true",
                     help="Genomic split-half consistency: classify Δ|m+cov on "
                          "even- vs odd-indexed chromosomes independently. If "
@@ -655,16 +659,26 @@ def main() -> None:
     method = args.classifier
 
     # Optional batch covariates (one-hot over the labeled cells) for the
-    # Δ|m+cov+batch control.
+    # Δ|m+cov+batch control — UNION of one or more batch factors (additive).
     batch_oh = None
-    if args.batch_column:
-        bvals = _load_column(args.samples, args.batch_column).reindex(cells).to_numpy()
-        oh = pd.get_dummies(pd.Series(bvals[keep]), drop_first=True, dummy_na=False)
-        batch_oh = oh.to_numpy(dtype=np.float64) if oh.shape[1] else None
-        nlev = (oh.shape[1] + 1) if oh.shape[1] else 0
-        print(f"[ep-existence] batch control on '{args.batch_column}': "
-              f"{nlev} levels"
-              + ("" if batch_oh is not None else " (only 1 level — skipped)"))
+    batch_cols = list(dict.fromkeys(
+        c.strip() for item in args.batch_column for c in item.split(",")
+        if c.strip()))
+    if batch_cols:
+        ohs = []
+        for col in batch_cols:
+            bvals = _load_column(args.samples, col).reindex(cells).to_numpy()
+            oh = pd.get_dummies(pd.Series(bvals[keep]), prefix=col,
+                                drop_first=True, dummy_na=False)
+            if oh.shape[1]:
+                ohs.append(oh.to_numpy(dtype=np.float64))
+        if ohs:
+            batch_oh = np.hstack(ohs)
+            print(f"[ep-existence] batch control on {batch_cols}: "
+                  f"{batch_oh.shape[1]} indicator columns (additive union)")
+        else:
+            print(f"[ep-existence] batch control {batch_cols}: no usable "
+                  f"levels — skipped")
 
     def _score(X, yy):
         if method == "rf":
