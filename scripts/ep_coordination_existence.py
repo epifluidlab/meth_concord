@@ -497,6 +497,12 @@ def main() -> None:
                          "NaN for the classifier to exploit, so a surviving "
                          "Δ|m+cov AUC is genuine concordance, not contact "
                          "presence.")
+    ap.add_argument("--split-half", action="store_true",
+                    help="Genomic split-half consistency: classify Δ|m+cov on "
+                         "even- vs odd-indexed chromosomes independently. If "
+                         "BOTH halves are significant, the signal is distributed "
+                         "genome-wide (not a few-region artifact). Adds two "
+                         "columns (evenchr/oddchr AUC + perm-p).")
     ap.add_argument("--output-prefix", default=None)
     args = ap.parse_args()
 
@@ -593,6 +599,7 @@ def main() -> None:
             for r, (delta, marg, n_o) in d.get(gk, {}).items():
                 j = ridx[r]
                 D[i, j] = delta; Mg[i, j] = marg; Cov[i, j] = n_o
+        region_keys = all_regions             # aligned with D columns
         # Region-observation filter: drop sparsely-observed regions so the
         # classifier can't exploit the missingness/imputation pattern.
         if args.min_region_frac > 0:
@@ -603,6 +610,7 @@ def main() -> None:
                       f"--min-region-frac {args.min_region_frac})")
                 continue
             D, Mg, Cov = D[:, cols], Mg[:, cols], Cov[:, cols]
+            region_keys = [r for r, c in zip(all_regions, cols) if c]
         n_reg = D.shape[1]
         covk_obs = Cov[keep][np.isfinite(Cov[keep])]
         med = int(np.median(covk_obs)) if covk_obs.size else 0
@@ -618,22 +626,40 @@ def main() -> None:
         Xmiss = _prep(_standardize(pd.DataFrame(Miss)))
         # Leakage controls: linear marginal, then marginal+marginal²+coverage.
         Xr = _prep(_standardize(pd.DataFrame(_residualize(Dk, Mk))))
-        Xr2 = _prep(_standardize(pd.DataFrame(
-            _residualize_multi(Dk, [Mk, Mk * Mk, Covk]))))
+        R2resid = _residualize_multi(Dk, [Mk, Mk * Mk, Covk])
+        Xr2 = _prep(_standardize(pd.DataFrame(R2resid)))
         cmean, cstd, cp = _auc_perm(Xc)
         rmean, rstd, rp = _auc_perm(Xr)
         r2mean, r2std, r2p = _auc_perm(Xr2)
         mmean, mstd = _score(Xm, y)
         missmean, _ = _score(Xmiss, y)
+        # Split-half genomic consistency: interleave chromosomes into two
+        # disjoint halves; classify Δ|m+cov on each independently.  Both halves
+        # significant => the signal is distributed genome-wide, not driven by a
+        # few regions (rules out a region-specific artifact).
+        shA = shAp = shB = shBp = np.nan
+        if args.split_half:
+            chrom_of = np.array([k.split(":")[0] for k in region_keys])
+            uchr = sorted(set(chrom_of))
+            setA = set(uchr[0::2])
+            mA = np.array([c in setA for c in chrom_of])
+            if mA.sum() >= 2:
+                shA, _, shAp = _auc_perm(_prep(_standardize(
+                    pd.DataFrame(R2resid[:, mA]))))
+            if (~mA).sum() >= 2:
+                shB, _, shBp = _auc_perm(_prep(_standardize(
+                    pd.DataFrame(R2resid[:, ~mA]))))
         if args.output_prefix:           # collect out-of-fold preds for ROC
             roc_data[gk] = {
                 "Δ": _cv_predict(Xc, y, method, args.n_folds, args.random_seed),
                 "Δ|m": _cv_predict(Xr, y, method, args.n_folds, args.random_seed),
                 "Δ|m+cov": _cv_predict(Xr2, y, method, args.n_folds,
                                        args.random_seed)}
+        sh = (f"  | even {shA:.3f}({shAp:.3f}) odd {shB:.3f}({shBp:.3f})"
+              if args.split_half else "")
         print(f"{gk:>11} {n_reg:>6} {med:>9} "
               f"{cmean:>7.3f} {cp:>6.3f} {rmean:>7.3f} {rp:>6.3f} "
-              f"{r2mean:>7.3f} {r2p:>6.3f} {missmean:>6.3f} {mmean:>6.3f}")
+              f"{r2mean:>7.3f} {r2p:>6.3f} {missmean:>6.3f} {mmean:>6.3f}{sh}")
         rows.append({"classifier": method,
                      "granularity": gk, "n_regions": n_reg,
                      "median_pairs_per_region": med,
@@ -645,6 +671,10 @@ def main() -> None:
                      "concordance_resid_full_auc": r2mean,
                      "concordance_resid_full_std": r2std,
                      "concordance_resid_full_perm_p": r2p,
+                     "resid_full_evenchr_auc": shA,
+                     "resid_full_evenchr_perm_p": shAp,
+                     "resid_full_oddchr_auc": shB,
+                     "resid_full_oddchr_perm_p": shBp,
                      "missingness_auc": missmean,
                      "marginal_auc": mmean, "marginal_auc_std": mstd})
 
