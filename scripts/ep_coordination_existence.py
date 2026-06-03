@@ -69,6 +69,19 @@ def _load_labels(path: str) -> pd.Series:
     return df.set_index("cell_name")["group"]
 
 
+def _load_column(path: str, col: str) -> pd.Series:
+    """Read an arbitrary per-cell column (e.g. batch) from the samples TSV."""
+    df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    if "cell_name" not in df.columns:
+        df = df.rename(columns={"cell": "cell_name"} if "cell" in df.columns
+                       else {df.columns[0]: "cell_name"})
+    col = col.strip().lower().replace(" ", "_")
+    if col not in df.columns:
+        raise SystemExit(f"{path} has no '{col}' column (have {df.columns.tolist()}).")
+    return df.set_index("cell_name")[col]
+
+
 def _ranges_concat(lo: np.ndarray, hi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Vectorized concat of half-open ranges [lo[i], hi[i]).
 
@@ -373,6 +386,21 @@ def _residualize_multi(D: np.ndarray, covars: list) -> np.ndarray:
     return Ds - fit
 
 
+def _residualize_against(R: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Remove the projection of R (cells × regions) onto the column space of a
+    PER-CELL design B (cells × k, e.g. batch one-hot — same for every region).
+
+    Used as a second stage on the marginal+coverage residual to also strip
+    per-batch offsets: a single least-squares projection (B is shared across
+    regions), so a surviving AUC is batch-independent coordination.
+    """
+    Bz = _zcols(B)
+    if Bz.shape[1] == 0 or not np.isfinite(Bz).any():
+        return R
+    beta, *_ = np.linalg.lstsq(Bz, R, rcond=None)        # k × regions
+    return R - Bz @ beta
+
+
 def _make_clf(method: str, seed: int):
     if method == "rf":
         from sklearn.ensemble import RandomForestClassifier
@@ -563,6 +591,13 @@ def main() -> None:
     ap.add_argument("--decay-bins", type=int, default=40,
                     help="Number of log-spaced distance bins for the decay plot "
                          "(default 40 ≈ 10 per decade → smooth Hi-C-style curve).")
+    ap.add_argument("--batch-column", default=None,
+                    help="Column in --samples holding a per-cell batch label. "
+                         "If set, residualize Δ ALSO against batch (one-hot, on "
+                         "top of marginal+coverage) → a Δ|m+cov+batch AUC. "
+                         "Survives => the signal is batch-independent; collapses "
+                         "=> it was a batch effect.  (split-half can't catch "
+                         "batch — it's a global per-cell confound.)")
     ap.add_argument("--split-half", action="store_true",
                     help="Genomic split-half consistency: classify Δ|m+cov on "
                          "even- vs odd-indexed chromosomes independently. If "
@@ -618,6 +653,18 @@ def main() -> None:
 
     y = y_all[keep].to_numpy()
     method = args.classifier
+
+    # Optional batch covariates (one-hot over the labeled cells) for the
+    # Δ|m+cov+batch control.
+    batch_oh = None
+    if args.batch_column:
+        bvals = _load_column(args.samples, args.batch_column).reindex(cells).to_numpy()
+        oh = pd.get_dummies(pd.Series(bvals[keep]), drop_first=True, dummy_na=False)
+        batch_oh = oh.to_numpy(dtype=np.float64) if oh.shape[1] else None
+        nlev = (oh.shape[1] + 1) if oh.shape[1] else 0
+        print(f"[ep-existence] batch control on '{args.batch_column}': "
+              f"{nlev} levels"
+              + ("" if batch_oh is not None else " (only 1 level — skipped)"))
 
     def _score(X, yy):
         if method == "rf":
@@ -702,6 +749,11 @@ def main() -> None:
         r2mean, r2std, r2p = _auc_perm(Xr2)
         mmean, mstd = _score(Xm, y)
         missmean, _ = _score(Xmiss, y)
+        # Batch control: also strip per-batch offsets from Δ|m+cov.
+        b3mean = b3p = np.nan
+        if batch_oh is not None:
+            b3mean, _, b3p = _auc_perm(_prep(_standardize(
+                pd.DataFrame(_residualize_against(R2resid, batch_oh)))))
         # Split-half genomic consistency: interleave chromosomes into two
         # disjoint halves; classify Δ|m+cov on each independently.  Both halves
         # significant => the signal is distributed genome-wide, not driven by a
@@ -726,9 +778,11 @@ def main() -> None:
                                        args.random_seed)}
         sh = (f"  | even {shA:.3f}({shAp:.3f}) odd {shB:.3f}({shBp:.3f})"
               if args.split_half else "")
+        bt = (f"  | Δ|m+cov+batch {b3mean:.3f}({b3p:.3f})"
+              if batch_oh is not None else "")
         print(f"{gk:>11} {n_reg:>6} {med:>9} "
               f"{cmean:>7.3f} {cp:>6.3f} {rmean:>7.3f} {rp:>6.3f} "
-              f"{r2mean:>7.3f} {r2p:>6.3f} {missmean:>6.3f} {mmean:>6.3f}{sh}")
+              f"{r2mean:>7.3f} {r2p:>6.3f} {missmean:>6.3f} {mmean:>6.3f}{sh}{bt}")
         rows.append({"classifier": method,
                      "granularity": gk, "n_regions": n_reg,
                      "median_pairs_per_region": med,
@@ -744,6 +798,8 @@ def main() -> None:
                      "resid_full_evenchr_perm_p": shAp,
                      "resid_full_oddchr_auc": shB,
                      "resid_full_oddchr_perm_p": shBp,
+                     "resid_full_batch_auc": b3mean,
+                     "resid_full_batch_perm_p": b3p,
                      "missingness_auc": missmean,
                      "marginal_auc": mmean, "marginal_auc_std": mstd})
 
