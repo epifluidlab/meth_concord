@@ -486,10 +486,8 @@ def _plot_distance_decay(mid: np.ndarray, curves: dict, E_mean: np.ndarray,
     for g in order:
         band(ax1, curves[g]["O_mean"], curves[g]["O_se"],
              allcells=(g == "all cells"), label=f"contacts (O) — {g}")
-    ax1.plot(mid, E_mean, "k--", lw=1.3, label="distance-matched random (E)")
-    ax1.fill_between(mid, E_mean - 1.96 * E_se, E_mean + 1.96 * E_se,
-                     where=np.isfinite(E_se), color="grey", alpha=0.15, linewidth=0)
-    ax1.set_ylabel("concordance  (soft agreement)")
+    ax1.set_ylabel("concordance = P(ends share state)\n"
+                   "= p·p + (1−p)·(1−p)  [co-open + co-closed]")
     ax1.set_title("Concordance vs genomic distance (Hi-C-style; 95% CI)")
     ax1.legend(fontsize=8)
     for g in order:
@@ -552,8 +550,8 @@ def main() -> None:
                     help="Distance-decay plot ONLY: lower bound (default 1 kb). "
                          "Independent of --min-distance; uses ALL read pairs in "
                          "[--decay-min-distance, --decay-max-distance].")
-    ap.add_argument("--decay-max-distance", type=int, default=10_000_000,
-                    help="Distance-decay plot ONLY: upper bound (default 10 Mb).")
+    ap.add_argument("--decay-max-distance", type=int, default=1_000_000,
+                    help="Distance-decay plot ONLY: upper bound (default 1 Mb).")
     ap.add_argument("--decay-bins", type=int, default=40,
                     help="Number of log-spaced distance bins for the decay plot "
                          "(default 40 ≈ 10 per decade → smooth Hi-C-style curve).")
