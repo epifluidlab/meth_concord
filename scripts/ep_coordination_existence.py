@@ -363,6 +363,14 @@ def main() -> None:
                          "0 disables. Default 50.")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--random-seed", type=int, default=42)
+    ap.add_argument("--min-region-frac", type=float, default=0.0,
+                    help="Keep only regions with a Δ observed in >= this "
+                         "fraction of labeled cells (default 0 = all).  Set "
+                         "e.g. 0.5–0.8 to remove the missingness/imputation "
+                         "confound: on well-observed regions there is little "
+                         "NaN for the classifier to exploit, so a surviving "
+                         "Δ|m+cov AUC is genuine concordance, not contact "
+                         "presence.")
     ap.add_argument("--output-prefix", default=None)
     args = ap.parse_args()
 
@@ -450,13 +458,23 @@ def main() -> None:
         D = np.full((len(cells), len(all_regions)), np.nan)
         Mg = np.full((len(cells), len(all_regions)), np.nan)
         Cov = np.full((len(cells), len(all_regions)), np.nan)
-        npairs = []
         for i, (_, d) in enumerate(results):
             for r, (delta, marg, n_o) in d.get(gk, {}).items():
                 j = ridx[r]
                 D[i, j] = delta; Mg[i, j] = marg; Cov[i, j] = n_o
-                if n_o > 0:
-                    npairs.append(n_o)
+        # Region-observation filter: drop sparsely-observed regions so the
+        # classifier can't exploit the missingness/imputation pattern.
+        if args.min_region_frac > 0:
+            of = np.isfinite(D[keep]).mean(axis=0)
+            cols = of >= args.min_region_frac
+            if int(cols.sum()) < 2:
+                print(f"{gk:>11} {int(cols.sum()):>6}  (too few regions after "
+                      f"--min-region-frac {args.min_region_frac})")
+                continue
+            D, Mg, Cov = D[:, cols], Mg[:, cols], Cov[:, cols]
+        n_reg = D.shape[1]
+        covk_obs = Cov[keep][np.isfinite(Cov[keep])]
+        med = int(np.median(covk_obs)) if covk_obs.size else 0
         Dk, Mk = D[keep], Mg[keep]
         Covk = np.log1p(np.nan_to_num(Cov[keep], nan=0.0))
         # Missingness mask: which (cell, region) have a Δ at all (contact
@@ -476,12 +494,11 @@ def main() -> None:
         r2mean, r2std, r2p = _auc_perm(Xr2)
         mmean, mstd = _score(Xm, y)
         missmean, _ = _score(Xmiss, y)
-        med = int(np.median(npairs)) if npairs else 0
-        print(f"{gk:>11} {len(all_regions):>6} {med:>9} "
+        print(f"{gk:>11} {n_reg:>6} {med:>9} "
               f"{cmean:>7.3f} {cp:>6.3f} {rmean:>7.3f} {rp:>6.3f} "
               f"{r2mean:>7.3f} {r2p:>6.3f} {missmean:>6.3f} {mmean:>6.3f}")
         rows.append({"classifier": method,
-                     "granularity": gk, "n_regions": len(all_regions),
+                     "granularity": gk, "n_regions": n_reg,
                      "median_pairs_per_region": med,
                      "concordance_auc": cmean, "concordance_auc_std": cstd,
                      "concordance_perm_p": cp,
