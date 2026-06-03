@@ -377,9 +377,12 @@ def main() -> None:
     labels = _load_labels(args.samples)
     n_classes = labels.loc[labels.index.isin(
         [f.stem.replace(".posteriors", "") for f in files])].nunique()
+    feat = (f"SVD top-{args.n_svd}" if args.classifier == "svd-lr"
+            else "ALL region features (no SVD)")
     print(f"[ep-existence] {len(files)} cells | band "
           f"{args.min_distance:,}–{args.max_distance:,} bp | "
-          f"{n_classes} cell types | grans={grans} | n_svd={args.n_svd}")
+          f"{n_classes} cell types | grans={grans} | "
+          f"classifier={args.classifier} → {feat}")
 
     if args.n_threads > 1 and len(files) > 1:
         from joblib import Parallel, delayed
