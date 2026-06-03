@@ -256,6 +256,36 @@ def _zcols(X: np.ndarray) -> np.ndarray:
     return np.where(sd < 1e-12, 0.0, Xc / np.where(sd < 1e-12, 1.0, sd))
 
 
+def _cv_rf(X: np.ndarray, y: np.ndarray, n_folds: int, seed: int):
+    """5-fold CV AUC with a random forest (binary → AUC, multiclass → OvR-macro).
+
+    Tree ensembles weight any feature regardless of its variance, so — unlike
+    SVD→LR — they recover label signal that lives in low-variance directions
+    (the concern when classifying the marginal-residualized Δ).
+    """
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import roc_auc_score
+    le = LabelEncoder(); yy = le.fit_transform(y); nc = len(le.classes_)
+    if nc < 2:
+        return np.nan, np.nan
+    folds = min(n_folds, int(np.bincount(yy).min()))
+    if folds < 2:
+        return np.nan, np.nan
+    skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+    aucs = []
+    for tr, te in skf.split(X, yy):
+        if len(np.unique(yy[tr])) < 2 or len(np.unique(yy[te])) < 2:
+            continue
+        clf = RandomForestClassifier(n_estimators=300, max_features="sqrt",
+                                     n_jobs=1, random_state=seed)
+        clf.fit(X[tr], yy[tr]); prob = clf.predict_proba(X[te])
+        aucs.append(roc_auc_score(yy[te], prob[:, 1]) if nc == 2 else
+                    roc_auc_score(yy[te], prob, multi_class="ovr", average="macro"))
+    return (float(np.mean(aucs)), float(np.std(aucs))) if aucs else (np.nan, np.nan)
+
+
 def _residualize(D: np.ndarray, M: np.ndarray) -> np.ndarray:
     """Per-region (per-column) residual of Δ (D) on the marginal (M).
 
@@ -290,9 +320,18 @@ def main() -> None:
                          "chrom,25,10,5.")
     ap.add_argument("--max-ends-per-chrom", type=int, default=4000,
                     help="Cap on a chromosome's ends used for the null pool.")
+    ap.add_argument("--classifier", choices=["svd-lr", "lr", "rf"], default="lr",
+                    help="Classifier for the AUC.  'lr' (default) = L2 logistic "
+                         "on the FULL standardized region features (no variance-"
+                         "based reduction).  'svd-lr' = SVD→L2-LR (fast, but the "
+                         "unsupervised SVD can discard low-variance label signal "
+                         "— a concern for the marginal-residualized Δ).  'rf' = "
+                         "random forest (recovers low-variance/non-linear signal). "
+                         "Run >1 and triangulate; the permutation null calibrates "
+                         "each.")
     ap.add_argument("--n-svd", type=int, default=30,
-                    help="SVD components for the classifier (0 = raw features). "
-                         "Default 30.")
+                    help="SVD components (only used by --classifier svd-lr; "
+                         "0 = raw features). Default 30.")
     ap.add_argument("--n-folds", type=int, default=5)
     ap.add_argument("--n-perm", type=int, default=50,
                     help="Label-permutation null for the concordance AUC. "
@@ -337,22 +376,38 @@ def main() -> None:
         sys.exit("Too few labeled cells.")
 
     y = y_all[keep].to_numpy()
+    method = args.classifier
+
+    def _score(X, yy):
+        if method == "rf":
+            return _cv_rf(X, yy, args.n_folds, args.random_seed)
+        return _cv_auc(X, yy, n_folds=args.n_folds, random_state=args.random_seed)
+
+    def _prep(Xstd):
+        # SVD only for svd-lr; lr/rf classify the FULL standardized features so
+        # the (unsupervised) SVD can't discard low-variance label signal.
+        return _svd_reduce(Xstd, args.n_svd) if method == "svd-lr" else Xstd
 
     def _auc_perm(X):
-        mean, std = _cv_auc(X, y, n_folds=args.n_folds,
-                            random_state=args.random_seed)
+        mean, std = _score(X, y)
         p = np.nan
-        if args.n_perm > 0:
+        if args.n_perm > 0 and np.isfinite(mean):
             prng = np.random.default_rng(args.random_seed)
-            null = np.array([_cv_auc(X, prng.permutation(y), n_folds=args.n_folds,
-                                     random_state=args.random_seed)[0]
-                             for _ in range(int(args.n_perm))])
+            yperms = [prng.permutation(y) for _ in range(int(args.n_perm))]
+            if args.n_threads > 1:
+                from joblib import Parallel, delayed
+                res = Parallel(n_jobs=args.n_threads)(
+                    delayed(_score)(X, yp) for yp in yperms)
+                null = np.array([m for m, _ in res])
+            else:
+                null = np.array([_score(X, yp)[0] for yp in yperms])
             null = null[np.isfinite(null)]
             if null.size:
                 p = float((np.sum(null >= mean) + 1) / (null.size + 1))
         return mean, std, p
 
-    print(f"\n{'granularity':>11} {'n_reg':>6} {'pairs/reg':>9} "
+    print(f"\n[classifier={method}]  "
+          f"{'granularity':>11} {'n_reg':>6} {'pairs/reg':>9} "
           f"{'Δ AUC':>12} {'p':>6} {'Δ|marg AUC':>12} {'p':>6} {'marg AUC':>10}")
     rows = []
     for gran in grans:
@@ -371,20 +426,19 @@ def main() -> None:
                 if n_o > 0:
                     npairs.append(n_o)
         Dk, Mk = D[keep], Mg[keep]
-        Xc = _svd_reduce(_standardize(pd.DataFrame(Dk)), args.n_svd)
-        Xm = _svd_reduce(_standardize(pd.DataFrame(Mk)), args.n_svd)
+        Xc = _prep(_standardize(pd.DataFrame(Dk)))
+        Xm = _prep(_standardize(pd.DataFrame(Mk)))
         # Marginal-residualized concordance: the leakage control.
-        Xr = _svd_reduce(_standardize(pd.DataFrame(_residualize(Dk, Mk))),
-                         args.n_svd)
+        Xr = _prep(_standardize(pd.DataFrame(_residualize(Dk, Mk))))
         cmean, cstd, cp = _auc_perm(Xc)
         rmean, rstd, rp = _auc_perm(Xr)
-        mmean, mstd = _cv_auc(Xm, y, n_folds=args.n_folds,
-                              random_state=args.random_seed)
+        mmean, mstd = _score(Xm, y)
         med = int(np.median(npairs)) if npairs else 0
         print(f"{gk:>11} {len(all_regions):>6} {med:>9} "
               f"{cmean:>7.3f}±{cstd:.2f} {cp:>6.3f} "
               f"{rmean:>7.3f}±{rstd:.2f} {rp:>6.3f} {mmean:>10.3f}")
-        rows.append({"granularity": gk, "n_regions": len(all_regions),
+        rows.append({"classifier": method,
+                     "granularity": gk, "n_regions": len(all_regions),
                      "median_pairs_per_region": med,
                      "concordance_auc": cmean, "concordance_auc_std": cstd,
                      "concordance_perm_p": cp,
