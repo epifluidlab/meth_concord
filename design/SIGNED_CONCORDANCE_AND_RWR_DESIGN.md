@@ -25,6 +25,14 @@
 > Use `distance-pooled` when the per-bin distance-matched expected is too
 > sparse/noisy and bin-marginal control suffices; use `distance-matched`
 > when you must also hold genomic distance fixed.
+>
+> **Findings (v0.6).** The headline empirical question — *does long-range
+> concordance carry cell-type information beyond marginal levels?* — is
+> answered **yes**, in two systems, after a full confound ladder (and after
+> catching one false positive and one false negative along the way). See the
+> new **§6b. Empirical findings** below for the evidence, the ladder, and the
+> honest effect sizes; the clean test lives in
+> `scripts/ep_coordination_existence.py` (no cross-cell imputation).
 
 ## Design document v0.3 — locked decisions (RWR pre-Layer 2, QN k-NN basis)
 
@@ -807,6 +815,113 @@ All items below are now locked. Decisions in **bold**.
     vs EM. EM offers no measurable benefit while adding significant
     implementation complexity. Layer 2 uses Dirichlet-Multinomial
     plug-in (signed) or Beta-Binomial plug-in (open).
+
+---
+
+## 6b. Empirical findings — does long-range concordance carry cell-type information beyond marginal levels?
+
+**The question.** Does long-range HCG-methylation (or GCH-accessibility)
+concordance carry cell-type identity *beyond* what the **marginal** (per-locus
+mean) methylation/accessibility already provides — i.e., is the
+**coordination** of distal loci informative, not just their individual levels?
+
+### 6b.1 Two methodological traps, both resolved
+
+1. **RWR-imputation false positive (graph leakage).** The pre-Layer-2 RWR
+   imputation (§3) smooths the per-(cell, bin) concordance on a cell–cell
+   k-NN graph built from `QN(mean accessibility/methylation)`. That **injects
+   the marginal's cell-type structure into the concordance matrix**. On
+   RWR-imputed concordance the cell-type classifier AUC was high (~0.94–0.98)
+   and the per-bin variance-partition residual looked strongly significant
+   (residual-kNN z ≈ 89–118). But regenerating concordance with
+   `--impute none` collapsed the standalone AUC to chance, and the residual
+   structure vanished. **→ the RWR "signal" was the marginals re-encoded by
+   the imputation graph, not coordination.** (Caution worth keeping: graph
+   imputation on a marginal-derived cell graph can manufacture apparent
+   cell-type signal that survives a *linear* confound regression.)
+
+2. **SVD-hidden false negative.** Without imputation the clean test first
+   looked **negative** (AUC ≈ 0.5 in cortex). That was an artifact of reducing
+   the residual feature matrix with **unsupervised SVD** before classifying:
+   after residualizing out the dominant, high-variance marginal, the cell-type
+   signal lives in **low-variance directions that SVD-top-k discards** (acute
+   in the p ≫ n regime — thousands of regions, hundreds of cells). Classifying
+   on the **full** standardized region features (L2-logistic or random forest)
+   recovered it — in cell lines (svd-lr 0.36 → rf 0.96) and cortex (≈0.5 →
+   0.82–0.84). The lesson: judge "does the residual carry signal?" with a
+   classifier that cannot variance-discard, calibrated by a permutation null.
+
+### 6b.2 The clean existence test
+
+`scripts/ep_coordination_existence.py` measures the signal **without
+cross-cell imputation**, densifying by pooling *pairs* (clean) not *cells*
+(leaky). Per (cell, coarse region) it forms a distance-matched **log2(O/E)**
+signed concordance Δ over a chosen distance band and classifies cell type
+(OvR-macro AUC for >2 types, label-permutation null). The companion
+distance-decay figure plots, vs log-distance (decade ticks, 95% CI, an
+"all cells" line): the soft co-state **agreement** (= co-open + co-closed =
+P[two ends share state] = the posterior product, **not** log2(O/E)), the
+signed **log2(O/E)**, and the **O − E** residual.
+
+### 6b.3 The confound ladder
+
+The cell-type signal was required to survive, **simultaneously**:
+
+| control | flag | removes |
+|---|---|---|
+| marginal level | `Δ\|m` (per-region residual on mean openness) | linear level |
+| nonlinear-marginal + coverage | `Δ\|m+cov` | level², per-region pair count |
+| missingness / contact-presence | `--min-region-frac 0.5`; vs the `miss` benchmark | "which regions a cell has data in" (scHi-C-like) |
+| short-range methylation domains | `--min-distance 20000` | local CpG-domain co-methylation (1–20 kb) |
+| classifier | `--classifier rf` **and** `lr` (full features) | SVD-discarding; linear-only |
+| chance | `--n-perm 200` | finite-sample / overfitting inflation |
+| region-specific artifact | `--split-half` | a few regions driving it (genome-wide consistency) |
+| batch (global per-cell) | `--batch-column exp_batch lib_batch` | library-prep / sequencing batch (additive union) |
+
+`split-half` is needed because batch is a *global per-cell* property that
+appears in both chromosome halves — so split-half alone cannot catch it;
+`--batch-column` is the dedicated control.
+
+### 6b.4 Result — two systems, both positive
+
+- **IMR90 / GM12878 cell lines (HCG, binary AUC).** Long-range (20 kb–2 Mb)
+  `Δ|m+cov` ≈ **0.79 (5 Mb) – 0.89 (1 Mb)**, p = 0.005, ≫ `miss` (~0.67–0.70);
+  split-half both halves ≈ 0.70–0.88, p = 0.005. Locus-scale (gone at
+  chrom/10–25 Mb region granularity), and **not** short-range domains (survives
+  `--min-distance 20000`).
+
+- **Mouse cortex (HCG, multiple cell types, OvR-macro AUC).** `Δ|m+cov` ≈
+  **0.82 (5 Mb) – 0.84 (1 Mb)**, p = 0.005, ≫ `miss` (~0.55–0.58); split-half
+  both halves ≈ 0.81–0.84, p = 0.005. **Batch did contribute** —
+  `Δ|m+cov+batch` (exp+lib, additive) drops to **0.73 / 0.68 / 0.66**
+  (5/2/1 Mb) — but stays **significant (p = 0.005) and above `miss`**.
+
+A note that *supports* the signal: across both systems `Δ|m ≥ Δ` (removing
+the marginal *sharpens* rather than reduces the AUC), i.e. the coordination
+signal was partly *obscured* by residual marginal structure, not produced by
+it.
+
+### 6b.5 Conclusion + honest scope
+
+**Long-range HCG-methylation concordance carries cell-type identity beyond
+marginal levels**, demonstrated in two systems including primary mouse cortex
+with multiple cell types, surviving the full ladder
+(marginal → nonlinear-marginal → coverage → missingness → short-range →
+two classifiers → permutation null → genome-wide split-half → multi-factor
+batch). The **honest effect size is the batch-corrected one** (cortex
+~0.66–0.73). The signal is **locus-scale** (1–5 Mb region pooling of 20 kb–2 Mb
+pairs) and **genome-wide-distributed**.
+
+Stated honestly:
+- The earlier "cortex negative" was a *classifier* (SVD-discarding) artifact,
+  not a true negative.
+- Multi-type effect sizes are OvR-macro (average separability across types),
+  not driven by a single easy type.
+- Two belt-and-suspenders controls were **not** run (not blockers): the batch
+  **interaction** (`exp×lib` composite vs additive main effects), and a
+  **co-observed-only / depth-matched** classification (the last global per-cell
+  sequencing-depth loophole). The additive multi-factor batch control is the
+  standard one, and the signal survived it.
 
 ---
 
