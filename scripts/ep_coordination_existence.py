@@ -197,30 +197,34 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
         dmin, dmax = float(decay_dbins[0]), float(decay_dbins[-1])
         nb = len(decay_dbins) - 1
 
-        def _dacc(dist, agree):
-            if dist.size == 0:
-                return np.zeros(nb), np.zeros(nb)
-            bi = np.clip(np.searchsorted(decay_dbins, dist, side="right") - 1,
-                         0, nb - 1)
-            return (np.bincount(bi, weights=agree, minlength=nb),
-                    np.bincount(bi, minlength=nb).astype(float))
+        def _bins(dist):
+            return np.clip(np.searchsorted(decay_dbins, dist, side="right") - 1,
+                           0, nb - 1)
 
-        # O: every informative pair with separation in the decay range.
+        # O: every informative pair in the decay range — co-open & co-closed
+        # tracked SEPARATELY (so a signed log2(O/E) can be formed per bin).
         dm = inf1 & inf2 & (sep >= dmin) & (sep <= dmax)
-        o_s, o_c = _dacc(sep[dm],
-                         (p1 * p2 + (1 - p1) * (1 - p2))[dm])
+        ob = _bins(sep[dm])
+        O_open = np.bincount(ob, weights=(p1 * p2)[dm], minlength=nb)
+        O_closed = np.bincount(ob, weights=((1 - p1) * (1 - p2))[dm], minlength=nb)
+        O_cnt = np.bincount(ob, minlength=nb).astype(float)
         # E: windowed non-contact null over the decay range, per chromosome.
-        e_ag_l, e_d_l = [], []
+        eo_l, ec_l, ed_l = [], [], []
         for c in uniq_chroms:
             sel = e_chrom == c
             _, eo, ec, ed = _window_pairs(e_pos[sel], e_p[sel], dmin, dmax,
                                           cap, rng)
             if ed.size:
-                e_ag_l.append(eo + ec); e_d_l.append(ed)
-        e_ag = np.concatenate(e_ag_l) if e_ag_l else np.empty(0)
-        e_dd = np.concatenate(e_d_l) if e_d_l else np.empty(0, np.int64)
-        e_s, e_c = _dacc(e_dd, e_ag)
-        decay = {"O_sum": o_s, "O_cnt": o_c, "E_sum": e_s, "E_cnt": e_c}
+                eo_l.append(eo); ec_l.append(ec); ed_l.append(ed)
+        if ed_l:
+            eb = _bins(np.concatenate(ed_l))
+            E_open = np.bincount(eb, weights=np.concatenate(eo_l), minlength=nb)
+            E_closed = np.bincount(eb, weights=np.concatenate(ec_l), minlength=nb)
+            E_cnt = np.bincount(eb, minlength=nb).astype(float)
+        else:
+            E_open = np.zeros(nb); E_closed = np.zeros(nb); E_cnt = np.zeros(nb)
+        decay = {"O_open_sum": O_open, "O_closed_sum": O_closed, "O_cnt": O_cnt,
+                 "E_open_sum": E_open, "E_closed_sum": E_closed, "E_cnt": E_cnt}
 
     eps = 1e-6
     out: dict = {}
@@ -462,10 +466,13 @@ def _decade_ticks(ax):
     ax.set_xlabel("log10(distance between ends)  —  exponent (distance)")
 
 
-def _plot_distance_decay(mid: np.ndarray, curves: dict, E_mean: np.ndarray,
-                         E_se: np.ndarray, dbins: np.ndarray, output: str) -> None:
-    """Hi-C-style distance decay with 95% CI shading (mean ± 1.96·SE across
-    cells; cells are the independent unit)."""
+def _plot_distance_decay(mid: np.ndarray, curves: dict, dbins: np.ndarray,
+                         output: str) -> None:
+    """Hi-C-style 3-panel distance decay with 95% CI shading (mean ± 1.96·SE
+    across cells, the independent unit):
+      (1) agreement      = P(ends share state) = co-open + co-closed,
+      (2) signed log2(O/E) = log2(O_open/E_open) − log2(O_closed/E_closed),
+      (3) residual         = O − E (agreement excess over the random null)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -475,29 +482,30 @@ def _plot_distance_decay(mid: np.ndarray, curves: dict, E_mean: np.ndarray,
             else dict(lw=1.3, marker="o", ms=3)
         ax.plot(mid, m, **style, **kw)
         col = ax.lines[-1].get_color()
-        lo, hi = m - 1.96 * se, m + 1.96 * se
-        ax.fill_between(mid, lo, hi, where=np.isfinite(se), color=col,
+        ax.fill_between(mid, m - 1.96 * se, m + 1.96 * se,
+                        where=np.isfinite(se), color=col,
                         alpha=0.12 if allcells else 0.2, linewidth=0)
 
-    # plot per-cell-type first, then the pooled 'all cells' on top (black)
     order = [g for g in sorted(curves) if g != "all cells"] + \
             (["all cells"] if "all cells" in curves else [])
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8))
-    for g in order:
-        band(ax1, curves[g]["O_mean"], curves[g]["O_se"],
-             allcells=(g == "all cells"), label=f"contacts (O) — {g}")
-    ax1.set_ylabel("concordance = P(ends share state)\n"
-                   "= p·p + (1−p)·(1−p)  [co-open + co-closed]")
-    ax1.set_title("Concordance vs genomic distance (Hi-C-style; 95% CI)")
-    ax1.legend(fontsize=8)
-    for g in order:
-        band(ax2, curves[g]["resid_mean"], curves[g]["resid_se"],
-             allcells=(g == "all cells"), label=f"O − E — {g}")
-    ax2.axhline(0.0, color="grey", lw=0.8)
-    ax2.set_ylabel("residual concordance  (O − E)")
-    ax2.set_title("Residual concordance (contacts vs distance-matched random; 95% CI)")
-    ax2.legend(fontsize=8)
-    for ax in (ax1, ax2):
+    panels = [
+        ("agree", "concordance = P(ends share state)\n= co-open + co-closed",
+         "Concordance (soft agreement) vs distance", False),
+        ("signed", "signed log2(O/E)\nlog2(O_open/E_open) − log2(O_closed/E_closed)",
+         "Directional coordination log2(O/E) vs distance", True),
+        ("resid", "residual agreement  (O − E)",
+         "Excess concordance over distance-matched random", True),
+    ]
+    fig, axes = plt.subplots(3, 1, figsize=(7, 11))
+    for ax, (key, ylab, title, zero) in zip(axes, panels):
+        for g in order:
+            band(ax, curves[g][f"{key}_mean"], curves[g][f"{key}_se"],
+                 allcells=(g == "all cells"), label=g)
+        if zero:
+            ax.axhline(0.0, color="grey", lw=0.8)
+        ax.set_ylabel(ylab, fontsize=9)
+        ax.set_title(title, fontsize=10)
+        ax.legend(fontsize=7)
         ax.set_xlim(dbins[0], dbins[-1])
         _decade_ticks(ax)
     fig.tight_layout()
@@ -760,32 +768,48 @@ def main() -> None:
         except Exception as e:                       # pragma: no cover
             print(f"[ep-existence] ROC plot skipped ({e})")
 
-        # ---- Distance-decay (Hi-C-style): concordance & residual vs dist --
-        # Curve = POOLED over all reads (Σsum/Σcnt) → smooth, Hi-C-like.
-        # 95% CI band = ±1.96·SE across CELLS (the independent unit).  An
-        # "all cells" line (pooled over every cell, not split by type) is added.
+        # ---- Distance-decay (Hi-C-style, 3 panels): agreement, signed
+        # log2(O/E), and residual O−E vs distance.  Curves are POOLED over all
+        # reads (Σsum/Σcnt → smooth); 95% CI = ±1.96·SE across CELLS.  An
+        # "all cells" line (pooled over every cell) is added to each panel.
         nb = len(dbins) - 1
         mid = np.sqrt(dbins[:-1] * dbins[1:])
         groups = y_all.to_numpy()
+        eps = 1e-6
+        _l2 = lambda x: np.log2(np.clip(x, eps, None))
 
-        def _cell_rate(dec, key):
-            s, c = dec[key + "_sum"], dec[key + "_cnt"]
+        def _rate(s, c):
             return np.divide(s, c, out=np.full(nb, np.nan), where=c > 0)
 
-        def _pooled(decs, key):                       # Σsum/Σcnt over reads
-            s = np.sum([d[key + "_sum"] for d in decs], axis=0)
-            c = np.sum([d[key + "_cnt"] for d in decs], axis=0)
-            return np.divide(s, c, out=np.full(nb, np.nan), where=c > 0)
+        def _metrics(oo, oc, eo, ec, ocnt, ecnt):
+            """(agreement, signed log2(O/E), residual O−E) from open/closed
+            sums + counts."""
+            o_op, o_cl = _rate(oo, ocnt), _rate(oc, ocnt)
+            e_op, e_cl = _rate(eo, ecnt), _rate(ec, ecnt)
+            agree = o_op + o_cl
+            signed = (_l2(o_op) - _l2(e_op)) - (_l2(o_cl) - _l2(e_cl))
+            resid = (o_op + o_cl) - (e_op + e_cl)
+            return agree, signed, resid
 
-        def _se_across_cells(rate_arrs):              # SE of per-cell rates
-            A = np.vstack(rate_arrs)
+        def _pooled_metrics(decs):
+            s = lambda k: np.sum([d[k] for d in decs], axis=0)
+            return _metrics(s("O_open_sum"), s("O_closed_sum"),
+                            s("E_open_sum"), s("E_closed_sum"),
+                            s("O_cnt"), s("E_cnt"))
+
+        def _cell_metrics(d):
+            return _metrics(d["O_open_sum"], d["O_closed_sum"],
+                            d["E_open_sum"], d["E_closed_sum"],
+                            d["O_cnt"], d["E_cnt"])
+
+        def _se(arrs):
+            A = np.vstack(arrs)
             n = np.sum(np.isfinite(A), axis=0)
             with np.errstate(invalid="ignore"):
                 sd = np.nanstd(A, axis=0, ddof=1)
             return np.where(n >= 2, sd / np.sqrt(np.maximum(n, 1)), np.nan)
 
-        decs_by_g: dict = {}
-        decs_all = []
+        decs_by_g: dict = {}; decs_all = []
         for (_, _, dec), g in zip(results, groups):
             if dec is None:
                 continue
@@ -794,42 +818,34 @@ def main() -> None:
                 decs_by_g.setdefault(g, []).append(dec)
         if decs_all:
             groups_plot = dict(sorted(decs_by_g.items()))
-            groups_plot["all cells"] = decs_all       # the extra pooled line
+            groups_plot["all cells"] = decs_all
             curves = {}
             for g, decs in groups_plot.items():
-                Ocurve = _pooled(decs, "O")
-                Ecurve = _pooled(decs, "E")
-                o_rates = [_cell_rate(d, "O") for d in decs]
-                r_rates = [_cell_rate(d, "O") - _cell_rate(d, "E") for d in decs]
-                curves[g] = dict(O_mean=Ocurve, O_se=_se_across_cells(o_rates),
-                                 resid_mean=Ocurve - Ecurve,
-                                 resid_se=_se_across_cells(r_rates))
-            E_mean = _pooled(decs_all, "E")
-            E_se = _se_across_cells([_cell_rate(d, "E") for d in decs_all])
-            # values CSV (x = dist_mid_bp; y = mean + 95% CI per curve)
+                ag, sg, rs = _pooled_metrics(decs)
+                cm = [_cell_metrics(d) for d in decs]
+                curves[g] = dict(
+                    agree_mean=ag, agree_se=_se([c[0] for c in cm]),
+                    signed_mean=sg, signed_se=_se([c[1] for c in cm]),
+                    resid_mean=rs, resid_se=_se([c[2] for c in cm]))
+            # values CSV (x = dist_mid_bp; y = the 3 metrics + 95% CI per group)
             dd = pd.DataFrame({
                 "dist_lo_bp": dbins[:-1].astype(np.int64),
                 "dist_hi_bp": dbins[1:].astype(np.int64),
                 "dist_mid_bp": mid.astype(np.int64),
                 "log10_dist_mid": np.log10(mid),
-                "E_mean": E_mean, "E_ci_lo": E_mean - 1.96 * E_se,
-                "E_ci_hi": E_mean + 1.96 * E_se,
             })
             for g in sorted(curves):
-                c = curves[g]
-                gs = g.replace(" ", "_")             # column-safe label
-                dd[f"O_{gs}_mean"] = c["O_mean"]
-                dd[f"O_{gs}_ci_lo"] = c["O_mean"] - 1.96 * c["O_se"]
-                dd[f"O_{gs}_ci_hi"] = c["O_mean"] + 1.96 * c["O_se"]
-                dd[f"residual_{gs}_mean"] = c["resid_mean"]
-                dd[f"residual_{gs}_ci_lo"] = c["resid_mean"] - 1.96 * c["resid_se"]
-                dd[f"residual_{gs}_ci_hi"] = c["resid_mean"] + 1.96 * c["resid_se"]
+                c = curves[g]; gs = g.replace(" ", "_")
+                for key in ("agree", "signed", "resid"):
+                    dd[f"{key}_{gs}_mean"] = c[f"{key}_mean"]
+                    dd[f"{key}_{gs}_ci_lo"] = c[f"{key}_mean"] - 1.96 * c[f"{key}_se"]
+                    dd[f"{key}_{gs}_ci_hi"] = c[f"{key}_mean"] + 1.96 * c[f"{key}_se"]
             dd_csv = f"{args.output_prefix}.distance_decay.values.csv"
             dd.to_csv(dd_csv, index=False)
             print(f"[ep-existence] wrote {dd_csv}")
             try:
                 dd_out = f"{args.output_prefix}.distance_decay.pdf"
-                _plot_distance_decay(mid, curves, E_mean, E_se, dbins, dd_out)
+                _plot_distance_decay(mid, curves, dbins, dd_out)
                 print(f"[ep-existence] wrote {dd_out}")
             except Exception as e:                   # pragma: no cover
                 print(f"[ep-existence] distance-decay plot skipped ({e})")
