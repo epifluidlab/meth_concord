@@ -1,11 +1,14 @@
 # Joint GCH+HCG multi-state long-range concordance
 
-## Design document v0.2 — locked decisions + implementation status
+## Design document v0.3 — locked decisions + implementation status
 
-> **v0.2 (implemented):** the §2–§4 core and a focused J4 are built as the
-> leakage-free *existence test* — see **§10**.  The J0 gate passed (long-range
-> HCG concordance carries cell-type information beyond marginal levels; see
-> `SIGNED_CONCORDANCE_AND_RWR_DESIGN.md` §6b), so the build proceeded to J1/J2.
+> **v0.3 (implemented):** J1/J2, a focused J4, and the J3 embedding are all
+> built as the leakage-free path — see **§10**.  J4 result on real data:
+> **long-range HCG (methylation) concordance carries strong cell-type identity
+> beyond marginals (Δ|m+cov ≈ 0.90–0.93 at 1–2 Mb), but the joint multi-state
+> does not exceed HCG-only** — methylation is the carrier (accessibility
+> concordance is weak), as §9b anticipated.  J3 was built for the interpretive
+> channel decomposition, not to beat HCG (§10.1).
 
 > Extends the signed (single-context) concordance pipeline
 > (`SIGNED_CONCORDANCE_AND_RWR_DESIGN.md`) to integrate **GCH
@@ -255,42 +258,68 @@ methylation bins) to lift the 16% observation rate.
 
 ---
 
-## 10. Implementation status (v0.2)
+## 10. Implementation status (v0.3)
 
-**Built — J1/J2 plus a focused J4, as the leakage-free *existence test*.** It
-mirrors the validated single-context `ep_coordination_existence.py` (pool
-PAIRS, not CELLS; distance-matched O/E; the full confound ladder) — **not** the
-RWR embedding path, which the single-context investigation showed can
+**Built — J1/J2, a focused J4, and J3 — all on the leakage-free path.** The
+estimator mirrors the validated single-context `ep_coordination_existence.py`
+(pool PAIRS, not CELLS; distance-matched O/E; the full confound ladder) —
+**not** the RWR path, which the single-context investigation showed can
 *manufacture* cell-type signal from the marginal-built cell graph
-(`SIGNED_CONCORDANCE_AND_RWR_DESIGN.md` §6b). Starting from the clean estimator
-means any joint signal is trustworthy *before* investing in the J3 embedding.
+(`SIGNED_CONCORDANCE_AND_RWR_DESIGN.md` §6b). The J3 embedding is plain
+unsupervised SVD/UMAP of the Δ tensor (not cross-cell smoothing on a marginal
+graph), so it stays leakage-free too.
 
-| component | file | what |
-|---|---|---|
-| §2–§3 core | `nome_hic_concordance/joint_state.py` | `per_end_joint_state` (independence product); `impute_missing_modality` (lenient, global prior); `pair_co_state` (4 co-states + `mixed`); `co_state_agreement` |
-| §4 per-cell | `nome_hic_concordance/joint_coordination.py` | join GCH+HCG per end (§7); distance-matched `log2(O/E)` per co-state channel pooled per region; emits **joint(4ch) / gch / hcg** feature sets on one end pool + one null |
-| eval ladder | `nome_hic_concordance/coordination_eval.py` | shared confound ladder (marginal → +coverage → +batch), classifier panel (`lr`/`svd-lr`/`rf`), permutation null, ROC — channel-agnostic |
-| §4/§6 CLI | `scripts/joint_coordination_existence.py` | runnable joint-vs-gch-vs-hcg test through the same ladder; `--per-channel` = which co-state carries identity (§6 diagnostic); QC line (§2.1) |
+| phase | component | file | what |
+|---|---|---|---|
+| J1/J2 | §2–§3 core | `nome_hic_concordance/joint_state.py` | `per_end_joint_state` (independence product); `impute_missing_modality` (lenient, global prior); `pair_co_state` (4 co-states + `mixed`) |
+| J2 | §4 per-cell | `nome_hic_concordance/joint_coordination.py` | join GCH+HCG per end (§7); distance-matched `log2(O/E)` per channel pooled per region; emits **joint(4ch)/gch/hcg** on one end pool + one null |
+| — | eval ladder | `nome_hic_concordance/coordination_eval.py` | shared confound ladder (marginal → +coverage → +batch), classifier panel (`lr`/`svd-lr`/`rf`), permutation null, ROC |
+| J4 | §4/§6 CLI | `scripts/joint_coordination_existence.py` | joint-vs-gch-vs-hcg through the same ladder; `--per-channel`; QC line (§2.1) |
+| J3 | §6 embedding | `nome_hic_concordance/joint_embedding.py` + `scripts/joint_multistate_embedding.py` | per-channel normalize → per-channel SVD → concat → (joint SVD/skip-top →) UMAP; per-channel component AUC (which co-state); optional Tucker channel factor |
 
 Tested: `joint_state` 17, `coordination_eval` 18, `joint_coordination` 6 (incl.
-the methylation-cancellation identity — with HCG fully missing the joint
-channels collapse to the accessibility ratios), CLI 2 end-to-end smoke.
+the methylation-cancellation identity), `joint_embedding` 7, + 4 CLI smoke =
+**52 new tests**; full suite 215 passed.
 
-**Implementation decisions beyond §9:**
-- **Global prior** for the missing modality (one number per context across
-  cells), not per-cell — so lenient-imputed ends inject no cell-type marginal
-  structure (locked decision #3, made concrete and leak-safe).
-- **gch/hcg references are computed on the *joint* end pool**, so "does joint
-  beat the best single context?" is apples-to-apples (same cells / ends / null
-  / CV folds). Absolute single-context numbers still come from
-  `ep_coordination_existence.py`.
+**Implementation decisions beyond §9:** **global prior** for the missing
+modality (one number/context, not per-cell — leak-safe, decision #3);
+**gch/hcg references computed on the *joint* end pool** (apples-to-apples
+"does joint beat the best single context?").
 
-**Not yet built:** J3 (per-channel SVD/UMAP embedding + tensor-decomposition
-option + per-channel component AUC on the *embedding*) and the
-`nome_hic_compare` wiring. **Gate J3 on a positive existence result:** if on
-real data `joint Δ|m+cov ≈ max(gch, hcg)` (the outcome §9b anticipates, with
-HCG real at only ~16 % of ends), the methylation axis adds little beyond the
-accessibility signal and the heavy embedding build is not warranted — a
-legitimate negative recorded cheaply. If `joint > max(gch, hcg)` above the
-permutation null and above the missingness benchmark, proceed to J3 (likely
-with coarsened HCG resolution to lift the observation rate).
+### 10.1 J4 result (real data, 5 / 2 / 1 Mb) — methylation is the carrier
+
+Δ|m+cov (marginal-, coverage- and missingness[`--min-region-frac 0.5`]-
+controlled; label-permutation *p*):
+
+| scale | joint(4ch) | gch (access) | hcg (methyl) | miss |
+|---|---|---|---|---|
+| 5 Mb | 0.63 (p=.04) | 0.52 (ns) | 0.57 (ns) | 0.54 |
+| 2 Mb | 0.90 (p=.02) | 0.62 (.04) | **0.91 (.02)** | 0.63 |
+| 1 Mb | 0.92 (p=.02) | 0.61 (.04) | **0.93 (.02)** | 0.62 |
+
+- **Long-range HCG (methylation) concordance carries strong cell-type identity
+  beyond marginal levels** (0.90–0.93 at 1–2 Mb, ≫ miss ≈ 0.62) — the §6b
+  result, reproduced in the joint pipeline. `Δ|m > Δ` again (residualizing the
+  marginal *sharpens* it).
+- **GCH (accessibility) concordance adds little** (0.52–0.62).
+- **Joint ≈ HCG, not above it** at the scales with signal → the joint-
+  combination hypothesis is **not supported here**; methylation does the work
+  (as §9b anticipated). Per-channel: the methylation-dependent co-states carry
+  it (1 Mb: active_methylated 0.94, open 0.93; poised 0.70 weakest).
+- Nuance at 5 Mb: joint and its open/am channels are significant where *neither*
+  single-context **signed contrast** is — the joint keeps 4 *separate* channels
+  while gch/hcg subtract two, cancelling co-moving signal at coarse scale. Weak.
+
+**Caveat:** the marginal AUC ≈ 1.0 (mean methylation level alone separates the
+cells), so the 0.90 residual leans on the residualization; the permutation null
+rules out *chance* but not residual-marginal leakage. The single-context HCG
+passed batch + split-half in §6b; re-run the joint test with `--split-half` and
+`--batch-column` to make *this* run airtight.
+
+**Why J3 was still built:** joint ≈ HCG means the *combination* adds nothing,
+but the 4-channel decomposition is interpretive — it localizes the signal to
+the methylation-dependent co-states and yields a cell map. Built for that, not
+to beat HCG.
+
+**Remaining:** the `nome_hic_compare` wiring (joint vs scHi-C / accessibility in
+the shared harness) and the confirmatory batch/split-half joint run.
