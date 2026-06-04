@@ -319,31 +319,41 @@ def main() -> None:
     def _batch_aucs(S):
         """Per-FACTOR batch AUC among labeled cells → {col: (auc, reason)}.
 
-        Per factor, NOT the composite: the cartesian product of several batch
-        columns fragments into singleton groups that CV can't score (the cause
-        of the earlier NaN).  ``auc`` is NaN with a reason when a factor can't
-        be scored (1 level, or a level with <2 cells)."""
+        Per factor, NOT the composite (the cartesian product fragments into
+        singletons CV can't score).  Within a factor, **drop only the cells
+        whose level has <2 labeled members** (stratified CV needs ≥2 per class)
+        and score the rest — so a factor with many fine levels (e.g. ~20 prep
+        dates) where one date happens to have a single labeled cell is still
+        scored on its other levels, instead of the whole factor going n/a."""
         out = {}
         if batch_df is None or not can_auc:
             return out
         for c in batch_cols:
             vals = batch_df[c].to_numpy()[labeled]
             uniq, counts = np.unique(vals, return_counts=True)
-            if len(uniq) < 2:
-                out[c] = (np.nan, "1 level among labeled cells")
-            elif counts.min() < 2:
-                out[c] = (np.nan, "a batch level has <2 cells")
-            else:
-                out[c] = (ce.score(S, vals, args.classifier, args.n_folds,
-                                   args.random_seed)[0], None)
+            big = uniq[counts >= 2]                 # levels usable for CV
+            if len(big) < 2:
+                out[c] = (np.nan, "<2 levels with ≥2 cells")
+                continue
+            keep = np.isin(vals, big)
+            auc = ce.score(S[keep], vals[keep], args.classifier, args.n_folds,
+                           args.random_seed)[0]
+            dropped = int((~keep).sum())
+            out[c] = (auc, None if dropped == 0
+                      else f"{dropped} cell(s) in singleton levels dropped")
         return out
 
     def _batch_str(S):
         r = _batch_aucs(S)
         if not r:
             return "n/a"
-        return "  ".join(f"{c}={v:.3f}" if np.isfinite(v) else f"{c}=n/a({rn})"
-                         for c, (v, rn) in r.items())
+        parts = []
+        for c, (v, rn) in r.items():
+            if np.isfinite(v):
+                parts.append(f"{c}={v:.3f}" + (f"[{rn}]" if rn else ""))
+            else:
+                parts.append(f"{c}=n/a({rn})")
+        return "  ".join(parts)
 
     # ---- Per-channel SVD component AUC (top 10) — which top components are a
     # technical axis to skip (low AUC) vs cell type (high AUC), per channel. ----
