@@ -338,14 +338,35 @@ not apply here, and there is no reason to avoid the validated RWR.
   — each cell's thousands of sparse region-Δ's are pooled into a few dense
   components *within that cell* (no cross-cell borrowing). Good enough whenever
   the SVD already separates the cells.
-- **`--rwr on`:** the **same RWR as the rest of `nome_hic_concordance`**
-  (scHiCluster-style) — k-NN graph from `QN(mean accessibility ⊕ mean
-  methylation)` (the §5 / `run_rwr_pipeline` pass-0 basis), then
-  `rwr_impute_matrices` on each normalized co-state channel, then re-embed.
-  Reuses `build_knn_graph` / `rwr_impute_matrices` unchanged.
-- **`--rwr-compare`:** runs both and prints the per-channel AUC delta
-  (SVD-only │ RWR │ Δ), writing `.svdonly` and `.rwr` outputs, so the effect of
-  cross-cell smoothing is visible rather than assumed.
+- **`--rwr on`:** the **same multi-pass RWR as the rest of
+  `nome_hic_concordance`** (`run_rwr_pipeline` scheme), reusing
+  `build_knn_graph` / `rwr_impute_matrices` / `post_norm_for_knn` /
+  `_top_eigengap` unchanged:
+  - **pass 0** — graph from `QN(mean accessibility ⊕ mean methylation)`;
+  - **pass ≥1 (refinement)** — graph rebuilt from the *concordance* of the
+    previous pass (`--rwr-refinement-basis postnorm|raw`), **re-imputing from the
+    original channels** (only the graph evolves);
+  - **`--rwr-auto-select`** — keep the pass with the largest post-norm
+    concordance eigengap (`_top_eigengap`, label-free; pass 0 never selected),
+    up to `--rwr-max-passes`, patience 1. `--rwr-refine-passes N` runs a fixed N.
+- **`--rwr-compare`:** runs SVD-only and RWR and prints the per-channel AUC delta
+  (SVD-only │ RWR │ Δ), writing `.svdonly` and `.rwr` outputs.
 
-(The earlier bespoke "concordance-graph RWR" was removed: it was unnecessary —
-the leakage question is settled — and untested relative to the package RWR.)
+(The earlier bespoke "concordance-graph RWR" was removed: unnecessary — the
+leakage question is settled — and untested relative to the package RWR.)
+
+### 10.3 Embedding = concatenated per-channel SVDs; component diagnostic
+
+The embedding fed to UMAP is the **concatenation of the per-channel SVD scores**
+(per-channel normalize → per-channel SVD → concat → joint SVD/skip-top → UMAP),
+**not** a tensor decomposition — Tucker (`--tensor`) is an optional side output
+(the channel factor), not the embedding itself.
+
+To decide whether any channel's leading SVD component is a technical axis (as the
+GCH 1st component was, single-context), the script prints a **per-channel,
+per-component cell-type AUC** table (top 10 of each channel; `*.component_auc.csv`)
+— high = cell type, low ≈ technical. `--skip-top-per-channel N` then drops the
+top N components **of each channel** before concatenation (the per-channel
+analogue of the single-context `--skip-top-svd`, which here acts only on the
+*joint* SVD). The per-cell-rank normalization already removes per-cell depth, so
+the default is 0.

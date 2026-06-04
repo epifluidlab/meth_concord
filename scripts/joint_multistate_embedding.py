@@ -108,6 +108,11 @@ def main() -> None:
                          "already removes per-cell depth, so this is usually "
                          "unneeded; use it only if the top joint component is a "
                          "known technical axis.")
+    ap.add_argument("--skip-top-per-channel", type=int, default=0,
+                    help="Drop the top N SVD components of EACH channel before "
+                         "concatenation (the per-channel analogue of the single-"
+                         "context skip-top; use the printed component-AUC table to "
+                         "decide which channels need it). Default 0.")
     ap.add_argument("--rwr", choices=["off", "on"], default="off",
                     help="Densify the sparse Δ before embedding via the SAME RWR "
                          "as the rest of nome_hic_concordance (scHiCluster-style: "
@@ -121,6 +126,25 @@ def main() -> None:
                     help="k for the RWR k-NN graph (default 15, scHiCluster).")
     ap.add_argument("--rwr-restart", type=float, default=0.5,
                     help="RWR restart probability (default 0.5, scHiCluster).")
+    ap.add_argument("--rwr-refine-passes", type=int, default=0,
+                    help="Fixed RWR refinement passes (pass ≥1 rebuilds the graph "
+                         "from the concordance of the previous pass, re-imputing "
+                         "from the ORIGINAL channels — same scheme as "
+                         "run_rwr_pipeline). 0 (default) = pass-0 only (marginal "
+                         "graph). Ignored if --rwr-auto-select.")
+    ap.add_argument("--rwr-auto-select", action="store_true",
+                    help="Auto-select the best refinement pass (up to "
+                         "--rwr-max-passes) by the post-norm concordance eigengap "
+                         "— the same label-free criterion as run_rwr_pipeline. "
+                         "Pass 0 is never selected (its top axis is the "
+                         "accessibility/batch confound).")
+    ap.add_argument("--rwr-max-passes", type=int, default=5,
+                    help="Max refinement passes under --rwr-auto-select (def 5).")
+    ap.add_argument("--rwr-refinement-basis", choices=["raw", "postnorm"],
+                    default="postnorm",
+                    help="Refinement-pass graph basis (default postnorm: per-cell-"
+                         "rank → QN → recenter, strips the per-cell shift; matches "
+                         "the package).")
     ap.add_argument("--classifier", choices=["svd-lr", "lr", "rf"], default="lr",
                     help="Classifier for the per-channel component AUC DIAGNOSTIC "
                          "only (which co-state carries cell-type identity). The "
@@ -209,6 +233,28 @@ def main() -> None:
     can_auc = labeled.sum() >= 10 and y_all[labeled].nunique() >= 2
     yl = y_all[labeled].to_numpy() if can_auc else None
 
+    # ---- Per-channel SVD component AUC (top 10) — which top components are a
+    # technical axis to skip (low AUC) vs cell type (high AUC), per channel. ----
+    if can_auc:
+        ndiag = max(10, args.k_per_channel + args.skip_top_per_channel)
+        _, diag_blocks = je.per_channel_svd(normed, ndiag, seed=args.random_seed)
+        pcauc = je.per_component_auc([b[labeled] for b in diag_blocks], names,
+                                     yl, max_comp=10)
+        ncomp = max(len(v) for v in pcauc.values())
+        print("\n[joint-embed] per-channel SVD component AUC (top 10) — "
+              "high = cell type, low ≈ technical (candidate to skip):")
+        print("    " + f"{'channel':<18}" + "".join(f"c{j:<5}" for j in range(ncomp)))
+        for n in names:
+            print("    " + f"{n:<18}" +
+                  "".join(f"{a:<6.2f}" for a in pcauc[n]))
+        pc_df = pd.DataFrame({n: pd.Series(pcauc[n]) for n in names}).T
+        pc_df.columns = [f"comp{j}" for j in range(pc_df.shape[1])]
+        pc_df.to_csv(f"{args.output_prefix}.component_auc.csv")
+        print(f"[joint-embed] wrote {args.output_prefix}.component_auc.csv")
+        if args.skip_top_per_channel:
+            print(f"[joint-embed] embedding will SKIP the top "
+                  f"{args.skip_top_per_channel} component(s) of each channel.")
+
     def _variant(suffix, use_rwr):
         """Embed (SVD-only or standard package RWR), report channel AUC, write
         scores + channel-AUC CSV + UMAP.  Returns {channel: auc}."""
@@ -216,13 +262,21 @@ def main() -> None:
             scores, blocks, _, info = je.rwr_embed(
                 normed, names, graph_basis, k_per_channel=args.k_per_channel,
                 n_neighbors=args.rwr_neighbors, restart_prob=args.rwr_restart,
-                seed=args.random_seed)
+                n_refine_passes=args.rwr_refine_passes,
+                auto_select=args.rwr_auto_select, max_passes=args.rwr_max_passes,
+                refinement_basis=args.rwr_refinement_basis,
+                seed=args.random_seed, skip_top=args.skip_top_per_channel)
             print(f"[joint-embed]{suffix} RWR (package scHiCluster-style): "
                   f"basis={info['graph_basis']}, k={info['n_neighbors']}, "
-                  f"r={info['restart_prob']}")
+                  f"r={info['restart_prob']}, selected_pass={info['selected_pass']}")
+            if info.get("auto_select"):
+                egs = ", ".join(f"p{p['pass']}={p.get('eigengap', float('nan')):.2f}"
+                                for p in info["passes"][1:])
+                print(f"[joint-embed]{suffix}   refine eigengaps: {egs}")
         else:
-            scores, blocks = je.per_channel_svd(normed, args.k_per_channel,
-                                                seed=args.random_seed)
+            scores, blocks = je.per_channel_svd(
+                normed, args.k_per_channel, seed=args.random_seed,
+                skip_top=args.skip_top_per_channel)
         label = "RWR" if use_rwr else "SVD-only"
         rows, aucd = [], {}
         if can_auc:

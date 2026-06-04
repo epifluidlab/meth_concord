@@ -7,7 +7,7 @@ import pytest
 
 from nome_hic_concordance.joint_embedding import (
     build_embedding, channel_auc, normalize_channel, per_cell_rank,
-    per_channel_svd, rwr_embed,
+    per_channel_svd, per_component_auc, rwr_embed,
 )
 
 
@@ -194,3 +194,56 @@ def test_rwr_deterministic():
     s2, *_ = rwr_embed(normed, _NAMES, basis, k_per_channel=4, n_neighbors=5,
                        seed=0)
     assert np.allclose(s1, s2)
+
+
+def test_rwr_fixed_refine_passes():
+    chans, y = _two_cluster_channels(seed=5)
+    normed = [normalize_channel(M) for M in chans]
+    basis = _cluster_basis(y, seed=5)
+    _, _, _, info = rwr_embed(normed, _NAMES, basis, k_per_channel=4,
+                              n_neighbors=5, n_refine_passes=2, seed=0)
+    assert info["selected_pass"] == 2
+    assert len(info["passes"]) == 3                      # pass 0, 1, 2
+    assert info["passes"][0]["basis"].startswith("QN(mean")
+    assert "concordance" in info["passes"][1]["basis"]   # refine from concordance
+
+
+def test_rwr_auto_select_never_pass0():
+    chans, y = _two_cluster_channels(seed=6)
+    normed = [normalize_channel(M) for M in chans]
+    basis = _cluster_basis(y, seed=6)
+    _, _, _, info = rwr_embed(normed, _NAMES, basis, k_per_channel=4,
+                              n_neighbors=5, auto_select=True, max_passes=3,
+                              seed=0)
+    assert info["auto_select"] is True
+    assert info["selected_pass"] >= 1                    # pass 0 never selected
+    # every refinement pass recorded an eigengap
+    assert all("eigengap" in p for p in info["passes"][1:])
+
+
+# --------------------------------------------------------------------------
+# per_component_auc + per-channel skip-top
+# --------------------------------------------------------------------------
+
+def test_per_component_auc_flags_informative_component():
+    rng = np.random.default_rng(7)
+    y = np.array(["A"] * 15 + ["B"] * 15)
+    # channel "open": component 0 separates the groups, the rest are noise
+    sep = np.concatenate([rng.normal(2, 0.3, 15), rng.normal(-2, 0.3, 15)])
+    block_open = np.column_stack([sep, rng.normal(0, 1, (30, 4))])
+    block_noise = rng.normal(0, 1, (30, 5))
+    pc = per_component_auc([block_open, block_noise], ["open", "closed"], y,
+                           max_comp=5)
+    assert pc["open"][0] > 0.9         # leading component carries cell type
+    assert max(pc["open"][1:]) < 0.8   # remaining components ~ chance
+    assert all(a < 0.8 for a in pc["closed"])   # pure-noise channel
+
+
+def test_per_channel_svd_skip_top_changes_embedding():
+    chans, _ = _two_cluster_channels(seed=8)
+    normed = [normalize_channel(M) for M in chans]
+    s0, _ = per_channel_svd(normed, k_per_channel=3, skip_top=0)
+    s1, b1 = per_channel_svd(normed, k_per_channel=3, skip_top=1)
+    assert s0.shape == s1.shape == (30, 12)   # 4 channels × 3, shape preserved
+    assert not np.allclose(s0, s1)            # dropping the top component changes it
+    assert all(b.shape == (30, 3) for b in b1)

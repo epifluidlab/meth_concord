@@ -109,3 +109,18 @@ def test_embedding_cli_rwr_compare(tmp_path):
     assert Path(f"{prefix}.rwr.channel_auc.csv").exists()
     rdf = pd.read_csv(f"{prefix}.rwr.channel_auc.csv")
     assert set(rdf["variant"]) == {"RWR"}
+
+
+def test_embedding_cli_component_auc_and_autoselect(tmp_path):
+    r, prefix = _run(tmp_path, ["--rwr", "on", "--rwr-auto-select",
+                                "--rwr-max-passes", "2",
+                                "--skip-top-per-channel", "1"])
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    # per-channel per-component AUC diagnostic table + CSV
+    assert "per-channel SVD component AUC" in r.stdout
+    cdf = pd.read_csv(f"{prefix}.component_auc.csv", index_col=0)
+    assert cdf.shape[0] == 4                       # 4 co-state channels
+    # multi-pass RWR with eigengap auto-select reported a selected pass
+    assert "selected_pass=" in r.stdout
+    assert "refine eigengaps" in r.stdout
+    assert "SKIP the top 1 component" in r.stdout
