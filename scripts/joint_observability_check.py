@@ -70,6 +70,9 @@ def main():
 
     thr, mind, bsz = args.min_sites, args.min_distance, args.bin_size
     end_counts = {"both": 0, "gch_only": 0, "cpg_only": 0, "neither": 0}
+    # same breakdown, but only over the two ends of LINKED (long-range,
+    # same-bin >= min_distance) pairs — the ends the joint method actually uses.
+    end_counts_link = {"both": 0, "gch_only": 0, "cpg_only": 0, "neither": 0}
     n_sb = n_strict = n_lenient = 0           # same-bin pair tallies
     n_sb_link = n_strict_link = n_lenient_link = 0
     per_bin_strict, per_bin_lenient = [], []
@@ -98,6 +101,12 @@ def main():
         lenient = (g1 | h1) & (g2 | h2)
         same_bin = (m["pos1"] // bsz) == (m["pos2"] // bsz)
         linked = same_bin & (m["distance"] >= mind)
+        # per-end modality restricted to the two ends of LINKED pairs
+        for (gi, hi) in ((g1, h1), (g2, h2)):
+            end_counts_link["both"] += int((gi & hi & linked).sum())
+            end_counts_link["gch_only"] += int((gi & ~hi & linked).sum())
+            end_counts_link["cpg_only"] += int((~gi & hi & linked).sum())
+            end_counts_link["neither"] += int((~gi & ~hi & linked).sum())
         n_sb += int(same_bin.sum())
         n_strict += int((strict & same_bin).sum())
         n_lenient += int((lenient & same_bin).sum())
@@ -130,6 +139,12 @@ def main():
     print(f"  linked pairs (any obs): {n_sb_link:>10,d}")
     print(f"  strict  : {n_strict_link:>10,d}  ({100*n_strict_link/max(n_sb_link,1):5.1f}%)")
     print(f"  lenient : {n_lenient_link:>10,d}  ({100*n_lenient_link/max(n_sb_link,1):5.1f}%)")
+
+    tot_ends_link = sum(end_counts_link.values())
+    print("\n=== per-end modality (over both ends of LINKED pairs only, "
+          ">= {:,} bp) ===".format(mind))
+    for k, v in end_counts_link.items():
+        print(f"  {k:>9s}: {v:>10,d}  ({100*v/max(tot_ends_link,1):5.1f}%)")
 
     def _med(x):
         return float(np.median(x)) if x else 0.0
