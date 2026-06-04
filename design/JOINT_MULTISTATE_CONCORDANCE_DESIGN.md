@@ -1,6 +1,11 @@
 # Joint GCH+HCG multi-state long-range concordance
 
-## Design document v0.1 — discussion-locked decisions
+## Design document v0.2 — locked decisions + implementation status
+
+> **v0.2 (implemented):** the §2–§4 core and a focused J4 are built as the
+> leakage-free *existence test* — see **§10**.  The J0 gate passed (long-range
+> HCG concordance carries cell-type information beyond marginal levels; see
+> `SIGNED_CONCORDANCE_AND_RWR_DESIGN.md` §6b), so the build proceeded to J1/J2.
 
 > Extends the signed (single-context) concordance pipeline
 > (`SIGNED_CONCORDANCE_AND_RWR_DESIGN.md`) to integrate **GCH
@@ -247,3 +252,45 @@ methylation bins) to lift the 16% observation rate.
 7. **Per-channel SVD embedding by default**; **tensor decomposition optional**.
 8. **Independence approximation** for the per-end joint (product of
    marginals) in v1; learned-joint in v2.
+
+---
+
+## 10. Implementation status (v0.2)
+
+**Built — J1/J2 plus a focused J4, as the leakage-free *existence test*.** It
+mirrors the validated single-context `ep_coordination_existence.py` (pool
+PAIRS, not CELLS; distance-matched O/E; the full confound ladder) — **not** the
+RWR embedding path, which the single-context investigation showed can
+*manufacture* cell-type signal from the marginal-built cell graph
+(`SIGNED_CONCORDANCE_AND_RWR_DESIGN.md` §6b). Starting from the clean estimator
+means any joint signal is trustworthy *before* investing in the J3 embedding.
+
+| component | file | what |
+|---|---|---|
+| §2–§3 core | `nome_hic_concordance/joint_state.py` | `per_end_joint_state` (independence product); `impute_missing_modality` (lenient, global prior); `pair_co_state` (4 co-states + `mixed`); `co_state_agreement` |
+| §4 per-cell | `nome_hic_concordance/joint_coordination.py` | join GCH+HCG per end (§7); distance-matched `log2(O/E)` per co-state channel pooled per region; emits **joint(4ch) / gch / hcg** feature sets on one end pool + one null |
+| eval ladder | `nome_hic_concordance/coordination_eval.py` | shared confound ladder (marginal → +coverage → +batch), classifier panel (`lr`/`svd-lr`/`rf`), permutation null, ROC — channel-agnostic |
+| §4/§6 CLI | `scripts/joint_coordination_existence.py` | runnable joint-vs-gch-vs-hcg test through the same ladder; `--per-channel` = which co-state carries identity (§6 diagnostic); QC line (§2.1) |
+
+Tested: `joint_state` 17, `coordination_eval` 18, `joint_coordination` 6 (incl.
+the methylation-cancellation identity — with HCG fully missing the joint
+channels collapse to the accessibility ratios), CLI 2 end-to-end smoke.
+
+**Implementation decisions beyond §9:**
+- **Global prior** for the missing modality (one number per context across
+  cells), not per-cell — so lenient-imputed ends inject no cell-type marginal
+  structure (locked decision #3, made concrete and leak-safe).
+- **gch/hcg references are computed on the *joint* end pool**, so "does joint
+  beat the best single context?" is apples-to-apples (same cells / ends / null
+  / CV folds). Absolute single-context numbers still come from
+  `ep_coordination_existence.py`.
+
+**Not yet built:** J3 (per-channel SVD/UMAP embedding + tensor-decomposition
+option + per-channel component AUC on the *embedding*) and the
+`nome_hic_compare` wiring. **Gate J3 on a positive existence result:** if on
+real data `joint Δ|m+cov ≈ max(gch, hcg)` (the outcome §9b anticipates, with
+HCG real at only ~16 % of ends), the methylation axis adds little beyond the
+accessibility signal and the heavy embedding build is not warranted — a
+legitimate negative recorded cheaply. If `joint > max(gch, hcg)` above the
+permutation null and above the missingness benchmark, proceed to J3 (likely
+with coarsened HCG resolution to lift the observation rate).
