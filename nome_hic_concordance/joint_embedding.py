@@ -134,6 +134,54 @@ def per_component_auc(blocks: list, channel_names: list, y, max_comp: int = 10):
     return out
 
 
+def tensor_embed(channels: list, channel_names: list, method: str = "tucker",
+                 rank=(10, 10, 4), seed: int = 0):
+    """Tensor-decomposition embedding (design §6 optional alternative).
+
+    Stacks the K co-state channel matrices into a **cells × regions × channel**
+    tensor and decomposes it, returning the **cell factor** (the embedding, →
+    UMAP) and the **channel factor** (how the four co-states combine into each
+    latent component).  Unlike concatenated per-channel SVD, the decomposition
+    couples the channels and regions jointly.
+
+    * ``method="tucker"`` — ``rank`` is ``(r_cell, r_region, r_channel)``; the
+      cell factor is ``cells × r_cell``.
+    * ``method="cp"`` (PARAFAC) — ``rank`` is the number of components R (an int,
+      or the first element of the tuple); cell factor is ``cells × R`` and the
+      channel factor ``K × R``.
+
+    Requires **tensorly** (``pip install tensorly``).  Returns
+    ``(cell_factor, channel_factor, info)``."""
+    try:
+        import tensorly as tl
+        from tensorly.decomposition import parafac, tucker
+    except ImportError as e:                                  # pragma: no cover
+        raise RuntimeError("tensor embedding requires tensorly "
+                           "(pip install tensorly)") from e
+    w = min(M.shape[1] for M in channels)
+    arr = np.stack([np.asarray(M, dtype=np.float64)[:, :w] for M in channels],
+                   axis=2)                                    # cells × w × K
+    T = tl.tensor(arr)
+    if method == "cp":
+        R = rank[0] if isinstance(rank, (tuple, list)) else int(rank)
+        R = max(1, min(int(R), arr.shape[0], w))
+        res = parafac(T, rank=R, random_state=seed, n_iter_max=200)
+    else:
+        rk = rank if isinstance(rank, (tuple, list)) else (rank, rank, len(channels))
+        ranks = [max(1, min(int(r), d)) for r, d in zip(rk, arr.shape)]
+        res = tucker(T, rank=ranks, random_state=seed)
+    # tensorly returns a (core/weights, factors) tuple or a CP/Tucker-Tensor;
+    # the factor matrices are the second element / the ``.factors`` attribute.
+    factors = getattr(res, "factors", None)
+    if factors is None:
+        factors = res[1]
+    cell_factor = np.asarray(factors[0])
+    channel_factor = np.asarray(factors[2])
+    info = {"method": method, "tensor_shape": list(arr.shape),
+            "cell_factor_dim": int(cell_factor.shape[1])}
+    return cell_factor, channel_factor, info
+
+
 def channel_auc(blocks: list, channel_names: list, y, method: str = "lr",
                 n_folds: int = 5, seed: int = 0) -> dict:
     """Per-channel cross-validated AUC of each channel's SVD-score block vs ``y``.

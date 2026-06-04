@@ -7,7 +7,7 @@ import pytest
 
 from nome_hic_concordance.joint_embedding import (
     build_embedding, channel_auc, normalize_channel, per_cell_rank,
-    per_channel_svd, per_component_auc, rwr_embed,
+    per_channel_svd, per_component_auc, rwr_embed, tensor_embed,
 )
 
 
@@ -247,3 +247,39 @@ def test_per_channel_svd_skip_top_changes_embedding():
     assert s0.shape == s1.shape == (30, 12)   # 4 channels × 3, shape preserved
     assert not np.allclose(s0, s1)            # dropping the top component changes it
     assert all(b.shape == (30, 3) for b in b1)
+
+
+# --------------------------------------------------------------------------
+# tensor_embed (needs tensorly — skipped where absent)
+# --------------------------------------------------------------------------
+
+def test_tensor_embed_tucker_cell_and_channel_factors():
+    pytest.importorskip("tensorly")
+    chans, y = _two_cluster_channels(seed=9, n_reg=30)
+    normed = [normalize_channel(M) for M in chans]
+    cell, chan, info = tensor_embed(normed, _NAMES, method="tucker",
+                                    rank=(6, 8, 4), seed=0)
+    assert cell.shape == (30, 6)              # cells × r_cell = the embedding
+    assert chan.shape == (4, 4)              # K channels × r_channel
+    assert info["method"] == "tucker" and info["cell_factor_dim"] == 6
+
+
+def test_tensor_embed_cp_shapes():
+    pytest.importorskip("tensorly")
+    chans, _ = _two_cluster_channels(seed=10, n_reg=30)
+    normed = [normalize_channel(M) for M in chans]
+    cell, chan, info = tensor_embed(normed, _NAMES, method="cp", rank=(5,), seed=0)
+    assert cell.shape == (30, 5)             # cells × R
+    assert chan.shape == (4, 5)              # K channels × R
+    assert info["method"] == "cp"
+
+
+def test_tensor_embed_separates_clusters():
+    pytest.importorskip("tensorly")
+    chans, y = _two_cluster_channels(noise=0.6, seed=11, n_reg=30)
+    normed = [normalize_channel(M) for M in chans]
+    cell, _, _ = tensor_embed(normed, _NAMES, method="tucker", rank=(6, 8, 4),
+                              seed=0)
+    from nome_hic_concordance import coordination_eval as ce
+    auc, _ = ce.score(cell, y, "lr", 4, 0)
+    assert auc > 0.8                         # the cell factor carries cell type

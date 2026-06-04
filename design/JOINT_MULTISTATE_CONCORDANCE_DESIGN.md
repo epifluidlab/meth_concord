@@ -275,7 +275,7 @@ graph), so it stays leakage-free too.
 | J2 | §4 per-cell | `nome_hic_concordance/joint_coordination.py` | join GCH+HCG per end (§7); distance-matched `log2(O/E)` per channel pooled per region; emits **joint(4ch)/gch/hcg** on one end pool + one null |
 | — | eval ladder | `nome_hic_concordance/coordination_eval.py` | shared confound ladder (marginal → +coverage → +batch), classifier panel (`lr`/`svd-lr`/`rf`), permutation null, ROC |
 | J4 | §4/§6 CLI | `scripts/joint_coordination_existence.py` | joint-vs-gch-vs-hcg through the same ladder; `--per-channel`; QC line (§2.1) |
-| J3 | §6 embedding | `nome_hic_concordance/joint_embedding.py` + `scripts/joint_multistate_embedding.py` | per-channel normalize → per-channel SVD → concat → (joint SVD/skip-top →) UMAP; per-channel component AUC (which co-state); optional Tucker channel factor; optional **standard package RWR** (`--rwr` / `--rwr-compare`, §10.2) |
+| J3 | §6 embedding | `nome_hic_concordance/joint_embedding.py` + `scripts/joint_multistate_embedding.py` | `--embedding concat-svd` (per-channel SVD → concat) or `tensor` (Tucker/CP cell factor); per-channel + per-component AUC (which co-state / which SVD comps to skip); optional **standard package RWR** (`--rwr` / `--rwr-compare`, §10.2) |
 
 Tested: `joint_state` 17, `coordination_eval` 18, `joint_coordination` 6 (incl.
 the methylation-cancellation identity), `joint_embedding` 7, + 4 CLI smoke =
@@ -355,12 +355,22 @@ not apply here, and there is no reason to avoid the validated RWR.
 (The earlier bespoke "concordance-graph RWR" was removed: unnecessary — the
 leakage question is settled — and untested relative to the package RWR.)
 
-### 10.3 Embedding = concatenated per-channel SVDs; component diagnostic
+### 10.3 Embedding method + component diagnostic
 
-The embedding fed to UMAP is the **concatenation of the per-channel SVD scores**
-(per-channel normalize → per-channel SVD → concat → joint SVD/skip-top → UMAP),
-**not** a tensor decomposition — Tucker (`--tensor`) is an optional side output
-(the channel factor), not the embedding itself.
+`--embedding` chooses how the cells × regions × 4-channel tensor becomes a cell
+embedding:
+
+- **`concat-svd` (default)** — per-channel normalize → per-channel SVD →
+  **concatenate** scores → joint SVD/skip-top → UMAP.
+- **`tensor`** — a **Tucker** (`--tensor-method tucker`, `--tensor-rank
+  r_cell,r_region,r_channel`) or **CP/PARAFAC** (`cp`) decomposition of the
+  tensor; the **cell factor** *is* the embedding (→ UMAP) and the **channel
+  factor** (co-state loadings per component) is reported + written
+  (`*.tensor_channel_factor.csv`). Needs `tensorly`; couples channels and regions
+  jointly rather than concatenating independent per-channel SVDs.
+
+Both feed the same UMAP and the same RWR densification (RWR smooths the channels
+first; then either embedding runs on the smoothed channels).
 
 To decide whether any channel's leading SVD component is a technical axis (as the
 GCH 1st component was, single-context), the script prints a **per-channel,

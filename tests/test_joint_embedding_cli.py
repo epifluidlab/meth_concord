@@ -84,12 +84,32 @@ def test_embedding_cli_end_to_end(tmp_path):
 
 
 def test_embedding_cli_resid_full(tmp_path):
-    r, prefix = _run(tmp_path, ["--feature", "resid_full", "--tensor"])
+    r, prefix = _run(tmp_path, ["--feature", "resid_full"])
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
-    # tensorly absent -> tensor step skipped, run still succeeds
-    assert "tensor decomposition skipped" in r.stdout or \
-           "channel factor" in r.stdout
     assert Path(f"{prefix}.embedding_scores.csv").exists()
+
+
+def test_embedding_cli_tensor_requires_tensorly(tmp_path):
+    import importlib.util
+    if importlib.util.find_spec("tensorly") is not None:
+        import pytest
+        pytest.skip("tensorly present — the missing-dep path can't be exercised")
+    r, _ = _run(tmp_path, ["--embedding", "tensor"])
+    assert r.returncode != 0                       # clean early exit, not a crash
+    assert "tensorly" in (r.stdout + r.stderr).lower()
+
+
+def test_embedding_cli_tensor(tmp_path):
+    import pytest
+    pytest.importorskip("tensorly")
+    r, prefix = _run(tmp_path, ["--embedding", "tensor", "--tensor-method",
+                                "tucker", "--tensor-rank", "5,8,4"])
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    assert "tensor embedding (tucker)" in r.stdout
+    assert Path(f"{prefix}.embedding_scores.csv").exists()
+    assert Path(f"{prefix}.tensor_channel_factor.csv").exists()
+    sdf = pd.read_csv(f"{prefix}.embedding_scores.csv", index_col=0)
+    assert any(c.startswith("cellfac") for c in sdf.columns)
 
 
 def test_embedding_cli_rwr_compare(tmp_path):

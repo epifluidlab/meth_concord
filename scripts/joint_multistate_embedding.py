@@ -18,10 +18,11 @@ cells* and draws the map.  SVD/UMAP of the Δ tensor is unsupervised
 dimensionality reduction — NOT the RWR cross-cell smoothing — so it stays
 leakage-free.
 
-The embedding-score table and the channel-AUC diagnostic are always written.
-The UMAP scatter (needs ``umap-learn``) and the optional tensor decomposition
-(needs ``tensorly``) are graceful add-ons: skipped with a message if the
-dependency is absent.
+The embedding can be the **concatenated per-channel SVDs** (default) or a
+**tensor decomposition** whose cell factor is the embedding (``--embedding
+tensor``, Tucker/CP, needs ``tensorly``).  The embedding-score table and the
+per-channel component-AUC diagnostic are always written; the UMAP scatter (needs
+``umap-learn``) is a graceful add-on, skipped with a message if absent.
 
 Example
 -------
@@ -30,7 +31,8 @@ Example
         --hcg-dir output/.../context_HCG/04_posteriors \\
         --samples samples.tsv --granularity 1 \\
         --min-distance 20000 --max-distance 200000 \\
-        --feature resid_full --min-region-frac 0.5 --tensor \\
+        --feature resid_full --min-region-frac 0.5 \\
+        --embedding tensor --tensor-method tucker --tensor-rank 20,30,4 \\
         --n-threads 8 --output-prefix joint_embed
 """
 
@@ -153,16 +155,31 @@ def main() -> None:
     ap.add_argument("--n-folds", type=int, default=5)
     ap.add_argument("--umap-neighbors", type=int, default=15)
     ap.add_argument("--umap-min-dist", type=float, default=0.1)
-    ap.add_argument("--tensor", action="store_true",
-                    help="Also run a Tucker tensor decomposition (needs "
-                         "tensorly) → a channel factor showing how the 4 "
-                         "co-states combine.")
+    ap.add_argument("--embedding", choices=["concat-svd", "tensor"],
+                    default="concat-svd",
+                    help="How to embed the cells × regions × 4-channel tensor. "
+                         "'concat-svd' (default): per-channel SVD → concatenate. "
+                         "'tensor': a Tucker/CP decomposition whose CELL FACTOR is "
+                         "the embedding (couples channels+regions jointly) — needs "
+                         "tensorly. Both feed the same UMAP and RWR densification.")
+    ap.add_argument("--tensor-method", choices=["tucker", "cp"], default="tucker",
+                    help="Tensor decomposition for --embedding tensor: Tucker "
+                         "(default) or CP/PARAFAC.")
     ap.add_argument("--tensor-rank", default="10,10,4",
-                    help="Tucker ranks 'cell,region,channel' (default 10,10,4).")
+                    help="Tucker ranks 'cell,region,channel' (default 10,10,4); "
+                         "for CP the first value is the number of components.")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--random-seed", type=int, default=42)
     ap.add_argument("--output-prefix", required=True)
     args = ap.parse_args()
+
+    if args.embedding == "tensor":
+        try:
+            import tensorly  # noqa: F401
+        except ImportError:
+            sys.exit("[joint-embed] --embedding tensor requires tensorly "
+                     "(pip install tensorly).")
+    ranks = tuple(int(x) for x in args.tensor_rank.split(","))
 
     gran = args.granularity if args.granularity == "chrom" else int(args.granularity)
     gch_cells = _cells(Path(args.gch_dir))
@@ -256,10 +273,11 @@ def main() -> None:
                   f"{args.skip_top_per_channel} component(s) of each channel.")
 
     def _variant(suffix, use_rwr):
-        """Embed (SVD-only or standard package RWR), report channel AUC, write
-        scores + channel-AUC CSV + UMAP.  Returns {channel: auc}."""
+        """Densify (SVD-only or package RWR), embed (concat-SVD or tensor), report
+        AUC, write scores + AUC CSV + UMAP.  Returns {label: auc}."""
+        # 1. densify → smoothed channels
         if use_rwr:
-            scores, blocks, _, info = je.rwr_embed(
+            _, _, smoothed, info = je.rwr_embed(
                 normed, names, graph_basis, k_per_channel=args.k_per_channel,
                 n_neighbors=args.rwr_neighbors, restart_prob=args.rwr_restart,
                 n_refine_passes=args.rwr_refine_passes,
@@ -274,34 +292,60 @@ def main() -> None:
                                 for p in info["passes"][1:])
                 print(f"[joint-embed]{suffix}   refine eigengaps: {egs}")
         else:
-            scores, blocks = je.per_channel_svd(
-                normed, args.k_per_channel, seed=args.random_seed,
-                skip_top=args.skip_top_per_channel)
+            smoothed = normed
         label = "RWR" if use_rwr else "SVD-only"
+        # 2. embed
+        if args.embedding == "tensor":
+            scores, chan_factor, tinfo = je.tensor_embed(
+                smoothed, names, method=args.tensor_method, rank=ranks,
+                seed=args.random_seed)
+            blocks = None
+            print(f"[joint-embed]{suffix} tensor embedding ({args.tensor_method}): "
+                  f"cell factor {scores.shape[0]}×{scores.shape[1]} | channel "
+                  f"factor (co-state loadings per component):")
+            for n, row in zip(names, chan_factor):
+                print("    " + f"{n:<18} " +
+                      " ".join(f"{v:+.2f}" for v in row[:8]))
+            pd.DataFrame(chan_factor, index=names,
+                         columns=[f"comp{j}" for j in range(chan_factor.shape[1])]
+                         ).to_csv(f"{args.output_prefix}{suffix}.tensor_channel_factor.csv")
+        else:
+            scores, blocks = je.per_channel_svd(
+                smoothed, args.k_per_channel, seed=args.random_seed,
+                skip_top=args.skip_top_per_channel)
+        # 3. AUC
         rows, aucd = [], {}
         if can_auc:
-            ch_auc = je.channel_auc([b[labeled] for b in blocks], names, yl,
-                                    method=args.classifier, n_folds=args.n_folds,
-                                    seed=args.random_seed)
+            if blocks is not None:
+                ch_auc = je.channel_auc([b[labeled] for b in blocks], names, yl,
+                                        method=args.classifier, n_folds=args.n_folds,
+                                        seed=args.random_seed)
+                print(f"\n[joint-embed] {label} per-channel component AUC "
+                      f"({args.classifier}) — which co-state carries identity:")
+                for n in names:
+                    m, sd = ch_auc[n]; aucd[n] = m
+                    print(f"    {n:<18} AUC={m:.3f} ± {sd:.3f}")
+                    rows.append({"variant": label, "channel": n, "auc": m,
+                                 "auc_std": sd})
+            else:
+                print(f"\n[joint-embed] {label} tensor-embedding AUC "
+                      f"({args.classifier}):")
             jauc = ce.score(scores[labeled], yl, args.classifier, args.n_folds,
                             args.random_seed)
-            print(f"\n[joint-embed] {label} per-channel component AUC "
-                  f"({args.classifier}) — which co-state carries identity:")
-            for n in names:
-                m, sd = ch_auc[n]; aucd[n] = m
-                print(f"    {n:<18} AUC={m:.3f} ± {sd:.3f}")
-                rows.append({"variant": label, "channel": n, "auc": m,
-                             "auc_std": sd})
-            print(f"    {'JOINT (all 4)':<18} AUC={jauc[0]:.3f} ± {jauc[1]:.3f}")
+            ename = "JOINT (all 4)" if blocks is not None else "cell factor"
+            print(f"    {ename:<18} AUC={jauc[0]:.3f} ± {jauc[1]:.3f}")
             aucd["joint_all"] = jauc[0]
             rows.append({"variant": label, "channel": "joint_all",
                          "auc": jauc[0], "auc_std": jauc[1]})
         else:
             print("[joint-embed] too few labeled cells / classes for AUC.")
-        # write scores + channel AUC
-        sdf = pd.DataFrame(scores, index=cells,
-                           columns=[f"{ch}_svd{j}" for ch in names
-                                    for j in range(scores.shape[1] // 4)])
+        # 4. scores CSV (column names depend on the embedding)
+        if args.embedding == "tensor":
+            cols = [f"cellfac{j}" for j in range(scores.shape[1])]
+        else:
+            kc = max(1, scores.shape[1] // len(names))
+            cols = [f"{ch}_svd{j}" for ch in names for j in range(kc)]
+        sdf = pd.DataFrame(scores, index=cells, columns=cols[:scores.shape[1]])
         sdf.insert(0, "group", y_all.values)
         sdf.to_csv(f"{args.output_prefix}{suffix}.embedding_scores.csv")
         if rows:
@@ -309,14 +353,15 @@ def main() -> None:
                 f"{args.output_prefix}{suffix}.channel_auc.csv", index=False)
         print(f"[joint-embed] wrote {args.output_prefix}{suffix}."
               f"embedding_scores.csv" + (" + .channel_auc.csv" if rows else ""))
-        # UMAP (joint SVD/skip-top → 2-D), graceful if umap absent
+        # 5. UMAP (joint SVD/skip-top → 2-D), graceful if umap absent
         try:
             from nome_hic_concordance.visualization import run_umap_and_plot
             out_dir = str(Path(args.output_prefix).parent or ".")
             uprefix = Path(args.output_prefix).name + suffix + ".umap"
             run_umap_and_plot(
                 pd.DataFrame(scores, index=cells), group_labels=y_all,
-                title=f"Joint multi-state ({label}, {args.feature}, gran={gran})",
+                title=f"Joint multi-state ({label}, {args.embedding}, "
+                      f"{args.feature}, gran={gran})",
                 output_prefix=uprefix, output_dir=out_dir,
                 n_neighbors=args.umap_neighbors, min_dist=args.umap_min_dist,
                 n_svd=args.n_svd, skip_top_svd=args.skip_top_svd,
@@ -330,58 +375,16 @@ def main() -> None:
         a_svd = _variant(".svdonly", False)
         a_rwr = _variant(".rwr", True)
         if a_svd and a_rwr:
+            keys = [n for n in names + ["joint_all"] if n in a_svd or n in a_rwr]
             print(f"\n[joint-embed] channel AUC — SVD-only vs RWR (marginal graph):")
             print(f"    {'channel':<18} {'SVD-only':>9} {'RWR':>7} {'Δ':>7}")
-            for n in names + ["joint_all"]:
+            for n in keys:
                 s, r = a_svd.get(n, np.nan), a_rwr.get(n, np.nan)
                 print(f"    {n:<18} {s:>9.3f} {r:>7.3f} {r - s:>+7.3f}")
             print("    RWR > SVD-only  => marginal-graph smoothing sharpens the map.")
             print("    RWR ≈ SVD-only  => region-pooling SVD already captured it.")
     else:
         _variant("", args.rwr == "on")
-
-    # ---- Optional tensor decomposition (Tucker) → channel factor ----
-    if args.tensor:
-        try:
-            _tensor_decompose(normed, list(JOINT_CHANNELS), args)
-        except Exception as e:
-            print(f"[joint-embed] tensor decomposition skipped "
-                  f"({type(e).__name__}: {e})")
-
-
-def _tensor_decompose(normed: list, names: list, args) -> None:
-    """Tucker decomposition of the cells × regions × channel tensor.
-
-    Yields a cell factor (→ could be embedded), a region factor, and a CHANNEL
-    factor (how the 4 co-states combine into each latent component) — the §6
-    optional view.  Requires that all channels share a region axis, so it uses
-    the intersection of well-observed regions (here: the per-channel normalized
-    matrices are already aligned to their own filtered region sets, so the
-    tensor is built on the common min width)."""
-    import tensorly as tl
-    from tensorly.decomposition import tucker
-
-    w = min(N.shape[1] for N in normed)
-    T = np.stack([N[:, :w] for N in normed], axis=2)        # cells × w × 4
-    ranks = [int(x) for x in args.tensor_rank.split(",")]
-    ranks = [min(ranks[0], T.shape[0]), min(ranks[1], T.shape[1]),
-             min(ranks[2], T.shape[2])]
-    core, factors = tucker(tl.tensor(T), rank=ranks, random_state=args.random_seed)
-    chan_factor = np.asarray(factors[2])                    # 4 × rank_channel
-    print(f"\n[joint-embed] Tucker channel factor (4 co-states × "
-          f"{chan_factor.shape[1]} components) — loadings:")
-    for n, row in zip(names, chan_factor):
-        print("    " + f"{n:<18} " + " ".join(f"{v:+.2f}" for v in row))
-    cf = pd.DataFrame(chan_factor, index=names,
-                      columns=[f"comp{j}" for j in range(chan_factor.shape[1])])
-    cf.to_csv(f"{args.output_prefix}.tensor_channel_factor.csv")
-    # cell factor → embedding table
-    cell_factor = np.asarray(factors[0])
-    pd.DataFrame(cell_factor,
-                 columns=[f"cellfac{j}" for j in range(cell_factor.shape[1])]) \
-        .to_csv(f"{args.output_prefix}.tensor_cell_factor.csv", index=False)
-    print(f"[joint-embed] wrote {args.output_prefix}.tensor_channel_factor.csv "
-          f"+ .tensor_cell_factor.csv")
 
 
 if __name__ == "__main__":
