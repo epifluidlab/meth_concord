@@ -117,3 +117,44 @@ def build_embedding(channels: list, channel_names: list, k_per_channel: int = 10
     normed = [normalize_channel(M, do_rank=do_rank) for M in channels]
     scores, blocks = per_channel_svd(normed, k_per_channel, seed=seed)
     return scores, blocks, normed
+
+
+def concordance_rwr_embed(channels_norm: list, channel_names: list,
+                          k_per_channel: int = 10, n_neighbors: int = 15,
+                          restart_prob: float = 0.5, n_passes: int = 1,
+                          seed: int = 0):
+    """LEAKAGE-FREE concordance-graph RWR densification, then re-embed.
+
+    Random-walk-with-restart densifies the sparse per-(cell, region) Δ by
+    borrowing across cells — but the leak the single-context investigation
+    caught (`SIGNED_CONCORDANCE_AND_RWR_DESIGN.md` §6b) was never RWR itself, it
+    was the **graph basis**: the original pass-0 graph was built from
+    ``QN(mean accessibility) ⊕ QN(mean methylation)`` — the *marginals* — which
+    injects marginal cell-type structure into the smoothed concordance.
+
+    Here the k-NN graph is built from the **concordance embedding itself** (the
+    per-channel SVD of the Δ tensor), never from the marginals, so it cannot
+    inject that structure.  Each pass: graph ← concordance scores → RWR-smooth
+    the ORIGINAL normalized channels on that graph (scHiCluster-style: refine
+    the graph, always smooth the raw data) → re-embed.  Reuses the validated
+    :func:`nome_hic_concordance.imputation.build_knn_graph` /
+    :func:`rwr_impute_matrices`.
+
+    **Caveat:** a concordance-built graph can *amplify / confirm* whatever the
+    SVD already separated — validate the result against the permutation /
+    split-half checks, do not trust it standalone.
+
+    Returns ``(scores, blocks, smoothed_channels, info)``."""
+    from .imputation import build_knn_graph, rwr_impute_matrices
+    scores, blocks = per_channel_svd(channels_norm, k_per_channel, seed=seed)
+    smoothed = channels_norm
+    info = {"n_passes": int(max(1, n_passes)), "n_neighbors": int(n_neighbors),
+            "restart_prob": float(restart_prob),
+            "graph_basis": "concordance_scores (leakage-free)"}
+    for _ in range(max(1, int(n_passes))):
+        _, P = build_knn_graph(scores, k=n_neighbors)          # graph ← concordance
+        mats = {nm: M for nm, M in zip(channel_names, channels_norm)}
+        imputed, _ = rwr_impute_matrices(mats, P, restart_prob=restart_prob)
+        smoothed = [imputed[nm] for nm in channel_names]
+        scores, blocks = per_channel_svd(smoothed, k_per_channel, seed=seed)
+    return scores, blocks, smoothed, info

@@ -6,9 +6,33 @@ import numpy as np
 import pytest
 
 from nome_hic_concordance.joint_embedding import (
-    build_embedding, channel_auc, normalize_channel, per_cell_rank,
-    per_channel_svd,
+    build_embedding, channel_auc, concordance_rwr_embed, normalize_channel,
+    per_cell_rank, per_channel_svd,
 )
+
+
+def _two_cluster_channels(n_per=15, n_reg=30, noise=0.6, seed=0):
+    """4 channels carrying a 2-cluster REGIONAL pattern (+ noise)."""
+    rng = np.random.default_rng(seed)
+    half = n_reg // 2
+
+    def block(hi_first):
+        sign = 1.0 if hi_first else -1.0
+        base = sign * np.hstack([np.ones((n_per, half)),
+                                 -np.ones((n_per, n_reg - half))])
+        return base + rng.normal(0, noise, (n_per, n_reg))
+    chans = [np.vstack([block(True), block(False)]) for _ in range(4)]
+    y = np.array(["A"] * n_per + ["B"] * n_per)
+    return chans, y
+
+
+def _within_cluster_dist(M, y):
+    from scipy.spatial.distance import pdist
+    tot, n = 0.0, 0
+    for g in np.unique(y):
+        d = pdist(M[y == g])
+        tot += d.sum(); n += len(d)
+    return tot / max(n, 1)
 
 
 # --------------------------------------------------------------------------
@@ -105,3 +129,54 @@ def test_build_embedding_shapes_and_normed():
     scores, blocks, normed = build_embedding(chans, names, k_per_channel=5)
     assert scores.shape == (25, 20)               # 4 × 5
     assert len(normed) == 4 and all(np.isfinite(N).all() for N in normed)
+
+
+# --------------------------------------------------------------------------
+# concordance_rwr_embed — leakage-free RWR densification
+# --------------------------------------------------------------------------
+
+_NAMES = ["open", "closed", "poised", "active_methylated"]
+
+
+def test_concordance_rwr_shapes_and_leakage_free_basis():
+    chans, _ = _two_cluster_channels(seed=1)
+    normed = [normalize_channel(M) for M in chans]
+    scores, blocks, smoothed, info = concordance_rwr_embed(
+        normed, _NAMES, k_per_channel=4, n_neighbors=5, n_passes=1, seed=0)
+    assert scores.shape == (30, 16)               # 4 channels × 4
+    assert len(smoothed) == 4
+    # the graph is built from concordance, never the marginals
+    assert "leakage-free" in info["graph_basis"]
+    assert "concordance" in info["graph_basis"]
+
+
+def test_concordance_rwr_tightens_within_cluster():
+    # RWR on a concordance graph that correctly groups same-cluster cells should
+    # pull their channel rows closer together (the denoising property).
+    chans, y = _two_cluster_channels(noise=0.6, seed=2)
+    normed = [normalize_channel(M) for M in chans]
+    _, _, smoothed, _ = concordance_rwr_embed(
+        normed, _NAMES, k_per_channel=4, n_neighbors=5, restart_prob=0.5, seed=0)
+    before = _within_cluster_dist(normed[0], y)
+    after = _within_cluster_dist(smoothed[0], y)
+    assert after < before
+
+
+def test_concordance_rwr_separates_clusters():
+    chans, y = _two_cluster_channels(noise=0.6, seed=3)
+    normed = [normalize_channel(M) for M in chans]
+    _, blocks, _, _ = concordance_rwr_embed(normed, _NAMES, k_per_channel=4,
+                                            n_neighbors=5, seed=0)
+    aucs = channel_auc(blocks, _NAMES, y, method="lr", n_folds=4, seed=0)
+    # every channel carries the 2-cluster pattern → all separate well
+    assert all(aucs[n][0] > 0.8 for n in _NAMES)
+
+
+def test_concordance_rwr_deterministic():
+    chans, _ = _two_cluster_channels(seed=4)
+    normed = [normalize_channel(M) for M in chans]
+    s1, *_ = concordance_rwr_embed(normed, _NAMES, k_per_channel=4,
+                                   n_neighbors=5, seed=0)
+    s2, *_ = concordance_rwr_embed(normed, _NAMES, k_per_channel=4,
+                                   n_neighbors=5, seed=0)
+    assert np.allclose(s1, s2)
