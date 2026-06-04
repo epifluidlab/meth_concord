@@ -19,6 +19,47 @@ _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / \
 _COLS = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
 
 
+def _run_batch(tmp_path, extra):
+    """Like _run but adds a 'batch' column to the samples sheet."""
+    gdir = tmp_path / "gch"; hdir = tmp_path / "hcg"; gdir.mkdir(); hdir.mkdir()
+    cells, groups, batches = [], [], []
+    for i in range(18):
+        grp = "A" if i % 2 == 0 else "B"
+        _write_cell(gdir, hdir, f"C{i:02d}", seed=i, group=grp)
+        cells.append(f"C{i:02d}"); groups.append(grp)
+        batches.append("b1" if i % 3 == 0 else "b2")
+    samples = tmp_path / "samples.tsv"
+    pd.DataFrame({"cell_name": cells, "group": groups, "batch": batches}).to_csv(
+        samples, sep="\t", index=False)
+    (tmp_path / "out").mkdir()
+    prefix = tmp_path / "out" / "emb"
+    cmd = [sys.executable, str(_SCRIPT),
+           "--gch-dir", str(gdir), "--hcg-dir", str(hdir),
+           "--samples", str(samples), "--granularity", "chrom",
+           "--min-distance", "10000", "--max-distance", "50000",
+           "--min-cpg-sites", "1", "--min-region-frac", "0.0",
+           "--k-per-channel", "3", "--n-folds", "3", "--n-threads", "1",
+           "--output-prefix", str(prefix)] + extra
+    return subprocess.run(cmd, capture_output=True, text=True), prefix
+
+
+def test_embedding_cli_batch_center(tmp_path):
+    # dependency-free batch correction on the embedding, before UMAP
+    r, prefix = _run_batch(tmp_path, ["--batch-method", "center",
+                                      "--batch-column", "batch"])
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    assert "batch correction on the embedding: method=center" in r.stdout
+    assert "batch-corrected embedding (center)" in r.stdout
+    assert "cell-type AUC" in r.stdout and "batch AUC" in r.stdout
+    assert Path(f"{prefix}.embedding_scores.csv").exists()
+
+
+def test_embedding_cli_batch_needs_column(tmp_path):
+    r, _ = _run_batch(tmp_path, ["--batch-method", "center"])   # no --batch-column
+    assert r.returncode != 0
+    assert "batch-column" in (r.stdout + r.stderr).lower()
+
+
 def _write_cell(gdir, hdir, cell, seed, group):
     rng = np.random.default_rng(seed)
     g, h = [], []

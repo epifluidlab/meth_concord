@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from nome_hic_concordance.joint_embedding import (
-    build_embedding, channel_auc, normalize_channel, per_cell_rank,
-    per_channel_svd, per_component_auc, rwr_embed, tensor_embed,
+    batch_correct_scores, build_embedding, channel_auc, normalize_channel,
+    per_cell_rank, per_channel_svd, per_component_auc, rwr_embed, tensor_embed,
 )
 
 
@@ -283,3 +284,58 @@ def test_tensor_embed_separates_clusters():
     from nome_hic_concordance import coordination_eval as ce
     auc, _ = ce.score(cell, y, "lr", 4, 0)
     assert auc > 0.8                         # the cell factor carries cell type
+
+
+# --------------------------------------------------------------------------
+# batch_correct_scores — embedding-level batch correction
+# --------------------------------------------------------------------------
+
+def test_batch_correct_none_identity():
+    X = np.arange(24.0).reshape(8, 3)
+    bdf = pd.DataFrame({"b": ["b1"] * 4 + ["b2"] * 4})
+    assert np.allclose(batch_correct_scores(X, bdf, "none"), X)
+
+
+def test_batch_correct_center_removes_offset():
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(40, 6))
+    X[:20] += 5.0                                  # batch-1 offset on the embedding
+    bdf = pd.DataFrame({"b": ["b1"] * 20 + ["b2"] * 20})
+    out = batch_correct_scores(X, bdf, "center")
+    # the per-batch offset is gone: both batches now share the column mean
+    assert np.allclose(out[:20].mean(0), out[20:].mean(0), atol=1e-9)
+    assert np.allclose(out[:20].mean(0), 0.0, atol=1e-9)
+
+
+def test_batch_correct_zscore_unit_scale_per_batch():
+    rng = np.random.default_rng(1)
+    X = np.vstack([rng.normal(0, 5, (20, 4)), rng.normal(3, 1, (20, 4))])
+    bdf = pd.DataFrame({"b": ["b1"] * 20 + ["b2"] * 20})
+    out = batch_correct_scores(X, bdf, "zscore")
+    assert np.allclose(out[:20].std(0), 1.0, atol=1e-6)
+    assert np.allclose(out[20:].std(0), 1.0, atol=1e-6)
+
+
+def test_batch_correct_multifactor_composite():
+    # two batch variables → cartesian-product groups for center
+    X = np.ones((8, 2))
+    X[:4] += 3.0
+    bdf = pd.DataFrame({"exp": ["e1", "e1", "e2", "e2", "e1", "e1", "e2", "e2"],
+                        "lib": ["l1", "l2", "l1", "l2", "l1", "l2", "l1", "l2"]})
+    out = batch_correct_scores(X, bdf, "center")
+    assert np.isfinite(out).all() and out.shape == X.shape
+
+
+def test_batch_correct_harmony_runs_and_preserves_shape():
+    pytest.importorskip("harmonypy")
+    rng = np.random.default_rng(2)
+    # 3 well-separated cell types (so harmony finds >1 cluster) + 2 batches
+    X = np.vstack([rng.normal(c * 10, 1, (40, 8)) for c in range(3)])
+    bt = np.array(list((["x"] * 20 + ["y"] * 20)) * 3)
+    X[bt == "y", 5] += 4                          # a batch offset on one dim
+    bdf = pd.DataFrame({"batch": bt})
+    out = batch_correct_scores(X, bdf, "harmony")
+    # the wrapper's contract: harmonypy runs, shape + finiteness preserved,
+    # correctly oriented to (cells, components), and it actually corrected.
+    assert out.shape == X.shape and np.isfinite(out).all()
+    assert not np.allclose(out, X)

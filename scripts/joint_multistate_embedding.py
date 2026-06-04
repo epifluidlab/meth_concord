@@ -67,6 +67,18 @@ def _labels(path: str) -> pd.Series:
     return df.set_index("cell_name")["group"]
 
 
+def _column(path: str, col: str) -> pd.Series:
+    df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    if "cell_name" not in df.columns:
+        df = df.rename(columns={"cell": "cell_name"} if "cell" in df.columns
+                       else {df.columns[0]: "cell_name"})
+    col = col.strip().lower().replace(" ", "_")
+    if col not in df.columns:
+        raise SystemExit(f"{path} has no '{col}' column (have {df.columns.tolist()}).")
+    return df.set_index("cell_name")[col]
+
+
 def _cells(d: Path) -> dict:
     return {p.name[: -len(".posteriors.parquet")]: p
             for p in d.glob("*.posteriors.parquet")}
@@ -168,6 +180,21 @@ def main() -> None:
     ap.add_argument("--tensor-rank", default="10,10,4",
                     help="Tucker ranks 'cell,region,channel' (default 10,10,4); "
                          "for CP the first value is the number of components.")
+    ap.add_argument("--batch-column", action="append", default=[], metavar="COLUMN",
+                    help="Per-cell batch column(s) in --samples (repeatable AND "
+                         "comma-separated, e.g. exp_batch,lib_batch). Batch "
+                         "correction is applied to the EMBEDDING (cell factor / "
+                         "scores) right before UMAP — the standard scRNA step — "
+                         "so the map is batch-free regardless of how batch "
+                         "entered.")
+    ap.add_argument("--batch-method", choices=["none", "harmony", "center",
+                                               "zscore"], default="none",
+                    help="How to correct batch on the embedding: harmony "
+                         "(needs harmonypy; models the batch columns jointly), or "
+                         "the dependency-free center / zscore (per-batch offset / "
+                         "offset+scale). Default none. Prints a cell-type-AUC and "
+                         "batch-AUC before→after QC (cell type should stay high, "
+                         "batch should drop).")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--random-seed", type=int, default=42)
     ap.add_argument("--output-prefix", required=True)
@@ -179,6 +206,13 @@ def main() -> None:
         except ImportError:
             sys.exit("[joint-embed] --embedding tensor requires tensorly "
                      "(pip install tensorly).")
+    if args.batch_method == "harmony":
+        try:
+            import harmonypy  # noqa: F401
+        except ImportError:
+            sys.exit("[joint-embed] --batch-method harmony requires harmonypy "
+                     "(pip install harmonypy); or use --batch-method center / "
+                     "zscore for a no-dependency correction.")
     ranks = tuple(int(x) for x in args.tensor_rank.split(","))
 
     gran = args.granularity if args.granularity == "chrom" else int(args.granularity)
@@ -250,6 +284,29 @@ def main() -> None:
     can_auc = labeled.sum() >= 10 and y_all[labeled].nunique() >= 2
     yl = y_all[labeled].to_numpy() if can_auc else None
 
+    # Batch frame (cells × batch-variable(s)) for embedding-level correction.
+    batch_df, bcomp_lab = None, None
+    batch_cols = list(dict.fromkeys(
+        c.strip() for item in args.batch_column for c in item.split(",")
+        if c.strip()))
+    if args.batch_method != "none":
+        if not batch_cols:
+            sys.exit("--batch-method needs at least one --batch-column.")
+        batch_df = pd.DataFrame({
+            c: _column(args.samples, c).reindex(cells).fillna("__unknown__")
+               .to_numpy() for c in batch_cols})
+        comp = batch_df.astype(str).agg("|".join, axis=1).to_numpy()
+        if can_auc and len(np.unique(comp[labeled])) >= 2:
+            bcomp_lab = comp[labeled]                # for the batch-AUC QC
+        print(f"[joint-embed] batch correction on the embedding: "
+              f"method={args.batch_method}, columns={batch_cols}")
+
+    def _batch_auc(S):
+        if bcomp_lab is None:
+            return np.nan
+        return ce.score(S, bcomp_lab, args.classifier, args.n_folds,
+                        args.random_seed)[0]
+
     # ---- Per-channel SVD component AUC (top 10) — which top components are a
     # technical axis to skip (low AUC) vs cell type (high AUC), per channel. ----
     if can_auc:
@@ -315,6 +372,20 @@ def main() -> None:
             scores, blocks = je.per_channel_svd(
                 smoothed, args.k_per_channel, seed=args.random_seed,
                 skip_top=args.skip_top_per_channel)
+        # 2b. batch-correct the EMBEDDING (before UMAP) — the standard scRNA
+        # step; corrects the map regardless of how batch entered.  Per-channel
+        # block AUCs (the "which co-state" diagnostic) stay on the raw channels.
+        if batch_df is not None:
+            ct0 = (ce.score(scores[labeled], yl, args.classifier, args.n_folds,
+                            args.random_seed)[0] if can_auc else np.nan)
+            bt0 = _batch_auc(scores[labeled])
+            scores = je.batch_correct_scores(scores, batch_df, args.batch_method)
+            ct1 = (ce.score(scores[labeled], yl, args.classifier, args.n_folds,
+                            args.random_seed)[0] if can_auc else np.nan)
+            bt1 = _batch_auc(scores[labeled])
+            print(f"[joint-embed]{suffix} batch-corrected embedding "
+                  f"({args.batch_method}): cell-type AUC {ct0:.3f}→{ct1:.3f} "
+                  f"(keep high) | batch AUC {bt0:.3f}→{bt1:.3f} (should drop)")
         # 3. AUC
         rows, aucd = [], {}
         if can_auc:

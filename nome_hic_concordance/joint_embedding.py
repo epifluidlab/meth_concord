@@ -182,6 +182,64 @@ def tensor_embed(channels: list, channel_names: list, method: str = "tucker",
     return cell_factor, channel_factor, info
 
 
+def batch_correct_scores(scores: np.ndarray, batch_df, method: str = "harmony"):
+    """Batch-correct a ``cells × components`` **embedding** — the standard
+    scRNA/scATAC step: harmonize the *low-dimensional cell embedding* (then UMAP
+    on it), NOT the high-dimensional features.
+
+    This differs from ``nome_hic_concordance.batch_correction`` (which corrects
+    the mean-accessibility matrix *before the RWR graph*, so batch does not enter
+    the RWR cell-cell similarities).  Here we correct the *final* embedding so
+    the map / clusters are batch-free regardless of how batch entered (the
+    concordance channels, the RWR graph, coverage…).  Run it right before UMAP.
+
+    Parameters
+    ----------
+    scores : ndarray, cells × components (the concat-SVD scores or tensor cell
+        factor).
+    batch_df : DataFrame, cells × batch-variable(s), positionally aligned to
+        ``scores`` rows.  Harmony harmonizes the variables jointly; center/zscore
+        collapse them to a composite (cartesian-product) batch.
+    method : {"none", "harmony", "center", "zscore"}
+
+    Returns
+    -------
+    ndarray, same shape as ``scores``, batch-corrected.
+    """
+    method = method or "none"
+    if method == "none" or batch_df is None or getattr(batch_df, "shape", (0, 0))[1] == 0:
+        return scores
+    X = np.asarray(scores, dtype=np.float64)
+    if method in ("center", "zscore"):
+        comp = batch_df.astype(str).agg("|".join, axis=1).to_numpy()
+        out = X.copy()
+        for b in np.unique(comp):
+            m = comp == b
+            sub = X[m]
+            mu = sub.mean(axis=0)
+            if method == "zscore":
+                sd = sub.std(axis=0); sd = np.where(sd < 1e-12, 1.0, sd)
+                out[m] = (sub - mu) / sd
+            else:
+                out[m] = sub - mu
+        return out
+    if method == "harmony":
+        try:
+            import harmonypy as hm
+        except ImportError as e:                              # pragma: no cover
+            raise RuntimeError("--batch-method harmony requires harmonypy "
+                               "(pip install harmonypy); or use center/zscore "
+                               "for a no-dependency correction.") from e
+        meta = batch_df.reset_index(drop=True)
+        out = hm.run_harmony(X, meta, list(batch_df.columns))
+        Z = np.asarray(out.Z_corr)
+        n, k = X.shape
+        if Z.shape == (k, n):                  # harmonypy version orientation
+            Z = Z.T
+        return Z
+    raise ValueError(f"unknown batch method {method!r}")
+
+
 def channel_auc(blocks: list, channel_names: list, y, method: str = "lr",
                 n_folds: int = 5, seed: int = 0) -> dict:
     """Per-channel cross-validated AUC of each channel's SVD-score block vs ``y``.
