@@ -182,19 +182,18 @@ def main() -> None:
                          "for CP the first value is the number of components.")
     ap.add_argument("--batch-column", action="append", default=[], metavar="COLUMN",
                     help="Per-cell batch column(s) in --samples (repeatable AND "
-                         "comma-separated, e.g. exp_batch,lib_batch). Batch "
-                         "correction is applied to the EMBEDDING (cell factor / "
-                         "scores) right before UMAP — the standard scRNA step — "
-                         "so the map is batch-free regardless of how batch "
-                         "entered.")
-    ap.add_argument("--batch-method", choices=["none", "harmony", "center",
-                                               "zscore"], default="none",
-                    help="How to correct batch on the embedding: harmony "
-                         "(needs harmonypy; models the batch columns jointly), or "
-                         "the dependency-free center / zscore (per-batch offset / "
-                         "offset+scale). Default none. Prints a cell-type-AUC and "
-                         "batch-AUC before→after QC (cell type should stay high, "
-                         "batch should drop).")
+                         "comma-separated, e.g. exp_batch,lib_batch). Harmony "
+                         "models them jointly. Required if --batch-correct != none.")
+    ap.add_argument("--batch-correct", choices=["none", "per-channel", "embedding"],
+                    default="none",
+                    help="Harmony batch correction (always Harmony — center/zscore "
+                         "are too weak). 'per-channel' (recommended): Harmony-"
+                         "correct EACH co-state channel AND the RWR marginal graph "
+                         "basis BEFORE RWR/tensor (matches the GCH/HCG pipeline, "
+                         "which corrects features before the RWR graph). "
+                         "'embedding': Harmony on the final cell factor before "
+                         "UMAP (the scRNA step). Both need harmonypy. Prints a "
+                         "batch-AUC QC on the final embedding (lower = cleaner).")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--random-seed", type=int, default=42)
     ap.add_argument("--output-prefix", required=True)
@@ -206,13 +205,15 @@ def main() -> None:
         except ImportError:
             sys.exit("[joint-embed] --embedding tensor requires tensorly "
                      "(pip install tensorly).")
-    if args.batch_method == "harmony":
+    if args.batch_correct != "none":
+        if not args.batch_column:
+            sys.exit("[joint-embed] --batch-correct needs at least one "
+                     "--batch-column.")
         try:
             import harmonypy  # noqa: F401
         except ImportError:
-            sys.exit("[joint-embed] --batch-method harmony requires harmonypy "
-                     "(pip install harmonypy); or use --batch-method center / "
-                     "zscore for a no-dependency correction.")
+            sys.exit("[joint-embed] --batch-correct requires harmonypy "
+                     "(pip install harmonypy).")
     ranks = tuple(int(x) for x in args.tensor_rank.split(","))
 
     gran = args.granularity if args.granularity == "chrom" else int(args.granularity)
@@ -284,22 +285,35 @@ def main() -> None:
     can_auc = labeled.sum() >= 10 and y_all[labeled].nunique() >= 2
     yl = y_all[labeled].to_numpy() if can_auc else None
 
-    # Batch frame (cells × batch-variable(s)) for embedding-level correction.
+    # ---- Batch correction setup (Harmony) -------------------------------
     batch_df, bcomp_lab = None, None
     batch_cols = list(dict.fromkeys(
         c.strip() for item in args.batch_column for c in item.split(",")
         if c.strip()))
-    if args.batch_method != "none":
+    if args.batch_correct != "none":
         if not batch_cols:
-            sys.exit("--batch-method needs at least one --batch-column.")
-        batch_df = pd.DataFrame({
-            c: _column(args.samples, c).reindex(cells).fillna("__unknown__")
-               .to_numpy() for c in batch_cols})
+            sys.exit("--batch-correct needs at least one --batch-column.")
+        batch_df = pd.DataFrame(
+            {c: _column(args.samples, c).reindex(cells).fillna("__unknown__")
+                .to_numpy() for c in batch_cols}, index=cells)
         comp = batch_df.astype(str).agg("|".join, axis=1).to_numpy()
         if can_auc and len(np.unique(comp[labeled])) >= 2:
             bcomp_lab = comp[labeled]                # for the batch-AUC QC
-        print(f"[joint-embed] batch correction on the embedding: "
-              f"method={args.batch_method}, columns={batch_cols}")
+
+        if args.batch_correct == "per-channel":
+            # Harmony-correct EACH channel AND the RWR marginal graph basis,
+            # BEFORE RWR / tensor — matches concordance.py Step 3.5 (correct the
+            # features before the RWR graph), generalized to the 4 channels.
+            from nome_hic_concordance import batch_correction as _bc
+            _hc = lambda M: _bc.apply_batch_correction(
+                pd.DataFrame(M, index=cells), batch_df, method="harmony").to_numpy()
+            normed = [_hc(N) for N in normed]
+            graph_basis = _hc(graph_basis)
+            print(f"[joint-embed] per-channel Harmony correction applied to each "
+                  f"co-state channel + the RWR graph basis (columns={batch_cols}).")
+        else:
+            print(f"[joint-embed] embedding-level Harmony correction (on the cell "
+                  f"factor, before UMAP; columns={batch_cols}).")
 
     def _batch_auc(S):
         if bcomp_lab is None:
@@ -372,20 +386,14 @@ def main() -> None:
             scores, blocks = je.per_channel_svd(
                 smoothed, args.k_per_channel, seed=args.random_seed,
                 skip_top=args.skip_top_per_channel)
-        # 2b. batch-correct the EMBEDDING (before UMAP) — the standard scRNA
-        # step; corrects the map regardless of how batch entered.  Per-channel
-        # block AUCs (the "which co-state" diagnostic) stay on the raw channels.
-        if batch_df is not None:
-            ct0 = (ce.score(scores[labeled], yl, args.classifier, args.n_folds,
-                            args.random_seed)[0] if can_auc else np.nan)
+        # 2b. embedding-stage Harmony (on the cell factor, before UMAP). The
+        # per-channel stage already corrected upstream; here we additionally
+        # harmonize the final embedding when --batch-correct embedding.
+        if args.batch_correct == "embedding" and batch_df is not None:
             bt0 = _batch_auc(scores[labeled])
-            scores = je.batch_correct_scores(scores, batch_df, args.batch_method)
-            ct1 = (ce.score(scores[labeled], yl, args.classifier, args.n_folds,
-                            args.random_seed)[0] if can_auc else np.nan)
-            bt1 = _batch_auc(scores[labeled])
-            print(f"[joint-embed]{suffix} batch-corrected embedding "
-                  f"({args.batch_method}): cell-type AUC {ct0:.3f}→{ct1:.3f} "
-                  f"(keep high) | batch AUC {bt0:.3f}→{bt1:.3f} (should drop)")
+            scores = je.batch_correct_scores(scores, batch_df, "harmony")
+            print(f"[joint-embed]{suffix} embedding Harmony: batch AUC "
+                  f"{bt0:.3f}→{_batch_auc(scores[labeled]):.3f} (should drop)")
         # 3. AUC
         rows, aucd = [], {}
         if can_auc:
@@ -410,6 +418,12 @@ def main() -> None:
             aucd["joint_all"] = jauc[0]
             rows.append({"variant": label, "channel": "joint_all",
                          "auc": jauc[0], "auc_std": jauc[1]})
+            if batch_df is not None and bcomp_lab is not None:
+                bauc = _batch_auc(scores[labeled])
+                print(f"    {'batch AUC':<18} {bauc:.3f}        (lower = batch "
+                      f"better removed; cell-type AUC above should stay high)")
+                rows.append({"variant": label, "channel": "batch", "auc": bauc,
+                             "auc_std": np.nan})
         else:
             print("[joint-embed] too few labeled cells / classes for AUC.")
         # 4. scores CSV (column names depend on the embedding)

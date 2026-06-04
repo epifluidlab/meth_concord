@@ -387,28 +387,32 @@ analogue of the single-context `--skip-top-svd`, which here acts only on the
 *joint* SVD). The per-cell-rank normalization already removes per-cell depth, so
 the default is 0.
 
-### 10.4 Batch correction — on the embedding, before UMAP
+### 10.4 Batch correction — Harmony, two stage choices
 
-Two distinct correction points, doing different things:
+**Always Harmony** — `center`/`zscore` are too weak even in 1-D and were dropped
+from the CLI. `--batch-column` (repeatable / comma-sep, e.g. `exp_batch,lib_batch`;
+modeled jointly) + `--batch-correct {none, per-channel, embedding}`:
 
-- **The single-context pipeline corrects the *graph basis***: `concordance.py`
-  Step 3.5 batch-corrects the mean-accessibility matrix **before the RWR k-NN
-  graph**, so batch doesn't enter the cell-cell similarities RWR smooths along.
-  That is the right place *for the RWR feature-generation step*.
-- **The joint *embedding* corrects the *embedding***: `--batch-column` /
-  `--batch-method {harmony,center,zscore}` runs on the **cell factor / concat-SVD
-  scores, right before UMAP** — the field-standard scRNA/scATAC step (PCA/embed →
-  Harmony → UMAP). It removes batch from the final map regardless of how batch
-  entered (the concordance channels, the RWR graph, coverage…), and so subsumes
-  the graph-basis correction for the map. **This is the recommended place for a
-  clustering/visualization deliverable.** `harmony` (needs `harmonypy`) models the
-  batch columns jointly; `center`/`zscore` are dependency-free per-batch
-  offset / offset+scale.
+- **`per-channel` (recommended)** — Harmony-correct **each co-state channel AND
+  the RWR marginal graph basis**, *before* RWR / tensor. This matches the
+  single-context pipeline (`concordance.py` Step 3.5: correct the mean-
+  accessibility *before* the RWR graph), generalized to the four channels — so
+  the corrected features feed RWR (graph from the corrected marginal) and the
+  tensor sees batch-free data. The graph basis **must** be corrected too, or
+  batch re-enters via the RWR graph. (Reuses
+  `nome_hic_concordance.batch_correction.apply_batch_correction(..., "harmony")`,
+  i.e. PCA → Harmony → reconstruct, per channel.)
+- **`embedding`** — Harmony on the **final cell factor / concat-SVD scores**,
+  right before UMAP (the field-standard scRNA `embed → Harmony → UMAP` step).
+  Cheaper (one Harmony run on ~20 dims) and corrects the map regardless of how
+  batch entered, but only the low-dim embedding.
 
-The script prints a **before→after QC**: the embedding's **cell-type AUC**
-(should stay high — batch correction must preserve biology) and its **batch AUC**
-(should drop — batch removed). If cell type *and* batch fall together, batch and
-cell type are **confounded** in the design (cells of a type don't span batches),
-and no correction can separate them — read that as a sampling problem, not a
-method one. Correction is applied per densification variant, so `--rwr-compare`
-reports the QC for both no-RWR and RWR.
+Pipeline order for `per-channel`: normalize each channel → **Harmony per channel
++ Harmony the marginal graph basis** → RWR (graph from corrected marginal; refine
+from corrected concordance) → tensor / concat-SVD cell factor → UMAP.
+
+The script prints a **batch-AUC** on the final embedding (lower = batch better
+removed) alongside the cell-type AUC (should stay high). If cell type *and* batch
+fall together, they are **confounded** in the design (cells of a type don't span
+batches) and no correction can separate them — a sampling problem, not a method
+one.
