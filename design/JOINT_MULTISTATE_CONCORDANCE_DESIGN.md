@@ -275,7 +275,7 @@ graph), so it stays leakage-free too.
 | J2 | §4 per-cell | `nome_hic_concordance/joint_coordination.py` | join GCH+HCG per end (§7); distance-matched `log2(O/E)` per channel pooled per region; emits **joint(4ch)/gch/hcg** on one end pool + one null |
 | — | eval ladder | `nome_hic_concordance/coordination_eval.py` | shared confound ladder (marginal → +coverage → +batch), classifier panel (`lr`/`svd-lr`/`rf`), permutation null, ROC |
 | J4 | §4/§6 CLI | `scripts/joint_coordination_existence.py` | joint-vs-gch-vs-hcg through the same ladder; `--per-channel`; QC line (§2.1) |
-| J3 | §6 embedding | `nome_hic_concordance/joint_embedding.py` + `scripts/joint_multistate_embedding.py` | per-channel normalize → per-channel SVD → concat → (joint SVD/skip-top →) UMAP; per-channel component AUC (which co-state); optional Tucker channel factor |
+| J3 | §6 embedding | `nome_hic_concordance/joint_embedding.py` + `scripts/joint_multistate_embedding.py` | per-channel normalize → per-channel SVD → concat → (joint SVD/skip-top →) UMAP; per-channel component AUC (which co-state); optional Tucker channel factor; optional **leakage-free concordance-graph RWR** (`--rwr` / `--rwr-compare`, §10.2) |
 
 Tested: `joint_state` 17, `coordination_eval` 18, `joint_coordination` 6 (incl.
 the methylation-cancellation identity), `joint_embedding` 7, + 4 CLI smoke =
@@ -323,3 +323,23 @@ to beat HCG.
 
 **Remaining:** the `nome_hic_compare` wiring (joint vs scHi-C / accessibility in
 the shared harness) and the confirmatory batch/split-half joint run.
+
+### 10.2 Densification — §5 RWR, made leakage-free
+
+§5 specified RWR denoising over both modalities, with the pass-0 k-NN graph
+built from `QN(mean GCH) ⊕ QN(mean HCG)` — the **marginals**.  §6b showed that
+exact basis is the leak (a marginal-built graph injects marginal cell-type
+structure into the smoothed concordance).  So the default J3 embedding uses
+**no RWR**: the densification is **region-pooling per-channel SVD** — each
+cell's ~thousands of sparse region-Δ's are pooled into a few dense components
+*within that cell* (the leakage-free analogue of what the existence-test
+classifier does), never borrowing across cells.
+
+RWR is still available, but **leakage-free**: `--rwr concordance` builds the
+k-NN graph from the **concordance embedding itself** (the per-channel SVD of the
+Δ tensor), never from the marginals — the same validated
+`build_knn_graph` / `rwr_impute_matrices`, only the basis changes.  `--rwr-
+compare` runs SVD-only and concordance-RWR side by side and prints the
+per-channel AUC delta.  **Caveat:** a concordance-built graph can amplify/
+confirm whatever SVD already separated, so a large RWR gain must be checked
+against the permutation / split-half nulls — not trusted standalone.
