@@ -90,3 +90,20 @@ def test_embedding_cli_resid_full(tmp_path):
     assert "tensor decomposition skipped" in r.stdout or \
            "channel factor" in r.stdout
     assert Path(f"{prefix}.embedding_scores.csv").exists()
+
+
+def test_embedding_cli_rwr_compare(tmp_path):
+    r, prefix = _run(tmp_path, ["--rwr-compare", "--rwr-neighbors", "5"])
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    # both variants reported + the side-by-side comparison
+    assert "SVD-only per-channel component AUC" in r.stdout
+    assert "RWR per-channel component AUC" in r.stdout
+    assert "SVD-only vs concordance-RWR" in r.stdout
+    assert "leakage-free" in r.stdout
+    # both variants' outputs written
+    assert Path(f"{prefix}.svdonly.embedding_scores.csv").exists()
+    assert Path(f"{prefix}.rwr.embedding_scores.csv").exists()
+    assert Path(f"{prefix}.svdonly.channel_auc.csv").exists()
+    assert Path(f"{prefix}.rwr.channel_auc.csv").exists()
+    rdf = pd.read_csv(f"{prefix}.rwr.channel_auc.csv")
+    assert set(rdf["variant"]) == {"RWR"}

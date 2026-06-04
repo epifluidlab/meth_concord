@@ -104,6 +104,23 @@ def main() -> None:
     ap.add_argument("--skip-top-svd", type=int, default=0,
                     help="Drop the first N joint-SVD components before UMAP "
                          "(when the top components carry depth/batch).")
+    ap.add_argument("--rwr", choices=["off", "concordance"], default="off",
+                    help="Densify the sparse Δ before embedding via LEAKAGE-FREE "
+                         "RWR on a graph built from the CONCORDANCE embedding "
+                         "(never the marginals — the §6b leak). 'off' (default) "
+                         "= region-pooling SVD only.")
+    ap.add_argument("--rwr-compare", action="store_true",
+                    help="Run BOTH svd-only AND concordance-RWR and print the "
+                         "channel AUC side by side (writes .svdonly and .rwr "
+                         "outputs). Shows whether cross-cell smoothing sharpens "
+                         "the map or just confirms the SVD structure.")
+    ap.add_argument("--rwr-neighbors", type=int, default=15,
+                    help="k for the concordance k-NN graph (default 15).")
+    ap.add_argument("--rwr-restart", type=float, default=0.5,
+                    help="RWR restart probability (default 0.5, scHiCluster).")
+    ap.add_argument("--rwr-passes", type=int, default=1,
+                    help="RWR refinement passes (graph rebuilt from the smoothed "
+                         "embedding each pass; default 1).")
     ap.add_argument("--classifier", choices=["svd-lr", "lr", "rf"], default="lr")
     ap.add_argument("--n-folds", type=int, default=5)
     ap.add_argument("--umap-neighbors", type=int, default=15)
@@ -177,61 +194,91 @@ def main() -> None:
     print(f"[joint-embed] channels: " +
           ", ".join(f"{n}={c.shape[1]}reg" for n, c in zip(JOINT_CHANNELS, channels)))
 
-    scores, blocks, normed = je.build_embedding(
-        channels, list(JOINT_CHANNELS), k_per_channel=args.k_per_channel,
-        do_rank=not args.no_rank, seed=args.random_seed)
-
-    # ---- Per-channel component AUC (the §6 "which co-state" diagnostic) ----
+    # Normalize each channel once; all embedding variants share it.
+    names = list(JOINT_CHANNELS)
+    normed = [je.normalize_channel(c, do_rank=not args.no_rank) for c in channels]
     labeled = y_all.notna().to_numpy()
-    auc_rows = []
-    if labeled.sum() >= 10 and y_all[labeled].nunique() >= 2:
-        yl = y_all[labeled].to_numpy()
-        ch_auc = je.channel_auc([b[labeled] for b in blocks],
-                                list(JOINT_CHANNELS), yl,
-                                method=args.classifier, n_folds=args.n_folds,
-                                seed=args.random_seed)
-        joint_auc = ce.score(scores[labeled], yl, args.classifier,
-                             args.n_folds, args.random_seed)
-        print(f"\n[joint-embed] per-channel component AUC ({args.classifier}) "
-              f"— which co-state carries cell-type identity:")
-        for n in JOINT_CHANNELS:
-            m, sd = ch_auc[n]
-            print(f"    {n:<18} AUC={m:.3f} ± {sd:.3f}")
-            auc_rows.append({"channel": n, "auc": m, "auc_std": sd})
-        print(f"    {'JOINT (all 4)':<18} AUC={joint_auc[0]:.3f} ± {joint_auc[1]:.3f}")
-        auc_rows.append({"channel": "joint_all", "auc": joint_auc[0],
-                         "auc_std": joint_auc[1]})
+    can_auc = labeled.sum() >= 10 and y_all[labeled].nunique() >= 2
+    yl = y_all[labeled].to_numpy() if can_auc else None
+
+    def _variant(suffix, use_rwr):
+        """Embed (SVD-only or concordance-RWR), report channel AUC, write
+        scores + channel-AUC CSV + UMAP.  Returns {channel: auc}."""
+        if use_rwr:
+            scores, blocks, _, info = je.concordance_rwr_embed(
+                normed, names, k_per_channel=args.k_per_channel,
+                n_neighbors=args.rwr_neighbors, restart_prob=args.rwr_restart,
+                n_passes=args.rwr_passes, seed=args.random_seed)
+            print(f"[joint-embed]{suffix} RWR: basis={info['graph_basis']}, "
+                  f"k={info['n_neighbors']}, r={info['restart_prob']}, "
+                  f"passes={info['n_passes']}")
+        else:
+            scores, blocks = je.per_channel_svd(normed, args.k_per_channel,
+                                                seed=args.random_seed)
+        label = "RWR" if use_rwr else "SVD-only"
+        rows, aucd = [], {}
+        if can_auc:
+            ch_auc = je.channel_auc([b[labeled] for b in blocks], names, yl,
+                                    method=args.classifier, n_folds=args.n_folds,
+                                    seed=args.random_seed)
+            jauc = ce.score(scores[labeled], yl, args.classifier, args.n_folds,
+                            args.random_seed)
+            print(f"\n[joint-embed] {label} per-channel component AUC "
+                  f"({args.classifier}) — which co-state carries identity:")
+            for n in names:
+                m, sd = ch_auc[n]; aucd[n] = m
+                print(f"    {n:<18} AUC={m:.3f} ± {sd:.3f}")
+                rows.append({"variant": label, "channel": n, "auc": m,
+                             "auc_std": sd})
+            print(f"    {'JOINT (all 4)':<18} AUC={jauc[0]:.3f} ± {jauc[1]:.3f}")
+            aucd["joint_all"] = jauc[0]
+            rows.append({"variant": label, "channel": "joint_all",
+                         "auc": jauc[0], "auc_std": jauc[1]})
+        else:
+            print("[joint-embed] too few labeled cells / classes for AUC.")
+        # write scores + channel AUC
+        sdf = pd.DataFrame(scores, index=cells,
+                           columns=[f"{ch}_svd{j}" for ch in names
+                                    for j in range(scores.shape[1] // 4)])
+        sdf.insert(0, "group", y_all.values)
+        sdf.to_csv(f"{args.output_prefix}{suffix}.embedding_scores.csv")
+        if rows:
+            pd.DataFrame(rows).to_csv(
+                f"{args.output_prefix}{suffix}.channel_auc.csv", index=False)
+        print(f"[joint-embed] wrote {args.output_prefix}{suffix}."
+              f"embedding_scores.csv" + (" + .channel_auc.csv" if rows else ""))
+        # UMAP (joint SVD/skip-top → 2-D), graceful if umap absent
+        try:
+            from nome_hic_concordance.visualization import run_umap_and_plot
+            out_dir = str(Path(args.output_prefix).parent or ".")
+            uprefix = Path(args.output_prefix).name + suffix + ".umap"
+            run_umap_and_plot(
+                pd.DataFrame(scores, index=cells), group_labels=y_all,
+                title=f"Joint multi-state ({label}, {args.feature}, gran={gran})",
+                output_prefix=uprefix, output_dir=out_dir,
+                n_neighbors=args.umap_neighbors, min_dist=args.umap_min_dist,
+                n_svd=args.n_svd, skip_top_svd=args.skip_top_svd,
+                n_threads=args.n_threads, random_state=args.random_seed)
+            print(f"[joint-embed] wrote {out_dir}/{uprefix}.* (UMAP)")
+        except Exception as e:
+            print(f"[joint-embed] UMAP skipped ({type(e).__name__}: {e})")
+        return aucd
+
+    if args.rwr_compare:
+        a_svd = _variant(".svdonly", False)
+        a_rwr = _variant(".rwr", True)
+        if a_svd and a_rwr:
+            print(f"\n[joint-embed] channel AUC — SVD-only vs concordance-RWR:")
+            print(f"    {'channel':<18} {'SVD-only':>9} {'RWR':>7} {'Δ':>7}")
+            for n in names + ["joint_all"]:
+                s, r = a_svd.get(n, np.nan), a_rwr.get(n, np.nan)
+                print(f"    {n:<18} {s:>9.3f} {r:>7.3f} {r - s:>+7.3f}")
+            print("    RWR > SVD-only  => cross-cell smoothing sharpens the map.")
+            print("    RWR ≈ SVD-only  => SVD already captured it (RWR only")
+            print("                       confirms; treat a big jump skeptically —")
+            print("                       a concordance graph can amplify itself).")
     else:
-        print("[joint-embed] too few labeled cells / classes for channel AUC.")
-
-    # ---- Write embedding scores + channel AUC (always) ----
-    sdf = pd.DataFrame(scores, index=cells,
-                       columns=[f"{ch}_svd{j}" for ch in JOINT_CHANNELS
-                                for j in range(scores.shape[1] // 4)])
-    sdf.insert(0, "group", y_all.values)
-    sdf.to_csv(f"{args.output_prefix}.embedding_scores.csv")
-    print(f"\n[joint-embed] wrote {args.output_prefix}.embedding_scores.csv")
-    if auc_rows:
-        pd.DataFrame(auc_rows).to_csv(f"{args.output_prefix}.channel_auc.csv",
-                                      index=False)
-        print(f"[joint-embed] wrote {args.output_prefix}.channel_auc.csv")
-
-    # ---- UMAP (joint SVD/skip-top → 2-D), graceful if umap absent ----
-    try:
-        from nome_hic_concordance.visualization import run_umap_and_plot
-        out_dir = str(Path(args.output_prefix).parent or ".")
-        prefix = Path(args.output_prefix).name + ".umap"
-        run_umap_and_plot(
-            pd.DataFrame(scores, index=cells),
-            group_labels=y_all,
-            title=f"Joint multi-state concordance ({args.feature}, gran={gran})",
-            output_prefix=prefix, output_dir=out_dir,
-            n_neighbors=args.umap_neighbors, min_dist=args.umap_min_dist,
-            n_svd=args.n_svd, skip_top_svd=args.skip_top_svd,
-            n_threads=args.n_threads, random_state=args.random_seed)
-        print(f"[joint-embed] wrote {out_dir}/{prefix}.* (UMAP)")
-    except Exception as e:
-        print(f"[joint-embed] UMAP skipped ({type(e).__name__}: {e})")
+        _variant("", args.rwr == "concordance")
 
     # ---- Optional tensor decomposition (Tucker) → channel factor ----
     if args.tensor:
