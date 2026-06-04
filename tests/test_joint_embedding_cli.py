@@ -98,8 +98,10 @@ def test_embedding_cli_rwr_compare(tmp_path):
     # both variants reported + the side-by-side comparison
     assert "SVD-only per-channel component AUC" in r.stdout
     assert "RWR per-channel component AUC" in r.stdout
-    assert "SVD-only vs concordance-RWR" in r.stdout
-    assert "leakage-free" in r.stdout
+    assert "SVD-only vs RWR" in r.stdout
+    # standard package RWR on the marginal graph (not a bespoke basis)
+    assert "scHiCluster-style" in r.stdout
+    assert "mean accessibility" in r.stdout
     # both variants' outputs written
     assert Path(f"{prefix}.svdonly.embedding_scores.csv").exists()
     assert Path(f"{prefix}.rwr.embedding_scores.csv").exists()

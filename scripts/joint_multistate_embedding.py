@@ -102,26 +102,30 @@ def main() -> None:
     ap.add_argument("--n-svd", type=int, default=30,
                     help="Joint SVD dim on the concatenated scores before UMAP.")
     ap.add_argument("--skip-top-svd", type=int, default=0,
-                    help="Drop the first N joint-SVD components before UMAP "
-                         "(when the top components carry depth/batch).")
-    ap.add_argument("--rwr", choices=["off", "concordance"], default="off",
-                    help="Densify the sparse Δ before embedding via LEAKAGE-FREE "
-                         "RWR on a graph built from the CONCORDANCE embedding "
-                         "(never the marginals — the §6b leak). 'off' (default) "
-                         "= region-pooling SVD only.")
+                    help="Drop the first N components of the JOINT SVD (over the "
+                         "concatenated per-channel scores, inside the UMAP step) "
+                         "— NOT per-channel. The per-cell-rank normalization "
+                         "already removes per-cell depth, so this is usually "
+                         "unneeded; use it only if the top joint component is a "
+                         "known technical axis.")
+    ap.add_argument("--rwr", choices=["off", "on"], default="off",
+                    help="Densify the sparse Δ before embedding via the SAME RWR "
+                         "as the rest of nome_hic_concordance (scHiCluster-style: "
+                         "k-NN graph from QN(mean accessibility ⊕ mean "
+                         "methylation), then rwr_impute_matrices). 'off' "
+                         "(default) = region-pooling SVD only.")
     ap.add_argument("--rwr-compare", action="store_true",
-                    help="Run BOTH svd-only AND concordance-RWR and print the "
-                         "channel AUC side by side (writes .svdonly and .rwr "
-                         "outputs). Shows whether cross-cell smoothing sharpens "
-                         "the map or just confirms the SVD structure.")
+                    help="Run BOTH svd-only AND RWR and print the channel AUC "
+                         "side by side (writes .svdonly and .rwr outputs).")
     ap.add_argument("--rwr-neighbors", type=int, default=15,
-                    help="k for the concordance k-NN graph (default 15).")
+                    help="k for the RWR k-NN graph (default 15, scHiCluster).")
     ap.add_argument("--rwr-restart", type=float, default=0.5,
                     help="RWR restart probability (default 0.5, scHiCluster).")
-    ap.add_argument("--rwr-passes", type=int, default=1,
-                    help="RWR refinement passes (graph rebuilt from the smoothed "
-                         "embedding each pass; default 1).")
-    ap.add_argument("--classifier", choices=["svd-lr", "lr", "rf"], default="lr")
+    ap.add_argument("--classifier", choices=["svd-lr", "lr", "rf"], default="lr",
+                    help="Classifier for the per-channel component AUC DIAGNOSTIC "
+                         "only (which co-state carries cell-type identity). The "
+                         "embedding itself is unsupervised SVD/UMAP and does not "
+                         "use it.")
     ap.add_argument("--n-folds", type=int, default=5)
     ap.add_argument("--umap-neighbors", type=int, default=15)
     ap.add_argument("--umap-min-dist", type=float, default=0.1)
@@ -176,6 +180,10 @@ def main() -> None:
     if not region_keys:
         sys.exit("No regions at this granularity.")
     Dj, Mj, Cj = mats["joint"]          # cells × (R·4), region-major
+    # Marginal graph basis for the optional standard RWR: per-cell
+    # mean accessibility ⊕ mean methylation — the §5 / package pass-0 basis
+    # (imputation.run_rwr_pipeline's QN(initial_feature_matrix)).
+    graph_basis = np.hstack([mats["gch"][1], mats["hcg"][1]])
 
     # Split into the 4 co-state channels (cells × R each), optionally
     # residualizing each against its own marginal + marginal² + coverage.
@@ -202,16 +210,16 @@ def main() -> None:
     yl = y_all[labeled].to_numpy() if can_auc else None
 
     def _variant(suffix, use_rwr):
-        """Embed (SVD-only or concordance-RWR), report channel AUC, write
+        """Embed (SVD-only or standard package RWR), report channel AUC, write
         scores + channel-AUC CSV + UMAP.  Returns {channel: auc}."""
         if use_rwr:
-            scores, blocks, _, info = je.concordance_rwr_embed(
-                normed, names, k_per_channel=args.k_per_channel,
+            scores, blocks, _, info = je.rwr_embed(
+                normed, names, graph_basis, k_per_channel=args.k_per_channel,
                 n_neighbors=args.rwr_neighbors, restart_prob=args.rwr_restart,
-                n_passes=args.rwr_passes, seed=args.random_seed)
-            print(f"[joint-embed]{suffix} RWR: basis={info['graph_basis']}, "
-                  f"k={info['n_neighbors']}, r={info['restart_prob']}, "
-                  f"passes={info['n_passes']}")
+                seed=args.random_seed)
+            print(f"[joint-embed]{suffix} RWR (package scHiCluster-style): "
+                  f"basis={info['graph_basis']}, k={info['n_neighbors']}, "
+                  f"r={info['restart_prob']}")
         else:
             scores, blocks = je.per_channel_svd(normed, args.k_per_channel,
                                                 seed=args.random_seed)
@@ -268,17 +276,15 @@ def main() -> None:
         a_svd = _variant(".svdonly", False)
         a_rwr = _variant(".rwr", True)
         if a_svd and a_rwr:
-            print(f"\n[joint-embed] channel AUC — SVD-only vs concordance-RWR:")
+            print(f"\n[joint-embed] channel AUC — SVD-only vs RWR (marginal graph):")
             print(f"    {'channel':<18} {'SVD-only':>9} {'RWR':>7} {'Δ':>7}")
             for n in names + ["joint_all"]:
                 s, r = a_svd.get(n, np.nan), a_rwr.get(n, np.nan)
                 print(f"    {n:<18} {s:>9.3f} {r:>7.3f} {r - s:>+7.3f}")
-            print("    RWR > SVD-only  => cross-cell smoothing sharpens the map.")
-            print("    RWR ≈ SVD-only  => SVD already captured it (RWR only")
-            print("                       confirms; treat a big jump skeptically —")
-            print("                       a concordance graph can amplify itself).")
+            print("    RWR > SVD-only  => marginal-graph smoothing sharpens the map.")
+            print("    RWR ≈ SVD-only  => region-pooling SVD already captured it.")
     else:
-        _variant("", args.rwr == "concordance")
+        _variant("", args.rwr == "on")
 
     # ---- Optional tensor decomposition (Tucker) → channel factor ----
     if args.tensor:

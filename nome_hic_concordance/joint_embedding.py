@@ -119,42 +119,35 @@ def build_embedding(channels: list, channel_names: list, k_per_channel: int = 10
     return scores, blocks, normed
 
 
-def concordance_rwr_embed(channels_norm: list, channel_names: list,
-                          k_per_channel: int = 10, n_neighbors: int = 15,
-                          restart_prob: float = 0.5, n_passes: int = 1,
-                          seed: int = 0):
-    """LEAKAGE-FREE concordance-graph RWR densification, then re-embed.
+def rwr_embed(channels_norm: list, channel_names: list, graph_basis: np.ndarray,
+              k_per_channel: int = 10, n_neighbors: int = 15,
+              restart_prob: float = 0.5, seed: int = 0):
+    """Densify the sparse per-channel Δ via the SAME RWR as the rest of
+    ``nome_hic_concordance`` (scHiCluster-style), then re-embed.
 
-    Random-walk-with-restart densifies the sparse per-(cell, region) Δ by
-    borrowing across cells — but the leak the single-context investigation
-    caught (`SIGNED_CONCORDANCE_AND_RWR_DESIGN.md` §6b) was never RWR itself, it
-    was the **graph basis**: the original pass-0 graph was built from
-    ``QN(mean accessibility) ⊕ QN(mean methylation)`` — the *marginals* — which
-    injects marginal cell-type structure into the smoothed concordance.
+    The k-NN graph is built from ``graph_basis`` — the per-cell
+    ``mean accessibility ⊕ mean methylation`` matrix — exactly the §5 / pass-0
+    basis used in :func:`nome_hic_concordance.imputation.run_rwr_pipeline`
+    (``QN(initial_feature_matrix)``).  Each normalized co-state channel is then
+    RWR-smoothed on that shared graph via the validated
+    :func:`~nome_hic_concordance.imputation.build_knn_graph` /
+    :func:`~nome_hic_concordance.imputation.rwr_impute_matrices`.
 
-    Here the k-NN graph is built from the **concordance embedding itself** (the
-    per-channel SVD of the Δ tensor), never from the marginals, so it cannot
-    inject that structure.  Each pass: graph ← concordance scores → RWR-smooth
-    the ORIGINAL normalized channels on that graph (scHiCluster-style: refine
-    the graph, always smooth the raw data) → re-embed.  Reuses the validated
-    :func:`nome_hic_concordance.imputation.build_knn_graph` /
-    :func:`rwr_impute_matrices`.
-
-    **Caveat:** a concordance-built graph can *amplify / confirm* whatever the
-    SVD already separated — validate the result against the permutation /
-    split-half checks, do not trust it standalone.
+    RWR is appropriate for this *embedding* step: the leakage-free existence
+    test already established that the long-range concordance carries cell-type
+    signal **beyond the marginal** (`SIGNED_CONCORDANCE_AND_RWR_DESIGN.md` §6b),
+    so smoothing on the marginal graph denoises a real signal — it is not the
+    hypothesis test, where a marginal-built graph would be circular.
 
     Returns ``(scores, blocks, smoothed_channels, info)``."""
-    from .imputation import build_knn_graph, rwr_impute_matrices
-    scores, blocks = per_channel_svd(channels_norm, k_per_channel, seed=seed)
-    smoothed = channels_norm
-    info = {"n_passes": int(max(1, n_passes)), "n_neighbors": int(n_neighbors),
-            "restart_prob": float(restart_prob),
-            "graph_basis": "concordance_scores (leakage-free)"}
-    for _ in range(max(1, int(n_passes))):
-        _, P = build_knn_graph(scores, k=n_neighbors)          # graph ← concordance
-        mats = {nm: M for nm, M in zip(channel_names, channels_norm)}
-        imputed, _ = rwr_impute_matrices(mats, P, restart_prob=restart_prob)
-        smoothed = [imputed[nm] for nm in channel_names]
-        scores, blocks = per_channel_svd(smoothed, k_per_channel, seed=seed)
+    from .imputation import (build_knn_graph, quantile_normalize_for_knn,
+                             rwr_impute_matrices)
+    qn = quantile_normalize_for_knn(np.asarray(graph_basis, dtype=np.float64))
+    _, P = build_knn_graph(qn, k=n_neighbors)
+    mats = {nm: M for nm, M in zip(channel_names, channels_norm)}
+    imputed, _ = rwr_impute_matrices(mats, P, restart_prob=restart_prob)
+    smoothed = [imputed[nm] for nm in channel_names]
+    scores, blocks = per_channel_svd(smoothed, k_per_channel, seed=seed)
+    info = {"n_neighbors": int(n_neighbors), "restart_prob": float(restart_prob),
+            "graph_basis": "QN(mean accessibility ⊕ mean methylation)"}
     return scores, blocks, smoothed, info

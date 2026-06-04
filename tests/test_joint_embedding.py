@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 
 from nome_hic_concordance.joint_embedding import (
-    build_embedding, channel_auc, concordance_rwr_embed, normalize_channel,
-    per_cell_rank, per_channel_svd,
+    build_embedding, channel_auc, normalize_channel, per_cell_rank,
+    per_channel_svd, rwr_embed,
 )
 
 
@@ -33,6 +33,15 @@ def _within_cluster_dist(M, y):
         d = pdist(M[y == g])
         tot += d.sum(); n += len(d)
     return tot / max(n, 1)
+
+
+def _cluster_basis(y, n_feat=8, seed=0):
+    """A marginal-like (mean accessibility ⊕ methylation) basis that separates
+    the clusters — stands in for the per-cell marginal the package RWR uses."""
+    rng = np.random.default_rng(seed)
+    classes = {g: i for i, g in enumerate(sorted(set(y)))}
+    centers = rng.normal(0, 3, (len(classes), n_feat))
+    return np.vstack([centers[classes[g]] + rng.normal(0, 0.3, n_feat) for g in y])
 
 
 # --------------------------------------------------------------------------
@@ -132,51 +141,56 @@ def test_build_embedding_shapes_and_normed():
 
 
 # --------------------------------------------------------------------------
-# concordance_rwr_embed — leakage-free RWR densification
+# rwr_embed — standard (package) RWR densification on the marginal graph
 # --------------------------------------------------------------------------
 
 _NAMES = ["open", "closed", "poised", "active_methylated"]
 
 
-def test_concordance_rwr_shapes_and_leakage_free_basis():
-    chans, _ = _two_cluster_channels(seed=1)
+def test_rwr_shapes_and_marginal_basis():
+    chans, y = _two_cluster_channels(seed=1)
     normed = [normalize_channel(M) for M in chans]
-    scores, blocks, smoothed, info = concordance_rwr_embed(
-        normed, _NAMES, k_per_channel=4, n_neighbors=5, n_passes=1, seed=0)
+    basis = _cluster_basis(y, seed=1)
+    scores, blocks, smoothed, info = rwr_embed(
+        normed, _NAMES, basis, k_per_channel=4, n_neighbors=5, seed=0)
     assert scores.shape == (30, 16)               # 4 channels × 4
     assert len(smoothed) == 4
-    # the graph is built from concordance, never the marginals
-    assert "leakage-free" in info["graph_basis"]
-    assert "concordance" in info["graph_basis"]
+    # graph built from the marginal (mean accessibility ⊕ methylation) — the
+    # same basis as the package RWR
+    assert "accessibility" in info["graph_basis"]
+    assert "methylation" in info["graph_basis"]
 
 
-def test_concordance_rwr_tightens_within_cluster():
-    # RWR on a concordance graph that correctly groups same-cluster cells should
+def test_rwr_tightens_within_cluster():
+    # RWR on a marginal graph that correctly groups same-cluster cells should
     # pull their channel rows closer together (the denoising property).
     chans, y = _two_cluster_channels(noise=0.6, seed=2)
     normed = [normalize_channel(M) for M in chans]
-    _, _, smoothed, _ = concordance_rwr_embed(
-        normed, _NAMES, k_per_channel=4, n_neighbors=5, restart_prob=0.5, seed=0)
+    basis = _cluster_basis(y, seed=2)
+    _, _, smoothed, _ = rwr_embed(normed, _NAMES, basis, k_per_channel=4,
+                                  n_neighbors=5, restart_prob=0.5, seed=0)
     before = _within_cluster_dist(normed[0], y)
     after = _within_cluster_dist(smoothed[0], y)
     assert after < before
 
 
-def test_concordance_rwr_separates_clusters():
+def test_rwr_separates_clusters():
     chans, y = _two_cluster_channels(noise=0.6, seed=3)
     normed = [normalize_channel(M) for M in chans]
-    _, blocks, _, _ = concordance_rwr_embed(normed, _NAMES, k_per_channel=4,
-                                            n_neighbors=5, seed=0)
+    basis = _cluster_basis(y, seed=3)
+    _, blocks, _, _ = rwr_embed(normed, _NAMES, basis, k_per_channel=4,
+                                n_neighbors=5, seed=0)
     aucs = channel_auc(blocks, _NAMES, y, method="lr", n_folds=4, seed=0)
     # every channel carries the 2-cluster pattern → all separate well
     assert all(aucs[n][0] > 0.8 for n in _NAMES)
 
 
-def test_concordance_rwr_deterministic():
-    chans, _ = _two_cluster_channels(seed=4)
+def test_rwr_deterministic():
+    chans, y = _two_cluster_channels(seed=4)
     normed = [normalize_channel(M) for M in chans]
-    s1, *_ = concordance_rwr_embed(normed, _NAMES, k_per_channel=4,
-                                   n_neighbors=5, seed=0)
-    s2, *_ = concordance_rwr_embed(normed, _NAMES, k_per_channel=4,
-                                   n_neighbors=5, seed=0)
+    basis = _cluster_basis(y, seed=4)
+    s1, *_ = rwr_embed(normed, _NAMES, basis, k_per_channel=4, n_neighbors=5,
+                       seed=0)
+    s2, *_ = rwr_embed(normed, _NAMES, basis, k_per_channel=4, n_neighbors=5,
+                       seed=0)
     assert np.allclose(s1, s2)
