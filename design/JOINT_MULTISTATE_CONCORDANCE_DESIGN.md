@@ -411,8 +411,13 @@ Pipeline order for `per-channel`: normalize each channel → **Harmony per chann
 + Harmony the marginal graph basis** → RWR (graph from corrected marginal; refine
 from corrected concordance) → tensor / concat-SVD cell factor → UMAP.
 
-The script prints a **batch-AUC** on the final embedding (lower = batch better
-removed) alongside the cell-type AUC (should stay high). If cell type *and* batch
-fall together, they are **confounded** in the design (cells of a type don't span
-batches) and no correction can separate them — a sampling problem, not a method
-one.
+The script prints a **per-factor batch-AUC** on the final embedding (one number
+per batch column, lower = batch better removed) alongside the cell-type AUC
+(should stay high). It scores **each batch factor separately**, NOT their
+cartesian-product composite — the composite of several factors fragments into
+singleton groups that CV can't score (which would print `NaN`); per-factor each
+column keeps enough cells per level. A factor with only one level among labeled
+cells, or a level with <2 cells, is reported as `n/a(reason)` rather than NaN.
+If cell type *and* batch fall together, they are **confounded** in the design
+(cells of a type don't span batches) and no correction can separate them — a
+sampling problem, not a method one.

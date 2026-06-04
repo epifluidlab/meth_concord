@@ -123,8 +123,11 @@ def make_clf(method: str, seed: int):
         return RandomForestClassifier(n_estimators=300, max_features="sqrt",
                                       n_jobs=1, random_state=seed)
     from sklearn.linear_model import LogisticRegression
-    return LogisticRegression(max_iter=2000, solver="lbfgs", multi_class="ovr",
-                              C=1.0)
+    from sklearn.multiclass import OneVsRestClassifier
+    # OvR via OneVsRestClassifier — LogisticRegression(multi_class="ovr") was
+    # deprecated in sklearn 1.5 (removed in 1.8); same one-vs-rest fits.
+    return OneVsRestClassifier(
+        LogisticRegression(max_iter=2000, solver="lbfgs", C=1.0))
 
 
 def cv_rf(X: np.ndarray, y: np.ndarray, n_folds: int, seed: int):

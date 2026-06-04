@@ -17,6 +17,7 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score as _roc_auc_score
+from sklearn.multiclass import OneVsRestClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 logger = logging.getLogger(__name__)
@@ -244,12 +245,11 @@ def _cv_auc(
         if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
             continue
 
-        clf = LogisticRegression(
-            max_iter=1000,
-            solver="lbfgs",
-            multi_class="ovr",
-            random_state=random_state,
-        )
+        # OvR via OneVsRestClassifier (the old LogisticRegression(multi_class=
+        # "ovr") was deprecated in sklearn 1.5); same K one-vs-rest fits, so the
+        # OvR-macro AUC below is unchanged.
+        clf = OneVsRestClassifier(LogisticRegression(
+            max_iter=1000, solver="lbfgs", random_state=random_state))
         try:
             clf.fit(X_train, y_train)
             if n_classes == 2:
@@ -368,15 +368,13 @@ def _likelihood_ratio_test(
     """
     try:
         clf_base = LogisticRegression(
-            max_iter=2000, solver="lbfgs", multi_class="ovr",
-            random_state=random_state,
+            max_iter=2000, solver="lbfgs", random_state=random_state,
         )
         clf_base.fit(X_base, y)
         ll_base = _log_likelihood(clf_base, X_base, y)
 
         clf_aug = LogisticRegression(
-            max_iter=2000, solver="lbfgs", multi_class="ovr",
-            random_state=random_state,
+            max_iter=2000, solver="lbfgs", random_state=random_state,
         )
         clf_aug.fit(X_aug, y)
         ll_aug = _log_likelihood(clf_aug, X_aug, y)

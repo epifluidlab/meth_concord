@@ -286,7 +286,7 @@ def main() -> None:
     yl = y_all[labeled].to_numpy() if can_auc else None
 
     # ---- Batch correction setup (Harmony) -------------------------------
-    batch_df, bcomp_lab = None, None
+    batch_df = None
     batch_cols = list(dict.fromkeys(
         c.strip() for item in args.batch_column for c in item.split(",")
         if c.strip()))
@@ -296,9 +296,10 @@ def main() -> None:
         batch_df = pd.DataFrame(
             {c: _column(args.samples, c).reindex(cells).fillna("__unknown__")
                 .to_numpy() for c in batch_cols}, index=cells)
-        comp = batch_df.astype(str).agg("|".join, axis=1).to_numpy()
-        if can_auc and len(np.unique(comp[labeled])) >= 2:
-            bcomp_lab = comp[labeled]                # for the batch-AUC QC
+        for c in batch_cols:                         # heads-up on each factor
+            nlev = int(pd.Series(batch_df[c].to_numpy()[labeled]).nunique())
+            print(f"[joint-embed]   batch factor '{c}': {nlev} level(s) among "
+                  f"labeled cells")
 
         if args.batch_correct == "per-channel":
             # Harmony-correct EACH channel AND the RWR marginal graph basis,
@@ -315,11 +316,34 @@ def main() -> None:
             print(f"[joint-embed] embedding-level Harmony correction (on the cell "
                   f"factor, before UMAP; columns={batch_cols}).")
 
-    def _batch_auc(S):
-        if bcomp_lab is None:
-            return np.nan
-        return ce.score(S, bcomp_lab, args.classifier, args.n_folds,
-                        args.random_seed)[0]
+    def _batch_aucs(S):
+        """Per-FACTOR batch AUC among labeled cells → {col: (auc, reason)}.
+
+        Per factor, NOT the composite: the cartesian product of several batch
+        columns fragments into singleton groups that CV can't score (the cause
+        of the earlier NaN).  ``auc`` is NaN with a reason when a factor can't
+        be scored (1 level, or a level with <2 cells)."""
+        out = {}
+        if batch_df is None or not can_auc:
+            return out
+        for c in batch_cols:
+            vals = batch_df[c].to_numpy()[labeled]
+            uniq, counts = np.unique(vals, return_counts=True)
+            if len(uniq) < 2:
+                out[c] = (np.nan, "1 level among labeled cells")
+            elif counts.min() < 2:
+                out[c] = (np.nan, "a batch level has <2 cells")
+            else:
+                out[c] = (ce.score(S, vals, args.classifier, args.n_folds,
+                                   args.random_seed)[0], None)
+        return out
+
+    def _batch_str(S):
+        r = _batch_aucs(S)
+        if not r:
+            return "n/a"
+        return "  ".join(f"{c}={v:.3f}" if np.isfinite(v) else f"{c}=n/a({rn})"
+                         for c, (v, rn) in r.items())
 
     # ---- Per-channel SVD component AUC (top 10) — which top components are a
     # technical axis to skip (low AUC) vs cell type (high AUC), per channel. ----
@@ -390,10 +414,10 @@ def main() -> None:
         # per-channel stage already corrected upstream; here we additionally
         # harmonize the final embedding when --batch-correct embedding.
         if args.batch_correct == "embedding" and batch_df is not None:
-            bt0 = _batch_auc(scores[labeled])
+            before = _batch_str(scores[labeled])
             scores = je.batch_correct_scores(scores, batch_df, "harmony")
             print(f"[joint-embed]{suffix} embedding Harmony: batch AUC "
-                  f"{bt0:.3f}→{_batch_auc(scores[labeled]):.3f} (should drop)")
+                  f"[{before}] → [{_batch_str(scores[labeled])}] (should drop)")
         # 3. AUC
         rows, aucd = [], {}
         if can_auc:
@@ -418,12 +442,12 @@ def main() -> None:
             aucd["joint_all"] = jauc[0]
             rows.append({"variant": label, "channel": "joint_all",
                          "auc": jauc[0], "auc_std": jauc[1]})
-            if batch_df is not None and bcomp_lab is not None:
-                bauc = _batch_auc(scores[labeled])
-                print(f"    {'batch AUC':<18} {bauc:.3f}        (lower = batch "
-                      f"better removed; cell-type AUC above should stay high)")
-                rows.append({"variant": label, "channel": "batch", "auc": bauc,
-                             "auc_std": np.nan})
+            if batch_df is not None:
+                print(f"    {'batch AUC':<18} {_batch_str(scores[labeled])}   "
+                      f"(lower = batch better removed; cell-type AUC stays high)")
+                for c, (v, _) in _batch_aucs(scores[labeled]).items():
+                    rows.append({"variant": label, "channel": f"batch:{c}",
+                                 "auc": v, "auc_std": np.nan})
         else:
             print("[joint-embed] too few labeled cells / classes for AUC.")
         # 4. scores CSV (column names depend on the embedding)
