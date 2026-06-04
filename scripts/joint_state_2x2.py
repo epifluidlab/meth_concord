@@ -82,11 +82,13 @@ def process_cell(gpath, hpath, min_d, max_d, bsz, min_gpc, min_cpg, hi, lo):
     if max_d and max_d > 0:
         linked = linked & (dist <= max_d)
 
+    chrom = m["chrom"].to_numpy()
     conf = {k: 0 for k in _STATES}
     n_both = n_conf = n_acc_amb = n_meth_amb = 0
     sa = sm = saa = smm = sam = 0.0; n_ends = 0
-    for ng, nh, ac, mc in (("n1g", "n1h", "a1", "m1"),
-                           ("n2g", "n2h", "a2", "m2")):
+    bin_ch, bin_id, bin_a, bin_m = [], [], [], []   # for the region-level test
+    for ng, nh, ac, mc, pc in (("n1g", "n1h", "a1", "m1", pos1),
+                               ("n2g", "n2h", "a2", "m2", pos2)):
         a = m[ac].to_numpy(np.float64, na_value=np.nan)
         me = m[mc].to_numpy(np.float64, na_value=np.nan)
         ok = (linked & (m[ng].to_numpy(np.float64) >= min_gpc)
@@ -110,8 +112,20 @@ def process_cell(gpath, hpath, min_d, max_d, bsz, min_gpc, min_cpg, hi, lo):
         sa += float(a.sum()); sm += float(me.sum())
         saa += float((a * a).sum()); smm += float((me * me).sum())
         sam += float((a * me).sum()); n_ends += int(a.size)
+        # bin each end for the region-level (a, m) means
+        bin_ch.append(chrom[ok]); bin_id.append((pc[ok] // bsz))
+        bin_a.append(a); bin_m.append(me)
+    if bin_a:
+        be = pd.DataFrame({"chrom": np.concatenate(bin_ch),
+                           "bin": np.concatenate(bin_id),
+                           "a": np.concatenate(bin_a),
+                           "m": np.concatenate(bin_m)})
+        binsum = be.groupby(["chrom", "bin"]).agg(
+            sa=("a", "sum"), sm=("m", "sum"), n=("a", "size")).reset_index()
+    else:
+        binsum = pd.DataFrame(columns=["chrom", "bin", "sa", "sm", "n"])
     return conf, (n_both, n_conf, n_acc_amb, n_meth_amb), \
-        (sa, sm, saa, smm, sam, n_ends)
+        (sa, sm, saa, smm, sam, n_ends), binsum
 
 
 def main():
@@ -129,6 +143,9 @@ def main():
     ap.add_argument("--posterior-low", type=float, default=0.4,
                     help="Mixture posterior <= this = negative (closed/unmeth); "
                          "in between = ambiguous, excluded.")
+    ap.add_argument("--region-min-ends", type=int, default=20,
+                    help="Min ends per genomic bin to include it in the "
+                         "region-level a-m correlation (default 20).")
     ap.add_argument("--max-cells", type=int, default=0)
     ap.add_argument("--n-threads", type=int, default=4)
     args = ap.parse_args()
@@ -191,22 +208,72 @@ def main():
     va = saa / n - ma * ma; vm = smm / n - mm * mm
     r = cov / np.sqrt(va * vm) if va > 0 and vm > 0 else np.nan
     print(f"\n=== coupling ===")
-    print(f"  mean a(accessible)={ma:.3f}  mean m(methylated)={mm:.3f}  "
+    print(f"  PER-END:  mean a={ma:.3f}  mean m={mm:.3f}  "
           f"Pearson r(a,m) across ends = {r:+.3f}")
+
+    # --- REGION level: average a, m per genomic bin, correlate across bins ----
+    # Averaging many ends per bin removes the per-end estimation noise, so this
+    # separates a true coupling from per-end attenuation, and is the scale the
+    # concordance / embedding actually operates at.
+    r_reg = np.nan; n_bins = 0; offd_reg = np.nan
+    allbin = [r4 for r4 in (rr[3] for rr in res) if len(r4)]
+    if allbin:
+        bs = pd.concat(allbin, ignore_index=True).groupby(
+            ["chrom", "bin"]).agg(sa=("sa", "sum"), sm=("sm", "sum"),
+                                  n=("n", "sum")).reset_index()
+        bs = bs[bs["n"] >= args.region_min_ends]
+        n_bins = len(bs)
+        if n_bins >= 3:
+            x = (bs["sa"] / bs["n"]).to_numpy()
+            y = (bs["sm"] / bs["n"]).to_numpy()
+            w = bs["n"].to_numpy().astype(float)
+            mx = np.average(x, weights=w); my = np.average(y, weights=w)
+            cxy = np.average((x - mx) * (y - my), weights=w)
+            vx = np.average((x - mx) ** 2, weights=w)
+            vy = np.average((y - my) ** 2, weights=w)
+            r_reg = cxy / np.sqrt(vx * vy) if vx > 0 and vy > 0 else np.nan
+            # region 2x2: split bins at the (end-weighted) mean of each axis
+            ah = x >= mx; mh = y >= my
+            tw = w.sum()
+            ou = w[ah & ~mh].sum() / tw; om = w[ah & mh].sum() / tw
+            cu = w[~ah & ~mh].sum() / tw; cm = w[~ah & mh].sum() / tw
+            offd_reg = om + cu
+            print(f"  REGION ({args.bin_size:,} bp, {n_bins:,} bins with "
+                  f">= {args.region_min_ends} ends):  Pearson r(mean_a, mean_m) "
+                  f"= {r_reg:+.3f}")
+            print(f"    region 2x2 (split at the mean): open-unmeth {ou:.1%}  "
+                  f"open-meth {om:.1%}  closed-unmeth {cu:.1%}  closed-meth "
+                  f"{cm:.1%}  (off-diag {offd_reg:.1%})")
 
     print(f"\n=== verdict ===")
     if offd < 0.10 or (np.isfinite(r) and r < -0.5):
-        print("  → strongly ANTI-CORRELATED, off-diagonal rare: a 2-STATE")
+        print("  → strongly ANTI-CORRELATED per end, off-diagonal rare: a 2-STATE")
         print("    (open/closed) model captures it; methylation is largely")
-        print("    redundant with accessibility on each end (explains why a joint")
-        print("    4-state embedding would not beat the single contexts).")
+        print("    redundant with accessibility (a joint 4-state would not beat")
+        print("    the single contexts).")
     elif offd >= 0.25 or (np.isfinite(r) and r > -0.2):
         print("  → the off-diagonal states are genuinely occupied / a,m not")
-        print("    strongly anti-correlated: the 4-STATE model is warranted —")
-        print("    methylation carries information beyond accessibility per end.")
+        print("    strongly anti-correlated PER END: a 4-state grid is occupied.")
     else:
-        print("  → intermediate: off-diagonal is a non-trivial minority. The")
-        print("    4-state model adds some information; weigh against sparsity.")
+        print("  → intermediate per end.")
+    # The region-level r is what matters for the joint embedding / concordance:
+    if np.isfinite(r_reg):
+        if r_reg < -0.4:
+            print(f"  → BUT region-level r = {r_reg:+.3f}: accessibility and")
+            print("    methylation ARE anti-correlated at the bin scale (the per-end")
+            print("    independence was noise). Region-wise the two modalities are")
+            print("    largely redundant → the joint adds little over the better")
+            print("    single context (consistent with the flat joint embedding).")
+        elif abs(r_reg) <= 0.2:
+            print(f"  → region-level r = {r_reg:+.3f}: accessibility and methylation")
+            print("    are independent at the bin scale TOO (not per-end noise). The")
+            print("    two axes carry SEPARATE region-level info → a joint embedding")
+            print("    SHOULD be >= the better single context; a WORSE joint is then")
+            print("    the pipeline (resid_full / log2(O/E) vs signed-diff / 1 Mb /")
+            print("    channel dilution), not a biology limit.")
+        else:
+            print(f"  → region-level r = {r_reg:+.3f}: weak/intermediate coupling at")
+            print("    the bin scale; the joint may add modest information.")
 
 
 if __name__ == "__main__":
