@@ -116,19 +116,21 @@ def test_embedding_cli_rwr_compare(tmp_path):
     r, prefix = _run(tmp_path, ["--rwr-compare", "--rwr-neighbors", "5"])
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     # both variants reported + the side-by-side comparison
-    assert "SVD-only per-channel component AUC" in r.stdout
+    assert "no-RWR per-channel component AUC" in r.stdout
     assert "RWR per-channel component AUC" in r.stdout
-    assert "SVD-only vs RWR" in r.stdout
+    assert "no-RWR vs RWR" in r.stdout
     # standard package RWR on the marginal graph (not a bespoke basis)
     assert "scHiCluster-style" in r.stdout
     assert "mean accessibility" in r.stdout
     # both variants' outputs written
-    assert Path(f"{prefix}.svdonly.embedding_scores.csv").exists()
+    assert Path(f"{prefix}.norwr.embedding_scores.csv").exists()
     assert Path(f"{prefix}.rwr.embedding_scores.csv").exists()
-    assert Path(f"{prefix}.svdonly.channel_auc.csv").exists()
+    assert Path(f"{prefix}.norwr.channel_auc.csv").exists()
     assert Path(f"{prefix}.rwr.channel_auc.csv").exists()
     rdf = pd.read_csv(f"{prefix}.rwr.channel_auc.csv")
     assert set(rdf["variant"]) == {"RWR"}
+    ndf = pd.read_csv(f"{prefix}.norwr.channel_auc.csv")
+    assert set(ndf["variant"]) == {"no-RWR"}
 
 
 def test_embedding_cli_component_auc_and_autoselect(tmp_path):

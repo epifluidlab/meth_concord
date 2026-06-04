@@ -349,8 +349,14 @@ not apply here, and there is no reason to avoid the validated RWR.
   - **`--rwr-auto-select`** — keep the pass with the largest post-norm
     concordance eigengap (`_top_eigengap`, label-free; pass 0 never selected),
     up to `--rwr-max-passes`, patience 1. `--rwr-refine-passes N` runs a fixed N.
-- **`--rwr-compare`:** runs SVD-only and RWR and prints the per-channel AUC delta
-  (SVD-only │ RWR │ Δ), writing `.svdonly` and `.rwr` outputs.
+- **`--rwr-compare`:** runs no-RWR and RWR (same embedding) and prints the AUC
+  delta (no-RWR │ RWR │ Δ), writing `.norwr` and `.rwr` outputs. A large RWR gain
+  on easy cell types is *marginal-driven* (the graph is the marginal), not
+  evidence the concordance separates the cells — `RWR ≈ no-RWR` is the clean win.
+
+The densification label (`RWR` / `no-RWR`) is **orthogonal to** the embedding
+(`concat-svd` / `tensor`): `--rwr off --embedding tensor` still runs the tensor
+decomposition, just on the un-smoothed channels (the leakage-free view).
 
 (The earlier bespoke "concordance-graph RWR" was removed: unnecessary — the
 leakage question is settled — and untested relative to the package RWR.)

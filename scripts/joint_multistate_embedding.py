@@ -293,7 +293,9 @@ def main() -> None:
                 print(f"[joint-embed]{suffix}   refine eigengaps: {egs}")
         else:
             smoothed = normed
-        label = "RWR" if use_rwr else "SVD-only"
+        # label describes the DENSIFICATION (RWR vs none) — orthogonal to the
+        # embedding method (concat-svd / tensor), which is shown separately.
+        label = "RWR" if use_rwr else "no-RWR"
         # 2. embed
         if args.embedding == "tensor":
             scores, chan_factor, tinfo = je.tensor_embed(
@@ -372,17 +374,22 @@ def main() -> None:
         return aucd
 
     if args.rwr_compare:
-        a_svd = _variant(".svdonly", False)
+        a_norwr = _variant(".norwr", False)
         a_rwr = _variant(".rwr", True)
-        if a_svd and a_rwr:
-            keys = [n for n in names + ["joint_all"] if n in a_svd or n in a_rwr]
-            print(f"\n[joint-embed] channel AUC — SVD-only vs RWR (marginal graph):")
-            print(f"    {'channel':<18} {'SVD-only':>9} {'RWR':>7} {'Δ':>7}")
+        if a_norwr and a_rwr:
+            keys = [n for n in names + ["joint_all"]
+                    if n in a_norwr or n in a_rwr]
+            print(f"\n[joint-embed] AUC — no-RWR vs RWR (marginal graph), "
+                  f"{args.embedding} embedding:")
+            print(f"    {'channel':<18} {'no-RWR':>9} {'RWR':>7} {'Δ':>7}")
             for n in keys:
-                s, r = a_svd.get(n, np.nan), a_rwr.get(n, np.nan)
+                s, r = a_norwr.get(n, np.nan), a_rwr.get(n, np.nan)
                 print(f"    {n:<18} {s:>9.3f} {r:>7.3f} {r - s:>+7.3f}")
-            print("    RWR > SVD-only  => marginal-graph smoothing sharpens the map.")
-            print("    RWR ≈ SVD-only  => region-pooling SVD already captured it.")
+            print("    RWR > no-RWR  => cross-cell (marginal-graph) smoothing")
+            print("                    sharpens it — but is marginal-DRIVEN, so")
+            print("                    not evidence the concordance separates cells.")
+            print("    RWR ≈ no-RWR  => the concordance embedding already captured")
+            print("                    it without the marginal graph (the clean result).")
     else:
         _variant("", args.rwr == "on")
 
