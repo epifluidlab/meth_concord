@@ -62,7 +62,7 @@ def _load(path: Path) -> pd.DataFrame:
     return df
 
 
-def process_cell(gpath, hpath, bands, bsz, min_gpc, min_cpg, hi, lo):
+def process_cell(gpath, hpath, bands, bsz, min_gpc, min_cpg, hi, lo, rbsz):
     """Load one cell's joined posteriors once and compute the 2×2 + coupling
     stats for every (lo, hi) band in ``bands``.  Returns ``{band_index: (conf,
     counts, stats, binsum)}`` or None if the cell has no joined pairs."""
@@ -116,7 +116,7 @@ def process_cell(gpath, hpath, bands, bsz, min_gpc, min_cpg, hi, lo):
             sa += float(a.sum()); sm += float(me.sum())
             saa += float((a * a).sum()); smm += float((me * me).sum())
             sam += float((a * me).sum()); n_ends += int(a.size)
-            bch.append(chrom[ok]); bid.append(pc[ok] // bsz); ba.append(a); bm.append(me)
+            bch.append(chrom[ok]); bid.append(pc[ok] // rbsz); ba.append(a); bm.append(me)
         if ba:
             be = pd.DataFrame({"chrom": np.concatenate(bch),
                                "bin": np.concatenate(bid),
@@ -208,7 +208,15 @@ def main():
                     help="Comma-separated bp edges → consecutive bands, swept in "
                          "ONE pass (e.g. 1000,20000,100000,1000000,10000000). "
                          "Overrides --min/--max-distance.")
-    ap.add_argument("--bin-size", type=int, default=250_000)
+    ap.add_argument("--bin-size", type=int, default=250_000,
+                    help="Same-bin bin size for the linked filter (caps the "
+                         "max separation a 'linked' pair can have).")
+    ap.add_argument("--region-bin-size", type=int, default=0,
+                    help="Bin size for the REGION-level a-m correlation (0 = use "
+                         "--bin-size). Shrink it (e.g. 5000) to test the "
+                         "gene-density/scale confound: if r(region) flips from + "
+                         "at 250 kb to - at ~5 kb, the positive region coupling "
+                         "was the coarse-scale gene-body confound.")
     ap.add_argument("--min-gpc-sites", type=int, default=2)
     ap.add_argument("--min-cpg-sites", type=int, default=2)
     ap.add_argument("--posterior-high", type=float, default=0.6)
@@ -239,8 +247,9 @@ def main():
           f"[{args.posterior_low}, {args.posterior_high}] | "
           f"{len(bands)} distance band(s)")
 
+    rbsz = args.region_bin_size if args.region_bin_size > 0 else args.bin_size
     at = (bands, args.bin_size, args.min_gpc_sites, args.min_cpg_sites,
-          args.posterior_high, args.posterior_low)
+          args.posterior_high, args.posterior_low, rbsz)
     if args.n_threads > 1 and len(shared) > 1:
         from joblib import Parallel, delayed
         res = Parallel(n_jobs=args.n_threads, verbose=5)(
