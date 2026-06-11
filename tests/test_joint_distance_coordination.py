@@ -97,6 +97,42 @@ def test_build_edges_spans_range():
 
 
 # --------------------------------------------------------------------------
+# Unit: band-summary helpers
+# --------------------------------------------------------------------------
+
+def test_band_edges_and_human_dist():
+    m = _mod()
+    assert m._band_edges(1, 1_000_000) == [1, 1_000, 10_000, 100_000, 1_000_000]
+    assert m._band_edges(10_000, 200_000) == [10_000, 100_000, 200_000]
+    assert m._human_dist(7) == "7bp"
+    assert m._human_dist(6_800) == "6.8kb"
+    assert m._human_dist(1_000_000) == "1Mb"
+
+
+def test_r_scalar_matches_pearson():
+    m = _mod()
+    rng = np.random.default_rng(1)
+    x = rng.random(400); y = 0.6 * x + 0.4 * rng.random(400)
+    acc = m._center(m._sums(np.zeros(400, np.int64), x, y,
+                            np.ones(400, bool), 1))      # (4, 1)
+    r, n = m._r_scalar(acc[:, 0])
+    assert n == 400
+    assert abs(r - np.corrcoef(x, y)[0, 1]) < 1e-9
+
+
+def test_pool_band_selects_right_columns():
+    m = _mod()
+    acc = np.arange(4 * 5, dtype=float).reshape(4, 5)
+    centers = np.array([5, 50, 500, 5_000, 50_000], float)
+    # [1, 1000) → first three bins
+    assert np.allclose(m._pool_band(acc, centers, 1, 1_000, last=False),
+                       acc[:, :3].sum(axis=1))
+    # last band is inclusive of the upper edge
+    assert np.allclose(m._pool_band(acc, centers, 1_000, 50_000, last=True),
+                       acc[:, 3:].sum(axis=1))
+
+
+# --------------------------------------------------------------------------
 # Integration: CLI on synthetic posteriors with a known structure
 # --------------------------------------------------------------------------
 
@@ -138,6 +174,10 @@ def test_cli_end_to_end(tmp_path):
     assert out.exists()
     tsv = out.with_suffix(".tsv")
     assert tsv.exists()
+    # the band-level summary stats log is printed
+    assert "concordance summary by distance band" in r.stdout
+    assert "headline (within-cell r)" in r.stdout
+    assert "10kb-100kb" in r.stdout                # the populated ~50 kb band
     df = pd.read_csv(tsv, sep="\t")
     # the populated bin (~50 kb) must show the planted structure
     pop = df[np.isfinite(df["gg_r_contact"]) & (df["gg_n"] >= 20)]

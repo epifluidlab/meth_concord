@@ -168,6 +168,36 @@ def _corr(acc, min_pairs):
     return r, n
 
 
+def _r_scalar(a4):
+    """Length-4 partial sums (cov, var_x, var_y, n) → (r, n) for one pooled band."""
+    cov, vx, vy, n = a4
+    d = np.sqrt(vx * vy)
+    return (cov / d if d > 0 else np.nan), n
+
+
+def _human_dist(x):
+    x = int(round(x))
+    if x >= 1_000_000:
+        return f"{x // 1_000_000}Mb" if x % 1_000_000 == 0 else f"{x / 1e6:.1f}Mb"
+    if x >= 1_000:
+        return f"{x // 1_000}kb" if x % 1_000 == 0 else f"{x / 1e3:.1f}kb"
+    return f"{x}bp"
+
+
+def _band_edges(min_d, max_d):
+    """Decade-boundary band edges spanning [min_d, max_d] for the summary."""
+    inner = [d for d in (1_000, 10_000, 100_000, 1_000_000, 10_000_000)
+             if min_d < d < max_d]
+    return [min_d, *inner, max_d]
+
+
+def _pool_band(acc, centers, lo, hi, last):
+    """Sum a (4, nb) array's columns whose bin centre falls in [lo, hi)
+    (inclusive of hi for the last band) → length-4 pooled partial sums."""
+    sel = (centers >= lo) & ((centers <= hi) if last else (centers < hi))
+    return acc[:, sel].sum(axis=1)
+
+
 def _build_edges(min_d, max_d, per_decade):
     lo, hi = np.log10(max(min_d, 1)), np.log10(max_d)
     n_edges = max(2, int(round((hi - lo) * per_decade)) + 1)
@@ -235,6 +265,55 @@ def _write_tsv(centers, edges, curves, path):
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, na_rep="nan")
 
 
+def _print_band_summary(raw, curves, centers, min_d, max_d, eps=0.05):
+    """Summary stats log: pool the per-bin concordance into decade distance
+    bands (within-cell partial sums summed across the band's bins, then a single
+    band-level r), and a per-measure headline (peak, contact-specific reach,
+    long-range floor).  ``contact - shuffle`` is the contact-specific excess."""
+    edges = _band_edges(min_d, max_d)
+    nbd = len(edges) - 1
+    names = [lab.split("  ")[0] for _, lab in _MEASURES]
+    print("\n=== concordance summary by distance band "
+          "(contact r | shuffle r | excess Δ) ===")
+    print(f"  {'band':<14}{'n(GG)':>9}  "
+          + "".join(f"{nm + ' c|s|Δ':>22}" for nm in names))
+    for bi in range(nbd):
+        lo, hi, last = edges[bi], edges[bi + 1], bi == nbd - 1
+        label = f"{_human_dist(lo)}-{_human_dist(hi)}"
+        cols, n_gg = "", 0
+        for key, _ in _MEASURES:
+            rc, n = _r_scalar(_pool_band(raw[key]["real"], centers, lo, hi, last))
+            rs, _ = _r_scalar(_pool_band(raw[key]["shuf"], centers, lo, hi, last))
+            if key == "gg":
+                n_gg = int(n)
+            ex = rc - rs if (np.isfinite(rc) and np.isfinite(rs)) else np.nan
+            cols += (f"{_sgn(rc)}|{_sgn(rs)}|{_sgn(ex)}").rjust(22)
+        print(f"  {label:<14}{n_gg:>9,d}  {cols}")
+
+    print("  headline (within-cell r):")
+    for key, lab in _MEASURES:
+        nm = lab.split("  ")[0]
+        rc = curves[key]["real"][0]; rs = curves[key]["shuf"][0]
+        ex = rc - rs
+        fin = np.isfinite(rc)
+        if not fin.any():
+            print(f"    {nm:<8}: n/a (no bin above --min-pairs)")
+            continue
+        idx = int(np.nanargmax(np.where(fin, np.abs(rc), np.nan)))
+        sig = fin & (np.abs(ex) >= eps)
+        reach = _human_dist(centers[sig].max()) if sig.any() else "none"
+        lr, _ = _r_scalar(_pool_band(raw[key]["real"], centers,
+                                     edges[-2], edges[-1], True))
+        print(f"    {nm:<8}: peak {rc[idx]:+.3f} @ {_human_dist(centers[idx])}"
+              f"  ·  |contact-shuffle|>={eps} out to ~{reach}"
+              f"  ·  {_human_dist(edges[-2])}-{_human_dist(edges[-1])} pooled "
+              f"{lr:+.3f}")
+
+
+def _sgn(x):
+    return f"{x:+.2f}" if np.isfinite(x) else "  n/a"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -285,13 +364,14 @@ def main():
     if not res:
         sys.exit("No qualifying pairs found in the distance range.")
 
-    curves = {}
+    raw, curves = {}, {}
     for key, _ in _MEASURES:
-        curves[key] = {}
+        raw[key], curves[key] = {}, {}
         for kind in ("real", "shuf"):
             acc = np.zeros((4, nb))
             for r in res:
                 acc += r[kind][key]
+            raw[key][kind] = acc                       # (4, nb) partial sums
             curves[key][kind] = _corr(acc, args.min_pairs)
 
     # console summary at the decade marks
@@ -308,6 +388,9 @@ def main():
             cells_txt += f"{rr:+7.3f}|{rs:+6.3f}   "
         npairs = int(curves["gg"]["real"][1][bi])
         print(f"  {d:>10,.0f}{npairs:>11,d} | {cells_txt}")
+
+    _print_band_summary(raw, curves, centers, args.min_distance,
+                        args.max_distance)
 
     out = Path(args.out)
     _plot(centers, edges, curves, len(res), args.min_gpc_sites,
