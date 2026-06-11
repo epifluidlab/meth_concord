@@ -78,6 +78,22 @@ def test_process_cell_independent_thresholds(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Unit: cell subsampling (0 = all, reproducible random, cap >= n = all)
+# --------------------------------------------------------------------------
+
+def test_subsample_modes():
+    m = _mod()
+    cells = [f"C{i:02d}" for i in range(20)]
+    assert m.subsample(cells, 0, 0) == cells          # 0 = all
+    assert m.subsample(cells, -1, 0) == cells          # negative = all
+    assert m.subsample(cells, 999, 0) == cells         # cap >= n = all
+    s1 = m.subsample(cells, 5, seed=1)
+    assert len(s1) == 5 and s1 == sorted(s1) and set(s1) <= set(cells)
+    assert m.subsample(cells, 5, seed=1) == s1         # reproducible
+    assert m.subsample(cells, 5, seed=2) != s1         # seed changes the draw
+
+
+# --------------------------------------------------------------------------
 # Integration: thread-invariance + flag wiring
 # --------------------------------------------------------------------------
 
@@ -117,3 +133,22 @@ def test_cli_min_sites_fallback(tmp_path):
         _write_pairs(g, h, f"C{i}", seed=200 + i)
     out = _run(g, h, "--min-sites", "3", "--n-threads", "1")
     assert "GpC>=3 CpG>=3" in out
+
+
+def test_cli_max_cells_zero_uses_all(tmp_path):
+    g = tmp_path / "g"; h = tmp_path / "h"; g.mkdir(); h.mkdir()
+    for i in range(7):
+        _write_pairs(g, h, f"C{i}", seed=300 + i)
+    out = _run(g, h, "--max-cells", "0", "--n-threads", "1")
+    assert "7 shared cells; using 7 (all)" in out
+
+
+def test_cli_random_sample_reproducible(tmp_path):
+    """A seeded subsample of the cells is byte-identical run-to-run."""
+    g = tmp_path / "g"; h = tmp_path / "h"; g.mkdir(); h.mkdir()
+    for i in range(10):
+        _write_pairs(g, h, f"C{i}", seed=400 + i)
+    a = _run(g, h, "--max-cells", "4", "--seed", "5", "--n-threads", "1")
+    b = _run(g, h, "--max-cells", "4", "--seed", "5", "--n-threads", "1")
+    assert "using 4 (random, seed 5)" in a
+    assert _report_body(a) == _report_body(b)          # same seed → same tallies

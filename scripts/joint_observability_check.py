@@ -47,6 +47,18 @@ def _load(path: Path) -> pd.DataFrame:
     return df
 
 
+def subsample(shared, max_cells, seed):
+    """The shared cells to process: **all** of them when ``max_cells`` is
+    ``<= 0`` or ``>=`` the number available, else a **reproducible random**
+    subsample of size ``max_cells`` (seeded by ``seed``).  Returned sorted so
+    downstream order is stable regardless of which cells were drawn."""
+    if max_cells and 0 < max_cells < len(shared):
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(shared), size=max_cells, replace=False)
+        return sorted(shared[i] for i in idx)
+    return list(shared)
+
+
 def process_cell(gpath, hpath, min_gpc, min_cpg, mind, bsz):
     """Tally one cell's observation completeness.
 
@@ -121,7 +133,10 @@ def main():
                     help="Long-range 'linked' threshold (bp).")
     ap.add_argument("--bin-size", type=int, default=250_000)
     ap.add_argument("--max-cells", type=int, default=40,
-                    help="Sample at most this many shared cells (speed).")
+                    help="Random subsample of at most this many shared cells "
+                         "(speed); 0 or negative = use ALL shared cells.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="RNG seed for the random cell subsample (reproducible).")
     ap.add_argument("--n-threads", type=int, default=4,
                     help="Parallel worker threads over cells (joblib).")
     args = ap.parse_args()
@@ -133,9 +148,10 @@ def main():
     shared = sorted(set(gch) & set(hcg))
     if not shared:
         raise SystemExit("No cells shared between the two read-pair dirs.")
-    sample = shared[: args.max_cells]
+    sample = subsample(shared, args.max_cells, args.seed)
     mind, bsz = args.min_distance, args.bin_size
-    print(f"{len(shared)} shared cells; sampling {len(sample)} | min sites "
+    mode = "all" if len(sample) == len(shared) else f"random, seed {args.seed}"
+    print(f"{len(shared)} shared cells; using {len(sample)} ({mode}) | min sites "
           f"GpC>={min_gpc} CpG>={min_cpg} | bin {bsz:,} | {args.n_threads} threads")
 
     if args.n_threads > 1 and len(sample) > 1:
