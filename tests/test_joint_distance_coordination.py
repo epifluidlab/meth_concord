@@ -242,6 +242,49 @@ def _run_gh(tmp_path, region_bin, n_cells=30):
     return row, r.stdout
 
 
+def _write_offset_cell(gdir, hdir, cell, level, seed, n=400, dist=200):
+    """A cell with a global offset `level` but NO within-cell end-to-end coupling
+    (the two ends are independent draws around `level`).  Pooling cells of
+    different levels makes r(a_i,a_j) high (cell-type covariation); within-cell
+    centring removes it."""
+    rng = np.random.default_rng(seed)
+    cols = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
+    def ind():
+        return np.clip(level + 0.05 * rng.standard_normal(n), 0.01, 0.99)
+    p1 = 1_000_000 + 1_000 * np.arange(n); p2 = p1 + dist
+    pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p2, "n1": 5, "n2": 5,
+                  "posterior1": ind(), "posterior2": ind()})[cols].to_parquet(
+        gdir / f"{cell}.posteriors.parquet", index=False)
+    pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p2, "n1": 5, "n2": 5,
+                  "posterior1": ind(), "posterior2": ind()})[cols].to_parquet(
+        hdir / f"{cell}.posteriors.parquet", index=False)
+
+
+def test_pooled_includes_cell_offset_within_cell_removes_it(tmp_path):
+    gdir = tmp_path / "g"; hdir = tmp_path / "h"; gdir.mkdir(); hdir.mkdir()
+    _write_offset_cell(gdir, hdir, "A", level=0.8, seed=1)
+    _write_offset_cell(gdir, hdir, "B", level=0.2, seed=2)
+
+    def run(mode):
+        out = tmp_path / f"{mode}.pdf"
+        cmd = [sys.executable, str(_SCRIPT), "--gch-dir", str(gdir),
+               "--hcg-dir", str(hdir), "--out", str(out),
+               "--min-distance", "50", "--max-distance", "1000",
+               "--bins-per-decade", "3", "--min-pairs", "30", "--n-threads", "1",
+               "--cell-centering", mode]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+        df = pd.read_csv(out.with_suffix(".tsv"), sep="\t")
+        pop = df[np.isfinite(df["gg_r_contact"]) & (df["gg_n"] >= 30)]
+        return pop.iloc[(pop["center_bp"] - 200).abs().argmin()]["gg_r_contact"], r.stdout
+
+    pooled, out_p = run("pooled")
+    within, _ = run("within-cell")
+    assert pooled > 0.7                       # cell-type offset inflates pooled r
+    assert abs(within) < 0.2                  # within-cell centring removes it
+    assert "pooled across cells" in out_p
+
+
 def test_region_pooling_across_cells_recovers_coupling(tmp_path):
     # raw single-end posteriors: cross coupling attenuated by per-end noise
     raw, _ = _run_gh(tmp_path / "raw", region_bin=0)

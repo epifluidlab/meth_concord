@@ -14,18 +14,20 @@ CpG)``):
               (canonically NEGATIVE: open ↔ unmethylated, even across ends).
               Pools both directions (a_i,m_j) and (a_j,m_i).
 
-Each is a **within-cell** Pearson correlation: per (cell, distance-bin) the two
-ends are centred by that cell/bin mean, then the centred cross-products are
-pooled across cells — so a cell's global accessibility/methylation level can't
-masquerade as coordination.  (This is the BETWEEN-end coordination that the
-concordance method rides on; ``joint_state_2x2.py`` measures the orthogonal
-WITHIN-end a–m coupling.)
+By default (``--cell-centering pooled``) every linked pair from every cell whose
+two ends both clear the min-site gate enters ONE Pearson correlation per
+distance bin (sufficient stats summed across all cells, centred once).  With
+``--cell-centering within-cell`` each cell is instead centred by its own
+(cell, bin) mean first, removing cell-type covariation from the contact curve.
+(This is the BETWEEN-end coordination the concordance method rides on;
+``joint_state_2x2.py`` measures the orthogonal WITHIN-end a–m coupling.)
 
 For each curve a **distance-matched shuffle** null is drawn: within (cell,
 distance-bin) the partner end is permuted, so every end keeps its own value and
-distance class but is paired with an end from a DIFFERENT contact.  The gap
-between a real curve and its shuffle is the contact-specific coordination —
-agreement beyond what 1-D genomic distance alone implies.
+distance class but is paired with an end from a DIFFERENT contact.  Pooled, this
+shuffle traces the cell-type baseline; the gap between a real curve and its
+shuffle is the contact-specific coordination — agreement beyond what 1-D genomic
+distance (and, pooled, cell-type structure) alone imply.
 
 Distance is binned log-spaced from --min-distance (default 1 bp, the finest
 within-read scale) to --max-distance (default 1 Mb), --bins-per-decade per
@@ -293,7 +295,8 @@ def _logx(ax, lo, hi):
     ax.set_xlabel("distance between ends")
 
 
-def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0):
+def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0,
+          pooled=True):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -326,12 +329,12 @@ def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0):
     axn.set_yscale("log"); axn.set_ylabel("GCH–GCH pair count", color="0.5",
                                           fontsize=8)
     axn.tick_params(axis="y", colors="0.5", labelsize=7)
-    reg = (f"  |  region-avg {region_bin:,} bp (pooled)" if region_bin > 0
-           else "  |  within-cell Pearson r")
+    lvl = ("pooled across cells" if pooled else "within-cell") + " Pearson r"
+    reg = (f"  |  region-avg {region_bin:,} bp" if region_bin > 0 else "")
     fig.suptitle(
         f"Distance–coordination: contact vs distance-matched shuffle  |  "
-        f"{n_cells} cells  |  GpC≥{min_gpc}, CpG≥{min_cpg} sites/end{reg}",
-        fontsize=11)
+        f"{n_cells} cells  |  GpC≥{min_gpc}, CpG≥{min_cpg} sites/end  |  "
+        f"{lvl}{reg}", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out)
     plt.close(fig)
@@ -419,6 +422,14 @@ def main():
                          "the per-end posteriors to surface the region/"
                          "compartment-scale coupling (e.g. the strong GCH–HCG "
                          "anti-correlation). 0 = raw single-end posteriors.")
+    ap.add_argument("--cell-centering", choices=["pooled", "within-cell"],
+                    default="pooled",
+                    help="'pooled' (default): correlate ALL linked pairs from "
+                         "every cell together per distance bin — the shuffle "
+                         "then traces the cell-type baseline and real-minus-"
+                         "shuffle is the contact-specific excess. 'within-cell': "
+                         "centre each cell first, removing cell-type covariation "
+                         "from the contact curve. (Region mode is always pooled.)")
     ap.add_argument("--max-cells", type=int, default=0)
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
@@ -471,19 +482,24 @@ def main():
     if not res:
         sys.exit("No qualifying pairs found in the distance range.")
 
-    # region mode pools sufficient stats across cells then centres once (matches
-    # joint_state_2x2.py's pooled region r); default centres within each cell.
+    # 'pooled' sums the sufficient stats across ALL cells then centres ONCE, so
+    # every linked pair (both ends >= min sites) enters one correlation per
+    # distance bin (the within-cell-partner shuffle then traces the cell-type
+    # baseline; real-minus-shuffle is the contact-specific excess).  Region mode
+    # is always pooled.  'within-cell' instead centres each cell first, removing
+    # cell-type covariation from the contact curve.
+    pooled = region or args.cell_centering == "pooled"
     raw, curves = {}, {}
     for key, _ in _MEASURES:
         raw[key], curves[key] = {}, {}
         for kind in ("real", "shuf"):
             sums = [r[kind][key] for r in res]         # (6, nb) raw per cell
-            acc = _center(sum(sums)) if region else sum(_center(s) for s in sums)
+            acc = _center(sum(sums)) if pooled else sum(_center(s) for s in sums)
             raw[key][kind] = acc                       # (4, nb) cov/var/var/n
             curves[key][kind] = _corr(acc, args.min_pairs)
 
     # console summary at the decade marks
-    lvl = "pooled" if region else "within-cell"
+    lvl = "pooled across cells" if pooled else "within-cell"
     print(f"\n=== {lvl} Pearson r (contact | shuffle), {len(res)} cells ===")
     print(f"  {'distance':>10}{'n_pairs':>11} | "
           + "".join(f"{lab.split('  ')[0]:>20}" for _, lab in _MEASURES))
@@ -510,7 +526,7 @@ def main():
 
     out = Path(args.out)
     _plot(centers, edges, curves, len(res), args.min_gpc_sites,
-          args.min_cpg_sites, out, args.region_bin_size)
+          args.min_cpg_sites, out, args.region_bin_size, pooled)
     tsv = out.with_suffix(".tsv")
     _write_tsv(centers, edges, curves, tsv)
     print(f"\nwrote {out}\n      {tsv}")
