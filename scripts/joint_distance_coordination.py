@@ -301,6 +301,7 @@ def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     lo, hi = edges[0], edges[-1]
+    ylab = ("pooled" if pooled else "within-cell") + " Pearson r"
     colors = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c"}
     fig, axes = plt.subplots(2, 2, figsize=(12, 8.5))
     panels = dict(zip(("gg", "hh", "gh"), axes.flat[:3]))
@@ -312,7 +313,7 @@ def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0,
         ax.plot(centers, r_shuf, "--", color=c, ms=3, lw=1.2, alpha=0.7,
                 label="shuffle (dist-matched)")
         _logx(ax, lo, hi)
-        ax.set_ylabel("within-cell Pearson r")
+        ax.set_ylabel(ylab)
         ax.set_title(label, fontsize=10)
         ax.legend(fontsize=8, loc="best")
     # 4th panel: overlay the three contact curves + pair-count context
@@ -321,7 +322,7 @@ def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0,
     for key, label in _MEASURES:
         ax.plot(centers, curves[key]["real"][0], "-o", ms=3, lw=1.5,
                 color=colors[key], label=label.split("  ")[0])
-    _logx(ax, lo, hi); ax.set_ylabel("within-cell Pearson r")
+    _logx(ax, lo, hi); ax.set_ylabel(ylab)
     ax.set_title("contact curves overlaid", fontsize=10)
     ax.legend(fontsize=8, loc="best")
     axn = ax.twinx()
