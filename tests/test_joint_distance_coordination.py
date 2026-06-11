@@ -176,20 +176,24 @@ def test_cli_end_to_end(tmp_path):
     assert tsv.exists()
     # the band-level summary stats log is printed
     assert "concordance summary by distance band" in r.stdout
-    assert "headline (within-cell r)" in r.stdout
+    assert "headline (contact vs 1D-autocorr baseline)" in r.stdout
     assert "10kb-100kb" in r.stdout                # the populated ~50 kb band
     df = pd.read_csv(tsv, sep="\t")
+    # the 1D-autocorrelation curve and 95% CI columns are emitted
+    for col in ("gg_autocorr_r", "gg_contact_lo", "gg_contact_hi",
+                "hh_autocorr_r", "gh_autocorr_r"):
+        assert col in df.columns
     # the populated bin (~50 kb) must show the planted structure
-    pop = df[np.isfinite(df["gg_r_contact"]) & (df["gg_n"] >= 20)]
+    pop = df[np.isfinite(df["gg_contact_r"]) & (df["gg_contact_n"] >= 20)]
     assert len(pop) >= 1
     row = pop.iloc[(pop["center_bp"] - 50_000).abs().argmin()]
-    assert row["gg_r_contact"] > 0.6           # ends share accessibility
-    assert row["hh_r_contact"] > 0.6           # ends share methylation
-    assert row["gh_r_contact"] < -0.3          # acc_i ↔ meth_j anti-correlated
+    assert row["gg_contact_r"] > 0.6           # ends share accessibility
+    assert row["hh_contact_r"] > 0.6           # ends share methylation
+    assert row["gh_contact_r"] < -0.3          # acc_i ↔ meth_j anti-correlated
     # distance-matched shuffle collapses every correlation toward 0
-    assert abs(row["gg_r_shuffle"]) < 0.2
-    assert abs(row["hh_r_shuffle"]) < 0.2
-    assert abs(row["gh_r_shuffle"]) < 0.2
+    assert abs(row["gg_shuffle_r"]) < 0.2
+    assert abs(row["hh_shuffle_r"]) < 0.2
+    assert abs(row["gh_shuffle_r"]) < 0.2
 
 
 _N_REG = 40
@@ -237,9 +241,52 @@ def _run_gh(tmp_path, region_bin, n_cells=30):
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     df = pd.read_csv(out.with_suffix(".tsv"), sep="\t")
-    pop = df[np.isfinite(df["gh_r_contact"]) & (df["gh_n"] >= 30)]
+    pop = df[np.isfinite(df["gh_contact_r"]) & (df["gh_contact_n"] >= 30)]
     row = pop.iloc[(pop["center_bp"] - 200).abs().argmin()]
     return row, r.stdout
+
+
+def _write_track_cell(gdir, hdir, cell, seed, n=2500, step=200, block=10_000):
+    """A genome track where METHYLATION has block structure (co-methylated
+    within ~block bp) but ACCESSIBILITY is spatially flat — so the 1-D
+    autocorrelation null is strongly >0 for HCG at short range and ~0 for GCH."""
+    rng = np.random.default_rng(seed)
+    pos = 1_000_000 + step * np.arange(n)
+    blk = ((pos // block) % 2).astype(float)               # alternating blocks
+    m = np.clip(0.15 + 0.7 * blk + 0.10 * rng.standard_normal(n), 0.01, 0.99)
+    a = np.clip(rng.random(n), 0.01, 0.99)                 # no spatial structure
+    p1, p2 = pos[:-1], pos[1:]
+    cols = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
+    pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p2, "n1": 5, "n2": 5,
+                  "posterior1": a[:-1], "posterior2": a[1:]})[cols].to_parquet(
+        gdir / f"{cell}.posteriors.parquet", index=False)
+    pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p2, "n1": 5, "n2": 5,
+                  "posterior1": m[:-1], "posterior2": m[1:]})[cols].to_parquet(
+        hdir / f"{cell}.posteriors.parquet", index=False)
+
+
+def test_autocorr_null_and_confidence_intervals(tmp_path):
+    gdir = tmp_path / "g"; hdir = tmp_path / "h"; gdir.mkdir(); hdir.mkdir()
+    for i in range(4):
+        _write_track_cell(gdir, hdir, f"T{i}", seed=20 + i)
+    out = tmp_path / "auto.pdf"
+    cmd = [sys.executable, str(_SCRIPT), "--gch-dir", str(gdir),
+           "--hcg-dir", str(hdir), "--out", str(out),
+           "--min-distance", "200", "--max-distance", "100000",
+           "--bins-per-decade", "3", "--min-pairs", "30", "--n-threads", "1",
+           "--n-bootstrap", "100"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    df = pd.read_csv(out.with_suffix(".tsv"), sep="\t")
+    near = lambda d: (df["center_bp"] - d).abs().idxmin()
+    short = df.loc[near(1_000)]
+    # 1-D autocorr: methylation co-methylated at short range, accessibility flat
+    assert short["hh_autocorr_r"] > 0.4
+    assert short["gg_autocorr_r"] < 0.25
+    # 95% CI present and ordered wherever the point estimate is defined
+    fin = df[np.isfinite(df["hh_contact_r"])]
+    assert np.isfinite(fin["hh_contact_lo"]).all()
+    assert (fin["hh_contact_lo"] <= fin["hh_contact_hi"]).all()
 
 
 def _write_offset_cell(gdir, hdir, cell, level, seed, n=400, dist=200):
@@ -275,8 +322,8 @@ def test_pooled_includes_cell_offset_within_cell_removes_it(tmp_path):
         r = subprocess.run(cmd, capture_output=True, text=True)
         assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
         df = pd.read_csv(out.with_suffix(".tsv"), sep="\t")
-        pop = df[np.isfinite(df["gg_r_contact"]) & (df["gg_n"] >= 30)]
-        return pop.iloc[(pop["center_bp"] - 200).abs().argmin()]["gg_r_contact"], r.stdout
+        pop = df[np.isfinite(df["gg_contact_r"]) & (df["gg_contact_n"] >= 30)]
+        return pop.iloc[(pop["center_bp"] - 200).abs().argmin()]["gg_contact_r"], r.stdout
 
     pooled, out_p = run("pooled")
     within, _ = run("within-cell")
@@ -291,9 +338,9 @@ def test_region_pooling_across_cells_recovers_coupling(tmp_path):
     # region means POOLED ACROSS 30 SPARSE CELLS recover the planted −1 coupling,
     # which no single (2-end) cell could denoise on its own.
     reg, out = _run_gh(tmp_path / "reg", region_bin=_REG_SIZE)
-    assert abs(raw["gh_r_contact"]) < 0.45            # per-end: attenuated
-    assert reg["gh_r_contact"] < -0.7                 # pooled region: strong
-    assert reg["gh_r_contact"] < raw["gh_r_contact"] - 0.3
+    assert abs(raw["gh_contact_r"]) < 0.45            # per-end: attenuated
+    assert reg["gh_contact_r"] < -0.7                 # pooled region: strong
+    assert reg["gh_contact_r"] < raw["gh_contact_r"] - 0.3
     # same-modality terms go ~1 below the bin size (both ends share region mean)
-    assert reg["gg_r_contact"] > 0.9
+    assert reg["gg_contact_r"] > 0.9
     assert "pooled across all cells" in out           # pass-1 ran

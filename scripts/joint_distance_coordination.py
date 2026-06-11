@@ -22,12 +22,19 @@ distance bin (sufficient stats summed across all cells, centred once).  With
 (This is the BETWEEN-end coordination the concordance method rides on;
 ``joint_state_2x2.py`` measures the orthogonal WITHIN-end a–m coupling.)
 
-For each curve a **distance-matched shuffle** null is drawn: within (cell,
-distance-bin) the partner end is permuted, so every end keeps its own value and
-distance class but is paired with an end from a DIFFERENT contact.  Pooled, this
-shuffle traces the cell-type baseline; the gap between a real curve and its
-shuffle is the contact-specific coordination — agreement beyond what 1-D genomic
-distance (and, pooled, cell-type structure) alone imply.
+Each curve is drawn with two nulls and a **95% CI** (cell-resampling bootstrap,
+shaded):
+
+  * **1-D autocorrelation** — the SAME loci paired by genomic distance instead
+    of by ligation: the co-methylation / co-accessibility you'd see from 1-D
+    proximity ALONE (so it is naturally >0 at short range, where nearby CpGs are
+    co-methylated).  CONTACT *above* this line is 3-D-contact-specific.
+  * **distance-matched shuffle** — within (cell, distance-bin) the partner end
+    is permuted (a different contact), so it traces the marginal-independence
+    floor (pooled, the cell-type baseline).
+
+So contact − autocorr is the 3-D-specific coordination beyond 1-D proximity,
+and the bootstrap CI says whether a gap is real given the cell-to-cell spread.
 
 Distance is binned log-spaced from --min-distance (default 1 bp, the finest
 within-read scale) to --max-distance (default 1 Mb), --bins-per-decade per
@@ -119,6 +126,84 @@ def _within_bin_partner(bins, rng):
     partner = np.empty(n, dtype=np.int64)
     partner[sort_orig] = sort_rand
     return partner
+
+
+def _acc_into(arr, bi, x, y, mask):
+    """Add (n, Σx, Σy, Σx², Σy², Σxy) for masked x,y into column ``bi`` of a
+    (6, nb) sums array."""
+    x = x[mask]; y = y[mask]
+    if x.size == 0:
+        return
+    arr[0, bi] += x.size
+    arr[1, bi] += x.sum(); arr[2, bi] += y.sum()
+    arr[3, bi] += (x * x).sum(); arr[4, bi] += (y * y).sum()
+    arr[5, bi] += (x * y).sum()
+
+
+def _autocorr_sums(chrom, pos, A, M, AO, MO, edges, rng):
+    """1-D genomic autocorrelation null: pair each locus with ONE other locus in
+    the same genomic-distance bin (sampled, same chromosome) → the co-methylation
+    / co-accessibility you'd see from 1-D proximity ALONE, ignoring 3-D contact.
+
+    Uses the SAME loci as the contact curve, paired by genomic distance instead
+    of by ligation, so contact-minus-autocorr isolates the 3-D-contact-specific
+    coordination (and the autocorr line is naturally >0 at short range, where
+    nearby CpGs are co-methylated).  Returns raw (6, nb) sums per measure."""
+    nb = len(edges) - 1
+    out = {k: np.zeros((6, nb)) for k in ("gg", "hh", "gh")}
+    order = np.lexsort((pos, chrom))
+    cs = chrom[order]; ps = pos[order].astype(np.int64)
+    A, M, AO, MO = A[order], M[order], AO[order], MO[order]
+    uniq, starts = np.unique(cs, return_index=True)
+    bounds = np.append(starts, cs.size)
+    for k in range(uniq.size):
+        s, e = bounds[k], bounds[k + 1]
+        P = ps[s:e]
+        if P.size < 2:
+            continue
+        av, mv, ao, mo = A[s:e], M[s:e], AO[s:e], MO[s:e]
+        ie = [np.searchsorted(P, P + ed, side="left") for ed in edges]
+        for bi in range(nb):
+            cnt = ie[bi + 1] - ie[bi]
+            has = cnt > 0
+            if not has.any():
+                continue
+            off = np.minimum((rng.random(P.size) * cnt).astype(np.int64),
+                             np.maximum(cnt - 1, 0))
+            j = ie[bi] + off
+            ip = np.flatnonzero(has); jp = j[ip]
+            _acc_into(out["gg"], bi, av[ip], av[jp], ao[ip] & ao[jp])
+            _acc_into(out["hh"], bi, mv[ip], mv[jp], mo[ip] & mo[jp])
+            _acc_into(out["gh"], bi, av[ip], mv[jp], ao[ip] & mo[jp])
+            _acc_into(out["gh"], bi, mv[ip], av[jp], mo[ip] & ao[jp])
+    return out
+
+
+def _bootstrap_ci(per_cell, pooled, min_pairs, n_boot, seed):
+    """Cell-level bootstrap 95% CI for each bin's r.  Resamples CELLS (the
+    independent units) with replacement — honest about the real uncertainty,
+    unlike a per-pair Fisher CI that, with millions of non-independent pairs,
+    would be absurdly tight.  Returns (lo, hi) arrays (NaN where undefined)."""
+    nb = per_cell[0].shape[1]; nc = len(per_cell)
+    nanrow = np.full(nb, np.nan)
+    if n_boot <= 0 or nc < 2:
+        return nanrow, nanrow
+    stack = (np.stack(per_cell) if pooled
+             else np.stack([_center(s) for s in per_cell]))   # (nc, 6|4, nb)
+    rng = np.random.default_rng(seed)
+    boots = np.empty((n_boot, nb))
+    for b in range(n_boot):
+        agg = stack[rng.integers(0, nc, nc)].sum(axis=0)
+        cov, vx, vy, n = _center(agg) if pooled else agg
+        denom = np.sqrt(vx * vy)
+        boots[b] = np.where((denom > 0) & (n >= min_pairs),
+                            cov / np.where(denom > 0, denom, 1.0), np.nan)
+    ok = np.isfinite(boots).any(axis=0)
+    lo, hi = nanrow.copy(), nanrow.copy()
+    if ok.any():
+        lo[ok] = np.nanpercentile(boots[:, ok], 2.5, axis=0)
+        hi[ok] = np.nanpercentile(boots[:, ok], 97.5, axis=0)
+    return lo, hi
 
 
 def _load_kept(gpath, hpath, edges, min_gpc, min_cpg):
@@ -239,7 +324,13 @@ def process_cell(gpath, hpath, edges, min_gpc, min_cpg, seed, cell_idx,
     rng = np.random.default_rng(int(seed) + int(cell_idx) * 7919)
     p = _within_bin_partner(bins, rng)
     shuf = measures(a2[p], m2[p], ga2[p], hm2[p])
-    return {"real": real, "shuf": shuf}
+    # 1-D autocorrelation null over the same loci, paired by genomic distance
+    auto = _autocorr_sums(np.concatenate([chrom, chrom]),
+                          np.concatenate([p1, p2]),
+                          np.concatenate([a1, a2]), np.concatenate([m1, m2]),
+                          np.concatenate([ga1, ga2]), np.concatenate([hm1, hm2]),
+                          edges, rng)
+    return {"real": real, "shuf": shuf, "auto": auto}
 
 
 def _corr(acc, min_pairs):
@@ -284,7 +375,9 @@ def _pool_band(acc, centers, lo, hi, last):
 def _build_edges(min_d, max_d, per_decade):
     lo, hi = np.log10(max(min_d, 1)), np.log10(max_d)
     n_edges = max(2, int(round((hi - lo) * per_decade)) + 1)
-    return np.logspace(lo, hi, n_edges)
+    edges = np.logspace(lo, hi, n_edges)
+    edges[0], edges[-1] = float(min_d), float(max_d)   # exact bounds (FP-safe)
+    return edges
 
 
 def _logx(ax, lo, hi):
@@ -303,25 +396,35 @@ def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0,
     lo, hi = edges[0], edges[-1]
     ylab = ("pooled" if pooled else "within-cell") + " Pearson r"
     colors = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c"}
+    # (kind, linestyle, marker, line-alpha, band-alpha, label)
+    kinds = [("real", "-", "o", 1.0, 0.22, "contact"),
+             ("auto", "--", "", 0.9, 0.16, "1D autocorrelation"),
+             ("shuf", ":", "", 0.7, 0.10, "shuffle (dist-matched)")]
     fig, axes = plt.subplots(2, 2, figsize=(12, 8.5))
     panels = dict(zip(("gg", "hh", "gh"), axes.flat[:3]))
+
+    def draw(ax, key, kind, ls, mk, al, ba, lbl):
+        c = colors[key]
+        r, n, clo, chi = curves[key][kind]
+        if np.isfinite(clo).any():
+            ax.fill_between(centers, clo, chi, color=c, alpha=ba, lw=0)
+        ax.plot(centers, r, ls, marker=mk, color=c, ms=3.2, lw=1.5, alpha=al,
+                label=lbl)
+
     for key, label in _MEASURES:
-        ax = panels[key]; c = colors[key]
-        r_real = curves[key]["real"][0]; r_shuf = curves[key]["shuf"][0]
+        ax = panels[key]
         ax.axhline(0, color="0.6", lw=0.8, zorder=0)
-        ax.plot(centers, r_real, "-o", color=c, ms=3.5, lw=1.6, label="contact")
-        ax.plot(centers, r_shuf, "--", color=c, ms=3, lw=1.2, alpha=0.7,
-                label="shuffle (dist-matched)")
+        for kind, ls, mk, al, ba, lbl in kinds:
+            draw(ax, key, kind, ls, mk, al, ba, lbl)
         _logx(ax, lo, hi)
         ax.set_ylabel(ylab)
         ax.set_title(label, fontsize=10)
         ax.legend(fontsize=8, loc="best")
-    # 4th panel: overlay the three contact curves + pair-count context
+    # 4th panel: overlay the three contact curves (with CI) + pair-count context
     ax = axes.flat[3]
     ax.axhline(0, color="0.6", lw=0.8, zorder=0)
     for key, label in _MEASURES:
-        ax.plot(centers, curves[key]["real"][0], "-o", ms=3, lw=1.5,
-                color=colors[key], label=label.split("  ")[0])
+        draw(ax, key, "real", "-", "o", 1.0, 0.18, label.split("  ")[0])
     _logx(ax, lo, hi); ax.set_ylabel(ylab)
     ax.set_title("contact curves overlaid", fontsize=10)
     ax.legend(fontsize=8, loc="best")
@@ -333,9 +436,9 @@ def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0,
     lvl = ("pooled across cells" if pooled else "within-cell") + " Pearson r"
     reg = (f"  |  region-avg {region_bin:,} bp" if region_bin > 0 else "")
     fig.suptitle(
-        f"Distance–coordination: contact vs distance-matched shuffle  |  "
-        f"{n_cells} cells  |  GpC≥{min_gpc}, CpG≥{min_cpg} sites/end  |  "
-        f"{lvl}{reg}", fontsize=11)
+        f"Distance–coordination: contact vs 1D-autocorrelation vs shuffle  "
+        f"(95% CI shaded)  |  {n_cells} cells  |  GpC≥{min_gpc}, CpG≥{min_cpg} "
+        f"sites/end  |  {lvl}{reg}", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out)
     plt.close(fig)
@@ -345,54 +448,59 @@ def _write_tsv(centers, edges, curves, path):
     rows = {"bin_lo": edges[:-1].astype(np.int64),
             "bin_hi": edges[1:].astype(np.int64),
             "center_bp": np.round(centers).astype(np.int64)}
+    names = {"real": "contact", "auto": "autocorr", "shuf": "shuffle"}
     for key, _ in _MEASURES:
-        rows[f"{key}_r_contact"] = curves[key]["real"][0]
-        rows[f"{key}_r_shuffle"] = curves[key]["shuf"][0]
-        rows[f"{key}_n"] = curves[key]["real"][1].astype(np.int64)
+        for kind, nm in names.items():
+            r, n, clo, chi = curves[key][kind]
+            rows[f"{key}_{nm}_r"] = r
+            rows[f"{key}_{nm}_lo"] = clo
+            rows[f"{key}_{nm}_hi"] = chi
+            rows[f"{key}_{nm}_n"] = n.astype(np.int64)
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, na_rep="nan")
 
 
 def _print_band_summary(raw, curves, centers, min_d, max_d, eps=0.05):
     """Summary stats log: pool the per-bin concordance into decade distance
-    bands (within-cell partial sums summed across the band's bins, then a single
-    band-level r), and a per-measure headline (peak, contact-specific reach,
-    long-range floor).  ``contact - shuffle`` is the contact-specific excess."""
+    bands (partial sums summed across the band's bins, then a single band-level
+    r), and a per-measure headline.  The baseline is now the 1-D autocorrelation,
+    so ``Δ = contact - autocorr`` is the 3-D-contact-specific excess (beyond 1-D
+    proximity)."""
     edges = _band_edges(min_d, max_d)
     nbd = len(edges) - 1
     names = [lab.split("  ")[0] for _, lab in _MEASURES]
     print("\n=== concordance summary by distance band "
-          "(contact r | shuffle r | excess Δ) ===")
+          "(contact r | 1D-autocorr r | Δ=contact-autocorr) ===")
     print(f"  {'band':<14}{'n(GG)':>9}  "
-          + "".join(f"{nm + ' c|s|Δ':>22}" for nm in names))
+          + "".join(f"{nm + ' c|a|Δ':>22}" for nm in names))
     for bi in range(nbd):
         lo, hi, last = edges[bi], edges[bi + 1], bi == nbd - 1
         label = f"{_human_dist(lo)}-{_human_dist(hi)}"
         cols, n_gg = "", 0
         for key, _ in _MEASURES:
             rc, n = _r_scalar(_pool_band(raw[key]["real"], centers, lo, hi, last))
-            rs, _ = _r_scalar(_pool_band(raw[key]["shuf"], centers, lo, hi, last))
+            ra, _ = _r_scalar(_pool_band(raw[key]["auto"], centers, lo, hi, last))
             if key == "gg":
                 n_gg = int(n)
-            ex = rc - rs if (np.isfinite(rc) and np.isfinite(rs)) else np.nan
-            cols += (f"{_sgn(rc)}|{_sgn(rs)}|{_sgn(ex)}").rjust(22)
+            ex = rc - ra if (np.isfinite(rc) and np.isfinite(ra)) else np.nan
+            cols += (f"{_sgn(rc)}|{_sgn(ra)}|{_sgn(ex)}").rjust(22)
         print(f"  {label:<14}{n_gg:>9,d}  {cols}")
 
-    print("  headline (within-cell r):")
+    print("  headline (contact vs 1D-autocorr baseline):")
     for key, lab in _MEASURES:
         nm = lab.split("  ")[0]
-        rc = curves[key]["real"][0]; rs = curves[key]["shuf"][0]
-        ex = rc - rs
+        rc = curves[key]["real"][0]; ra = curves[key]["auto"][0]
+        ex = rc - ra
         fin = np.isfinite(rc)
         if not fin.any():
             print(f"    {nm:<8}: n/a (no bin above --min-pairs)")
             continue
         idx = int(np.nanargmax(np.where(fin, np.abs(rc), np.nan)))
-        sig = fin & (np.abs(ex) >= eps)
+        sig = fin & np.isfinite(ex) & (np.abs(ex) >= eps)
         reach = _human_dist(centers[sig].max()) if sig.any() else "none"
         lr, _ = _r_scalar(_pool_band(raw[key]["real"], centers,
                                      edges[-2], edges[-1], True))
         print(f"    {nm:<8}: peak {rc[idx]:+.3f} @ {_human_dist(centers[idx])}"
-              f"  ·  |contact-shuffle|>={eps} out to ~{reach}"
+              f"  ·  3D-specific |contact-autocorr|>={eps} out to ~{reach}"
               f"  ·  {_human_dist(edges[-2])}-{_human_dist(edges[-1])} pooled "
               f"{lr:+.3f}")
 
@@ -432,6 +540,9 @@ def main():
                          "centre each cell first, removing cell-type covariation "
                          "from the contact curve. (Region mode is always pooled.)")
     ap.add_argument("--max-cells", type=int, default=0)
+    ap.add_argument("--n-bootstrap", type=int, default=200,
+                    help="Cell-resampling bootstrap iterations for the 95%% CI "
+                         "shaded bands (0 = no CI).")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -493,27 +604,31 @@ def main():
     raw, curves = {}, {}
     for key, _ in _MEASURES:
         raw[key], curves[key] = {}, {}
-        for kind in ("real", "shuf"):
+        for kind in ("real", "shuf", "auto"):
             sums = [r[kind][key] for r in res]         # (6, nb) raw per cell
             acc = _center(sum(sums)) if pooled else sum(_center(s) for s in sums)
             raw[key][kind] = acc                       # (4, nb) cov/var/var/n
-            curves[key][kind] = _corr(acc, args.min_pairs)
+            r_, n_ = _corr(acc, args.min_pairs)
+            lo, hi = _bootstrap_ci(sums, pooled, args.min_pairs,
+                                   args.n_bootstrap, args.seed)
+            curves[key][kind] = (r_, n_, lo, hi)        # r, n, CI lo, CI hi
 
     # console summary at the decade marks
     lvl = "pooled across cells" if pooled else "within-cell"
-    print(f"\n=== {lvl} Pearson r (contact | shuffle), {len(res)} cells ===")
+    print(f"\n=== {lvl} Pearson r (contact / 1D-autocorr / shuffle), "
+          f"{len(res)} cells ===")
     print(f"  {'distance':>10}{'n_pairs':>11} | "
-          + "".join(f"{lab.split('  ')[0]:>20}" for _, lab in _MEASURES))
+          + "".join(f"{lab.split('  ')[0]:>22}" for _, lab in _MEASURES))
     for bi in range(nb):
         if not np.isfinite(curves['gg']['real'][0][bi]):
             continue
-        d = centers[bi]
         cells_txt = ""
         for key, _ in _MEASURES:
-            rr = curves[key]["real"][0][bi]; rs = curves[key]["shuf"][0][bi]
-            cells_txt += f"{rr:+7.3f}|{rs:+6.3f}   "
+            rc = curves[key]["real"][0][bi]; ra = curves[key]["auto"][0][bi]
+            rs = curves[key]["shuf"][0][bi]
+            cells_txt += f"{rc:+.2f}/{ra:+.2f}/{rs:+.2f}  "
         npairs = int(curves["gg"]["real"][1][bi])
-        print(f"  {d:>10,.0f}{npairs:>11,d} | {cells_txt}")
+        print(f"  {centers[bi]:>10,.0f}{npairs:>11,d} | {cells_txt}")
 
     if args.region_bin_size > 0:
         print(f"\n  (region-avg {args.region_bin_size:,} bp, pooled across all "
@@ -531,11 +646,12 @@ def main():
     tsv = out.with_suffix(".tsv")
     _write_tsv(centers, edges, curves, tsv)
     print(f"\nwrote {out}\n      {tsv}")
-    print("\nRead the figure: a POSITIVE GCH–GCH / HCG–HCG contact curve that "
-          "decays\n  with distance and sits ABOVE its flat ~0 shuffle = "
-          "contact-specific\n  state agreement; a NEGATIVE GCH–HCG curve at "
-          "short range that relaxes\n  toward 0 = the canonical open↔unmethylated "
-          "coupling is a local property.")
+    print("\nRead the figure (95% CI shaded): the 1D-AUTOCORRELATION line is the "
+          "co-\n  methylation / co-accessibility expected from 1-D genomic "
+          "proximity ALONE\n  (same loci, paired by distance not contact) — so it "
+          "is naturally >0 at\n  short range. CONTACT sitting ABOVE the "
+          "autocorrelation (Δ in the band\n  summary) is 3-D-contact-specific "
+          "coordination; the shuffle is the\n  marginal-independence floor.")
 
 
 if __name__ == "__main__":
