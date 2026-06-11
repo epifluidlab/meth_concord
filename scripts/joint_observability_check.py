@@ -22,7 +22,8 @@ Usage
     python scripts/joint_observability_check.py \\
         --gch-read-pairs-dir output/.../context_GCH/02_read_pair_counts \\
         --hcg-read-pairs-dir output/.../context_HCG/02_read_pair_counts \\
-        --min-sites 2 --min-distance 20000 --bin-size 250000 --max-cells 40
+        --min-gpc-sites 2 --min-cpg-sites 2 \\
+        --min-distance 20000 --bin-size 250000 --max-cells 40 --n-threads 4
 """
 
 from __future__ import annotations
@@ -46,19 +47,86 @@ def _load(path: Path) -> pd.DataFrame:
     return df
 
 
+def process_cell(gpath, hpath, min_gpc, min_cpg, mind, bsz):
+    """Tally one cell's observation completeness.
+
+    Returns a dict of **additive** contributions (count dicts, scalar tallies,
+    and per-(cell,bin) linked-count lists) so cells processed on different
+    threads can simply be summed/concatenated.  An end is GpC-informative at
+    ``>= min_gpc`` sites and CpG-informative at ``>= min_cpg`` sites — the two
+    modalities have independent thresholds."""
+    g = _load(Path(gpath)).rename(columns={"n1": "n1g", "n2": "n2g"})
+    h = _load(Path(hpath)).rename(columns={"n1": "n1h", "n2": "n2h"})
+    m = g.merge(h[["chrom", "pos1", "pos2", "n1h", "n2h"]],
+                on=["chrom", "pos1", "pos2"], how="outer")
+    for c in ("n1g", "n2g", "n1h", "n2h"):
+        m[c] = m[c].fillna(0)
+    if "distance" in m:
+        m["distance"] = m["distance"].fillna((m["pos2"] - m["pos1"]).abs())
+    # per-end informativeness (independent GpC / CpG thresholds)
+    g1, h1 = m["n1g"] >= min_gpc, m["n1h"] >= min_cpg
+    g2, h2 = m["n2g"] >= min_gpc, m["n2h"] >= min_cpg
+    same_bin = (m["pos1"] // bsz) == (m["pos2"] // bsz)
+    linked = same_bin & (m["distance"] >= mind)
+    end_counts = {"both": 0, "gch_only": 0, "cpg_only": 0, "neither": 0}
+    end_counts_link = {"both": 0, "gch_only": 0, "cpg_only": 0, "neither": 0}
+    for (gi, hi) in ((g1, h1), (g2, h2)):
+        end_counts["both"] += int((gi & hi).sum())
+        end_counts["gch_only"] += int((gi & ~hi).sum())
+        end_counts["cpg_only"] += int((~gi & hi).sum())
+        end_counts["neither"] += int((~gi & ~hi).sum())
+        end_counts_link["both"] += int((gi & hi & linked).sum())
+        end_counts_link["gch_only"] += int((gi & ~hi & linked).sum())
+        end_counts_link["cpg_only"] += int((~gi & hi & linked).sum())
+        end_counts_link["neither"] += int((~gi & ~hi & linked).sum())
+    strict = (g1 & h1) & (g2 & h2)
+    lenient = (g1 | h1) & (g2 | h2)
+    binid = (m["pos1"] // bsz)
+    ls = pd.DataFrame({"bin": binid[linked],
+                       "strict": (strict & linked)[linked].astype(int),
+                       "lenient": (lenient & linked)[linked].astype(int)})
+    if len(ls):
+        grp = ls.groupby("bin").sum()
+        per_bin_strict = grp["strict"].tolist()
+        per_bin_lenient = grp["lenient"].tolist()
+    else:
+        per_bin_strict, per_bin_lenient = [], []
+    return {
+        "end_counts": end_counts, "end_counts_link": end_counts_link,
+        "n_sb": int(same_bin.sum()),
+        "n_strict": int((strict & same_bin).sum()),
+        "n_lenient": int((lenient & same_bin).sum()),
+        "n_sb_link": int(linked.sum()),
+        "n_strict_link": int((strict & linked).sum()),
+        "n_lenient_link": int((lenient & linked).sum()),
+        "per_bin_strict": per_bin_strict, "per_bin_lenient": per_bin_lenient,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gch-read-pairs-dir", required=True)
     ap.add_argument("--hcg-read-pairs-dir", required=True)
     ap.add_argument("--min-sites", type=int, default=2,
-                    help="Min context sites per end to call a modality informative.")
+                    help="Shared default min sites/end for BOTH modalities "
+                         "(used where --min-gpc-sites/--min-cpg-sites are unset).")
+    ap.add_argument("--min-gpc-sites", type=int, default=None,
+                    help="Min GpC sites per end to call accessibility "
+                         "informative (default: --min-sites).")
+    ap.add_argument("--min-cpg-sites", type=int, default=None,
+                    help="Min CpG sites per end to call methylation "
+                         "informative (default: --min-sites).")
     ap.add_argument("--min-distance", type=int, default=20_000,
                     help="Long-range 'linked' threshold (bp).")
     ap.add_argument("--bin-size", type=int, default=250_000)
     ap.add_argument("--max-cells", type=int, default=40,
                     help="Sample at most this many shared cells (speed).")
+    ap.add_argument("--n-threads", type=int, default=4,
+                    help="Parallel worker threads over cells (joblib).")
     args = ap.parse_args()
+    min_gpc = args.min_gpc_sites if args.min_gpc_sites is not None else args.min_sites
+    min_cpg = args.min_cpg_sites if args.min_cpg_sites is not None else args.min_sites
 
     gch = _cells(Path(args.gch_read_pairs_dir))
     hcg = _cells(Path(args.hcg_read_pairs_dir))
@@ -66,62 +134,33 @@ def main():
     if not shared:
         raise SystemExit("No cells shared between the two read-pair dirs.")
     sample = shared[: args.max_cells]
-    print(f"{len(shared)} shared cells; sampling {len(sample)}.")
+    mind, bsz = args.min_distance, args.bin_size
+    print(f"{len(shared)} shared cells; sampling {len(sample)} | min sites "
+          f"GpC>={min_gpc} CpG>={min_cpg} | bin {bsz:,} | {args.n_threads} threads")
 
-    thr, mind, bsz = args.min_sites, args.min_distance, args.bin_size
-    end_counts = {"both": 0, "gch_only": 0, "cpg_only": 0, "neither": 0}
+    if args.n_threads > 1 and len(sample) > 1:
+        from joblib import Parallel, delayed
+        res = Parallel(n_jobs=args.n_threads, verbose=5)(
+            delayed(process_cell)(gch[c], hcg[c], min_gpc, min_cpg, mind, bsz)
+            for c in sample)
+    else:
+        res = [process_cell(gch[c], hcg[c], min_gpc, min_cpg, mind, bsz)
+               for c in sample]
+
+    # additive aggregation across cells (order-independent → thread-invariant)
+    keys = ("both", "gch_only", "cpg_only", "neither")
+    end_counts = {k: sum(r["end_counts"][k] for r in res) for k in keys}
     # same breakdown, but only over the two ends of LINKED (long-range,
     # same-bin >= min_distance) pairs — the ends the joint method actually uses.
-    end_counts_link = {"both": 0, "gch_only": 0, "cpg_only": 0, "neither": 0}
-    n_sb = n_strict = n_lenient = 0           # same-bin pair tallies
-    n_sb_link = n_strict_link = n_lenient_link = 0
-    per_bin_strict, per_bin_lenient = [], []
-
-    for cell in sample:
-        g = _load(gch[cell]).rename(columns={"n1": "n1g", "n2": "n2g"})
-        h = _load(hcg[cell]).rename(columns={"n1": "n1h", "n2": "n2h"})
-        m = g.merge(h[["chrom", "pos1", "pos2", "n1h", "n2h"]],
-                    on=["chrom", "pos1", "pos2"], how="outer")
-        for c in ("n1g", "n2g", "n1h", "n2h"):
-            m[c] = m[c].fillna(0)
-        if "distance" in m:
-            m["distance"] = m["distance"].fillna(
-                (m["pos2"] - m["pos1"]).abs())
-        # per-end informativeness
-        g1, h1 = m["n1g"] >= thr, m["n1h"] >= thr
-        g2, h2 = m["n2g"] >= thr, m["n2h"] >= thr
-        for (gi, hi) in ((g1, h1), (g2, h2)):
-            both = (gi & hi).sum()
-            go = (gi & ~hi).sum(); ho = (~gi & hi).sum()
-            nei = (~gi & ~hi).sum()
-            end_counts["both"] += int(both); end_counts["gch_only"] += int(go)
-            end_counts["cpg_only"] += int(ho); end_counts["neither"] += int(nei)
-        # pair classes
-        strict = (g1 & h1) & (g2 & h2)
-        lenient = (g1 | h1) & (g2 | h2)
-        same_bin = (m["pos1"] // bsz) == (m["pos2"] // bsz)
-        linked = same_bin & (m["distance"] >= mind)
-        # per-end modality restricted to the two ends of LINKED pairs
-        for (gi, hi) in ((g1, h1), (g2, h2)):
-            end_counts_link["both"] += int((gi & hi & linked).sum())
-            end_counts_link["gch_only"] += int((gi & ~hi & linked).sum())
-            end_counts_link["cpg_only"] += int((~gi & hi & linked).sum())
-            end_counts_link["neither"] += int((~gi & ~hi & linked).sum())
-        n_sb += int(same_bin.sum())
-        n_strict += int((strict & same_bin).sum())
-        n_lenient += int((lenient & same_bin).sum())
-        n_sb_link += int(linked.sum())
-        n_strict_link += int((strict & linked).sum())
-        n_lenient_link += int((lenient & linked).sum())
-        # per (cell, bin) linked counts
-        binid = (m["pos1"] // bsz)
-        ls = pd.DataFrame({"bin": binid[linked],
-                           "strict": (strict & linked)[linked].astype(int),
-                           "lenient": (lenient & linked)[linked].astype(int)})
-        if len(ls):
-            grp = ls.groupby("bin").sum()
-            per_bin_strict += grp["strict"].tolist()
-            per_bin_lenient += grp["lenient"].tolist()
+    end_counts_link = {k: sum(r["end_counts_link"][k] for r in res) for k in keys}
+    n_sb = sum(r["n_sb"] for r in res)
+    n_strict = sum(r["n_strict"] for r in res)
+    n_lenient = sum(r["n_lenient"] for r in res)
+    n_sb_link = sum(r["n_sb_link"] for r in res)
+    n_strict_link = sum(r["n_strict_link"] for r in res)
+    n_lenient_link = sum(r["n_lenient_link"] for r in res)
+    per_bin_strict = [v for r in res for v in r["per_bin_strict"]]
+    per_bin_lenient = [v for r in res for v in r["per_bin_lenient"]]
 
     tot_ends = sum(end_counts.values())
     print("\n=== per-end modality (over both ends of all joined pairs) ===")
