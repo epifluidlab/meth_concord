@@ -38,10 +38,12 @@ Usage
         --hcg-dir .../context_HCG/04_posteriors \\
         --out joint_distance_coordination.pdf
 
-    # --region-bin-size denoises per-end posteriors to their (cell, chrom,
-    # pos//SIZE) genomic-bin mean before correlating, surfacing the strong
-    # region/compartment-scale GCH-HCG coupling that single-end noise hides:
-    #     ... --region-bin-size 100000
+    # --region-bin-size denoises per-end posteriors to their (chrom, pos//SIZE)
+    # genomic-bin mean POOLED ACROSS ALL CELLS (a single cell is too sparse to
+    # denoise a small bin) before correlating, surfacing the strong region/
+    # compartment-scale GCH-HCG coupling that single-end noise hides — the
+    # distance-resolved analogue of joint_state_2x2.py's r(region):
+    #     ... --region-bin-size 2000
 """
 
 from __future__ import annotations
@@ -117,40 +119,10 @@ def _within_bin_partner(bins, rng):
     return partner
 
 
-def _region_average(chrom, p1, p2, a1, a2, m1, m2, ga1, ga2, hm1, hm2, B):
-    """Replace each end's per-end a/m with the mean a/m over its (chrom,
-    pos//B) genomic bin (averaging only the modality-observed ends) — the
-    distance-resolved analogue of joint_state_2x2.py's region-level coupling.
-
-    Denoising the per-end posteriors this way surfaces the region/compartment-
-    scale a-m anti-correlation that single-end noise attenuates.  Returns the
-    region-substituted (a1, a2, m1, m2, ga1, ga2, hm1, hm2); an end's region
-    mean is valid (mask True) only if its bin had >= 1 observed end."""
-    N = p1.size
-    ec = np.concatenate([chrom, chrom])
-    ep = np.concatenate([p1, p2])
-    ea = np.concatenate([a1, a2]); em = np.concatenate([m1, m2])
-    eao = np.concatenate([ga1, ga2]); emo = np.concatenate([hm1, hm2])
-    rb = (ep // B).astype(np.int64)
-    ccode = pd.factorize(ec)[0].astype(np.int64)
-    code = pd.factorize(ccode * (int(rb.max()) + 1) + rb)[0]
-    K = int(code.max()) + 1
-    na = np.bincount(code[eao], minlength=K).astype(np.float64)
-    nm = np.bincount(code[emo], minlength=K).astype(np.float64)
-    ma = np.bincount(code[eao], weights=ea[eao], minlength=K) / np.where(na > 0, na, 1.0)
-    mm = np.bincount(code[emo], weights=em[emo], minlength=K) / np.where(nm > 0, nm, 1.0)
-    Ra, Rm = ma[code], mm[code]
-    Va, Vm = (na > 0)[code], (nm > 0)[code]
-    return (Ra[:N], Ra[N:], Rm[:N], Rm[N:], Va[:N], Va[N:], Vm[:N], Vm[N:])
-
-
-def process_cell(gpath, hpath, edges, min_gpc, min_cpg, seed, cell_idx,
-                 region_bin=0):
-    """One cell → within-cell centred partial sums per (measure, real/shuf, bin).
-
-    Returns ``{"real": {gg,hh,gh}, "shuf": {...}}`` where each value is a
-    (4, nb) array (cov, var_x, var_y, n), or None if the cell has no joined
-    pairs in the distance range."""
+def _load_kept(gpath, hpath, edges, min_gpc, min_cpg):
+    """Shared load+join+distance-filter for both passes.  Returns
+    (chrom, p1, p2, bins, a1, a2, m1, m2, ga1, ga2, hm1, hm2, nb) over the kept
+    pairs, or None."""
     g = _load(Path(gpath)).rename(columns={"n1": "n1g", "n2": "n2g",
                                            "posterior1": "a1", "posterior2": "a2"})
     h = _load(Path(hpath)).rename(columns={"n1": "n1h", "n2": "n2h",
@@ -165,8 +137,6 @@ def process_cell(gpath, hpath, edges, min_gpc, min_cpg, seed, cell_idx,
         return None
     nb = len(edges) - 1
     bins = np.clip(np.digitize(dist[keep], edges) - 1, 0, nb - 1).astype(np.int64)
-    chrom = m["chrom"].to_numpy()[keep]
-    p1, p2 = pos1[keep], pos2[keep]
 
     def col(name):
         return m[name].to_numpy(np.float64)[keep]
@@ -177,18 +147,90 @@ def process_cell(gpath, hpath, edges, min_gpc, min_cpg, seed, cell_idx,
     hm2 = (col("n2h") >= min_cpg) & np.isfinite(m2)
     a1 = np.nan_to_num(a1); a2 = np.nan_to_num(a2)
     m1 = np.nan_to_num(m1); m2 = np.nan_to_num(m2)
+    return (m["chrom"].to_numpy()[keep], pos1[keep], pos2[keep], bins,
+            a1, a2, m1, m2, ga1, ga2, hm1, hm2, nb)
 
-    if region_bin and region_bin > 0:                  # denoise to region means
-        a1, a2, m1, m2, ga1, ga2, hm1, hm2 = _region_average(
-            chrom, p1, p2, a1, a2, m1, m2, ga1, ga2, hm1, hm2, region_bin)
+
+def cell_region_sums(gpath, hpath, edges, min_gpc, min_cpg, B):
+    """PASS 1 — one cell's per (chrom, pos//B) genomic-bin sums: Σa and count
+    over GpC-observed ends, Σm and count over CpG-observed ends.
+
+    A single cell is far too sparse to denoise a small bin on its own (~1 end
+    per 2 kb bin), so these are summed ACROSS ALL CELLS in :func:`_build_global_
+    means` to form well-pooled region means — matching how joint_state_2x2.py's
+    region coupling is pooled over the whole dataset."""
+    loaded = _load_kept(gpath, hpath, edges, min_gpc, min_cpg)
+    if loaded is None:
+        return None
+    chrom, p1, p2, _, a1, a2, m1, m2, ga1, ga2, hm1, hm2, _ = loaded
+    ec = np.concatenate([chrom, chrom])
+    erb = np.concatenate([p1, p2]) // B
+    ea = np.concatenate([a1, a2]); em = np.concatenate([m1, m2])
+    eao = np.concatenate([ga1, ga2]); emo = np.concatenate([hm1, hm2])
+    return pd.DataFrame({"chrom": ec, "rbin": erb,
+                         "sa": np.where(eao, ea, 0.0), "na": eao.astype(np.int64),
+                         "sm": np.where(emo, em, 0.0), "nm": emo.astype(np.int64)}
+                        ).groupby(["chrom", "rbin"], as_index=False).sum()
+
+
+def _build_global_means(sum_dfs, B):
+    """Aggregate the per-cell region sums into a pooled, lookup-ready table:
+    (chroms tuple, MULT, sorted int keys, mean_a, mean_m).  ``mean_*`` is NaN
+    where the region had no observed end of that modality (→ masked out)."""
+    g = pd.concat(sum_dfs, ignore_index=True).groupby(
+        ["chrom", "rbin"], as_index=False).sum()
+    na = g["na"].to_numpy(np.float64); nm = g["nm"].to_numpy(np.float64)
+    mean_a = np.where(na > 0, g["sa"].to_numpy() / np.where(na > 0, na, 1.0), np.nan)
+    mean_m = np.where(nm > 0, g["sm"].to_numpy() / np.where(nm > 0, nm, 1.0), np.nan)
+    chroms = tuple(sorted(g["chrom"].unique()))
+    cmap = {c: i for i, c in enumerate(chroms)}
+    cc = g["chrom"].map(cmap).to_numpy(np.int64)
+    rb = g["rbin"].to_numpy(np.int64)
+    mult = int(rb.max()) + 1 if rb.size else 1
+    key = cc * mult + rb
+    o = np.argsort(key)
+    return (chroms, mult, key[o], mean_a[o], mean_m[o])
+
+
+def _region_lookup(chrom, pos, gmeans, B):
+    """Each (chrom, pos//B) end → its pooled region (mean_a, mean_m), NaN if the
+    region is absent.  Vectorized: map chrom→code, searchsorted on the keys."""
+    chroms, mult, keys, ma, mm = gmeans
+    cc = np.full(chrom.shape, -1, dtype=np.int64)
+    for i, c in enumerate(chroms):
+        cc[chrom == c] = i
+    k = cc * mult + (pos // B)
+    idx = np.clip(np.searchsorted(keys, k), 0, max(len(keys) - 1, 0))
+    hit = (cc >= 0) & (keys[idx] == k) if keys.size else np.zeros(k.shape, bool)
+    return np.where(hit, ma[idx], np.nan), np.where(hit, mm[idx], np.nan)
+
+
+def process_cell(gpath, hpath, edges, min_gpc, min_cpg, seed, cell_idx,
+                 region_bin=0, gmeans=None):
+    """PASS 2 — one cell → RAW per-bin partial sums (6, nb) per (measure,
+    real/shuf), so the caller can pool ACROSS cells (region mode) or centre
+    within each cell (default).  In region mode each end's a/m is replaced by
+    its POOLED region mean (``gmeans``) before correlating."""
+    loaded = _load_kept(gpath, hpath, edges, min_gpc, min_cpg)
+    if loaded is None:
+        return None
+    chrom, p1, p2, bins, a1, a2, m1, m2, ga1, ga2, hm1, hm2, nb = loaded
+
+    if gmeans is not None:                              # substitute pooled region means
+        a1, m1 = _region_lookup(chrom, p1, gmeans, region_bin)
+        a2, m2 = _region_lookup(chrom, p2, gmeans, region_bin)
+        ga1, hm1 = np.isfinite(a1), np.isfinite(m1)
+        ga2, hm2 = np.isfinite(a2), np.isfinite(m2)
+        a1 = np.nan_to_num(a1); a2 = np.nan_to_num(a2)
+        m1 = np.nan_to_num(m1); m2 = np.nan_to_num(m2)
 
     def measures(a2_, m2_, ga2_, hm2_):
         return {
-            "gg": _center(_sums(bins, a1, a2_, ga1 & ga2_, nb)),
-            "hh": _center(_sums(bins, m1, m2_, hm1 & hm2_, nb)),
+            "gg": _sums(bins, a1, a2_, ga1 & ga2_, nb),
+            "hh": _sums(bins, m1, m2_, hm1 & hm2_, nb),
             # cross pools both end orderings so accessibility is always x, meth y
-            "gh": _center(_sums(bins, a1, m2_, ga1 & hm2_, nb)
-                          + _sums(bins, a2_, m1, ga2_ & hm1, nb)),
+            "gh": _sums(bins, a1, m2_, ga1 & hm2_, nb)
+                  + _sums(bins, a2_, m1, ga2_ & hm1, nb),
         }
 
     real = measures(a2, m2, ga2, hm2)
@@ -284,11 +326,12 @@ def _plot(centers, edges, curves, n_cells, min_gpc, min_cpg, out, region_bin=0):
     axn.set_yscale("log"); axn.set_ylabel("GCH–GCH pair count", color="0.5",
                                           fontsize=8)
     axn.tick_params(axis="y", colors="0.5", labelsize=7)
-    reg = f"  |  region-avg {region_bin:,} bp" if region_bin > 0 else ""
+    reg = (f"  |  region-avg {region_bin:,} bp (pooled)" if region_bin > 0
+           else "  |  within-cell Pearson r")
     fig.suptitle(
         f"Distance–coordination: contact vs distance-matched shuffle  |  "
-        f"{n_cells} cells  |  GpC≥{min_gpc}, CpG≥{min_cpg} sites/end  |  "
-        f"within-cell Pearson r{reg}", fontsize=11)
+        f"{n_cells} cells  |  GpC≥{min_gpc}, CpG≥{min_cpg} sites/end{reg}",
+        fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out)
     plt.close(fig)
@@ -400,30 +443,48 @@ def main():
           f"({args.bins_per_decade}/decade) | min sites GpC>={args.min_gpc_sites} "
           f"CpG>={args.min_cpg_sites}{reg}")
 
-    jobs = [(gch[c], hcg[c], edges, args.min_gpc_sites, args.min_cpg_sites,
-             args.seed, i, args.region_bin_size) for i, c in enumerate(shared)]
-    if args.n_threads > 1 and len(jobs) > 1:
+    region = args.region_bin_size > 0
+    par = None
+    if args.n_threads > 1 and len(shared) > 1:
         from joblib import Parallel, delayed
-        res = Parallel(n_jobs=args.n_threads, verbose=5)(
-            delayed(process_cell)(*j) for j in jobs)
-    else:
-        res = [process_cell(*j) for j in jobs]
+        par = Parallel(n_jobs=args.n_threads, verbose=5)
+
+    gmeans = None
+    if region:                                        # PASS 1: pool region means over ALL cells
+        sjobs = [(gch[c], hcg[c], edges, args.min_gpc_sites, args.min_cpg_sites,
+                  args.region_bin_size) for c in shared]
+        sums = (par(delayed(cell_region_sums)(*j) for j in sjobs) if par
+                else [cell_region_sums(*j) for j in sjobs])
+        sums = [s for s in sums if s is not None]
+        if not sums:
+            sys.exit("No ends in range to pool region means.")
+        gmeans = _build_global_means(sums, args.region_bin_size)
+        print(f"  region means: {len(gmeans[2]):,} genomic bins of "
+              f"{args.region_bin_size:,} bp pooled across all cells (pass 1)")
+
+    jobs = [(gch[c], hcg[c], edges, args.min_gpc_sites, args.min_cpg_sites,
+             args.seed, i, args.region_bin_size, gmeans)
+            for i, c in enumerate(shared)]
+    res = (par(delayed(process_cell)(*j) for j in jobs) if par
+           else [process_cell(*j) for j in jobs])
     res = [r for r in res if r is not None]
     if not res:
         sys.exit("No qualifying pairs found in the distance range.")
 
+    # region mode pools sufficient stats across cells then centres once (matches
+    # joint_state_2x2.py's pooled region r); default centres within each cell.
     raw, curves = {}, {}
     for key, _ in _MEASURES:
         raw[key], curves[key] = {}, {}
         for kind in ("real", "shuf"):
-            acc = np.zeros((4, nb))
-            for r in res:
-                acc += r[kind][key]
-            raw[key][kind] = acc                       # (4, nb) partial sums
+            sums = [r[kind][key] for r in res]         # (6, nb) raw per cell
+            acc = _center(sum(sums)) if region else sum(_center(s) for s in sums)
+            raw[key][kind] = acc                       # (4, nb) cov/var/var/n
             curves[key][kind] = _corr(acc, args.min_pairs)
 
     # console summary at the decade marks
-    print(f"\n=== within-cell Pearson r (contact | shuffle), {len(res)} cells ===")
+    lvl = "pooled" if region else "within-cell"
+    print(f"\n=== {lvl} Pearson r (contact | shuffle), {len(res)} cells ===")
     print(f"  {'distance':>10}{'n_pairs':>11} | "
           + "".join(f"{lab.split('  ')[0]:>20}" for _, lab in _MEASURES))
     for bi in range(nb):
@@ -438,10 +499,11 @@ def main():
         print(f"  {d:>10,.0f}{npairs:>11,d} | {cells_txt}")
 
     if args.region_bin_size > 0:
-        print(f"\n  (region-avg {args.region_bin_size:,} bp: same-modality "
-              f"GCH–GCH / HCG–HCG ≈ 1 below the bin size — both ends share the "
-              f"region mean; read the GCH–HCG cross curve for the denoised "
-              f"region/compartment-scale a–m coupling.)")
+        print(f"\n  (region-avg {args.region_bin_size:,} bp, pooled across all "
+              f"cells: same-modality GCH–GCH / HCG–HCG ≈ 1 below the bin size — "
+              f"both ends share the region mean; read the GCH–HCG cross curve "
+              f"for the denoised region/compartment-scale a–m coupling, the "
+              f"distance-resolved analogue of joint_state_2x2.py's r(region).)")
 
     _print_band_summary(raw, curves, centers, args.min_distance,
                         args.max_distance)

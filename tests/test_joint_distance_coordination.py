@@ -192,18 +192,23 @@ def test_cli_end_to_end(tmp_path):
     assert abs(row["gh_r_shuffle"]) < 0.2
 
 
-def _write_region_cell(gdir, hdir, cell, seed, n_reg=25, per_reg=80,
-                       reg_size=10_000, dist=200, noise=0.5):
-    """Pairs grouped into genomic regions; each region r has a latent A_r with
-    methylation = 1 − A_r, but each end's posterior is A_r/(1−A_r) plus LARGE
-    per-end noise — so single-end r(a,m) is heavily attenuated, while the
-    region mean (over many ends) recovers the strong −1 anti-correlation."""
+_N_REG = 40
+_REG_SIZE = 10_000
+# fixed compartment latent A_r per region (SAME across cells, so pooling many
+# cells denoises the same latent); methylation = 1 − A_r.
+_A = 0.2 + 0.6 * (np.arange(_N_REG) + 0.5) / _N_REG
+
+
+def _write_region_cell(gdir, hdir, cell, seed, per_reg=2, dist=200, noise=0.7):
+    """SPARSE per cell: only ``per_reg`` ends per region, so a single cell can't
+    denoise (per-cell mean of ~2 noisy ends is still noisy) — only pooling the
+    region across MANY cells recovers the planted −1 compartment coupling."""
     rng = np.random.default_rng(seed)
     cols = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
     g, h = [], []
-    for r in range(n_reg):
-        A = rng.random()
-        base = 1_000_000 + r * reg_size * 2          # regions well separated
+    for r in range(_N_REG):
+        A = _A[r]
+        base = 1_000_000 + r * _REG_SIZE * 2         # regions well separated
         p1 = base + 10 * np.arange(per_reg)
         p2 = p1 + dist                               # both ends inside the region
         a1 = np.clip(A + noise * rng.standard_normal(per_reg), 0.01, 0.99)
@@ -218,10 +223,10 @@ def _write_region_cell(gdir, hdir, cell, seed, n_reg=25, per_reg=80,
     pd.concat(h)[cols].to_parquet(hdir / f"{cell}.posteriors.parquet", index=False)
 
 
-def _run_gh(tmp_path, region_bin):
+def _run_gh(tmp_path, region_bin, n_cells=30):
     gdir = tmp_path / "g"; hdir = tmp_path / "h"
     gdir.mkdir(parents=True, exist_ok=True); hdir.mkdir(parents=True, exist_ok=True)
-    for i in range(2):
+    for i in range(n_cells):
         _write_region_cell(gdir, hdir, f"R{i}", seed=70 + i)
     out = tmp_path / f"r{region_bin}.pdf"
     cmd = [sys.executable, str(_SCRIPT), "--gch-dir", str(gdir),
@@ -234,16 +239,18 @@ def _run_gh(tmp_path, region_bin):
     df = pd.read_csv(out.with_suffix(".tsv"), sep="\t")
     pop = df[np.isfinite(df["gh_r_contact"]) & (df["gh_n"] >= 30)]
     row = pop.iloc[(pop["center_bp"] - 200).abs().argmin()]
-    return row
+    return row, r.stdout
 
 
-def test_region_averaging_recovers_coupling(tmp_path):
+def test_region_pooling_across_cells_recovers_coupling(tmp_path):
     # raw single-end posteriors: cross coupling attenuated by per-end noise
-    raw = _run_gh(tmp_path / "raw", region_bin=0)
-    # region-averaged: the strong −1 region anti-correlation is recovered
-    reg = _run_gh(tmp_path / "reg", region_bin=10_000)
+    raw, _ = _run_gh(tmp_path / "raw", region_bin=0)
+    # region means POOLED ACROSS 30 SPARSE CELLS recover the planted −1 coupling,
+    # which no single (2-end) cell could denoise on its own.
+    reg, out = _run_gh(tmp_path / "reg", region_bin=_REG_SIZE)
     assert abs(raw["gh_r_contact"]) < 0.45            # per-end: attenuated
-    assert reg["gh_r_contact"] < -0.7                 # region: strong negative
+    assert reg["gh_r_contact"] < -0.7                 # pooled region: strong
     assert reg["gh_r_contact"] < raw["gh_r_contact"] - 0.3
     # same-modality terms go ~1 below the bin size (both ends share region mean)
     assert reg["gg_r_contact"] > 0.9
+    assert "pooled across all cells" in out           # pass-1 ran
