@@ -19,6 +19,7 @@ def run_svd_scree(
     output_prefix: str = "svd_scree",
     output_dir: str = "output/06_umap",
     random_state: int = 42,
+    plot_format: str = "png",
 ) -> pd.DataFrame:
     """Fit TruncatedSVD on ``matrix`` and emit a scree plot + table.
 
@@ -33,8 +34,11 @@ def run_svd_scree(
         Upper bound on number of components to fit.  Clamped to
         min(max_components, n_cells - 1, n_bins).
     output_prefix : str
-        Filename prefix for the .tsv and .png outputs.
+        Filename prefix for the .tsv and figure outputs.
     output_dir : str
+    plot_format : str
+        Figure extension: ``png`` (default), or a vector format such as
+        ``pdf`` / ``svg`` for publication figures.
 
     Returns
     -------
@@ -96,7 +100,8 @@ def run_svd_scree(
 
     ax1.set_title(f"SVD scree: top {k} components")
     fig.tight_layout()
-    fig.savefig(out_path / f"{output_prefix}.png", dpi=150, bbox_inches="tight")
+    fig.savefig(out_path / f"{output_prefix}.{plot_format}", dpi=150,
+                bbox_inches="tight")
     plt.close(fig)
 
     # Log the K needed to hit common variance thresholds.
@@ -159,6 +164,7 @@ def run_umap_and_plot(
     random_state: int = 42,
     group_colors: dict | None = None,
     group_order: list | None = None,
+    plot_format: str = "png",
 ) -> pd.DataFrame:
     """Embed ``matrix`` via UMAP and save a coordinate table + scatter plot.
 
@@ -194,6 +200,9 @@ def run_umap_and_plot(
         present in the data but absent from the list are appended in
         data-encounter order; names in the list that aren't in the data are
         ignored, so one order can be reused across subsets.
+    plot_format : str
+        Figure extension: ``png`` (default), or a vector format such as
+        ``pdf`` / ``svg`` for publication figures.
 
     Returns
     -------
@@ -304,7 +313,8 @@ def run_umap_and_plot(
     ax.set_ylabel("UMAP2")
     ax.set_title(title)
     plt.tight_layout()
-    plt.savefig(out_path / f"{output_prefix}.png", dpi=150, bbox_inches="tight")
+    plt.savefig(out_path / f"{output_prefix}.{plot_format}", dpi=150,
+                bbox_inches="tight")
     plt.close(fig)
 
     return result

@@ -123,3 +123,46 @@ def test_cli_accepts_color_and_order_flags():
 def test_cli_defaults_are_none():
     args = parse_args(["--samples", "s.tsv", "--output-dir", "out"])
     assert args.color_column is None and args.group_order is None
+
+
+# --------------------------------------------------------------------------
+# --plot-format
+# --------------------------------------------------------------------------
+
+def test_cli_plot_format_default_and_choices():
+    assert parse_args(["--samples", "s.tsv", "--output-dir", "o"]).plot_format \
+        == "png"
+    assert parse_args(["--samples", "s.tsv", "--output-dir", "o",
+                       "--plot-format", "pdf"]).plot_format == "pdf"
+    with pytest.raises(SystemExit):
+        parse_args(["--samples", "s.tsv", "--output-dir", "o",
+                    "--plot-format", "jpeg"])
+
+
+@pytest.mark.parametrize("fmt", ["png", "pdf", "svg"])
+def test_svd_scree_honours_plot_format(tmp_path, fmt):
+    """run_svd_scree needs no umap, so it exercises the real savefig path."""
+    from nome_hic_concordance.visualization import run_svd_scree
+
+    rng = np.random.default_rng(0)
+    m = pd.DataFrame(rng.random((12, 20)),
+                     index=[f"c{i}" for i in range(12)])
+    run_svd_scree(m, max_components=4, output_prefix="scree",
+                  output_dir=str(tmp_path), plot_format=fmt)
+    fig = tmp_path / f"scree.{fmt}"
+    assert fig.exists() and fig.stat().st_size > 0
+    # the vector formats are real vector files, not a renamed raster
+    head = fig.read_bytes()[:5]
+    if fmt == "pdf":
+        assert head.startswith(b"%PDF")
+    elif fmt == "png":
+        assert head.startswith(b"\x89PNG")
+
+
+def test_svd_scree_defaults_to_png(tmp_path):
+    from nome_hic_concordance.visualization import run_svd_scree
+
+    rng = np.random.default_rng(1)
+    m = pd.DataFrame(rng.random((10, 15)), index=[f"c{i}" for i in range(10)])
+    run_svd_scree(m, max_components=3, output_prefix="s", output_dir=str(tmp_path))
+    assert (tmp_path / "s.png").exists()

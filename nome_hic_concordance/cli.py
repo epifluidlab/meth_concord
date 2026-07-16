@@ -237,6 +237,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "for pearson and betabinom (legacy).",
     )
     parser.add_argument(
+        "--plot-format", type=str, default="png",
+        choices=["png", "pdf", "svg"],
+        help="Figure format for the step-7 UMAP and SVD-scree plots. "
+             "'pdf' (or 'svg') writes a vector figure for publication; "
+             "default 'png'.",
+    )
+    parser.add_argument(
         "--color-column", type=str, default=None,
         help="Column in --samples holding the plot colour for each cell (a hex "
              "code like '#1f77b4' or a matplotlib colour name).  Every cell of "
@@ -1283,6 +1290,7 @@ def run_context(
                 output_prefix=f"svd_scree_{matrix_norm}",
                 output_dir=str(umap_dir),
                 random_state=args.random_seed,
+                plot_format=args.plot_format,
             )
 
             svd_suffix = f"_svd{n_svd}" if n_svd and n_svd > 0 else ""
@@ -1305,6 +1313,7 @@ def run_context(
                 random_state=args.random_seed,
                 group_colors=group_colors,
                 group_order=group_order,
+                plot_format=args.plot_format,
             )
             visualization.run_umap_and_plot(
                 matrices["zscore"], group_labels,
@@ -1317,6 +1326,7 @@ def run_context(
                 random_state=args.random_seed,
                 group_colors=group_colors,
                 group_order=group_order,
+                plot_format=args.plot_format,
             )
     else:
         logger.info("Step 7: Skipped.")
