@@ -116,6 +116,34 @@ def run_svd_scree(
     return df
 
 
+def order_groups(groups, group_order) -> list:
+    """Groups arranged for the legend: those named in ``group_order`` first, in
+    that order, then any remaining groups in data-encounter order.
+
+    Names in ``group_order`` that don't occur in the data are ignored, so a
+    single project-wide order string can be reused across cell subsets.
+    """
+    seq = list(groups)
+    if not group_order:
+        return seq
+    present = set(seq)
+    ordered = [g for g in group_order if g in present]
+    named = set(ordered)
+    return ordered + [g for g in seq if g not in named]
+
+
+def resolve_group_colors(groups, group_colors) -> list:
+    """One colour per group: the explicit ``group_colors`` entry where present,
+    else that slot's tab20 fallback (so a partial colour column still works)."""
+    import matplotlib.pyplot as plt
+
+    n = len(groups)
+    fallback = list(plt.cm.tab20(np.linspace(0, 1, max(n, 1))))
+    if not group_colors:
+        return fallback
+    return [group_colors.get(g, fallback[i]) for i, g in enumerate(groups)]
+
+
 def run_umap_and_plot(
     matrix: pd.DataFrame,
     group_labels: pd.Series | None = None,
@@ -129,6 +157,8 @@ def run_umap_and_plot(
     skip_top_svd: int = 0,
     n_threads: int = 4,
     random_state: int = 42,
+    group_colors: dict | None = None,
+    group_order: list | None = None,
 ) -> pd.DataFrame:
     """Embed ``matrix`` via UMAP and save a coordinate table + scatter plot.
 
@@ -154,6 +184,16 @@ def run_umap_and_plot(
         top components carry non-target signal (per-cell depth, batch,
         k-NN community structure).  Requires ``n_svd > skip_top_svd``.
         Default 0.
+    group_colors : dict, optional
+        ``group -> matplotlib colour`` (hex or named).  Overrides the default
+        tab20 palette, and lifts the 20-group cap (with explicit colours there
+        is no palette to run out of).  Groups missing from the dict fall back
+        to tab20.
+    group_order : list, optional
+        Explicit group order for the legend (and plotting/z-order).  Groups
+        present in the data but absent from the list are appended in
+        data-encounter order; names in the list that aren't in the data are
+        ignored, so one order can be reused across subsets.
 
     Returns
     -------
@@ -242,14 +282,16 @@ def run_umap_and_plot(
     result.to_csv(out_path / f"{output_prefix}_coordinates.tsv", sep="\t", index=False)
 
     fig, ax = plt.subplots(figsize=(8, 7))
-    unique_groups = result["group"].dropna().unique()
-    if group_labels is not None and 0 < len(unique_groups) <= 20:
-        colors = plt.cm.tab20(np.linspace(0, 1, max(len(unique_groups), 1)))
+    unique_groups = order_groups(result["group"].dropna().unique(), group_order)
+    n_g = len(unique_groups)
+    # explicit colours also lift the tab20 cap — there is no palette to exhaust
+    if group_labels is not None and n_g > 0 and (n_g <= 20 or group_colors):
+        colors = resolve_group_colors(unique_groups, group_colors)
         for g, c in zip(unique_groups, colors):
             mask = result["group"] == g
             ax.scatter(
                 result.loc[mask, "UMAP1"], result.loc[mask, "UMAP2"],
-                c=[c], label=str(g), s=15, alpha=0.75, edgecolors="none",
+                color=c, label=str(g), s=15, alpha=0.75, edgecolors="none",
             )
         ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
     else:

@@ -237,6 +237,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "for pearson and betabinom (legacy).",
     )
     parser.add_argument(
+        "--color-column", type=str, default=None,
+        help="Column in --samples holding the plot colour for each cell (a hex "
+             "code like '#1f77b4' or a matplotlib colour name).  Every cell of "
+             "a group should carry the same colour; the group's first colour "
+             "wins (a warning names any group with more than one).  When set, "
+             "the UMAP legend uses these colours instead of tab20, which also "
+             "lifts the 20-group cap.",
+    )
+    parser.add_argument(
+        "--group-order", type=str, default=None,
+        help="COMMA-SEPARATED group order for the UMAP legend, e.g. "
+             "'IT-L2/3,IT-L4,IT-L5'.  Groups present in --samples but absent "
+             "here are appended in data order; names not in the data are "
+             "ignored, so one order can be reused across subsets.",
+    )
+    parser.add_argument(
         "--batch-column", type=str, default=None,
         help="Column name(s) in --samples holding batch labels.  Accepts a "
              "single column (e.g. 'batch') or a COMMA-SEPARATED list of "
@@ -521,6 +537,49 @@ def load_samples(path: str) -> pd.DataFrame:
     n_groups = df["group"].nunique()
     logger.info(f"Loaded {len(df)} samples, {n_groups} group(s).")
     return df
+
+
+def group_colors_from_samples(samples: pd.DataFrame,
+                              color_column: str | None) -> dict | None:
+    """``group -> colour`` from a per-cell colour column in --samples.
+
+    The legend is per group, so each group needs one colour: the group's first
+    colour wins and any group carrying several is named in a warning.  Colours
+    are validated up front (matplotlib hex/name) so a typo fails loudly here
+    rather than deep inside plotting.  Returns None when no column is given.
+    """
+    if not color_column:
+        return None
+    if color_column not in samples.columns:
+        raise ValueError(
+            f"--color-column {color_column!r} not in the sample manifest. "
+            f"Available columns: {samples.columns.tolist()}"
+        )
+    from matplotlib.colors import is_color_like
+
+    sub = samples[["group", color_column]].dropna(subset=[color_column])
+    mapping: dict = {}
+    for g, vals in sub.groupby("group")[color_column]:
+        uniq = list(dict.fromkeys(vals))          # unique, first-seen order
+        if len(uniq) > 1:
+            logger.warning(
+                f"--color-column {color_column!r}: group {g!r} has "
+                f"{len(uniq)} colours {uniq}; using {uniq[0]!r}."
+            )
+        if not is_color_like(uniq[0]):
+            raise ValueError(
+                f"--color-column {color_column!r}: {uniq[0]!r} (group {g!r}) is "
+                f"not a matplotlib colour (use a hex code like '#1f77b4' or a "
+                f"named colour)."
+            )
+        mapping[g] = uniq[0]
+    missing = sorted(set(samples["group"]) - set(mapping))
+    if missing:
+        logger.warning(
+            f"--color-column {color_column!r}: no colour for group(s) {missing}; "
+            f"they fall back to the default palette."
+        )
+    return mapping
 
 
 def _parse_context_bed(spec: str) -> dict[str, str]:
@@ -1196,6 +1255,9 @@ def run_context(
         )
 
         group_labels = samples.set_index("cell_name")["group"]
+        group_colors = group_colors_from_samples(samples, args.color_column)
+        group_order = ([s.strip() for s in args.group_order.split(",") if s.strip()]
+                       if args.group_order else None)
 
         if matrices["imputed"].shape[1] == 0:
             logger.warning(
@@ -1241,6 +1303,8 @@ def run_context(
                 skip_top_svd=skip_top_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
+                group_colors=group_colors,
+                group_order=group_order,
             )
             visualization.run_umap_and_plot(
                 matrices["zscore"], group_labels,
@@ -1251,6 +1315,8 @@ def run_context(
                 skip_top_svd=skip_top_svd,
                 n_threads=args.n_threads,
                 random_state=args.random_seed,
+                group_colors=group_colors,
+                group_order=group_order,
             )
     else:
         logger.info("Step 7: Skipped.")
