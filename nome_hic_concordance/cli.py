@@ -7,6 +7,7 @@ or with ``python -m nome_hic_concordance``.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import sys
@@ -499,21 +500,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
+def _manifest_text(path: str) -> io.StringIO:
+    """Manifest text with WHOLE-LINE ``#`` comments dropped.
+
+    Deliberately not pandas' ``comment='#'``: that also strips INLINE ``#...``,
+    which silently truncates a row at a hex colour like ``#FF9A4C`` — blanking
+    that field *and every column to its right* (so --color-column and the batch
+    columns all came back NaN).  Only full-line comments are removed here, which
+    keeps ``#`` usable inside a field.
+    """
+    with open(path) as fh:
+        kept = [ln for ln in fh if not ln.lstrip().startswith("#")]
+    return io.StringIO("".join(kept))
+
+
 def load_samples(path: str) -> pd.DataFrame:
     """Load a TSV manifest: cell_name, bam_path, optional group.
 
     Accepts files with or without a header row.  If the first row looks
     like a header (first field equals ``cell_name``), it is consumed as
-    column names; otherwise the file is treated as headerless.
+    column names; otherwise the file is treated as headerless.  ``#`` starts a
+    comment only at the START of a line, so hex colours are safe in any field.
     """
-    # Peek at the first line to decide whether a header is present.
+    # Peek at the first non-comment line to decide whether a header is present.
+    first_line = ""
     with open(path) as fh:
-        first_line = fh.readline().strip()
+        for line in fh:
+            if line.strip() and not line.lstrip().startswith("#"):
+                first_line = line.strip()
+                break
     first_field = first_line.split("\t")[0].strip().lower()
     has_header = first_field in ("cell_name", "cellname", "cell", "sample", "sample_name")
 
     if has_header:
-        df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+        df = pd.read_csv(_manifest_text(path), sep="\t", dtype=str)
         # Normalise column names coming from the header.
         col_map = {c: c.strip().lower().replace(" ", "_") for c in df.columns}
         df.rename(columns=col_map, inplace=True)
@@ -526,7 +546,7 @@ def load_samples(path: str) -> pd.DataFrame:
             df.rename(columns={"sample_name": "cell_name"}, inplace=True)
     else:
         df = pd.read_csv(
-            path, sep="\t", header=None, comment="#",
+            _manifest_text(path), sep="\t", header=None,
             names=["cell_name", "bam_path", "group"],
             engine="python", dtype=str,
         )

@@ -11,8 +11,52 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from nome_hic_concordance.cli import group_colors_from_samples, parse_args
+from nome_hic_concordance.cli import (group_colors_from_samples, load_samples,
+                                      parse_args)
 from nome_hic_concordance.visualization import order_groups, resolve_group_colors
+
+
+# --------------------------------------------------------------------------
+# load_samples: '#' is a comment only at the START of a line
+# --------------------------------------------------------------------------
+
+_MANIFEST = (
+    "cell_name\tbam_path\tgroup\tcolor\texp_batch\tplate_batch\tlib_batch\n"
+    "b2.ACTTGA\tb2.ACTTGA.bam\tIT-L2/3\t#FF9A4C\tbatch2\tplate9\t2024-02-08\n"
+    "b2.ATCACG\tb2.ATCACG.bam\tODC\t#66C2A5\tbatch2\tplate10\t2024-02-05\n"
+)
+
+
+def test_hex_colors_do_not_truncate_the_row(tmp_path):
+    """Regression: pandas' comment='#' treated a hex colour as an inline
+    comment, blanking it AND every column to its right (batch columns)."""
+    p = tmp_path / "s.tsv"
+    p.write_text(_MANIFEST)
+    df = load_samples(str(p))
+    assert df["color"].tolist() == ["#FF9A4C", "#66C2A5"]
+    # everything to the RIGHT of the colour survives too
+    assert df["exp_batch"].tolist() == ["batch2", "batch2"]
+    assert df["plate_batch"].tolist() == ["plate9", "plate10"]
+    assert df["lib_batch"].tolist() == ["2024-02-08", "2024-02-05"]
+    assert group_colors_from_samples(df, "color") == {"IT-L2/3": "#FF9A4C",
+                                                      "ODC": "#66C2A5"}
+
+
+def test_whole_line_comments_still_skipped(tmp_path):
+    p = tmp_path / "s.tsv"
+    p.write_text("# a leading comment\n" + _MANIFEST + "#trailing comment\n")
+    df = load_samples(str(p))
+    assert len(df) == 2                          # comment lines dropped
+    assert df["cell_name"].tolist() == ["b2.ACTTGA", "b2.ATCACG"]
+    assert df["color"].tolist() == ["#FF9A4C", "#66C2A5"]
+
+
+def test_headerless_manifest_still_loads(tmp_path):
+    p = tmp_path / "h.tsv"
+    p.write_text("# comment\nc0\tc0.bam\tIT-L4\nc1\tc1.bam\tODC\n")
+    df = load_samples(str(p))
+    assert df["cell_name"].tolist() == ["c0", "c1"]
+    assert df["group"].tolist() == ["IT-L4", "ODC"]
 
 
 # --------------------------------------------------------------------------
