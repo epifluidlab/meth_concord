@@ -570,6 +570,7 @@ def classifier_comparison_pairwise(
     n_folds: int,
     random_state: int,
     min_class_cells: int = 6,
+    skip_top_svd: dict | None = None,
 ) -> pd.DataFrame:
     """One-vs-one CV AUC: baselines vs baselines+concordance, per cell-type
     PAIR — the headroom-sensitive, leakage-robust version of (d).
@@ -602,7 +603,8 @@ def classifier_comparison_pairwise(
         norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage)
         if norm.shape[1] < _MIN_BINS:
             continue                              # too sparse — skip (warned elsewhere)
-        scores, _ = _svd_scores(norm.loc[common], n_svd)
+        scores, _ = _svd_scores(norm.loc[common], n_svd,
+                                skip_top=int((skip_top_svd or {}).get(name, 0)))
         blocks[name] = pd.DataFrame(scores, index=cells_index)
 
     present_baselines = [b for b in baseline_names if b in blocks]
@@ -758,7 +760,7 @@ def run_comparison(
             ptab = classifier_comparison_pairwise(
                 matrices, labels, baseline_names, concordance_names,
                 output_dir, matrix_norm, n_svd, min_cell_coverage, n_folds,
-                random_state)
+                random_state, skip_top_svd=skip_top_svd)
             if len(ptab):
                 summary["pairwise"] = ptab.to_dict(orient="records")
     else:
