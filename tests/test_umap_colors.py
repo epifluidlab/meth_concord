@@ -214,6 +214,95 @@ def test_compare_threads_colors_into_umap_calls():
 
 
 # --------------------------------------------------------------------------
+# nome_hic_compare: --skip-top-svd NAME=N and --batch-correction
+# --------------------------------------------------------------------------
+
+def test_parse_skip_top_svd():
+    from nome_hic_concordance.comparison_cli import _parse_skip_top_svd
+
+    assert _parse_skip_top_svd([]) == {}
+    assert _parse_skip_top_svd(["accessibility=1"]) == {"accessibility": 1}
+    assert _parse_skip_top_svd(["accessibility=1", "residual_gch=2"]) == {
+        "accessibility": 1, "residual_gch": 2}
+    for bad, msg in [(["accessibility"], "NAME=N"),
+                     (["accessibility=x"], "must be an integer"),
+                     (["accessibility=-1"], "must be >= 0")]:
+        with pytest.raises(ValueError, match=msg):
+            _parse_skip_top_svd(bad)
+
+
+def test_svd_scores_skip_top_drops_leading_components():
+    from nome_hic_concordance.comparison import _svd_scores
+
+    rng = np.random.default_rng(0)
+    m = pd.DataFrame(rng.random((30, 12)), index=[f"c{i}" for i in range(30)])
+    full, vr = _svd_scores(m, 5)
+    skipped, vr_s = _svd_scores(m, 5, skip_top=1)
+    assert full.shape == (30, 5)
+    assert skipped.shape == (30, 4)                 # one leading column dropped
+    assert np.allclose(skipped, full[:, 1:])
+    # var_ratio is NOT sliced -> top_svd_var_frac still reports what was dropped
+    assert np.allclose(vr, vr_s)
+
+
+def test_svd_scores_skip_never_drops_everything():
+    from nome_hic_concordance.comparison import _svd_scores
+
+    rng = np.random.default_rng(1)
+    m = pd.DataFrame(rng.random((10, 6)), index=[f"c{i}" for i in range(10)])
+    s, _ = _svd_scores(m, 3, skip_top=99)
+    assert s.shape[1] == 1                          # at least one kept
+
+
+def test_batch_correction_preserves_nan_mask(tmp_path):
+    """run_comparison must restore the NaN mask after correction, or the
+    downstream --min-cell-coverage filter silently passes every bin."""
+    from nome_hic_concordance import batch_correction as bc
+
+    rng = np.random.default_rng(2)
+    cells = [f"c{i}" for i in range(20)]
+    m = pd.DataFrame(rng.random((20, 8)), index=cells,
+                     columns=[f"chr1:{i}" for i in range(8)])
+    m.iloc[0:10, 0] = np.nan                        # a poorly covered bin
+    batch = pd.Series(["a"] * 10 + ["b"] * 10, index=cells, name="batch")
+
+    out = bc.apply_batch_correction(m, batch, method="zscore")
+    restored = out.where(m.notna())
+    assert restored.iloc[0:10, 0].isna().all()      # mask preserved
+    assert restored.iloc[10:, 0].notna().all()
+
+
+def test_compare_cli_skip_and_batch_flags():
+    from nome_hic_concordance.comparison_cli import parse_args as cmp_args
+
+    a = cmp_args(["--output-dir", "o",
+                  "--skip-top-svd", "accessibility=1",
+                  "--skip-top-svd", "residual_gch=1",
+                  "--batch-column", "exp_batch,lib_batch",
+                  "--batch-correction", "harmony"])
+    assert a.skip_top_svd == ["accessibility=1", "residual_gch=1"]
+    assert a.batch_column == "exp_batch,lib_batch"
+    assert a.batch_correction == "harmony"
+    d = cmp_args(["--output-dir", "o"])
+    assert d.skip_top_svd == [] and d.batch_correction == "none"
+
+
+def test_compare_threads_skip_and_batch():
+    import inspect
+
+    from nome_hic_concordance import comparison
+
+    rc = inspect.signature(comparison.run_comparison).parameters
+    for p in ("skip_top_svd", "batch_labels", "batch_correction"):
+        assert p in rc, p
+    assert "skip_top_svd" in inspect.signature(
+        comparison.marginal_analysis).parameters
+    assert "skip_top_svd" in inspect.signature(
+        comparison.classifier_comparison).parameters
+    assert "skip_top" in inspect.signature(comparison.residual_umap).parameters
+
+
+# --------------------------------------------------------------------------
 # --plot-format
 # --------------------------------------------------------------------------
 

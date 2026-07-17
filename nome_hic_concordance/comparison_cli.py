@@ -59,6 +59,25 @@ def _load_group_labels(path: str) -> pd.Series:
     return _load_samples_sheet(path).set_index("cell_name")["group"]
 
 
+def _parse_skip_top_svd(specs: list[str]) -> dict[str, int]:
+    """``['accessibility=1', 'gch=1']`` -> ``{'accessibility': 1, 'gch': 1}``."""
+    out: dict[str, int] = {}
+    for s in specs:
+        if "=" not in s:
+            raise ValueError(
+                f"--skip-top-svd expects NAME=N (e.g. accessibility=1), got {s!r}."
+            )
+        name, val = s.split("=", 1)
+        try:
+            n = int(val)
+        except ValueError:
+            raise ValueError(f"--skip-top-svd {s!r}: N must be an integer.")
+        if n < 0:
+            raise ValueError(f"--skip-top-svd {s!r}: N must be >= 0.")
+        out[name.strip()] = n
+    return out
+
+
 def _parse_named(spec: str) -> tuple[str, str]:
     """Parse 'name=path' (or bare 'path' -> name 'concordance')."""
     if "=" in spec:
@@ -92,6 +111,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="samples TSV with 'cell'/'cell_name' + 'group' "
                         "labels (enables silhouette/kNN-purity + classifier).")
     p.add_argument("--output-dir", required=True)
+    p.add_argument("--skip-top-svd", action="append", default=[],
+                   metavar="NAME=N",
+                   help="Drop the first N SVD components for ONE matrix "
+                        "(repeatable; default 0 for every matrix).  N applies to "
+                        "that matrix's UMAP *and* its silhouette / kNN-purity / "
+                        "classifier block.  NAME is a matrix name — "
+                        "'accessibility', 'compartment', a --baseline-matrix or "
+                        "--concordance-matrix name — or 'residual_<name>' for a "
+                        "residual UMAP.  e.g. --skip-top-svd accessibility=1 "
+                        "(the top component is the per-cell depth/batch axis).")
+    p.add_argument("--batch-column", type=str, default=None,
+                   help="Column name(s) in --samples holding batch labels; "
+                        "accepts a COMMA-SEPARATED list (e.g. "
+                        "'exp_batch,lib_batch').  Required by "
+                        "--batch-correction.")
+    p.add_argument("--batch-correction",
+                   choices=["none", "center", "zscore", "combat", "harmony"],
+                   default="none",
+                   help="Correct EVERY input matrix before any analysis, so the "
+                        "marginal UMAPs, the variance-partition regression (and "
+                        "hence the residual) and the classifier all see "
+                        "harmonised inputs — mirroring nome_hic_concordance, "
+                        "which corrects the mean-accessibility matrix before it "
+                        "is normalised.  Default 'none'.")
     p.add_argument("--color-column", type=str, default=None,
                    help="Column in --samples holding the plot colour per cell "
                         "(hex like '#1f77b4' or a matplotlib name).  Each group "
@@ -156,17 +199,32 @@ def main(argv: list[str] | None = None) -> int:
             "Only one matrix provided — running marginal analysis only; "
             "cross-method comparison needs >= 2.")
 
-    group_labels = group_colors = None
+    group_labels = group_colors = batch_labels = None
     if args.samples:
         from .cli import group_colors_from_samples
 
         sheet = _load_samples_sheet(args.samples)
         group_labels = sheet.set_index("cell_name")["group"]
         group_colors = group_colors_from_samples(sheet, args.color_column)
-    elif args.color_column:
-        raise ValueError("--color-column requires --samples.")
+        if args.batch_column:
+            bcols = [c.strip() for c in args.batch_column.split(",") if c.strip()]
+            miss = [c for c in bcols if c not in sheet.columns]
+            if miss:
+                raise ValueError(
+                    f"--batch-column {miss} not in {args.samples}. "
+                    f"Available columns: {sheet.columns.tolist()}"
+                )
+            idx = sheet.set_index("cell_name")
+            batch_labels = idx[bcols[0]] if len(bcols) == 1 else idx[bcols]
+    elif args.color_column or args.batch_column:
+        raise ValueError("--color-column / --batch-column require --samples.")
+    if args.batch_correction != "none" and batch_labels is None:
+        raise ValueError(
+            f"--batch-correction {args.batch_correction!r} requires --batch-column."
+        )
     group_order = ([s.strip() for s in args.group_order.split(",") if s.strip()]
                    if args.group_order else None)
+    skip_top_svd = _parse_skip_top_svd(args.skip_top_svd)
 
     summary = comparison.run_comparison(
         matrices, group_labels,
@@ -181,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
         level_control=args.level_control,
         group_colors=group_colors,
         group_order=group_order,
+        skip_top_svd=skip_top_svd,
+        batch_labels=batch_labels,
+        batch_correction=args.batch_correction,
     )
 
     # Headline to stdout.

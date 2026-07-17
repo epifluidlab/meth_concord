@@ -88,8 +88,16 @@ def _prep_matrix(
 _MIN_BINS = 2
 
 
-def _svd_scores(normalized: pd.DataFrame, n_svd: int) -> tuple[np.ndarray, np.ndarray]:
-    """Column-standardize then TruncatedSVD; return (scores, var_ratio)."""
+def _svd_scores(normalized: pd.DataFrame, n_svd: int,
+                skip_top: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """Column-standardize then TruncatedSVD; return (scores, var_ratio).
+
+    ``skip_top`` drops the leading component(s) from the returned SCORES — the
+    per-cell depth / batch axis — matching ``run_umap_and_plot(skip_top_svd=)``.
+    At least one component is always kept.  ``var_ratio`` is deliberately NOT
+    sliced, so ``top_svd_var_frac`` still reports what the dropped component
+    carried.
+    """
     from sklearn.decomposition import TruncatedSVD
 
     X = normalized.to_numpy(dtype=np.float64)
@@ -99,7 +107,8 @@ def _svd_scores(normalized: pd.DataFrame, n_svd: int) -> tuple[np.ndarray, np.nd
     Z = (X - mu) / sd
     k = max(1, min(n_svd, Z.shape[0] - 1, Z.shape[1]))
     svd = TruncatedSVD(n_components=k, random_state=42).fit(Z)
-    return svd.transform(Z), svd.explained_variance_ratio_
+    s = min(max(int(skip_top), 0), max(k - 1, 0))
+    return svd.transform(Z)[:, s:], svd.explained_variance_ratio_
 
 
 def _silhouette(scores: np.ndarray, labels: pd.Series) -> float:
@@ -226,8 +235,10 @@ def marginal_analysis(
     random_state: int,
     group_colors: dict | None = None,
     group_order: list | None = None,
+    skip_top_svd: dict | None = None,
 ) -> dict[str, dict]:
     """Per-matrix UMAP + silhouette/kNN-purity.  Returns metrics per matrix."""
+    skip_map = skip_top_svd or {}
     out = ensure_dir(output_dir)
     metrics: dict[str, dict] = {}
     for name, df in matrices.items():
@@ -247,16 +258,19 @@ def marginal_analysis(
             norm, output_prefix=f"svd_scree_{name}",
             output_dir=str(out), random_state=random_state,
         )
+        skip = int(skip_map.get(name, 0))
         _safe_umap(
             norm, group_labels, title=f"UMAP ({name})",
             output_prefix=f"umap_{name}", output_dir=str(out),
-            n_svd=n_svd, n_threads=1, random_state=random_state,
+            n_svd=n_svd, skip_top_svd=skip, n_threads=1,
+            random_state=random_state,
             group_colors=group_colors, group_order=group_order,
         )
-        m = {"n_cells": int(norm.shape[0]), "n_bins": int(norm.shape[1])}
+        m = {"n_cells": int(norm.shape[0]), "n_bins": int(norm.shape[1]),
+             "skip_top_svd": skip}
         if group_labels is not None:
             common = norm.index.intersection(group_labels.index)
-            scores, vr = _svd_scores(norm.loc[common], n_svd)
+            scores, vr = _svd_scores(norm.loc[common], n_svd, skip_top=skip)
             lab = group_labels.loc[common]
             m["silhouette"] = _silhouette(scores, lab)
             ks = _knn_purity_stats(scores, lab)
@@ -411,6 +425,7 @@ def residual_umap(
     random_state: int,
     group_colors: dict | None = None,
     group_order: list | None = None,
+    skip_top: int = 0,
 ) -> dict:
     """UMAP + cluster metrics on the residual matrix."""
     out = ensure_dir(output_dir)
@@ -423,13 +438,14 @@ def residual_umap(
     _safe_umap(
         norm, group_labels, title=f"UMAP (residual: {target_name} | baselines)",
         output_prefix=f"umap_residual_{target_name}", output_dir=str(out),
-        n_svd=n_svd, n_threads=1, random_state=random_state,
+        n_svd=n_svd, skip_top_svd=int(skip_top), n_threads=1,
+        random_state=random_state,
         group_colors=group_colors, group_order=group_order,
     )
-    m = {"n_bins": int(norm.shape[1])}
+    m = {"n_bins": int(norm.shape[1]), "skip_top_svd": int(skip_top)}
     if group_labels is not None:
         common = norm.index.intersection(group_labels.index)
-        scores, _ = _svd_scores(norm.loc[common], n_svd)
+        scores, _ = _svd_scores(norm.loc[common], n_svd, skip_top=int(skip_top))
         lab = group_labels.loc[common]
         m["silhouette"] = _silhouette(scores, lab)
         ks = _knn_purity_stats(scores, lab)
@@ -456,12 +472,15 @@ def classifier_comparison(
     min_cell_coverage: float,
     n_folds: int,
     random_state: int,
+    skip_top_svd: dict | None = None,
 ) -> pd.DataFrame:
     """CV cell-type AUC for individual + combined feature sets.
 
     The headline rows: 'baselines' vs 'baselines+<concordance>' and 'all'.
-    Each feature set is the concatenation of per-matrix SVD scores.
+    Each feature set is the concatenation of per-matrix SVD scores, so a
+    per-matrix ``skip_top_svd`` applies unambiguously to that matrix's block.
     """
+    skip_map = skip_top_svd or {}
     out = ensure_dir(output_dir)
     # Per-matrix SVD feature blocks on the common cells.
     common = group_labels.index
@@ -478,7 +497,8 @@ def classifier_comparison(
                 f"[classifier] {name}: only {norm.shape[1]} bin(s) after "
                 f"coverage filter — excluding from classification (too sparse).")
             continue
-        scores, _ = _svd_scores(norm.loc[common], n_svd)
+        scores, _ = _svd_scores(norm.loc[common], n_svd,
+                                skip_top=int(skip_map.get(name, 0)))
         blocks[name] = scores
 
     def _auc(names: list[str]) -> tuple[float, float]:
@@ -640,6 +660,9 @@ def run_comparison(
     level_control: str = "linear",
     group_colors: dict | None = None,
     group_order: list | None = None,
+    skip_top_svd: dict | None = None,
+    batch_labels=None,
+    batch_correction: str = "none",
 ) -> dict:
     """Run the full §4.2 suite; write summary.json; return the headline dict."""
     out = ensure_dir(output_dir)
@@ -661,11 +684,31 @@ def run_comparison(
 
     summary: dict = {"n_cells": len(common), "matrices": list(matrices)}
 
+    # (a0) Batch-correct EVERY matrix up front, so the marginal UMAPs, the
+    # variance-partition regression (and hence the residual) and the classifier
+    # all see harmonised inputs — mirroring nome_hic_concordance, which corrects
+    # the mean-accessibility matrix before it is normalised/consumed.
+    if batch_labels is not None and batch_correction != "none":
+        from . import batch_correction as _bc
+
+        for name in list(matrices):
+            raw = matrices[name]
+            logger.info(f"[batch] correcting {name} ({batch_correction})")
+            corrected = _bc.apply_batch_correction(raw, batch_labels,
+                                                   method=batch_correction)
+            # harmony/combat NaN-impute internally and hand back a FULL matrix;
+            # restore the original NaN mask or --min-cell-coverage (and the
+            # _MIN_BINS guard) would silently pass every bin from here on.
+            matrices[name] = corrected.where(raw.notna())
+        summary["batch_correction"] = {
+            "method": batch_correction, "matrices": sorted(matrices)}
+
     # (a) Marginal.
     summary["marginal"] = marginal_analysis(
         matrices, labels, output_dir, matrix_norm, n_svd,
         min_cell_coverage, random_state,
-        group_colors=group_colors, group_order=group_order)
+        group_colors=group_colors, group_order=group_order,
+        skip_top_svd=skip_top_svd)
 
     # (b)+(c) Variance partition + residual UMAP for each concordance matrix.
     present_baselines = [b for b in baseline_names if b in matrices]
@@ -697,7 +740,8 @@ def run_comparison(
             summary["residual"][cn] = residual_umap(
                 resid, labels, cn, output_dir, matrix_norm, n_svd,
                 min_cell_coverage, random_state,
-                group_colors=group_colors, group_order=group_order)
+                group_colors=group_colors, group_order=group_order,
+                skip_top=int((skip_top_svd or {}).get(f"residual_{cn}", 0)))
     else:
         logger.warning("No usable baseline matrices; skipping (b)/(c).")
 
@@ -705,7 +749,8 @@ def run_comparison(
     if labels is not None:
         tab = classifier_comparison(
             matrices, labels, baseline_names, concordance_names, output_dir,
-            matrix_norm, n_svd, min_cell_coverage, n_folds, random_state)
+            matrix_norm, n_svd, min_cell_coverage, n_folds, random_state,
+            skip_top_svd=skip_top_svd)
         summary["classifier"] = tab.to_dict(orient="records")
         # (d2) One-vs-one pairwise AUC — headroom-sensitive when the aggregate
         # is ceiling-limited by saturating marginal levels.
