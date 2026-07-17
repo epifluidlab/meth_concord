@@ -65,17 +65,25 @@ def _prep_matrix(
     output_dir: str,
     matrix_norm: str,
     min_cell_coverage: float,
+    per_cell_norm: str = "off",
+    post_norm_recenter: bool = False,
 ) -> pd.DataFrame:
-    """Coverage-filter + impute + per-bin normalize a cells × bins matrix.
+    """Coverage-filter + impute + (optional per-cell) + per-bin normalize a
+    cells × bins matrix.
 
     Reuses :func:`matrix_ops.process_concordance_matrix` so every feature
-    matrix gets the identical treatment (fairness).  Returns the normalized
-    cells × bins DataFrame ('zscore' key, regardless of matrix_norm).
+    matrix gets the identical treatment (fairness).  ``per_cell_norm`` and
+    ``post_norm_recenter`` default to off, reproducing the historical
+    compare behaviour; set them to mirror the nome_hic_concordance step-7 stack
+    (per-cell rank + recenter).  Returns the normalized cells × bins DataFrame
+    ('zscore' key, regardless of matrix_norm).
     """
     res = matrix_ops.process_concordance_matrix(
         df, min_cell_coverage=min_cell_coverage,
         output_dir=str(Path(output_dir) / "prep" / name),
         matrix_norm=matrix_norm,
+        per_cell_norm=per_cell_norm,
+        post_norm_recenter=post_norm_recenter,
     )
     return res["zscore"]
 
@@ -236,6 +244,9 @@ def marginal_analysis(
     group_colors: dict | None = None,
     group_order: list | None = None,
     skip_top_svd: dict | None = None,
+    per_cell_norm: str = "off",
+    post_norm_recenter: bool = False,
+    plot_format: str = "png",
 ) -> dict[str, dict]:
     """Per-matrix UMAP + silhouette/kNN-purity.  Returns metrics per matrix."""
     skip_map = skip_top_svd or {}
@@ -243,7 +254,8 @@ def marginal_analysis(
     metrics: dict[str, dict] = {}
     for name, df in matrices.items():
         logger.info(f"[marginal] {name}: {df.shape}")
-        norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage)
+        norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage,
+                            per_cell_norm, post_norm_recenter)
         if norm.shape[1] < _MIN_BINS:
             logger.warning(
                 f"[marginal] {name}: only {norm.shape[1]} bin(s) survive the "
@@ -257,6 +269,7 @@ def marginal_analysis(
         visualization.run_svd_scree(
             norm, output_prefix=f"svd_scree_{name}",
             output_dir=str(out), random_state=random_state,
+            plot_format=plot_format,
         )
         skip = int(skip_map.get(name, 0))
         _safe_umap(
@@ -265,6 +278,7 @@ def marginal_analysis(
             n_svd=n_svd, skip_top_svd=skip, n_threads=1,
             random_state=random_state,
             group_colors=group_colors, group_order=group_order,
+            plot_format=plot_format,
         )
         m = {"n_cells": int(norm.shape[0]), "n_bins": int(norm.shape[1]),
              "skip_top_svd": skip}
@@ -325,6 +339,7 @@ def variance_partition(
     target_name: str,
     output_dir: str,
     level_control: str = "linear",
+    plot_format: str = "png",
 ) -> pd.DataFrame:
     """Per-bin OLS of ``target`` on ``predictors`` (aligned to target grid).
 
@@ -385,7 +400,7 @@ def variance_partition(
     residual_df = pd.DataFrame(residual, index=cells, columns=bins)
     residual_df.to_parquet(out / f"delta_residual_{target_name}.parquet")
 
-    _r2_hist(r2, target_name, out)
+    _r2_hist(r2, target_name, out, plot_format)
     med = float(np.nanmedian(r2))
     logger.info(
         f"[variance-partition] {target_name} ~ {'+'.join(predictors)} "
@@ -395,7 +410,8 @@ def variance_partition(
     return residual_df
 
 
-def _r2_hist(r2: np.ndarray, target_name: str, out: Path) -> None:
+def _r2_hist(r2: np.ndarray, target_name: str, out: Path,
+             plot_format: str = "png") -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -410,7 +426,7 @@ def _r2_hist(r2: np.ndarray, target_name: str, out: Path) -> None:
     ax.set_title(f"How much of {target_name} the baselines explain")
     ax.legend()
     plt.tight_layout()
-    plt.savefig(out / f"regression_R2_hist_{target_name}.png", dpi=150)
+    plt.savefig(out / f"regression_R2_hist_{target_name}.{plot_format}", dpi=150)
     plt.close(fig)
 
 
@@ -426,11 +442,15 @@ def residual_umap(
     group_colors: dict | None = None,
     group_order: list | None = None,
     skip_top: int = 0,
+    per_cell_norm: str = "off",
+    post_norm_recenter: bool = False,
+    plot_format: str = "png",
 ) -> dict:
     """UMAP + cluster metrics on the residual matrix."""
     out = ensure_dir(output_dir)
     norm = _prep_matrix(residual, f"residual_{target_name}", output_dir,
-                        matrix_norm, min_cell_coverage)
+                        matrix_norm, min_cell_coverage,
+                        per_cell_norm, post_norm_recenter)
     if norm.shape[1] < _MIN_BINS:
         logger.warning(f"[residual] {target_name}: {norm.shape[1]} bin(s) — "
                        f"skipping residual UMAP/metrics.")
@@ -441,6 +461,7 @@ def residual_umap(
         n_svd=n_svd, skip_top_svd=int(skip_top), n_threads=1,
         random_state=random_state,
         group_colors=group_colors, group_order=group_order,
+        plot_format=plot_format,
     )
     m = {"n_bins": int(norm.shape[1]), "skip_top_svd": int(skip_top)}
     if group_labels is not None:
@@ -473,6 +494,8 @@ def classifier_comparison(
     n_folds: int,
     random_state: int,
     skip_top_svd: dict | None = None,
+    per_cell_norm: str = "off",
+    post_norm_recenter: bool = False,
 ) -> pd.DataFrame:
     """CV cell-type AUC for individual + combined feature sets.
 
@@ -491,7 +514,8 @@ def classifier_comparison(
 
     blocks: dict[str, np.ndarray] = {}
     for name, df in matrices.items():
-        norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage)
+        norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage,
+                            per_cell_norm, post_norm_recenter)
         if norm.shape[1] < _MIN_BINS:
             logger.warning(
                 f"[classifier] {name}: only {norm.shape[1]} bin(s) after "
@@ -571,6 +595,8 @@ def classifier_comparison_pairwise(
     random_state: int,
     min_class_cells: int = 6,
     skip_top_svd: dict | None = None,
+    per_cell_norm: str = "off",
+    post_norm_recenter: bool = False,
 ) -> pd.DataFrame:
     """One-vs-one CV AUC: baselines vs baselines+concordance, per cell-type
     PAIR — the headroom-sensitive, leakage-robust version of (d).
@@ -600,7 +626,8 @@ def classifier_comparison_pairwise(
     # aggregate run); rows are subset per pair below.
     blocks: dict[str, pd.DataFrame] = {}
     for name, df in matrices.items():
-        norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage)
+        norm = _prep_matrix(df, name, output_dir, matrix_norm, min_cell_coverage,
+                            per_cell_norm, post_norm_recenter)
         if norm.shape[1] < _MIN_BINS:
             continue                              # too sparse — skip (warned elsewhere)
         scores, _ = _svd_scores(norm.loc[common], n_svd,
@@ -665,6 +692,9 @@ def run_comparison(
     skip_top_svd: dict | None = None,
     batch_labels=None,
     batch_correction: str = "none",
+    per_cell_norm: str = "off",
+    post_norm_recenter: bool = False,
+    plot_format: str = "png",
 ) -> dict:
     """Run the full §4.2 suite; write summary.json; return the headline dict."""
     out = ensure_dir(output_dir)
@@ -710,7 +740,8 @@ def run_comparison(
         matrices, labels, output_dir, matrix_norm, n_svd,
         min_cell_coverage, random_state,
         group_colors=group_colors, group_order=group_order,
-        skip_top_svd=skip_top_svd)
+        skip_top_svd=skip_top_svd, per_cell_norm=per_cell_norm,
+        post_norm_recenter=post_norm_recenter, plot_format=plot_format)
 
     # (b)+(c) Variance partition + residual UMAP for each concordance matrix.
     present_baselines = [b for b in baseline_names if b in matrices]
@@ -718,7 +749,8 @@ def run_comparison(
     # Drop baselines too sparse to use as regressors.
     base_norm = {}
     for b in present_baselines:
-        bn = _prep_matrix(matrices[b], b, output_dir, matrix_norm, min_cell_coverage)
+        bn = _prep_matrix(matrices[b], b, output_dir, matrix_norm,
+                          min_cell_coverage, per_cell_norm, post_norm_recenter)
         if bn.shape[1] < _MIN_BINS:
             logger.warning(f"[residual] baseline {b}: {bn.shape[1]} bin(s) — "
                            f"excluding from the variance-partition regression.")
@@ -729,7 +761,8 @@ def run_comparison(
             if cn not in matrices:
                 continue
             tnorm = _prep_matrix(matrices[cn], cn, output_dir, matrix_norm,
-                                 min_cell_coverage)
+                                 min_cell_coverage, per_cell_norm,
+                                 post_norm_recenter)
             if tnorm.shape[1] < _MIN_BINS:
                 logger.warning(f"[residual] {cn}: {tnorm.shape[1]} bin(s) after "
                                f"coverage filter — skipping residual analysis "
@@ -738,12 +771,15 @@ def run_comparison(
                 summary["residual"][cn] = {"skipped": "too_few_bins"}
                 continue
             resid = variance_partition(tnorm, base_norm, cn, output_dir,
-                                       level_control=level_control)
+                                       level_control=level_control,
+                                       plot_format=plot_format)
             summary["residual"][cn] = residual_umap(
                 resid, labels, cn, output_dir, matrix_norm, n_svd,
                 min_cell_coverage, random_state,
                 group_colors=group_colors, group_order=group_order,
-                skip_top=int((skip_top_svd or {}).get(f"residual_{cn}", 0)))
+                skip_top=int((skip_top_svd or {}).get(f"residual_{cn}", 0)),
+                per_cell_norm=per_cell_norm, post_norm_recenter=post_norm_recenter,
+                plot_format=plot_format)
     else:
         logger.warning("No usable baseline matrices; skipping (b)/(c).")
 
@@ -752,7 +788,8 @@ def run_comparison(
         tab = classifier_comparison(
             matrices, labels, baseline_names, concordance_names, output_dir,
             matrix_norm, n_svd, min_cell_coverage, n_folds, random_state,
-            skip_top_svd=skip_top_svd)
+            skip_top_svd=skip_top_svd, per_cell_norm=per_cell_norm,
+            post_norm_recenter=post_norm_recenter)
         summary["classifier"] = tab.to_dict(orient="records")
         # (d2) One-vs-one pairwise AUC — headroom-sensitive when the aggregate
         # is ceiling-limited by saturating marginal levels.
@@ -760,7 +797,8 @@ def run_comparison(
             ptab = classifier_comparison_pairwise(
                 matrices, labels, baseline_names, concordance_names,
                 output_dir, matrix_norm, n_svd, min_cell_coverage, n_folds,
-                random_state, skip_top_svd=skip_top_svd)
+                random_state, skip_top_svd=skip_top_svd,
+                per_cell_norm=per_cell_norm, post_norm_recenter=post_norm_recenter)
             if len(ptab):
                 summary["pairwise"] = ptab.to_dict(orient="records")
     else:

@@ -302,6 +302,54 @@ def test_compare_threads_skip_and_batch():
     assert "skip_top" in inspect.signature(comparison.residual_umap).parameters
 
 
+def test_compare_threads_per_cell_norm_and_plot_format():
+    import inspect
+
+    from nome_hic_concordance import comparison
+
+    for fn in (comparison.run_comparison, comparison.marginal_analysis,
+               comparison.residual_umap, comparison.classifier_comparison,
+               comparison.classifier_comparison_pairwise, comparison._prep_matrix):
+        params = inspect.signature(fn).parameters
+        assert "per_cell_norm" in params, fn.__name__
+        assert "post_norm_recenter" in params, fn.__name__
+    # plot_format only reaches the plotting functions, not the classifiers
+    for fn in (comparison.run_comparison, comparison.marginal_analysis,
+               comparison.residual_umap):
+        assert "plot_format" in inspect.signature(fn).parameters, fn.__name__
+
+
+def test_prep_matrix_per_cell_rank_changes_the_matrix(tmp_path):
+    from nome_hic_concordance.comparison import _prep_matrix
+
+    rng = np.random.default_rng(0)
+    # cells with very different global levels — per-cell rank should erase that
+    lvl = np.arange(24).reshape(-1, 1) / 24.0
+    m = pd.DataFrame(lvl + 0.05 * rng.standard_normal((24, 10)),
+                     index=[f"c{i}" for i in range(24)],
+                     columns=[f"chr1:{i}" for i in range(10)])
+    off = _prep_matrix(m, "x", str(tmp_path), "quantile", 0.5,
+                       per_cell_norm="off", post_norm_recenter=False)
+    rank = _prep_matrix(m, "y", str(tmp_path), "quantile", 0.5,
+                        per_cell_norm="rank", post_norm_recenter=True)
+    assert off.shape == rank.shape
+    assert not np.allclose(off.to_numpy(), rank.to_numpy())   # it did something
+
+
+def test_compare_cli_norm_and_plot_flags():
+    from nome_hic_concordance.comparison_cli import parse_args as cmp_args
+
+    a = cmp_args(["--output-dir", "o", "--per-cell-norm", "rank",
+                  "--post-norm-recenter", "on", "--plot-format", "pdf"])
+    assert a.per_cell_norm == "rank" and a.post_norm_recenter == "on"
+    assert a.plot_format == "pdf"
+    d = cmp_args(["--output-dir", "o"])
+    assert (d.per_cell_norm, d.post_norm_recenter, d.plot_format) == (
+        "off", "off", "png")
+    with pytest.raises(SystemExit):
+        cmp_args(["--output-dir", "o", "--plot-format", "jpeg"])
+
+
 # --------------------------------------------------------------------------
 # --plot-format
 # --------------------------------------------------------------------------

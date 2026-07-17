@@ -146,6 +146,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "data order; names not in the data are ignored.")
     p.add_argument("--matrix-norm", choices=["zscore", "quantile"],
                    default="quantile")
+    p.add_argument("--per-cell-norm", choices=["off", "rank", "center"],
+                   default="off",
+                   help="Per-cell normalization applied to EVERY matrix before "
+                        "the per-bin norm.  Default 'off' (historical compare "
+                        "behaviour); use 'rank' to mirror the "
+                        "nome_hic_concordance step-7 stack so the UMAPs are "
+                        "directly comparable.")
+    p.add_argument("--post-norm-recenter", choices=["off", "on"], default="off",
+                   help="Subtract each cell's row-mean after normalization "
+                        "(fixes the non-commutativity of per-cell rank + per-bin "
+                        "QN).  Default 'off'; set 'on' with --per-cell-norm rank "
+                        "to match nome_hic_concordance's signed step-7 default.")
+    p.add_argument("--plot-format", choices=["png", "pdf", "svg"], default="png",
+                   help="Figure format for the UMAP and SVD-scree plots. "
+                        "'pdf'/'svg' write vector figures.  Default 'png'.")
     p.add_argument("--n-svd", type=int, default=10)
     p.add_argument("--min-cell-coverage", type=float, default=0.5)
     p.add_argument("--n-folds", type=int, default=5)
@@ -242,6 +257,9 @@ def main(argv: list[str] | None = None) -> int:
         skip_top_svd=skip_top_svd,
         batch_labels=batch_labels,
         batch_correction=args.batch_correction,
+        per_cell_norm=args.per_cell_norm,
+        post_norm_recenter=args.post_norm_recenter == "on",
+        plot_format=args.plot_format,
     )
 
     # Headline to stdout.
