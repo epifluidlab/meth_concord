@@ -31,9 +31,16 @@ from . import comparison
 logger = logging.getLogger("nome_hic_compare")
 
 
-def _load_group_labels(path: str) -> pd.Series:
-    """Read cell -> group label from a samples TSV (cell/cell_name + group)."""
-    df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+def _load_samples_sheet(path: str) -> pd.DataFrame:
+    """Read the samples TSV (cell/cell_name + group [+ colour/batch columns]).
+
+    Uses cli._manifest_text rather than pandas' ``comment='#'``: the latter also
+    strips INLINE ``#...``, which truncates a row at a hex colour like
+    '#FF9A4C' and blanks every column to its right.
+    """
+    from .cli import _manifest_text
+
+    df = pd.read_csv(_manifest_text(path), sep="\t", dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "cell_name" not in df.columns:
         if "cell" in df.columns:
@@ -44,7 +51,12 @@ def _load_group_labels(path: str) -> pd.Series:
         raise ValueError(
             f"{path} has no 'group' column (columns: {df.columns.tolist()})."
         )
-    return df.set_index("cell_name")["group"]
+    return df
+
+
+def _load_group_labels(path: str) -> pd.Series:
+    """cell -> group label."""
+    return _load_samples_sheet(path).set_index("cell_name")["group"]
 
 
 def _parse_named(spec: str) -> tuple[str, str]:
@@ -80,6 +92,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="samples TSV with 'cell'/'cell_name' + 'group' "
                         "labels (enables silhouette/kNN-purity + classifier).")
     p.add_argument("--output-dir", required=True)
+    p.add_argument("--color-column", type=str, default=None,
+                   help="Column in --samples holding the plot colour per cell "
+                        "(hex like '#1f77b4' or a matplotlib name).  Each group "
+                        "should carry one colour; the group's first wins.  Used "
+                        "for every UMAP legend here (marginal + residual).")
+    p.add_argument("--group-order", type=str, default=None,
+                   help="COMMA-SEPARATED group order for the UMAP legends, e.g. "
+                        "'IT-L2/3,IT-L4,ODC'.  Groups not listed are appended in "
+                        "data order; names not in the data are ignored.")
     p.add_argument("--matrix-norm", choices=["zscore", "quantile"],
                    default="quantile")
     p.add_argument("--n-svd", type=int, default=10)
@@ -135,7 +156,17 @@ def main(argv: list[str] | None = None) -> int:
             "Only one matrix provided — running marginal analysis only; "
             "cross-method comparison needs >= 2.")
 
-    group_labels = _load_group_labels(args.samples) if args.samples else None
+    group_labels = group_colors = None
+    if args.samples:
+        from .cli import group_colors_from_samples
+
+        sheet = _load_samples_sheet(args.samples)
+        group_labels = sheet.set_index("cell_name")["group"]
+        group_colors = group_colors_from_samples(sheet, args.color_column)
+    elif args.color_column:
+        raise ValueError("--color-column requires --samples.")
+    group_order = ([s.strip() for s in args.group_order.split(",") if s.strip()]
+                   if args.group_order else None)
 
     summary = comparison.run_comparison(
         matrices, group_labels,
@@ -148,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
         n_folds=args.n_folds,
         random_state=args.random_seed,
         level_control=args.level_control,
+        group_colors=group_colors,
+        group_order=group_order,
     )
 
     # Headline to stdout.

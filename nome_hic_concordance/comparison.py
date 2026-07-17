@@ -224,6 +224,8 @@ def marginal_analysis(
     n_svd: int,
     min_cell_coverage: float,
     random_state: int,
+    group_colors: dict | None = None,
+    group_order: list | None = None,
 ) -> dict[str, dict]:
     """Per-matrix UMAP + silhouette/kNN-purity.  Returns metrics per matrix."""
     out = ensure_dir(output_dir)
@@ -249,6 +251,7 @@ def marginal_analysis(
             norm, group_labels, title=f"UMAP ({name})",
             output_prefix=f"umap_{name}", output_dir=str(out),
             n_svd=n_svd, n_threads=1, random_state=random_state,
+            group_colors=group_colors, group_order=group_order,
         )
         m = {"n_cells": int(norm.shape[0]), "n_bins": int(norm.shape[1])}
         if group_labels is not None:
@@ -406,6 +409,8 @@ def residual_umap(
     n_svd: int,
     min_cell_coverage: float,
     random_state: int,
+    group_colors: dict | None = None,
+    group_order: list | None = None,
 ) -> dict:
     """UMAP + cluster metrics on the residual matrix."""
     out = ensure_dir(output_dir)
@@ -419,6 +424,7 @@ def residual_umap(
         norm, group_labels, title=f"UMAP (residual: {target_name} | baselines)",
         output_prefix=f"umap_residual_{target_name}", output_dir=str(out),
         n_svd=n_svd, n_threads=1, random_state=random_state,
+        group_colors=group_colors, group_order=group_order,
     )
     m = {"n_bins": int(norm.shape[1])}
     if group_labels is not None:
@@ -632,6 +638,8 @@ def run_comparison(
     n_folds: int = 5,
     random_state: int = 42,
     level_control: str = "linear",
+    group_colors: dict | None = None,
+    group_order: list | None = None,
 ) -> dict:
     """Run the full §4.2 suite; write summary.json; return the headline dict."""
     out = ensure_dir(output_dir)
@@ -656,7 +664,8 @@ def run_comparison(
     # (a) Marginal.
     summary["marginal"] = marginal_analysis(
         matrices, labels, output_dir, matrix_norm, n_svd,
-        min_cell_coverage, random_state)
+        min_cell_coverage, random_state,
+        group_colors=group_colors, group_order=group_order)
 
     # (b)+(c) Variance partition + residual UMAP for each concordance matrix.
     present_baselines = [b for b in baseline_names if b in matrices]
@@ -687,7 +696,8 @@ def run_comparison(
                                        level_control=level_control)
             summary["residual"][cn] = residual_umap(
                 resid, labels, cn, output_dir, matrix_norm, n_svd,
-                min_cell_coverage, random_state)
+                min_cell_coverage, random_state,
+                group_colors=group_colors, group_order=group_order)
     else:
         logger.warning("No usable baseline matrices; skipping (b)/(c).")
 

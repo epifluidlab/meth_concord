@@ -170,6 +170,50 @@ def test_cli_defaults_are_none():
 
 
 # --------------------------------------------------------------------------
+# nome_hic_compare: same colour/order flags, same '#' handling
+# --------------------------------------------------------------------------
+
+def test_compare_samples_sheet_survives_hex_colors(tmp_path):
+    """Regression: comparison_cli had the same pandas comment='#' bug."""
+    from nome_hic_concordance.comparison_cli import (_load_group_labels,
+                                                     _load_samples_sheet)
+    p = tmp_path / "s.tsv"
+    p.write_text(_MANIFEST)
+    sheet = _load_samples_sheet(str(p))
+    assert sheet["color"].tolist() == ["#FF9A4C", "#66C2A5"]
+    assert sheet["lib_batch"].tolist() == ["2024-02-08", "2024-02-05"]
+    assert group_colors_from_samples(sheet, "color") == {"IT-L2/3": "#FF9A4C",
+                                                         "ODC": "#66C2A5"}
+    # the group-label path still works off the same sheet
+    assert _load_group_labels(str(p)).to_dict() == {"b2.ACTTGA": "IT-L2/3",
+                                                    "b2.ATCACG": "ODC"}
+
+
+def test_compare_cli_has_color_and_order_flags():
+    from nome_hic_concordance.comparison_cli import parse_args as cmp_args
+
+    a = cmp_args(["--output-dir", "o", "--color-column", "color",
+                  "--group-order", "IT-L2/3,ODC"])
+    assert a.color_column == "color" and a.group_order == "IT-L2/3,ODC"
+    d = cmp_args(["--output-dir", "o"])
+    assert d.color_column is None and d.group_order is None
+
+
+def test_compare_threads_colors_into_umap_calls():
+    """run_comparison/marginal_analysis/residual_umap must accept and forward
+    group_colors/group_order (the plot itself needs umap at runtime)."""
+    import inspect
+
+    from nome_hic_concordance import comparison
+
+    for fn in (comparison.run_comparison, comparison.marginal_analysis,
+               comparison.residual_umap):
+        params = inspect.signature(fn).parameters
+        assert "group_colors" in params, fn.__name__
+        assert "group_order" in params, fn.__name__
+
+
+# --------------------------------------------------------------------------
 # --plot-format
 # --------------------------------------------------------------------------
 
