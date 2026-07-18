@@ -311,6 +311,60 @@ static py::dict parse_cell_site_distance(
     std::mt19937_64 rng(seed);
     uint64_t n_pairs_total = 0;
 
+    // ---- GIL HELD: pull every Python-owned buffer out up front -------------
+    // Nothing below may touch the interpreter, so the whole parse can run with
+    // the GIL released.  That lets callers use a THREAD pool and share this
+    // cell's (large) context tables instead of pickling them to each process.
+    struct ChromCtx {
+        std::string chrom;
+        const int64_t *gp = nullptr, *hp = nullptr;
+        const uint8_t *gr = nullptr, *hr = nullptr;
+        int64_t ng = 0, nh = 0;
+        std::vector<int64_t> bl_start, bl_end;
+    };
+    std::vector<ChromCtx> ctxs;
+    std::vector<py::object> keepalive;      // hold refs so .data() stays valid
+
+    std::vector<std::string> chroms;
+    for (auto item : ctx_gch) chroms.push_back(py::str(item.first));
+    for (auto item : ctx_hcg) {
+        std::string c = py::str(item.first);
+        if (std::find(chroms.begin(), chroms.end(), c) == chroms.end())
+            chroms.push_back(c);
+    }
+    std::sort(chroms.begin(), chroms.end());
+
+    for (const std::string& chrom : chroms) {
+        ChromCtx cc; cc.chrom = chrom;
+        if (ctx_gch.contains(chrom.c_str())) {
+            auto t = ctx_gch[chrom.c_str()].cast<py::tuple>();
+            auto pa = t[0].cast<py::array_t<int64_t>>();
+            auto ra = t[1].cast<py::array_t<uint8_t>>();
+            cc.gp = pa.data(); cc.gr = ra.data(); cc.ng = pa.size();
+            keepalive.push_back(pa); keepalive.push_back(ra);
+        }
+        if (ctx_hcg.contains(chrom.c_str())) {
+            auto t = ctx_hcg[chrom.c_str()].cast<py::tuple>();
+            auto pa = t[0].cast<py::array_t<int64_t>>();
+            auto ra = t[1].cast<py::array_t<uint8_t>>();
+            cc.hp = pa.data(); cc.hr = ra.data(); cc.nh = pa.size();
+            keepalive.push_back(pa); keepalive.push_back(ra);
+        }
+        if (cc.ng == 0 && cc.nh == 0) continue;
+        if (blacklist.contains(chrom.c_str())) {
+            auto t = blacklist[chrom.c_str()].cast<py::tuple>();
+            auto sa = t[0].cast<py::array_t<int64_t>>();
+            auto ea = t[1].cast<py::array_t<int64_t>>();
+            cc.bl_start.assign(sa.data(), sa.data() + sa.size());
+            cc.bl_end.assign(ea.data(), ea.data() + ea.size());
+        }
+        ctxs.push_back(std::move(cc));
+    }
+
+    // ---- GIL RELEASED for all htslib + compute work ------------------------
+    {
+    py::gil_scoped_release release;
+
     samFile* fp = sam_open(bam_path.c_str(), "r");
     if (!fp) throw std::runtime_error("cannot open BAM: " + bam_path);
     bam_hdr_t* hdr = sam_hdr_read(fp);
@@ -322,43 +376,13 @@ static py::dict parse_cell_site_distance(
     }
     const uint16_t skip_flags = keep_supplementary ? SKIP_FLAGS_BASE : SKIP_FLAGS;
 
-    // Union of chromosomes present in either context table.
-    std::vector<std::string> chroms;
-    for (auto item : ctx_gch) chroms.push_back(py::str(item.first));
-    for (auto item : ctx_hcg) {
-        std::string c = py::str(item.first);
-        if (std::find(chroms.begin(), chroms.end(), c) == chroms.end())
-            chroms.push_back(c);
-    }
-    std::sort(chroms.begin(), chroms.end());
-
-    for (const std::string& chrom : chroms) {
-        const int64_t *gp = nullptr, *hp = nullptr;
-        const uint8_t *gr = nullptr, *hr = nullptr;
-        int64_t ng = 0, nh = 0;
-        py::array_t<int64_t> gpa, hpa; py::array_t<uint8_t> gra, hra;
-        if (ctx_gch.contains(chrom.c_str())) {
-            auto t = ctx_gch[chrom.c_str()].cast<py::tuple>();
-            gpa = t[0].cast<py::array_t<int64_t>>();
-            gra = t[1].cast<py::array_t<uint8_t>>();
-            gp = gpa.data(); gr = gra.data(); ng = gpa.size();
-        }
-        if (ctx_hcg.contains(chrom.c_str())) {
-            auto t = ctx_hcg[chrom.c_str()].cast<py::tuple>();
-            hpa = t[0].cast<py::array_t<int64_t>>();
-            hra = t[1].cast<py::array_t<uint8_t>>();
-            hp = hpa.data(); hr = hra.data(); nh = hpa.size();
-        }
-        if (ng == 0 && nh == 0) continue;
-
-        std::vector<int64_t> bl_start, bl_end;
-        if (blacklist.contains(chrom.c_str())) {
-            auto t = blacklist[chrom.c_str()].cast<py::tuple>();
-            auto sa = t[0].cast<py::array_t<int64_t>>();
-            auto ea = t[1].cast<py::array_t<int64_t>>();
-            bl_start.assign(sa.data(), sa.data() + sa.size());
-            bl_end.assign(ea.data(), ea.data() + ea.size());
-        }
+    for (const ChromCtx& cc : ctxs) {
+        const std::string& chrom = cc.chrom;
+        const int64_t *gp = cc.gp, *hp = cc.hp;
+        const uint8_t *gr = cc.gr, *hr = cc.hr;
+        const int64_t ng = cc.ng, nh = cc.nh;
+        const std::vector<int64_t>& bl_start = cc.bl_start;
+        const std::vector<int64_t>& bl_end = cc.bl_end;
 
         int tid = bam_name2id(hdr, chrom.c_str());
         if (tid < 0) continue;
@@ -456,6 +480,7 @@ static py::dict parse_cell_site_distance(
     hts_idx_destroy(idx);
     bam_hdr_destroy(hdr);
     sam_close(fp);
+    }   // GIL reacquired here
 
     py::dict out;
     out["gg_linked"] = to_numpy(gg_l);

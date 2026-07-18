@@ -74,11 +74,40 @@ def test_chrom_naming_mismatch_is_reconciled(tmp_path):
 
 
 def test_vcf_is_one_based_context_is_zero_based(tmp_path):
-    """VCF POS 1001 must remove the 0-based context site 1000, not 1001."""
+    """VCF POS 1001 must map to the 0-based context site 1000, not 1001.
+
+    Uses motif_flank=0 so this isolates the coordinate convention; with the
+    default 3-bp motif span the neighbour 1001 is (correctly) dropped too.
+    """
     m = _mod()
     vcf = _vcf(tmp_path / "off.vcf", "chr1", [1001])
-    out = m._drop_snp_sites(_ctx([1000, 1001]), str(vcf))
+    out = m._drop_snp_sites(_ctx([1000, 1001]), str(vcf), motif_flank=0)
     assert list(out["GCH"]["chr1"]["pos"]) == [1001]
+
+
+def test_snp_anywhere_in_the_motif_drops_the_site(tmp_path):
+    """GCH/HCG are 3-bp motifs: a SNP at the flanking G or H invalidates the
+    site just as much as one at the cytosine (a GCH whose G is polymorphic may
+    really be an HCH, so its accessibility call is meaningless)."""
+    m = _mod()
+    # cytosines at 0-based 1000/2000/3000/4000; SNPs (1-based) hit:
+    #   1000 -> 0-based  999 = the 5' flank of site 1000
+    #   2001 -> 0-based 2000 = the cytosine of site 2000
+    #   3002 -> 0-based 3001 = the 3' flank of site 3000
+    vcf = _vcf(tmp_path / "motif.vcf", "chr1", [1000, 2001, 3002])
+    out = m._drop_snp_sites(_ctx([1000, 2000, 3000, 4000]), str(vcf))
+    assert list(out["GCH"]["chr1"]["pos"]) == [4000]
+
+
+def test_cytosine_only_flank_would_be_missed(tmp_path):
+    """Pins WHY the motif span matters: flank SNPs survive a centre-only check."""
+    m = _mod()
+    vcf = _vcf(tmp_path / "flank.vcf", "chr1", [1000, 3002])   # both flanks
+    centre_only = m._drop_snp_sites(_ctx([1000, 3000, 4000]), str(vcf),
+                                    motif_flank=0)
+    assert list(centre_only["GCH"]["chr1"]["pos"]) == [1000, 3000, 4000]
+    full = m._drop_snp_sites(_ctx([1000, 3000, 4000]), str(vcf))
+    assert list(full["GCH"]["chr1"]["pos"]) == [4000]
 
 
 def test_no_matching_chromosome_exits_loudly(tmp_path):

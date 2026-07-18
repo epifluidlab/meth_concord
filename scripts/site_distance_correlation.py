@@ -189,15 +189,34 @@ def _add_pair(accs, cond, edges, rng, cap, c1, c2, cross_only=False):
     _ = nb
 
 
-def process_cell_cpp(bam_path, ctx_positions, edges, trim_ends, mapq_min,
-                     cap, null_window, seed, baseq_min=0, blacklist=None):
-    """htslib fast path — same result as :func:`process_cell`, ~100x faster."""
-    ctx_g = {c: (a["pos"].astype(np.int64), a["ref_base"].astype(np.uint8))
+def prepare_ctx(ctx_positions, blacklist=None):
+    """Convert the context tables to the C++ layout ONCE.
+
+    ``arr["pos"]`` on a structured array is a strided view, so ``.astype`` copies
+    the whole table (~2 GB for a mammalian GCH+HCG set).  Doing that per cell
+    burned that allocation 1577 times per worker; hoisting it here means the
+    buffers are built once and, under the thread pool, shared by every worker.
+    """
+    ctx_g = {c: (np.ascontiguousarray(a["pos"], np.int64),
+                 np.ascontiguousarray(a["ref_base"], np.uint8))
              for c, a in ctx_positions.get("GCH", {}).items()}
-    ctx_h = {c: (a["pos"].astype(np.int64), a["ref_base"].astype(np.uint8))
+    ctx_h = {c: (np.ascontiguousarray(a["pos"], np.int64),
+                 np.ascontiguousarray(a["ref_base"], np.uint8))
              for c, a in ctx_positions.get("HCG", {}).items()}
-    bl = {c: (iv[:, 0].astype(np.int64), iv[:, 1].astype(np.int64))
+    bl = {c: (np.ascontiguousarray(iv[:, 0], np.int64),
+              np.ascontiguousarray(iv[:, 1], np.int64))
           for c, iv in (blacklist or {}).items() if len(iv)}
+    return ctx_g, ctx_h, bl
+
+
+def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
+                     cap, null_window, seed, baseq_min=0):
+    """htslib fast path — same result as :func:`process_cell`, ~100x faster.
+
+    ``prepared`` comes from :func:`prepare_ctx`; the extension releases the GIL,
+    so this is safe to run on a thread pool.
+    """
+    ctx_g, ctx_h, bl = prepared
     res = _CPP.parse_cell_site_distance(
         str(bam_path), ctx_g, ctx_h, [float(e) for e in edges],
         int(trim_ends), int(mapq_min), int(null_window), int(cap), int(seed),
@@ -315,13 +334,16 @@ def _load_snps_all(dbsnp_vcf, wanted_chroms):
     return {c: v for c, v in found.items() if v}
 
 
-def _drop_snp_sites(ctx_positions, dbsnp_vcf):
-    """Remove context sites that coincide with a dbSNP locus.
+def _drop_snp_sites(ctx_positions, dbsnp_vcf, motif_flank=1):
+    """Remove context sites whose MOTIF overlaps a dbSNP locus.
 
-    At a C/T (or G/A) polymorphism the read base is ambiguous: an unconverted
-    C and a genomic T look identical, so the site would contribute a spurious
-    'unmethylated' call.  ``--reference`` routes through Step-1 extraction,
-    which already does this; this is the ``--context-bed`` path.
+    Checking only the cytosine is not enough: GCH and HCG are 3-bp motifs, and a
+    SNP at the flanking G (or at the H) means the locus is not that motif in
+    this sample at all — a GCH whose G is polymorphic may really be an HCH, so
+    its "accessibility" call is meaningless.  A SNP at the cytosine itself is
+    the other failure (an unconverted C and a genomic T are indistinguishable).
+    So a site is dropped when ANY of pos-1, pos, pos+1 carries a SNP, which
+    covers the motif on either strand (the cytosine is always the middle base).
     """
     out, dropped, kept = {}, 0, 0
     chroms = sorted({c for ctx in ctx_positions.values() for c in ctx})
@@ -343,7 +365,12 @@ def _drop_snp_sites(ctx_positions, dbsnp_vcf):
                 kept += len(arr)
                 continue
             snp_arr = np.fromiter(s, np.int64, len(s))
-            mask = ~np.isin(arr["pos"], snp_arr)
+            pos = arr["pos"]
+            # drop if ANY motif base (pos-flank .. pos+flank) hits a SNP
+            hit = np.zeros(pos.shape, dtype=bool)
+            for off in range(-motif_flank, motif_flank + 1):
+                hit |= np.isin(pos + off, snp_arr)
+            mask = ~hit
             out[ctx][chrom] = arr[mask]
             dropped += int((~mask).sum())
             kept += int(mask.sum())
@@ -554,9 +581,14 @@ def main():
           f"{args.null_window} bp | {pairs_note} | backend {backend}")
 
     if use_cpp:
-        jobs = [(row["bam_path"], ctx_positions, edges, args.trim_ends,
+        prepared = prepare_ctx(ctx_positions, blacklist)
+        n_sites = sum(len(v[0]) for v in prepared[0].values()) + \
+            sum(len(v[0]) for v in prepared[1].values())
+        print(f"  context prepared once: {n_sites:,} sites, shared across "
+              f"threads (no per-worker copy)")
+        jobs = [(row["bam_path"], prepared, edges, args.trim_ends,
                  args.mapq_min, args.max_site_pairs_per_read,
-                 args.null_window, args.seed + i, args.baseq_min, blacklist)
+                 args.null_window, args.seed + i, args.baseq_min)
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = process_cell_cpp
     else:
@@ -573,9 +605,14 @@ def main():
     t0 = time.time()
     if args.n_threads > 1 and len(jobs) > 1:
         from joblib import Parallel, delayed
+        # THREADS for the htslib backend: the extension releases the GIL, so
+        # threads run truly in parallel AND share the ~GB context tables.  With
+        # processes (loky) each worker would need its own pickled copy, which
+        # dominates the run.  The pysam fallback still needs processes.
+        backend_kw = {"prefer": "threads"} if use_cpp else {}
         # verbose=10 makes joblib log each completed task, so a long run shows
         # progress instead of going silent for hours.
-        res = Parallel(n_jobs=args.n_threads, verbose=10)(
+        res = Parallel(n_jobs=args.n_threads, verbose=10, **backend_kw)(
             delayed(fn)(*j) for j in jobs)
     else:
         res = []
