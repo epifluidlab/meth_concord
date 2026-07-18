@@ -384,7 +384,7 @@ def prepare_ctx(ctx_positions, blacklist=None):
 def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
                      cap, null_window, seed, baseq_min=0,
                      donor_cap=0, anchor_cap=0, anchor_long_cap=0,
-                     long_range_bp=1000):
+                     long_range_bp=1000, strand_min_evidence=1):
     """htslib fast path — same result as :func:`process_cell`, ~100x faster.
 
     ``prepared`` comes from :func:`prepare_ctx`; the extension releases the GIL,
@@ -398,7 +398,8 @@ def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
         str(bam_path), ctx_g, ctx_h, [float(e) for e in edges],
         int(trim_ends), int(mapq_min), int(null_window), int(cap), int(seed),
         False, int(baseq_min), bl, int(donor_cap), int(anchor_cap),
-        int(anchor_long_cap), int(long_range_bp))
+        int(anchor_long_cap), int(long_range_bp),
+        int(strand_min_evidence))
     accs = {}
     for m, _ in _MEASURES:
         for c, _lab in _CONDS:
@@ -409,7 +410,9 @@ def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
                  {"anchor_long": int(res["n_anchor_long"]),
                   "anchor_short": int(res["n_anchor_short"]),
                   "pairs_long_seen": int(res["n_pairs_long_seen"])})
-    return accs, int(res["n_pairs"]), int(res["n_null_eligible"]), pools
+    strand = {"known": int(res["n_strand_known"]),
+              "disagree": int(res["n_strand_disagree"])}
+    return accs, int(res["n_pairs"]), int(res["n_null_eligible"]), pools, strand
 
 
 def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
@@ -430,7 +433,7 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
         bam_path, ctx_positions, trim_ends=trim_ends, mapq_min=mapq_min,
         max_pairs_per_cell=max_pairs, rng=rng))
     if not pairs:
-        return accs, 0, 0, None
+        return accs, 0, 0, None, {"known": 0, "disagree": 0}
 
     for chrom, mid1, mid2, c1, c2 in pairs:
         _add_pair(accs, "linked", edges, rng, cap, c1, c2)
@@ -465,7 +468,7 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
         # Same pair, TRUE partner, cross-end only — the like-for-like baseline
         # for the null, since the null can only ever see THESE pairs.
         _add_pair(accs, "matched", edges, rng, cap, c1, c2, cross_only=True)
-    return accs, len(pairs), n_eligible, None
+    return accs, len(pairs), n_eligible, None, {"known": 0, "disagree": 0}
 
 
 # --------------------------------------------------------------------------
@@ -838,6 +841,16 @@ def main():
     ap.add_argument("--n-bootstrap", type=int, default=1000,
                     help="Cell-level bootstrap resamples for the Δ confidence "
                          "band and p-value. 0 disables.")
+    ap.add_argument("--strand-min-evidence", type=int, default=1,
+                    help="How far C>T must lead G>A (or vice versa) in a read's "
+                         "MD tag before its conversion strand is trusted. The "
+                         "default 1 is the historical behaviour: a SINGLE "
+                         "mismatch, which may be a SNP or a sequencing error, "
+                         "decides the strand for the whole read, and a wrong "
+                         "call makes every site on it a reading of the "
+                         "complementary base. Raise to 2-3 to drop ambiguous "
+                         "reads instead (they become strand-unknown and "
+                         "contribute nothing).")
     ap.add_argument("--plot-format", choices=["png", "pdf", "svg"], default="pdf")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
@@ -929,7 +942,7 @@ def main():
                  args.mapq_min, args.max_site_pairs_per_read,
                  args.null_window, args.seed + i, args.baseq_min,
                  donor_cap, anchor_cap, anchor_long_cap,
-                 args.null_long_range_bp)
+                 args.null_long_range_bp, args.strand_min_evidence)
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = process_cell_cpp
     else:
@@ -979,6 +992,20 @@ def main():
             _tick(i + 1, i, res[-1][1])
     print(f"  parsed {len(res)} cells in {(time.time() - t0) / 60:.1f} min "
           f"({sum(r[1] for r in res):,} read pairs total)")
+
+    # A sub-read-length HCG-HCG pair (distance 1 = the two strands of one CpG
+    # dyad) can ONLY form when the two mates disagree on conversion strand.  In
+    # a directional library they should agree, so this rate is the denominator
+    # for how much of that bin is real.
+    sk = sum(r[4]["known"] for r in res)
+    sd = sum(r[4]["disagree"] for r in res)
+    if sk:
+        print(f"  mate conversion strand: {sd:,}/{sk:,} pairs DISAGREE "
+              f"({100.0 * sd / sk:.2f}%) at --strand-min-evidence "
+              f"{args.strand_min_evidence}")
+        print("    only these pairs can produce a sub-read-length HCG-HCG "
+              "point (the CpG dyad),\n    so treat the shortest bins as a "
+              "selected subset, not a population estimate.")
 
     keys = [(m, c) for m, _ in _MEASURES for c, _ in _CONDS]
     groups: dict[str, list[int]] = {"all": list(range(len(res)))}

@@ -202,8 +202,8 @@ def test_htslib_backend_matches_pysam_exactly():
     res = cpp.parse_cell_site_distance(str(bam), ctx_g, ctx_h,
                                        [float(e) for e in edges],
                                        5, 30, 100, 0, 42, False)
-    accs_py, n_py, elig_py, _pools = m.process_cell(str(bam), cp, edges, 5, 30,
-                                                    0, 0, 100, 42)
+    accs_py, n_py, elig_py, _pools, _st = m.process_cell(
+        str(bam), cp, edges, 5, 30, 0, 0, 100, 42)
     assert int(res["n_pairs"]) == n_py
     assert int(res["n_null_eligible"]) == elig_py
     for key in ("gg", "hh", "gh"):

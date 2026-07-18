@@ -76,7 +76,12 @@ static inline void cigar_lengths(const uint32_t* cigar, int n_cigar,
 }
 
 /* Infer C→T vs G→A from the MD tag, exactly as bam_parser_core does. */
-static int infer_conversion_strand(const bam1_t* b) {
+/* ``min_margin`` is how far the winning count must lead before the strand is
+ * trusted.  At the default 1 this is the historical "ct > ga", i.e. a SINGLE
+ * C->T mismatch -- which may be a SNP or a sequencing error -- decides the
+ * conversion strand for the whole read, and a wrong call makes every site on
+ * that read a reading of the complementary base. */
+static int infer_conversion_strand(const bam1_t* b, int min_margin = 1) {
     const uint8_t* md_aux = bam_aux_get(b, "MD");
     if (!md_aux) return STRAND_UNKNOWN;
     const char* md = bam_aux2Z(md_aux);
@@ -108,8 +113,9 @@ static int infer_conversion_strand(const bam1_t* b) {
             ++p;
         }
     }
-    if (ct > ga) return STRAND_CT;
-    if (ga > ct) return STRAND_GA;
+    if (min_margin < 1) min_margin = 1;
+    if (ct - ga >= min_margin) return STRAND_CT;
+    if (ga - ct >= min_margin) return STRAND_GA;
     return STRAND_UNKNOWN;
 }
 
@@ -392,7 +398,8 @@ static py::dict parse_cell_site_distance(
     int trim_ends, int mapq_min, int null_window,
     int max_site_pairs_per_read, uint64_t seed,
     bool keep_supplementary, int baseq_min, py::dict blacklist,
-    int donor_cap, int anchor_cap, int anchor_long_cap, int long_range_bp)
+    int donor_cap, int anchor_cap, int anchor_long_cap, int long_range_bp,
+    int strand_min_evidence)
 {
     const int nb = (int)edges.size() - 1;
     Acc gg_l(nb), hh_l(nb), gh_l(nb), gg_n(nb), hh_n(nb), gh_n(nb);
@@ -412,6 +419,7 @@ static py::dict parse_cell_site_distance(
     // Sampling for the pooled cross-cell null draws from its own stream too.
     std::mt19937_64 rng_s(seed ^ 0xC2B2AE3D27D4EB4FULL);
     uint64_t n_pairs_total = 0, n_null_eligible = 0;
+    uint64_t n_strand_known = 0, n_strand_disagree = 0;
     Reservoir<EndRec> donors; donors.cap = donor_cap;
     // STRATIFIED by span.  A uniform sample of pairs is ~99% short-range, so a
     // flat cap starves exactly the long-range bins this analysis is about: at
@@ -536,7 +544,16 @@ static py::dict parse_cell_site_distance(
             PairRec rec;
             rec.mid1 = (r1->core.pos + bam_endpos(r1)) / 2;
             rec.mid2 = (r2->core.pos + bam_endpos(r2)) / 2;
-            int s1 = infer_conversion_strand(r1), s2 = infer_conversion_strand(r2);
+            int s1 = infer_conversion_strand(r1, strand_min_evidence);
+            int s2 = infer_conversion_strand(r2, strand_min_evidence);
+            // A distance-1 HCG pair is the two strands of one CpG dyad, and it
+            // can ONLY form when the mates disagree here.  In a directional
+            // library that disagreement is anomalous, so track its rate: it is
+            // the denominator for how much to trust the sub-read-length bins.
+            if (s1 != STRAND_UNKNOWN && s2 != STRAND_UNKNOWN) {
+                ++n_strand_known;
+                if (s1 != s2) ++n_strand_disagree;
+            }
             if (ng) {
                 site_calls(gp, gr, ng, r1, trim_ends, s1, baseq_min, rec.g1);
                 site_calls(gp, gr, ng, r2, trim_ends, s2, baseq_min, rec.g2);
@@ -647,6 +664,8 @@ static py::dict parse_cell_site_distance(
     out["gh_matched"] = to_numpy(gh_m);
     out["n_pairs"] = py::int_(n_pairs_total);
     out["n_null_eligible"] = py::int_(n_null_eligible);
+    out["n_strand_known"] = py::int_(n_strand_known);
+    out["n_strand_disagree"] = py::int_(n_strand_disagree);
 
     // Samples for the pooled cross-cell null, flattened to CSR so a read end
     // with an unusual number of sites is never truncated.
@@ -800,6 +819,7 @@ PYBIND11_MODULE(_site_dist_core, m) {
           py::arg("blacklist") = py::dict(),
           py::arg("donor_cap") = 0, py::arg("anchor_cap") = 0,
           py::arg("anchor_long_cap") = 0, py::arg("long_range_bp") = 1000,
+          py::arg("strand_min_evidence") = 1,
           "Parse one cell's BAM and return per-distance-bin Pearson "
           "sufficient statistics for GCH-GCH / HCG-HCG / HCG-GCH, linked and "
           "non-linked.");
