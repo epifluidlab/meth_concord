@@ -321,13 +321,18 @@ def _load_snps_all(dbsnp_vcf, wanted_chroms):
                     break
     else:
         logger.warning(
-            "%s has no tabix index — reading it sequentially (slower). "
-            "bgzip + tabix it to speed this up.", dbsnp_vcf)
+            "%s has no tabix index, so it must be read sequentially in ONE "
+            "pass — this phase is inherently single-threaded (~1-2 min for a "
+            "mammalian dbSNP). bgzip + tabix it to avoid this.", dbsnp_vcf)
+        t_scan = time.time()
         for rec in vcf.fetch():                         # whole-file scan
             orig = want.get(_norm(rec.chrom))
             if orig is not None:
                 found[orig].add(rec.pos - 1)
                 n += 1
+                if n % 10_000_000 == 0:                 # keep the phase visible
+                    print(f"    dbSNP scan: {n / 1e6:.0f}M records "
+                          f"({time.time() - t_scan:.0f}s)", flush=True)
     vcf.close()
     logger.info("dbSNP: loaded %s SNP positions over %s chromosomes",
                 f"{n:,}", sum(1 for v in found.values() if v))
@@ -602,28 +607,41 @@ def main():
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = process_cell
 
+    cell_names = samples["cell_name"].tolist()
+    n_jobs_total = len(jobs)
     t0 = time.time()
-    if args.n_threads > 1 and len(jobs) > 1:
-        from joblib import Parallel, delayed
-        # THREADS for the htslib backend: the extension releases the GIL, so
-        # threads run truly in parallel AND share the ~GB context tables.  With
-        # processes (loky) each worker would need its own pickled copy, which
-        # dominates the run.  The pysam fallback still needs processes.
-        backend_kw = {"prefer": "threads"} if use_cpp else {}
-        # verbose=10 makes joblib log each completed task, so a long run shows
-        # progress instead of going silent for hours.
-        res = Parallel(n_jobs=args.n_threads, verbose=10, **backend_kw)(
+
+    def _tick(done, idx, n_pairs):
+        """One line per finished cell: which cell, how far along, and an ETA."""
+        el = time.time() - t0
+        eta = el / max(done, 1) * (n_jobs_total - done)
+        print(f"  [{done}/{n_jobs_total}] {cell_names[idx]}: {n_pairs:,} pairs "
+              f"| {el / 60:.1f} min elapsed, ETA {eta / 60:.1f} min",
+              flush=True)
+
+    if use_cpp and args.n_threads > 1 and n_jobs_total > 1:
+        # THREADS: the extension releases the GIL, so they run truly in parallel
+        # AND share the ~GB context tables (processes would each need a pickled
+        # copy).  Driving the pool directly — rather than joblib — is what lets
+        # us report "[i/N] <cell>" instead of joblib's opaque "Done N tasks".
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        res = [None] * n_jobs_total
+        with ThreadPoolExecutor(max_workers=args.n_threads) as ex:
+            futs = {ex.submit(fn, *j): i for i, j in enumerate(jobs)}
+            for done, fut in enumerate(as_completed(futs), 1):
+                i = futs[fut]
+                res[i] = fut.result()
+                _tick(done, i, res[i][1])
+    elif args.n_threads > 1 and n_jobs_total > 1:
+        from joblib import Parallel, delayed          # pysam fallback: processes
+        res = Parallel(n_jobs=args.n_threads, verbose=10)(
             delayed(fn)(*j) for j in jobs)
     else:
         res = []
-        for i, j in enumerate(jobs, 1):
+        for i, j in enumerate(jobs):
             res.append(fn(*j))
-            el = time.time() - t0
-            eta = el / i * (len(jobs) - i)
-            print(f"  [{i}/{len(jobs)}] {samples.iloc[i-1]['cell_name']}: "
-                  f"{res[-1][1]:,} pairs  ({el:.0f}s elapsed, ETA {eta:.0f}s)",
-                  flush=True)
-    print(f"  parsed {len(res)} cells in {time.time() - t0:.0f}s "
+            _tick(i + 1, i, res[-1][1])
+    print(f"  parsed {len(res)} cells in {(time.time() - t0) / 60:.1f} min "
           f"({sum(r[1] for r in res):,} read pairs total)")
 
     keys = [(m, c) for m, _ in _MEASURES for c, _ in _CONDS]
