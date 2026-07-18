@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -388,6 +389,29 @@ def _drop_snp_sites(ctx_positions, dbsnp_vcf, motif_flank=1):
     return out
 
 
+_UNSAFE_IN_NAME = re.compile(r"[^A-Za-z0-9._+-]")
+
+
+def safe_names(labels):
+    """``{label: filename-safe name}``, unique across ``labels``.
+
+    Cell-type labels routinely contain characters that are not filename-safe —
+    'IT-L2/3' and 'PC/EC' turn a filename into a path into a directory that
+    does not exist.  Slashes and friends collapse to '_', and if two labels
+    collapse onto the same name a numeric suffix keeps them distinct.  Only the
+    FILENAME is rewritten; titles and the summary JSON keep the real label.
+    """
+    out, used = {}, {}
+    for lab in labels:
+        base = _UNSAFE_IN_NAME.sub("_", str(lab).strip()) or "unnamed"
+        if not base.strip("."):        # '.' / '..' are path components, not names
+            base = "unnamed"
+        n = used.get(base, 0)
+        used[base] = n + 1
+        out[lab] = base if n == 0 else f"{base}_{n + 1}"
+    return out
+
+
 def _logx(ax, lo, hi):
     ax.set_xscale("log")
     ticks = [t for t in _TLAB if lo <= t <= hi]
@@ -395,7 +419,7 @@ def _logx(ax, lo, hi):
     ax.set_xlabel("genomic distance between the two cytosines")
 
 
-def _plot(curves, centers, edges, label, n_cells, n_pairs, out, plot_format):
+def _plot(curves, centers, edges, label, n_cells, n_pairs, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -432,7 +456,7 @@ def _plot(curves, centers, edges, label, n_cells, n_pairs, out, plot_format):
                  f"{n_cells} cells, {n_pairs:,} read pairs", fontsize=12)
     fig.tight_layout(rect=(0, 0.04, 1, 0.96))
     fig.text(0.5, 0.012, _QC, ha="center", fontsize=7.5, color="0.35")
-    fig.savefig(out.with_suffix(f".{plot_format}"))
+    fig.savefig(out)
     plt.close(fig)
 
 
@@ -448,11 +472,16 @@ def _write_tsv(curves, centers, edges, path):
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, na_rep="nan")
 
 
-def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args):
+def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
+            safe=None):
     curves = {k: _corr(v, args.min_pairs) for k, v in accs.items()}
-    stem = out_dir / f"site_distance_corr_{label}"
-    _plot(curves, centers, edges, label, n_cells, n_pairs, stem, args.plot_format)
-    _write_tsv(curves, centers, edges, stem.with_suffix(".tsv"))
+    # Build the two paths explicitly: Path.with_suffix() would ALSO mangle a
+    # label containing a dot ('A.B' -> '..._A.pdf'), silently.
+    stem_name = f"site_distance_corr_{safe or label}"
+    fig_path = out_dir / f"{stem_name}.{args.plot_format}"
+    tsv_path = out_dir / f"{stem_name}.tsv"
+    _plot(curves, centers, edges, label, n_cells, n_pairs, fig_path)
+    _write_tsv(curves, centers, edges, tsv_path)
     print(f"\n=== {label}: {n_cells} cells, {n_pairs:,} read pairs ===")
     print(f"  {'distance':>10}{'n(GG)':>12} | "
           + "".join(f"{m.split('  ')[0]:>22}" for _, m in _MEASURES))
@@ -465,7 +494,7 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args):
             rn = curves[(key, "null")][0][bi]
             cols += f"{rl:+.3f}/{rn:+.3f}".rjust(22)
         print(f"  {centers[bi]:>10,.0f}{int(curves[('gg','linked')][1][bi]):>12,d} | {cols}")
-    print(f"  wrote {stem}.{args.plot_format} and {stem}.tsv")
+    print(f"  wrote {fig_path} and {tsv_path}")
     return curves
 
 
@@ -654,14 +683,17 @@ def main():
             groups.setdefault(str(g), []).append(gi)
 
     summary = {}
+    safe = safe_names(groups)          # 'IT-L2/3' -> 'IT-L2_3', collision-proof
     for label, idxs in groups.items():
         accs = {k: sum(res[i][0][k] for i in idxs) for k in keys}
         n_pairs = sum(res[i][1] for i in idxs)
         if n_pairs == 0:
             print(f"\n=== {label}: no usable read pairs — skipped ===")
             continue
-        _report(accs, len(idxs), n_pairs, centers, edges, label, out_dir, args)
-        summary[label] = {"n_cells": len(idxs), "n_read_pairs": int(n_pairs)}
+        _report(accs, len(idxs), n_pairs, centers, edges, label, out_dir, args,
+                safe=safe[label])
+        summary[label] = {"n_cells": len(idxs), "n_read_pairs": int(n_pairs),
+                          "file_stem": f"site_distance_corr_{safe[label]}"}
     with open(out_dir / "site_distance_corr_summary.json", "w") as fh:
         json.dump({"groups": summary, "qc": _QC,
                    "null_window_bp": args.null_window}, fh, indent=2)
