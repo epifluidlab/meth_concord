@@ -187,7 +187,7 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
 
     pairs = list(iter_cell_read_pairs(
         bam_path, ctx_positions, trim_ends=trim_ends, mapq_min=mapq_min,
-        max_pairs_per_cell=max_pairs))
+        max_pairs_per_cell=max_pairs, rng=rng))
     if not pairs:
         return accs, 0
 
@@ -330,9 +330,12 @@ def main():
     ap.add_argument("--max-cells", type=int, default=0,
                     help="0 = all cells in --samples.")
     ap.add_argument("--max-pairs-per-cell", type=int, default=20000,
-                    help="Cap read pairs parsed per cell (0 = unlimited). The "
-                         "curves need ~1e5 site pairs per bin, so a modest cap "
-                         "keeps the BAM pass affordable.")
+                    help="Approximate read pairs to keep per cell (0 = all). "
+                         "Applied as UNIFORM RANDOM down-sampling (rate derived "
+                         "from the BAM index), not truncation, so the sample is "
+                         "genome-wide rather than the start of each chromosome. "
+                         "The curves need ~1e5 site pairs per bin, so a modest "
+                         "value keeps the BAM pass cheap.")
     ap.add_argument("--max-site-pairs-per-read", type=int, default=64,
                     help="Cap site-pair combinations sampled per read pair, "
                          "bounding the O(n·m) blow-up on site-dense reads.")

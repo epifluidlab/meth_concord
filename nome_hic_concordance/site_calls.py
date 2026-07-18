@@ -140,19 +140,35 @@ def iter_cell_read_pairs(
         (chrom, mid1, mid2, {ctx: (pos1, state1)}, {ctx: (pos2, state2)})
 
     where ``mid*`` are the read-end midpoints (matching bam_parser's pair
-    positions).  ``max_pairs_per_cell`` (0 = unlimited) caps the pairs kept per
-    cell via reservoir-free head sampling — cheap and adequate because BAM order
-    is coordinate-sorted per chromosome, so the cap is applied per chromosome to
-    avoid biasing toward chr1.
+    positions).
+
+    ``max_pairs_per_cell`` (0 = unlimited) is honoured by UNIFORM RANDOM
+    down-sampling, not by truncation: the index's mapped-read counts give a
+    cheap estimate of the cell's pair total, from which a Bernoulli keep-rate is
+    derived and applied per pair.  Truncating instead (stop once the quota is
+    full) would sample only the start of each chromosome — a positional bias in
+    a genome-wide statistic.  The draw happens BEFORE the per-site extraction,
+    so the expensive work still scales with the kept fraction.
     """
     import pysam
 
+    if rng is None:
+        rng = np.random.default_rng(0)
     skip_flags = _SKIP_FLAGS_BASE if keep_supplementary else _SKIP_FLAGS
     contexts = list(context_positions)
     chroms = sorted({c for ctx in contexts for c in context_positions[ctx]})
-    per_chrom_cap = 0
-    if max_pairs_per_cell and chroms:
-        per_chrom_cap = max(1, int(max_pairs_per_cell // len(chroms)))
+
+    keep_rate = 1.0
+    if max_pairs_per_cell:
+        try:
+            with pysam.AlignmentFile(bam_path, "rb") as _b:
+                mapped = sum(s.mapped for s in _b.get_index_statistics())
+            est_pairs = max(1.0, mapped / 2.0)
+            keep_rate = min(1.0, float(max_pairs_per_cell) / est_pairs)
+        except (ValueError, AttributeError):        # no index → keep everything
+            logger.warning(
+                "%s: no BAM index statistics; --max-pairs-per-cell ignored "
+                "(parsing all pairs).", bam_path)
 
     with pysam.AlignmentFile(bam_path, "rb") as bam:
         for chrom in chroms:
@@ -169,10 +185,7 @@ def iter_cell_read_pairs(
                 continue
 
             buf: dict[str, object] = {}
-            kept = 0
             for read in read_iter:
-                if per_chrom_cap and kept >= per_chrom_cap:
-                    break
                 flag = read.flag
                 if flag & skip_flags:
                     continue
@@ -189,6 +202,9 @@ def iter_cell_read_pairs(
                     continue
                 if mate.mapping_quality < mapq_min:       # mapQ>30 BOTH ends
                     continue
+                # Uniform down-sample BEFORE the costly per-site extraction.
+                if keep_rate < 1.0 and rng.random() >= keep_rate:
+                    continue
 
                 r1, r2 = ((read, mate)
                           if read.reference_start <= mate.reference_start
@@ -202,6 +218,5 @@ def iter_cell_read_pairs(
                     continue                              # no informative site
                 mid1 = (r1.reference_start + r1.reference_end) // 2
                 mid2 = (r2.reference_start + r2.reference_end) // 2
-                kept += 1
                 yield chrom, mid1, mid2, calls1, calls2
             del buf

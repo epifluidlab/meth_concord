@@ -142,6 +142,34 @@ def test_corr_respects_min_pairs():
     assert m._corr(acc, min_pairs=1)[0][0] == pytest.approx(1.0)
 
 
+def test_downsampling_is_genome_wide_not_truncated():
+    """--max-pairs-per-cell must sample uniformly across each chromosome.
+
+    Truncating (stop once the quota fills) would only ever return the START of
+    the chromosome — a positional bias in a genome-wide statistic.
+    """
+    pysam = pytest.importorskip("pysam")
+    bam_path = Path("/tmp/sdc/cell1.sorted.bam")
+    if not bam_path.exists():
+        pytest.skip("synthetic fixture BAM not present")
+    from nome_hic_concordance.cli import _parse_context_bed
+    from nome_hic_concordance.reference import load_context_from_bed
+    from nome_hic_concordance.site_calls import iter_cell_read_pairs
+
+    cp = load_context_from_bed(
+        _parse_context_bed("GCH:/tmp/sdc/GCH.bed.gz,HCG:/tmp/sdc/HCG.bed.gz"),
+        n_threads=1, c_offset=0)
+    full = [p[1] for p in iter_cell_read_pairs(str(bam_path), cp)]
+    sub = [p[1] for p in iter_cell_read_pairs(
+        str(bam_path), cp, max_pairs_per_cell=len(full) // 4,
+        rng=np.random.default_rng(0))]
+    assert 0 < len(sub) < len(full)
+    # the subsample must span nearly the same positional range as the full set,
+    # not cluster at the chromosome start
+    assert max(sub) > 0.8 * max(full), "sample looks truncated to the start"
+    assert np.median(sub) > 0.5 * np.median(full)
+
+
 def test_build_edges_exact_bounds():
     m = _mod()
     e = m._build_edges(1, 1_000_000, 8)
