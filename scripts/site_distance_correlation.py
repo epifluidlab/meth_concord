@@ -61,6 +61,17 @@ if str(_REPO_ROOT) not in sys.path:
 
 from nome_hic_concordance.site_calls import iter_cell_read_pairs  # noqa: E402
 
+# htslib backend: does the whole hot path (parse → sites → pair → bin →
+# accumulate) in C++.  Essential here — only ~1% of pairs are long-range, so the
+# long-range arm needs FULL BAMs, and the Python loop cannot carry ~1e6
+# pairs/cell.  Verified bit-identical to the pysam path, ~100x faster.
+try:                                                        # pysam first: its
+    import pysam as _pysam                                  # bundled libhts
+    _ = _pysam                                              # supplies symbols
+    from nome_hic_concordance import _site_dist_core as _CPP
+except Exception:                                           # pragma: no cover
+    _CPP = None
+
 _MEASURES = (("gg", "GCH–GCH  r(site_i, site_j)"),
              ("hh", "HCG–HCG  r(site_i, site_j)"),
              ("gh", "HCG–GCH  r(CpG, GpC)  [cross-context]"))
@@ -173,6 +184,24 @@ def _add_pair(accs, cond, edges, rng, cap, c1, c2, cross_only=False):
     _ = nb
 
 
+def process_cell_cpp(bam_path, ctx_positions, edges, trim_ends, mapq_min,
+                     cap, null_window, seed):
+    """htslib fast path — same result as :func:`process_cell`, ~100x faster."""
+    ctx_g = {c: (a["pos"].astype(np.int64), a["ref_base"].astype(np.uint8))
+             for c, a in ctx_positions.get("GCH", {}).items()}
+    ctx_h = {c: (a["pos"].astype(np.int64), a["ref_base"].astype(np.uint8))
+             for c, a in ctx_positions.get("HCG", {}).items()}
+    res = _CPP.parse_cell_site_distance(
+        str(bam_path), ctx_g, ctx_h, [float(e) for e in edges],
+        int(trim_ends), int(mapq_min), int(null_window), int(cap), int(seed),
+        False)
+    accs = {}
+    for m, _ in _MEASURES:
+        for c, _lab in _CONDS:
+            accs[(m, c)] = np.asarray(res[f"{m}_{c}"], dtype=np.float64)
+    return accs, int(res["n_pairs"])
+
+
 def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
                  max_pairs, cap, null_window, seed):
     """One cell → {(measure, condition): (6, nb) sums}.
@@ -180,6 +209,8 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
     Both conditions are built from the SAME parsed pairs (one BAM pass): the
     linked condition uses the true partner end; the null replaces it with a
     different end whose midpoint lies within ±``null_window`` of it.
+
+    Pure-Python/pysam fallback; the htslib backend above is used when built.
     """
     rng = np.random.default_rng(seed)
     nb = len(edges) - 1
@@ -329,13 +360,18 @@ def main():
     ap.add_argument("--trim-ends", type=int, default=5)
     ap.add_argument("--max-cells", type=int, default=0,
                     help="0 = all cells in --samples.")
-    ap.add_argument("--max-pairs-per-cell", type=int, default=20000,
-                    help="Approximate read pairs to keep per cell (0 = all). "
-                         "Applied as UNIFORM RANDOM down-sampling (rate derived "
-                         "from the BAM index), not truncation, so the sample is "
-                         "genome-wide rather than the start of each chromosome. "
-                         "The curves need ~1e5 site pairs per bin, so a modest "
-                         "value keeps the BAM pass cheap.")
+    ap.add_argument("--max-pairs-per-cell", type=int, default=0,
+                    help="0 (default) = use ALL read pairs. Only ~1%% of pairs "
+                         "are long-range, so capping would starve the "
+                         "long-range arm; the htslib backend makes the full "
+                         "pass affordable. A non-zero value down-samples "
+                         "uniformly (rate from the BAM index), and is only "
+                         "honoured by the --backend python fallback.")
+    ap.add_argument("--backend", choices=["auto", "htslib", "python"],
+                    default="auto",
+                    help="'auto' (default) uses the C++/htslib backend when "
+                         "built and falls back to pysam otherwise; 'htslib' "
+                         "requires it; 'python' forces the pysam path.")
     ap.add_argument("--max-site-pairs-per-read", type=int, default=64,
                     help="Cap site-pair combinations sampled per read pair, "
                          "bounding the O(n·m) blow-up on site-dense reads.")
@@ -363,21 +399,40 @@ def main():
     edges = _build_edges(args.min_distance, args.max_distance,
                          args.bins_per_decade)
     centers = np.sqrt(edges[:-1] * edges[1:])
+    use_cpp = _CPP is not None if args.backend == "auto" else args.backend == "htslib"
+    if use_cpp and _CPP is None:
+        sys.exit("--backend htslib requested but the extension is not built "
+                 "(pip install -e . with htslib + pybind11 available).")
+    backend = "htslib (C++)" if use_cpp else "python (pysam)"
+    if not use_cpp and not args.max_pairs_per_cell:
+        print("  NOTE: the pysam fallback on FULL BAMs is ~100x slower than the "
+              "htslib backend; build the extension or set --max-pairs-per-cell.",
+              file=sys.stderr)
+    pairs_note = ("ALL pairs" if not args.max_pairs_per_cell
+                  else f"~{args.max_pairs_per_cell:,} pairs/cell")
     print(f"# {_QC}")
     print(f"[site-dist] {len(samples)} cells | {len(edges)-1} bins "
           f"{args.min_distance:,}–{args.max_distance:,} bp | null window ±"
-          f"{args.null_window} bp | cap {args.max_pairs_per_cell:,} pairs/cell")
+          f"{args.null_window} bp | {pairs_note} | backend {backend}")
 
-    jobs = [(row["bam_path"], ctx_positions, edges, args.trim_ends,
-             args.mapq_min, args.max_pairs_per_cell,
-             args.max_site_pairs_per_read, args.null_window, args.seed + i)
-            for i, (_, row) in enumerate(samples.iterrows())]
+    if use_cpp:
+        jobs = [(row["bam_path"], ctx_positions, edges, args.trim_ends,
+                 args.mapq_min, args.max_site_pairs_per_read,
+                 args.null_window, args.seed + i)
+                for i, (_, row) in enumerate(samples.iterrows())]
+        fn = process_cell_cpp
+    else:
+        jobs = [(row["bam_path"], ctx_positions, edges, args.trim_ends,
+                 args.mapq_min, args.max_pairs_per_cell,
+                 args.max_site_pairs_per_read, args.null_window, args.seed + i)
+                for i, (_, row) in enumerate(samples.iterrows())]
+        fn = process_cell
     if args.n_threads > 1 and len(jobs) > 1:
         from joblib import Parallel, delayed
         res = Parallel(n_jobs=args.n_threads, verbose=5)(
-            delayed(process_cell)(*j) for j in jobs)
+            delayed(fn)(*j) for j in jobs)
     else:
-        res = [process_cell(*j) for j in jobs]
+        res = [fn(*j) for j in jobs]
 
     keys = [(m, c) for m, _ in _MEASURES for c, _ in _CONDS]
     groups: dict[str, list[int]] = {"all": list(range(len(res)))}

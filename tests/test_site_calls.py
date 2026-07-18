@@ -170,6 +170,49 @@ def test_downsampling_is_genome_wide_not_truncated():
     assert np.median(sub) > 0.5 * np.median(full)
 
 
+def test_htslib_backend_matches_pysam_exactly():
+    """The C++ fast path must be bit-identical to the validated pysam path.
+
+    Uncapped (cap=0) both enumerate every site pair, so the LINKED accumulators
+    are deterministic and must match exactly; the null draws a random partner
+    and so is compared only for shape.
+    """
+    pytest.importorskip("pysam")
+    import pysam  # noqa: F401  — loads the bundled libhts the ext resolves against
+    try:
+        from nome_hic_concordance import _site_dist_core as cpp
+    except Exception:
+        pytest.skip("htslib extension not built")
+    bam = Path("/tmp/sdc/cell1.sorted.bam")
+    if not bam.exists():
+        pytest.skip("synthetic fixture BAM not present")
+    from nome_hic_concordance.cli import _parse_context_bed
+    from nome_hic_concordance.reference import load_context_from_bed
+
+    m = _mod()
+    cp = load_context_from_bed(
+        _parse_context_bed("GCH:/tmp/sdc/GCH.bed.gz,HCG:/tmp/sdc/HCG.bed.gz"),
+        n_threads=1, c_offset=0)
+    edges = m._build_edges(1, 100_000, 3)
+    ctx_g = {c: (a["pos"].astype(np.int64), a["ref_base"].astype(np.uint8))
+             for c, a in cp["GCH"].items()}
+    ctx_h = {c: (a["pos"].astype(np.int64), a["ref_base"].astype(np.uint8))
+             for c, a in cp["HCG"].items()}
+
+    res = cpp.parse_cell_site_distance(str(bam), ctx_g, ctx_h,
+                                       [float(e) for e in edges],
+                                       5, 30, 100, 0, 42, False)
+    accs_py, n_py = m.process_cell(str(bam), cp, edges, 5, 30, 0, 0, 100, 42)
+    assert int(res["n_pairs"]) == n_py
+    for key in ("gg", "hh", "gh"):
+        a = np.asarray(res[f"{key}_linked"])
+        b = accs_py[(key, "linked")]
+        assert a.shape == b.shape
+        assert np.allclose(a, b), f"{key}_linked differs between backends"
+        assert a[0].sum() > 0, f"{key}: no site pairs accumulated"
+        assert np.asarray(res[f"{key}_null"]).shape == b.shape
+
+
 def test_build_edges_exact_bounds():
     m = _mod()
     e = m._build_edges(1, 1_000_000, 8)

@@ -127,19 +127,26 @@ def _get_pybind11_include():
         )
 
 
-def _make_ext():
+def _make_exts():
+    """Both htslib extensions: the aggregate k/n parser and the site-level
+    distance-correlation backend (the latter needs full BAMs, so the C++ path
+    is not optional in practice)."""
     include_dirs, library_dirs = _find_htslib()
     include_dirs.append(_get_pybind11_include())
 
-    return Extension(
-        "nome_hic_concordance._bam_parser_core",
-        sources=["nome_hic_concordance/ext/bam_parser_core.cpp"],
-        include_dirs=include_dirs,
-        library_dirs=library_dirs,
-        libraries=["hts"],
-        runtime_library_dirs=library_dirs[:],
-        language="c++",
-    )
+    def _ext(name, source):
+        return Extension(
+            f"nome_hic_concordance.{name}",
+            sources=[f"nome_hic_concordance/ext/{source}"],
+            include_dirs=include_dirs,
+            library_dirs=library_dirs,
+            libraries=["hts"],
+            runtime_library_dirs=library_dirs[:],
+            language="c++",
+        )
+
+    return [_ext("_bam_parser_core", "bam_parser_core.cpp"),
+            _ext("_site_dist_core", "site_dist_core.cpp")]
 
 
 # Build the extension only when actually compiling (not for metadata queries).
@@ -148,7 +155,7 @@ _BUILD_COMMANDS = {"build", "build_ext", "install", "develop",
                    "bdist_wheel", "bdist_egg", "editable_wheel"}
 if _BUILD_COMMANDS & set(sys.argv):
     try:
-        ext_modules = [_make_ext()]
+        ext_modules = _make_exts()
     except RuntimeError as e:
         print(f"WARNING: {e}", file=sys.stderr)
         print("The package will use the pure-Python BAM parser.\n", file=sys.stderr)
