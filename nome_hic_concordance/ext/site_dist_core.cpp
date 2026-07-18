@@ -392,7 +392,7 @@ static py::dict parse_cell_site_distance(
     int trim_ends, int mapq_min, int null_window,
     int max_site_pairs_per_read, uint64_t seed,
     bool keep_supplementary, int baseq_min, py::dict blacklist,
-    int donor_cap, int anchor_cap)
+    int donor_cap, int anchor_cap, int anchor_long_cap, int long_range_bp)
 {
     const int nb = (int)edges.size() - 1;
     Acc gg_l(nb), hh_l(nb), gh_l(nb), gg_n(nb), hh_n(nb), gh_n(nb);
@@ -413,7 +413,14 @@ static py::dict parse_cell_site_distance(
     std::mt19937_64 rng_s(seed ^ 0xC2B2AE3D27D4EB4FULL);
     uint64_t n_pairs_total = 0, n_null_eligible = 0;
     Reservoir<EndRec> donors; donors.cap = donor_cap;
+    // STRATIFIED by span.  A uniform sample of pairs is ~99% short-range, so a
+    // flat cap starves exactly the long-range bins this analysis is about: at
+    // 2500 anchors/cell only ~1% survive to >1kb, which for a context as sparse
+    // as HCG (~1 site per read end) lands below any sane min-pairs and the bin
+    // goes NaN.  Long-range pairs are rare enough to keep almost all of them
+    // for very little memory, so they get their own reservoir.
     Reservoir<AnchorRec> anchors; anchors.cap = anchor_cap;
+    Reservoir<AnchorRec> anchors_long; anchors_long.cap = anchor_long_cap;
 
     // ---- GIL HELD: pull every Python-owned buffer out up front -------------
     // Nothing below may touch the interpreter, so the whole parse can run with
@@ -594,7 +601,7 @@ static py::dict parse_cell_site_distance(
         // ---- sample for the POOLED cross-cell null ----------------------
         // BOTH ends are valid substitute partners (neither is linked to the
         // anchor), so offering both doubles donor density for free.
-        if (donor_cap > 0 || anchor_cap > 0) {
+        if (donor_cap > 0 || anchor_cap > 0 || anchor_long_cap > 0) {
             for (PairRec& p : pairs) {
                 if (donor_cap > 0) {
                     EndRec e1; e1.chrom = (int32_t)ci;
@@ -604,12 +611,20 @@ static py::dict parse_cell_site_distance(
                     e2.mid = (int32_t)p.mid2; e2.g = p.g2; e2.h = p.h2;
                     donors.offer(std::move(e2), rng_s);
                 }
-                if (anchor_cap > 0) {
+                const int64_t span = p.mid2 > p.mid1 ? p.mid2 - p.mid1
+                                                     : p.mid1 - p.mid2;
+                // anchor_long_cap <= 0 means "no stratification": everything
+                // goes to the one reservoir.  It must NOT mean "throw the
+                // long-range pairs away", which is the failure this whole
+                // stratification exists to prevent.
+                const bool is_long = anchor_long_cap > 0
+                                     && span >= (int64_t)long_range_bp;
+                if ((is_long ? anchor_long_cap : anchor_cap) > 0) {
                     AnchorRec a; a.chrom = (int32_t)ci;
                     a.mid2 = (int32_t)p.mid2;
                     a.g1 = std::move(p.g1); a.h1 = std::move(p.h1);
                     a.g2 = std::move(p.g2); a.h2 = std::move(p.h2);
-                    anchors.offer(std::move(a), rng_s);
+                    (is_long ? anchors_long : anchors).offer(std::move(a), rng_s);
                 }
             }
         }
@@ -651,12 +666,18 @@ static py::dict parse_cell_site_distance(
 
         std::vector<int32_t> ac, am;
         Csr ag1, ah1, ag2, ah2;
-        ac.reserve(anchors.keep.size()); am.reserve(anchors.keep.size());
-        for (const AnchorRec& a : anchors.keep) {
-            ac.push_back(a.chrom); am.push_back(a.mid2);
-            ag1.push(a.g1); ah1.push(a.h1);
-            ag2.push(a.g2); ah2.push(a.h2);
+        ac.reserve(anchors.keep.size() + anchors_long.keep.size());
+        am.reserve(ac.capacity());
+        for (const Reservoir<AnchorRec>* r : {&anchors, &anchors_long}) {
+            for (const AnchorRec& a : r->keep) {
+                ac.push_back(a.chrom); am.push_back(a.mid2);
+                ag1.push(a.g1); ah1.push(a.h1);
+                ag2.push(a.g2); ah2.push(a.h2);
+            }
         }
+        out["n_anchor_short"] = py::int_((uint64_t)anchors.keep.size());
+        out["n_anchor_long"] = py::int_((uint64_t)anchors_long.keep.size());
+        out["n_pairs_long_seen"] = py::int_(anchors_long.seen);
         py::dict an;
         an["chrom"] = vec_to_numpy(ac);
         an["mid2"] = vec_to_numpy(am);
@@ -778,6 +799,7 @@ PYBIND11_MODULE(_site_dist_core, m) {
           py::arg("keep_supplementary") = false, py::arg("baseq_min") = 0,
           py::arg("blacklist") = py::dict(),
           py::arg("donor_cap") = 0, py::arg("anchor_cap") = 0,
+          py::arg("anchor_long_cap") = 0, py::arg("long_range_bp") = 1000,
           "Parse one cell's BAM and return per-distance-bin Pearson "
           "sufficient statistics for GCH-GCH / HCG-HCG / HCG-GCH, linked and "
           "non-linked.");

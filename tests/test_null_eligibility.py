@@ -253,6 +253,61 @@ def test_pooled_null_keeps_per_cell_accumulators_for_the_bootstrap(tmp_path):
     assert np.isfinite(tot).all()
 
 
+def test_long_range_anchors_are_sampled_separately(tmp_path):
+    """Stratified anchor sampling.
+
+    Only ~1% of real pairs are long-range, so a single uniform reservoir hands
+    the long-range bins ~1% of an already small sample.  For a context as sparse
+    as HCG (~1 site per read end) those bins then fall under --min-pairs and go
+    NaN -- which is exactly what a 1577-cell run showed.  Long-range pairs get
+    their own reservoir so a tight short cap cannot starve them.
+    """
+    cpp = _cpp()
+    m = _mod()
+    short = [1_200 + 20 * i for i in range(20)]      # span 200..580 -> short
+    long_ = [50_000, 120_000, 200_000]               # span ~49kb+   -> long
+    bam, ctx = _spaced_bam(tmp_path, short + long_)
+    edges = m._build_edges(1, 1_000_000, 3)
+
+    def run(anchor_cap, anchor_long_cap):
+        return cpp.parse_cell_site_distance(
+            str(bam), ctx, {}, [float(e) for e in edges],
+            5, 30, 100, 0, 42, False, 0, {},
+            0, anchor_cap, anchor_long_cap, 1_000)
+
+    # no stratification (long cap 0) -> ONE reservoir, and a tight cap there
+    # keeps only 2 anchors out of 23, long-range ones almost certainly lost.
+    r = run(2, 0)
+    assert int(r["n_anchor_long"]) == 0        # nothing routed to the long arm
+    assert int(r["n_anchor_short"]) == 2       # ...but the pairs are not deleted
+
+    # the same tight short cap, but long-range gets its own generous reservoir
+    r = run(2, 100)
+    assert int(r["n_anchor_short"]) == 2, "short stratum should stay capped"
+    assert int(r["n_anchor_long"]) == 3, (
+        "every long-range pair should survive its own reservoir, got "
+        f"{int(r['n_anchor_long'])}")
+    assert int(r["n_pairs_long_seen"]) == 3
+
+
+def test_stratification_threshold_is_respected(tmp_path):
+    """A pair lands in the long stratum only when its SPAN crosses the cut."""
+    cpp = _cpp()
+    m = _mod()
+    bam, ctx = _spaced_bam(tmp_path, [3_000, 60_000])   # spans ~2kb and ~59kb
+    edges = m._build_edges(1, 1_000_000, 3)
+
+    def n_long(threshold):
+        r = cpp.parse_cell_site_distance(
+            str(bam), ctx, {}, [float(e) for e in edges],
+            5, 30, 100, 0, 42, False, 0, {}, 0, 100, 100, threshold)
+        return int(r["n_anchor_long"])
+
+    assert n_long(1_000) == 2        # both spans exceed 1kb
+    assert n_long(10_000) == 1       # only the 59kb pair
+    assert n_long(100_000) == 0      # neither
+
+
 def test_csr_concat_and_permute_round_trip():
     """The CSR plumbing must not scramble which sites belong to which end."""
     m = _mod()

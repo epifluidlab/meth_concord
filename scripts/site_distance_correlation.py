@@ -289,9 +289,12 @@ def _pooled_null(res, idxs, edges, args, nb):
                          for c in range(k)]
         match_pc[mkey] = [np.asarray(out["matched_per_cell"][3 * c + mi], np.float64)
                           for c in range(k)]
+    st = [res[i][3][2] for i in kept if len(res[i][3]) > 2]
     return {"null_per_cell": null_pc, "matched_per_cell": match_pc,
             "n_eligible": int(out["n_eligible"]),
-            "n_anchors": int(out["n_anchors"]), "n_donors": int(len(d_mid))}
+            "n_anchors": int(out["n_anchors"]), "n_donors": int(len(d_mid)),
+            "n_anchor_long": sum(s["anchor_long"] for s in st),
+            "n_pairs_long_seen": sum(s["pairs_long_seen"] for s in st)}
 
 
 def _build_edges(min_d, max_d, per_decade):
@@ -380,7 +383,8 @@ def prepare_ctx(ctx_positions, blacklist=None):
 
 def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
                      cap, null_window, seed, baseq_min=0,
-                     donor_cap=0, anchor_cap=0):
+                     donor_cap=0, anchor_cap=0, anchor_long_cap=0,
+                     long_range_bp=1000):
     """htslib fast path — same result as :func:`process_cell`, ~100x faster.
 
     ``prepared`` comes from :func:`prepare_ctx`; the extension releases the GIL,
@@ -393,13 +397,18 @@ def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
     res = _CPP.parse_cell_site_distance(
         str(bam_path), ctx_g, ctx_h, [float(e) for e in edges],
         int(trim_ends), int(mapq_min), int(null_window), int(cap), int(seed),
-        False, int(baseq_min), bl, int(donor_cap), int(anchor_cap))
+        False, int(baseq_min), bl, int(donor_cap), int(anchor_cap),
+        int(anchor_long_cap), int(long_range_bp))
     accs = {}
     for m, _ in _MEASURES:
         for c, _lab in _CONDS:
             accs[(m, c)] = np.asarray(res[f"{m}_{c}"], dtype=np.float64)
-    pools = ((dict(res["donors"]), dict(res["anchors"]))
-             if (donor_cap or anchor_cap) else None)
+    pools = None
+    if donor_cap or anchor_cap or anchor_long_cap:
+        pools = (dict(res["donors"]), dict(res["anchors"]),
+                 {"anchor_long": int(res["n_anchor_long"]),
+                  "anchor_short": int(res["n_anchor_short"]),
+                  "pairs_long_seen": int(res["n_pairs_long_seen"])})
     return accs, int(res["n_pairs"]), int(res["n_null_eligible"]), pools
 
 
@@ -810,9 +819,22 @@ def main():
                          "pool. Raise it if the eligible fraction is low; it "
                          "is the main memory knob (~50 B per donor).")
     ap.add_argument("--null-anchors-per-cell", type=int, default=2_500,
-                    help="Read pairs sampled per cell as pooled-null anchors. "
-                         "The null and matched curves are reference curves, so "
-                         "they do not need every pair.")
+                    help="SHORT-range read pairs sampled per cell as "
+                         "pooled-null anchors. Short-range bins have orders of "
+                         "magnitude more data than they need, so this stays "
+                         "small.")
+    ap.add_argument("--null-anchors-long-per-cell", type=int, default=10_000,
+                    help="LONG-range (span >= --null-long-range-bp) pairs "
+                         "sampled per cell. Sampled separately because only "
+                         "~1%% of pairs are long-range: a uniform sample "
+                         "starves exactly the bins this analysis is about, "
+                         "and for a context as sparse as HCG those bins then "
+                         "fall under --min-pairs and go NaN. Long-range pairs "
+                         "are rare enough that a high cap keeps nearly all of "
+                         "them cheaply.")
+    ap.add_argument("--null-long-range-bp", type=int, default=1_000,
+                    help="Span at which a pair counts as long-range for the "
+                         "stratified anchor sampling above.")
     ap.add_argument("--n-bootstrap", type=int, default=1000,
                     help="Cell-level bootstrap resamples for the Δ confidence "
                          "band and p-value. 0 disables.")
@@ -875,6 +897,7 @@ def main():
         pooled_null = False
     donor_cap = args.null_donors_per_cell if pooled_null else 0
     anchor_cap = args.null_anchors_per_cell if pooled_null else 0
+    anchor_long_cap = args.null_anchors_long_per_cell if pooled_null else 0
 
     print(f"# {_QC}")
     print(f"[site-dist] {len(samples)} cells | {len(edges)-1} bins "
@@ -882,11 +905,16 @@ def main():
           f"{args.null_window} bp | {pairs_note} | backend {backend}")
     if pooled_null:
         # ~50 B/donor and ~100 B/anchor, measured on the CSR layout below.
-        mb = len(samples) * (donor_cap * 2 * 50 + anchor_cap * 100) / 1e6
+        mb = len(samples) * (donor_cap * 2 * 50
+                             + (anchor_cap + anchor_long_cap) * 90) / 1e6
         print(f"  null scope: POOLED — substitute ends are drawn from every "
               f"cell in the group\n"
-              f"    sampling {donor_cap:,} donor ends and {anchor_cap:,} "
-              f"anchors per cell (~{mb:,.0f} MB held)")
+              f"    sampling {donor_cap:,} donor ends per cell, and anchors "
+              f"STRATIFIED by span:\n"
+              f"      <{args.null_long_range_bp:,}bp: up to {anchor_cap:,}/cell"
+              f"   >={args.null_long_range_bp:,}bp: up to "
+              f"{anchor_long_cap:,}/cell   (<={mb:,.0f} MB, a ceiling — a cell "
+              f"with fewer long-range pairs than the cap uses less)")
     else:
         print("  null scope: WITHIN-CELL — substitute ends come only from the "
               "anchor's own cell")
@@ -900,7 +928,8 @@ def main():
         jobs = [(row["bam_path"], prepared, edges, args.trim_ends,
                  args.mapq_min, args.max_site_pairs_per_read,
                  args.null_window, args.seed + i, args.baseq_min,
-                 donor_cap, anchor_cap)
+                 donor_cap, anchor_cap, anchor_long_cap,
+                 args.null_long_range_bp)
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = process_cell_cpp
     else:
@@ -986,9 +1015,14 @@ def main():
                     accs[(m, "matched")] = sum(pooled["matched_per_cell"][m])
                 n_pairs_null = pooled["n_anchors"]
                 n_elig = pooled["n_eligible"]
+                seen_l = pooled["n_pairs_long_seen"]
+                kept_l = pooled["n_anchor_long"]
+                frac = f"{100.0 * kept_l / seen_l:.0f}%" if seen_l else "n/a"
                 scope_note = (
                     f"pooled null: {pooled['n_donors']:,} donor ends from "
-                    f"{len(idxs)} cells; {pooled['n_anchors']:,} anchors sampled")
+                    f"{len(idxs)} cells; {pooled['n_anchors']:,} anchors "
+                    f"({kept_l:,} long-range = {frac} of the "
+                    f"{seen_l:,} seen)")
                 # eligibility is now relative to the sampled anchors
                 n_pairs_for_pct = n_pairs_null
             else:
