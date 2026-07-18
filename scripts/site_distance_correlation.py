@@ -40,6 +40,21 @@ baseline: same pairs, same anchor end, same arm, differing from the null only
 in whether the partner is the real mate.  The run reports the eligible
 fraction; when it is low, read the null against MATCHED.
 
+--null-scope pooled (the default) attacks the same problem at the source: the
+substitute end is drawn from the read ends of EVERY cell in the group being
+plotted -- the group's own cells for a group figure, all cells for the 'all'
+figure -- which raises donor density by roughly the number of cells.  Each cell
+contributes a bounded reservoir sample, so this costs one BAM pass and a
+predictable amount of memory rather than holding every pair.  --null-scope cell
+restores the old within-cell behaviour.
+
+Each panel is paired with Δ = matched − null, its 95% CI, and a p-value from a
+CELL-level bootstrap: site pairs are not independent (tens per read, ~1e6 reads
+per cell), so a test that treats them as independent would report significance
+for everything.  Bins with fewer than --min-pairs site pairs on EITHER side are
+masked, which is what keeps a thin, noisy null from putting a lone spike in an
+otherwise smooth curve.
+
 Because the null swaps the PARTNER END, it applies to the cross-end arm only.
 Within-read pairs have no non-linked counterpart — both cytosines sit on the
 same molecule by construction — so the null curve is undefined (NaN) below
@@ -65,6 +80,7 @@ import logging
 import re
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -142,6 +158,140 @@ def _corr(acc, min_pairs):
         r = np.where((n >= min_pairs) & (den > 0), cov / np.where(den > 0, den, 1.0),
                      np.nan)
     return r, n
+
+
+def _corr_stack(acc, min_pairs):
+    """:func:`_corr` vectorised over a leading (bootstrap) axis: (B, 6, nb) → r."""
+    n, sx, sy, sxx, syy, sxy = (acc[:, i] for i in range(6))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nz = np.where(n > 0, n, 1.0)
+        cov = sxy - sx * sy / nz
+        den = np.sqrt((sxx - sx * sx / nz) * (syy - sy * sy / nz))
+        return np.where((n >= min_pairs) & (den > 0),
+                        cov / np.where(den > 0, den, 1.0), np.nan)
+
+
+def _bootstrap_delta(per_cell_a, per_cell_b, min_pairs, n_boot, seed):
+    """Cell-level bootstrap of r(a) − r(b) per bin → (lo, hi, p).
+
+    The unit of resampling is the CELL, not the site pair.  Site pairs are
+    massively non-independent -- tens of them come off one read, ~1e6 reads off
+    one cell -- so a Fisher z-test on the site-pair count would treat ~1e8
+    correlated observations as independent and return p-values of order 1e-300
+    for any difference at all.  Resampling cells is the honest unit and is what
+    the sibling joint_distance_coordination.py already does for its CIs.
+    """
+    a = np.stack(per_cell_a).astype(np.float64)          # (k, 6, nb)
+    b = np.stack(per_cell_b).astype(np.float64)
+    k = a.shape[0]
+    if k < 3 or n_boot <= 0:                             # too few cells to resample
+        return None
+    rng = np.random.default_rng(seed)
+    w = rng.multinomial(k, np.full(k, 1.0 / k), size=n_boot).astype(np.float64)
+    d = (_corr_stack((w @ a.reshape(k, -1)).reshape(n_boot, 6, -1), min_pairs)
+         - _corr_stack((w @ b.reshape(k, -1)).reshape(n_boot, 6, -1), min_pairs))
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        # A bin masked in every resample is an all-NaN slice — expected, not an
+        # error; it simply has no Δ to report.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        lo, hi = np.nanpercentile(d, [2.5, 97.5], axis=0)
+        n_ok = np.sum(np.isfinite(d), axis=0)
+        p = 2.0 * np.minimum(np.sum(d <= 0, axis=0), np.sum(d >= 0, axis=0)) \
+            / np.maximum(n_ok, 1)
+    # Below ~20 usable resamples the tail is unresolvable; report nothing.
+    p = np.where(n_ok >= 20, np.minimum(p, 1.0), np.nan)
+    return lo, hi, np.where(n_ok >= 20, p, np.nan)
+
+
+def _stars(p):
+    if not np.isfinite(p):
+        return ""
+    return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+
+
+# --------------------------------------------------------------------------
+# Pooled cross-cell null
+# --------------------------------------------------------------------------
+
+def _concat_csr(parts, tag):
+    """Concatenate per-cell CSR columns, shifting each part's row pointers."""
+    if not parts:
+        return (np.zeros(0, np.int32), np.zeros(0, np.int8), np.zeros(1, np.int32))
+    pos = np.concatenate([np.asarray(p[f"{tag}_pos"]) for p in parts])
+    st = np.concatenate([np.asarray(p[f"{tag}_st"]) for p in parts])
+    ptrs, off = [], 0
+    for p in parts:
+        q = np.asarray(p[f"{tag}_ptr"], np.int64)
+        ptrs.append(q[:-1] + off)
+        off += int(q[-1])
+    ptr = np.concatenate(ptrs + [np.array([off], np.int64)])
+    return pos.astype(np.int32), st.astype(np.int8), ptr.astype(np.int32)
+
+
+def _permute_csr(pos, st, ptr, order):
+    """Reorder CSR rows — donors must reach the matcher sorted by (chrom, mid)."""
+    ptr = ptr.astype(np.int64)
+    lens = (ptr[1:] - ptr[:-1])[order]
+    new_ptr = np.concatenate([[0], np.cumsum(lens)])
+    total = int(new_ptr[-1])
+    if total == 0:
+        return pos[:0].copy(), st[:0].copy(), new_ptr.astype(np.int32)
+    idx = np.repeat(ptr[order] - new_ptr[:-1], lens) + np.arange(total)
+    return pos[idx], st[idx], new_ptr.astype(np.int32)
+
+
+def _pooled_null(res, idxs, edges, args, nb):
+    """Null drawn from the read ends of EVERY cell in this group.
+
+    Within one cell a long-range pair rarely has another end within ±window, so
+    the within-cell null is built from a small, read-density-biased minority.
+    Pooling the donor ends across the group's cells raises donor density by
+    roughly the number of cells.  Returns per-cell accumulators so the bootstrap
+    can still resample cells.
+    """
+    kept = [i for i in idxs if res[i][3] is not None
+            and len(res[i][3][1]["chrom"]) > 0]
+    if not kept:
+        return None
+    dparts = [res[i][3][0] for i in kept]
+    aparts = [res[i][3][1] for i in kept]
+
+    def _col(parts, name, dtype):
+        return np.concatenate([np.asarray(p[name], dtype) for p in parts])
+
+    def _cellcol(parts):
+        return np.concatenate([np.full(len(np.asarray(p["chrom"])), j, np.int32)
+                               for j, p in enumerate(parts)])
+
+    d_chrom, d_mid = _col(dparts, "chrom", np.int32), _col(dparts, "mid", np.int32)
+    order = np.lexsort((d_mid, d_chrom))
+    donors = {"chrom": d_chrom[order], "mid": d_mid[order],
+              "cell": _cellcol(dparts)[order]}
+    for tag in ("g", "h"):
+        p_, s_, q_ = _permute_csr(*_concat_csr(dparts, tag), order)
+        donors[f"{tag}_pos"], donors[f"{tag}_st"], donors[f"{tag}_ptr"] = p_, s_, q_
+
+    anchors = {"chrom": _col(aparts, "chrom", np.int32),
+               "mid2": _col(aparts, "mid2", np.int32),
+               "cell": _cellcol(aparts)}
+    for tag in ("g1", "h1", "g2", "h2"):
+        p_, s_, q_ = _concat_csr(aparts, tag)
+        anchors[f"{tag}_pos"], anchors[f"{tag}_st"], anchors[f"{tag}_ptr"] = p_, s_, q_
+
+    out = _CPP.cross_cell_null(anchors, donors, [float(e) for e in edges],
+                               int(args.null_window),
+                               int(args.max_site_pairs_per_read),
+                               int(args.seed), len(kept))
+    k = len(kept)
+    null_pc, match_pc = {}, {}
+    for mi, (mkey, _) in enumerate(_MEASURES):
+        null_pc[mkey] = [np.asarray(out["null_per_cell"][3 * c + mi], np.float64)
+                         for c in range(k)]
+        match_pc[mkey] = [np.asarray(out["matched_per_cell"][3 * c + mi], np.float64)
+                          for c in range(k)]
+    return {"null_per_cell": null_pc, "matched_per_cell": match_pc,
+            "n_eligible": int(out["n_eligible"]),
+            "n_anchors": int(out["n_anchors"]), "n_donors": int(len(d_mid))}
 
 
 def _build_edges(min_d, max_d, per_decade):
@@ -229,22 +379,28 @@ def prepare_ctx(ctx_positions, blacklist=None):
 
 
 def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
-                     cap, null_window, seed, baseq_min=0):
+                     cap, null_window, seed, baseq_min=0,
+                     donor_cap=0, anchor_cap=0):
     """htslib fast path — same result as :func:`process_cell`, ~100x faster.
 
     ``prepared`` comes from :func:`prepare_ctx`; the extension releases the GIL,
     so this is safe to run on a thread pool.
+
+    ``donor_cap`` / ``anchor_cap`` additionally reservoir-sample this cell's
+    read ends and pairs for the POOLED cross-cell null (see ``--null-scope``).
     """
     ctx_g, ctx_h, bl = prepared
     res = _CPP.parse_cell_site_distance(
         str(bam_path), ctx_g, ctx_h, [float(e) for e in edges],
         int(trim_ends), int(mapq_min), int(null_window), int(cap), int(seed),
-        False, int(baseq_min), bl)
+        False, int(baseq_min), bl, int(donor_cap), int(anchor_cap))
     accs = {}
     for m, _ in _MEASURES:
         for c, _lab in _CONDS:
             accs[(m, c)] = np.asarray(res[f"{m}_{c}"], dtype=np.float64)
-    return accs, int(res["n_pairs"]), int(res["n_null_eligible"])
+    pools = ((dict(res["donors"]), dict(res["anchors"]))
+             if (donor_cap or anchor_cap) else None)
+    return accs, int(res["n_pairs"]), int(res["n_null_eligible"]), pools
 
 
 def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
@@ -265,7 +421,7 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
         bam_path, ctx_positions, trim_ends=trim_ends, mapq_min=mapq_min,
         max_pairs_per_cell=max_pairs, rng=rng))
     if not pairs:
-        return accs, 0, 0
+        return accs, 0, 0, None
 
     for chrom, mid1, mid2, c1, c2 in pairs:
         _add_pair(accs, "linked", edges, rng, cap, c1, c2)
@@ -300,7 +456,7 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
         # Same pair, TRUE partner, cross-end only — the like-for-like baseline
         # for the null, since the null can only ever see THESE pairs.
         _add_pair(accs, "matched", edges, rng, cap, c1, c2, cross_only=True)
-    return accs, len(pairs), n_eligible
+    return accs, len(pairs), n_eligible, None
 
 
 # --------------------------------------------------------------------------
@@ -443,47 +599,73 @@ def _logx(ax, lo, hi):
     ax.set_xlabel("genomic distance between the two cytosines")
 
 
-def _plot(curves, centers, edges, label, n_cells, n_pairs, out):
+def _delta(curves, key, min_pairs):
+    """matched − null, masked where EITHER side is too thin to trust.
+
+    Masking jointly matters: a bin can hold millions of linked site pairs and a
+    few hundred null ones, and differencing an unmasked noisy null is exactly
+    what produces a lone spike in an otherwise smooth curve.
+    """
+    rm, nm = curves[(key, "matched")]
+    rn, nn = curves[(key, "null")]
+    ok = (nm >= min_pairs) & (nn >= min_pairs)
+    return np.where(ok, rm - rn, np.nan), ok
+
+
+def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     colors = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c"}
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8.5))
-    panels = dict(zip(("gg", "hh", "gh"), axes.flat[:3]))
-    for key, title in _MEASURES:
-        ax = panels[key]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8.6), sharex=True)
+
+    for col, (key, title) in enumerate(_MEASURES):
+        ax = axes[0, col]
         ax.axhline(0, color="0.6", lw=0.8, zorder=0)
         for cond, clabel in _CONDS:
-            r, n = curves[(key, cond)]
-            ax.plot(centers, r, color=colors[key], label=clabel,
-                    **_CSTYLE[cond])
-        _logx(ax, edges[0], edges[-1])
+            r, _n = curves[(key, cond)]
+            ax.plot(centers, r, color=colors[key], label=clabel, **_CSTYLE[cond])
         ax.set_ylabel("Pearson r (phi) of 0/1 calls")
         ax.set_title(title, fontsize=10)
-        ax.legend(fontsize=8, loc="best")
-    ax = axes.flat[3]
-    ax.axhline(0, color="0.6", lw=0.8, zorder=0)
-    for key, title in _MEASURES:
-        ax.plot(centers, curves[(key, "linked")][0], "-o", ms=3, lw=1.5,
-                color=colors[key], label=title.split("  ")[0])
-    _logx(ax, edges[0], edges[-1])
-    ax.set_ylabel("Pearson r (phi) of 0/1 calls")
-    ax.set_title("linked curves overlaid", fontsize=10)
-    ax.legend(fontsize=8, loc="best")
-    axn = ax.twinx()
-    axn.plot(centers, curves[("gg", "linked")][1], color="0.5", lw=0.9, alpha=0.5)
-    axn.set_yscale("log")
-    axn.set_ylabel("GCH–GCH site-pair count", color="0.5", fontsize=8)
-    axn.tick_params(axis="y", colors="0.5", labelsize=7)
+        ax.legend(fontsize=7.5, loc="best")
+
+        # ---- delta panel -------------------------------------------------
+        axd = axes[1, col]
+        axd.axhline(0, color="0.6", lw=0.8, zorder=0)
+        d, ok = _delta(curves, key, min_pairs)
+        sig = None
+        if boot and boot.get(key) is not None:
+            lo, hi, p = boot[key]
+            lo = np.where(ok, lo, np.nan); hi = np.where(ok, hi, np.nan)
+            axd.fill_between(centers, lo, hi, color=colors[key], alpha=0.20,
+                             lw=0, label="95% CI (cell bootstrap)")
+            sig = np.isfinite(d) & np.isfinite(p) & (p < 0.05)
+        axd.plot(centers, d, "-o", ms=3.2, lw=1.6, color=colors[key],
+                 label="Δ = matched − null")
+        # AFTER the line, or the ring is hidden underneath its own marker.
+        if sig is not None and sig.any():
+            axd.plot(np.asarray(centers)[sig], d[sig], "o", ms=7.5,
+                     mfc="none", mec="0.15", mew=1.2, ls="none",
+                     label="p < 0.05", zorder=5)
+        _logx(axd, edges[0], edges[-1])
+        axd.set_ylabel("Δ Pearson r")
+        axd.set_title(f"Δ {title.split('  ')[0]}   (same-molecule excess)",
+                      fontsize=9.5)
+        axd.legend(fontsize=7, loc="best")
+
     fig.suptitle(f"Site-level correlation vs distance — {label}  |  "
                  f"{n_cells} cells, {n_pairs:,} read pairs", fontsize=12)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.96))
-    fig.text(0.5, 0.012, _QC, ha="center", fontsize=7.5, color="0.35")
+    fig.tight_layout(rect=(0, 0.045, 1, 0.955))
+    fig.text(0.5, 0.024, _QC, ha="center", fontsize=7.5, color="0.35")
+    fig.text(0.5, 0.008,
+             f"bins with fewer than {min_pairs:,} site pairs on either side are "
+             f"masked; p from a cell-level bootstrap (site pairs are not "
+             f"independent)", ha="center", fontsize=7, color="0.45")
     fig.savefig(out)
     plt.close(fig)
 
 
-def _write_tsv(curves, centers, edges, path):
+def _write_tsv(curves, boot, centers, edges, path, min_pairs):
     rows = {"bin_lo": edges[:-1].astype(np.int64),
             "bin_hi": edges[1:].astype(np.int64),
             "center_bp": np.round(centers).astype(np.int64)}
@@ -492,32 +674,47 @@ def _write_tsv(curves, centers, edges, path):
             r, n = curves[(key, cond)]
             rows[f"{key}_{cond}_r"] = r
             rows[f"{key}_{cond}_n"] = n.astype(np.int64)
+        d, _ok = _delta(curves, key, min_pairs)
+        rows[f"{key}_delta"] = d
+        if boot and boot.get(key) is not None:
+            lo, hi, p = boot[key]
+            rows[f"{key}_delta_ci_lo"] = np.where(np.isfinite(d), lo, np.nan)
+            rows[f"{key}_delta_ci_hi"] = np.where(np.isfinite(d), hi, np.nan)
+            rows[f"{key}_delta_p"] = np.where(np.isfinite(d), p, np.nan)
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, na_rep="nan")
 
 
 def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
-            safe=None, n_eligible=0):
+            safe=None, n_eligible=0, boot=None, scope_note="",
+            n_pairs_for_pct=None):
     curves = {k: _corr(v, args.min_pairs) for k, v in accs.items()}
     # Build the two paths explicitly: Path.with_suffix() would ALSO mangle a
     # label containing a dot ('A.B' -> '..._A.pdf'), silently.
     stem_name = f"site_distance_corr_{safe or label}"
     fig_path = out_dir / f"{stem_name}.{args.plot_format}"
     tsv_path = out_dir / f"{stem_name}.tsv"
-    _plot(curves, centers, edges, label, n_cells, n_pairs, fig_path)
-    _write_tsv(curves, centers, edges, tsv_path)
+    _plot(curves, boot, centers, edges, label, n_cells, n_pairs, fig_path,
+          args.min_pairs)
+    _write_tsv(curves, boot, centers, edges, tsv_path, args.min_pairs)
     print(f"\n=== {label}: {n_cells} cells, {n_pairs:,} read pairs ===")
-    pct = 100.0 * n_eligible / n_pairs if n_pairs else 0.0
-    print(f"  null-eligible: {n_eligible:,} pairs ({pct:.1f}%) had another end "
-          f"within ±{args.null_window}bp")
+    if scope_note:
+        print(f"  {scope_note}")
+    denom = n_pairs_for_pct if n_pairs_for_pct else n_pairs
+    pct = 100.0 * n_eligible / denom if denom else 0.0
+    print(f"  null-eligible: {n_eligible:,} anchors ({pct:.1f}%) had a "
+          f"non-linked end within ±{args.null_window}bp")
     if pct < 25.0:
-        print("  NOTE: most pairs have no nearby non-linked end, and the ones "
+        print("  NOTE: most anchors have no nearby non-linked end, and the ones "
               "that do sit in read-dense loci.\n"
               "        Compare 'null' against 'matched' (same pairs), NOT "
-              "against 'linked' (all pairs).")
+              "against 'linked' (all pairs).\n"
+              "        --null-scope pooled raises this by drawing donor ends "
+              "from every cell in the group.")
+    deltas = {k: _delta(curves, k, args.min_pairs)[0] for k, _ in _MEASURES}
     print(f"  {'distance':>10}{'n(GG)':>12} | "
-          + "".join(f"{m.split('  ')[0]:>26}" for _, m in _MEASURES))
+          + "".join(f"{m.split('  ')[0]:>36}" for _, m in _MEASURES))
     print(f"  {'':>10}{'':>12} | "
-          + "".join(f"{'linked/matched/null':>26}" for _ in _MEASURES))
+          + "".join(f"{'linked/matched/null    Δ':>36}" for _ in _MEASURES))
     for bi in range(len(centers)):
         if not np.isfinite(curves[("gg", "linked")][0][bi]):
             continue
@@ -525,8 +722,17 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
         for key, _ in _MEASURES:
             vals = "/".join(
                 f"{curves[(key, c)][0][bi]:+.3f}" for c, _ in _CONDS)
-            cols += vals.rjust(26)
+            dv = deltas[key][bi]
+            if np.isfinite(dv):
+                star = _stars(boot[key][2][bi]) if boot and boot.get(key) is not None else ""
+                vals += f"  {dv:+.3f}{star}"
+            else:
+                vals += "      ."          # masked: too few pairs on one side
+            cols += vals.rjust(36)
         print(f"  {centers[bi]:>10,.0f}{int(curves[('gg','linked')][1][bi]):>12,d} | {cols}")
+    if boot:
+        print("  Δ = matched − null;  * p<0.05  ** p<0.01  *** p<0.001 "
+              f"({args.n_bootstrap} cell-level bootstrap resamples)")
     print(f"  wrote {fig_path} and {tsv_path}")
     return curves
 
@@ -588,8 +794,28 @@ def main():
     ap.add_argument("--max-site-pairs-per-read", type=int, default=64,
                     help="Cap site-pair combinations sampled per read pair, "
                          "bounding the O(n·m) blow-up on site-dense reads.")
-    ap.add_argument("--min-pairs", type=int, default=100,
-                    help="Drop a distance bin with fewer site pairs than this.")
+    ap.add_argument("--min-pairs", type=int, default=2000,
+                    help="Mask a distance bin with fewer site pairs than this, "
+                         "on EITHER side of a comparison. Thin bins are what "
+                         "produce lone spikes in an otherwise smooth curve.")
+    ap.add_argument("--null-scope", choices=["pooled", "cell"], default="pooled",
+                    help="Where substitute partner ends come from. 'pooled' "
+                         "(default) draws them from every cell in the group "
+                         "being plotted — the group's own cells for a group "
+                         "figure, all cells for the 'all' figure. 'cell' "
+                         "restricts them to the anchor's own cell, which at "
+                         "single-cell coverage leaves few pairs eligible.")
+    ap.add_argument("--null-donors-per-cell", type=int, default=10_000,
+                    help="Read ends sampled per cell into the pooled donor "
+                         "pool. Raise it if the eligible fraction is low; it "
+                         "is the main memory knob (~50 B per donor).")
+    ap.add_argument("--null-anchors-per-cell", type=int, default=2_500,
+                    help="Read pairs sampled per cell as pooled-null anchors. "
+                         "The null and matched curves are reference curves, so "
+                         "they do not need every pair.")
+    ap.add_argument("--n-bootstrap", type=int, default=1000,
+                    help="Cell-level bootstrap resamples for the Δ confidence "
+                         "band and p-value. 0 disables.")
     ap.add_argument("--plot-format", choices=["png", "pdf", "svg"], default="pdf")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
@@ -642,10 +868,28 @@ def main():
               file=sys.stderr)
     pairs_note = ("ALL pairs" if not args.max_pairs_per_cell
                   else f"~{args.max_pairs_per_cell:,} pairs/cell")
+    pooled_null = args.null_scope == "pooled"
+    if pooled_null and not use_cpp:
+        print("  NOTE: --null-scope pooled needs the htslib backend; falling "
+              "back to the within-cell null.", file=sys.stderr)
+        pooled_null = False
+    donor_cap = args.null_donors_per_cell if pooled_null else 0
+    anchor_cap = args.null_anchors_per_cell if pooled_null else 0
+
     print(f"# {_QC}")
     print(f"[site-dist] {len(samples)} cells | {len(edges)-1} bins "
           f"{args.min_distance:,}–{args.max_distance:,} bp | null window ±"
           f"{args.null_window} bp | {pairs_note} | backend {backend}")
+    if pooled_null:
+        # ~50 B/donor and ~100 B/anchor, measured on the CSR layout below.
+        mb = len(samples) * (donor_cap * 2 * 50 + anchor_cap * 100) / 1e6
+        print(f"  null scope: POOLED — substitute ends are drawn from every "
+              f"cell in the group\n"
+              f"    sampling {donor_cap:,} donor ends and {anchor_cap:,} "
+              f"anchors per cell (~{mb:,.0f} MB held)")
+    else:
+        print("  null scope: WITHIN-CELL — substitute ends come only from the "
+              "anchor's own cell")
 
     if use_cpp:
         prepared = prepare_ctx(ctx_positions, blacklist)
@@ -655,7 +899,8 @@ def main():
               f"threads (no per-worker copy)")
         jobs = [(row["bam_path"], prepared, edges, args.trim_ends,
                  args.mapq_min, args.max_site_pairs_per_read,
-                 args.null_window, args.seed + i, args.baseq_min)
+                 args.null_window, args.seed + i, args.baseq_min,
+                 donor_cap, anchor_cap)
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = process_cell_cpp
     else:
@@ -724,12 +969,48 @@ def main():
         if n_pairs == 0:
             print(f"\n=== {label}: no usable read pairs — skipped ===")
             continue
+
+        # Per-cell accumulators, so the bootstrap can resample cells.  For the
+        # within-cell null they come straight from the parse; for the pooled
+        # null the matcher returns them keyed by the anchor's cell.
+        pc = {(m, c): [res[i][0][(m, c)] for i in idxs]
+              for m, _ in _MEASURES for c, _ in _CONDS}
+        scope_note = ""
+        if pooled_null:
+            pooled = _pooled_null(res, idxs, edges, args, len(edges) - 1)
+            if pooled is not None:
+                for m, _ in _MEASURES:
+                    pc[(m, "null")] = pooled["null_per_cell"][m]
+                    pc[(m, "matched")] = pooled["matched_per_cell"][m]
+                    accs[(m, "null")] = sum(pooled["null_per_cell"][m])
+                    accs[(m, "matched")] = sum(pooled["matched_per_cell"][m])
+                n_pairs_null = pooled["n_anchors"]
+                n_elig = pooled["n_eligible"]
+                scope_note = (
+                    f"pooled null: {pooled['n_donors']:,} donor ends from "
+                    f"{len(idxs)} cells; {pooled['n_anchors']:,} anchors sampled")
+                # eligibility is now relative to the sampled anchors
+                n_pairs_for_pct = n_pairs_null
+            else:
+                n_pairs_for_pct = n_pairs
+        else:
+            n_pairs_for_pct = n_pairs
+
+        boot = None
+        if args.n_bootstrap > 0 and len(idxs) >= 3:
+            boot = {}
+            for m, _ in _MEASURES:
+                boot[m] = _bootstrap_delta(pc[(m, "matched")], pc[(m, "null")],
+                                           args.min_pairs, args.n_bootstrap,
+                                           args.seed)
         _report(accs, len(idxs), n_pairs, centers, edges, label, out_dir, args,
-                safe=safe[label], n_eligible=n_elig)
+                safe=safe[label], n_eligible=n_elig, boot=boot,
+                scope_note=scope_note, n_pairs_for_pct=n_pairs_for_pct)
         summary[label] = {"n_cells": len(idxs), "n_read_pairs": int(n_pairs),
-                          "n_null_eligible_pairs": int(n_elig),
-                          "null_eligible_frac": (round(n_elig / n_pairs, 4)
-                                                 if n_pairs else None),
+                          "null_scope": "pooled" if pooled_null else "cell",
+                          "n_null_eligible": int(n_elig),
+                          "null_eligible_frac": (round(n_elig / n_pairs_for_pct, 4)
+                                                 if n_pairs_for_pct else None),
                           "file_stem": f"site_distance_corr_{safe[label]}"}
     with open(out_dir / "site_distance_corr_summary.json", "w") as fh:
         json.dump({"groups": summary, "qc": _QC,

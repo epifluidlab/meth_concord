@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -298,13 +299,100 @@ static inline bool hits_blacklist(const std::vector<int64_t>& starts,
     return i > 0 && ends[i - 1] > s;      // merged ⇒ only the predecessor can hit
 }
 
+/* ------------------------------------------------------------------------
+ * Pooled cross-cell null
+ *
+ * Within one cell, a pair only has a substitute partner if another of THAT
+ * cell's ends lands within +-window -- at ~1e6 pairs over a mammalian genome
+ * that is a small and read-density-biased minority.  Pooling candidate ends
+ * across the cells of a group fixes the density problem, but the full pair set
+ * (1e6 x ~1.5e3 cells) cannot be held.  So each cell reservoir-samples a small
+ * compact set of DONOR ends and ANCHOR pairs; those are pooled per group on the
+ * Python side and matched by cross_cell_null() below.  The per-cell caps are
+ * what bound memory, and the sample is uniform within each cell.
+ * --------------------------------------------------------------------- */
+
+template <typename T>
+static py::array_t<T> vec_to_numpy(const std::vector<T>& v) {
+    py::array_t<T> a((py::ssize_t)v.size());
+    if (!v.empty()) std::memcpy(a.mutable_data(), v.data(), v.size() * sizeof(T));
+    return a;
+}
+
+/* One read end: where it is, and the sites it called. */
+struct EndRec {
+    int32_t chrom = 0, mid = 0;
+    SiteVec g, h;
+};
+
+/* One read pair, kept whole so the MATCHED arm can use the true partner. */
+struct AnchorRec {
+    int32_t chrom = 0, mid2 = 0;
+    SiteVec g1, h1, g2, h2;
+};
+
+/* Uniform reservoir sample of at most `cap` items (cap <= 0 disables). */
+template <typename T>
+struct Reservoir {
+    std::vector<T> keep;
+    uint64_t seen = 0;
+    int cap = 0;
+    void offer(T&& item, std::mt19937_64& rng) {
+        if (cap <= 0) return;
+        ++seen;
+        if ((int)keep.size() < cap) { keep.push_back(std::move(item)); return; }
+        uint64_t j = rng() % seen;                 // classic algorithm R
+        if (j < (uint64_t)cap) keep[(size_t)j] = std::move(item);
+    }
+};
+
+/* Flatten a SiteVec column into CSR (values + row pointers). */
+struct Csr {
+    std::vector<int32_t> pos, ptr;
+    std::vector<int8_t> st;
+    Csr() { ptr.push_back(0); }
+    void push(const SiteVec& s) {
+        for (size_t i = 0; i < s.size(); ++i) {
+            pos.push_back((int32_t)s.pos[i]);
+            st.push_back((int8_t)s.st[i]);
+        }
+        ptr.push_back((int32_t)pos.size());
+    }
+    void into(py::dict& d, const char* tag) const {
+        d[(std::string(tag) + "_pos").c_str()] = vec_to_numpy(pos);
+        d[(std::string(tag) + "_st").c_str()] = vec_to_numpy(st);
+        d[(std::string(tag) + "_ptr").c_str()] = vec_to_numpy(ptr);
+    }
+};
+
+/* A CSR column viewed back as SiteVecs, for the pooled matcher. */
+struct CsrView {
+    const int32_t* pos = nullptr; const int8_t* st = nullptr;
+    const int32_t* ptr = nullptr;
+    void bind(const py::dict& d, const char* tag) {
+        auto p = d[(std::string(tag) + "_pos").c_str()].cast<py::array_t<int32_t>>();
+        auto s = d[(std::string(tag) + "_st").c_str()].cast<py::array_t<int8_t>>();
+        auto q = d[(std::string(tag) + "_ptr").c_str()].cast<py::array_t<int32_t>>();
+        pos = p.data(); st = s.data(); ptr = q.data();
+        keep.push_back(p); keep.push_back(s); keep.push_back(q);
+    }
+    std::vector<py::object> keep;                 // hold refs while GIL is off
+    inline void get(int64_t i, SiteVec& out) const {
+        out.pos.clear(); out.st.clear();
+        for (int32_t k = ptr[i]; k < ptr[i + 1]; ++k) {
+            out.pos.push_back(pos[k]); out.st.push_back(st[k]);
+        }
+    }
+};
+
 static py::dict parse_cell_site_distance(
     const std::string& bam_path,
     py::dict ctx_gch, py::dict ctx_hcg,
     std::vector<double> edges,
     int trim_ends, int mapq_min, int null_window,
     int max_site_pairs_per_read, uint64_t seed,
-    bool keep_supplementary, int baseq_min, py::dict blacklist)
+    bool keep_supplementary, int baseq_min, py::dict blacklist,
+    int donor_cap, int anchor_cap)
 {
     const int nb = (int)edges.size() - 1;
     Acc gg_l(nb), hh_l(nb), gh_l(nb), gg_n(nb), hh_n(nb), gh_n(nb);
@@ -321,7 +409,11 @@ static py::dict parse_cell_site_distance(
     // Separate stream, so adding this arm leaves the linked and null draws --
     // and hence any previously computed result -- bit-identical.
     std::mt19937_64 rng_m(seed ^ 0x9E3779B97F4A7C15ULL);
+    // Sampling for the pooled cross-cell null draws from its own stream too.
+    std::mt19937_64 rng_s(seed ^ 0xC2B2AE3D27D4EB4FULL);
     uint64_t n_pairs_total = 0, n_null_eligible = 0;
+    Reservoir<EndRec> donors; donors.cap = donor_cap;
+    Reservoir<AnchorRec> anchors; anchors.cap = anchor_cap;
 
     // ---- GIL HELD: pull every Python-owned buffer out up front -------------
     // Nothing below may touch the interpreter, so the whole parse can run with
@@ -388,7 +480,8 @@ static py::dict parse_cell_site_distance(
     }
     const uint16_t skip_flags = keep_supplementary ? SKIP_FLAGS_BASE : SKIP_FLAGS;
 
-    for (const ChromCtx& cc : ctxs) {
+    for (size_t ci = 0; ci < ctxs.size(); ++ci) {
+        const ChromCtx& cc = ctxs[ci];
         const std::string& chrom = cc.chrom;
         const int64_t *gp = cc.gp, *hp = cc.hp;
         const uint8_t *gr = cc.gr, *hr = cc.hr;
@@ -497,6 +590,29 @@ static py::dict parse_cell_site_distance(
                          max_site_pairs_per_read, rng_m, true);
             }
         }
+
+        // ---- sample for the POOLED cross-cell null ----------------------
+        // BOTH ends are valid substitute partners (neither is linked to the
+        // anchor), so offering both doubles donor density for free.
+        if (donor_cap > 0 || anchor_cap > 0) {
+            for (PairRec& p : pairs) {
+                if (donor_cap > 0) {
+                    EndRec e1; e1.chrom = (int32_t)ci;
+                    e1.mid = (int32_t)p.mid1; e1.g = p.g1; e1.h = p.h1;
+                    donors.offer(std::move(e1), rng_s);
+                    EndRec e2; e2.chrom = (int32_t)ci;
+                    e2.mid = (int32_t)p.mid2; e2.g = p.g2; e2.h = p.h2;
+                    donors.offer(std::move(e2), rng_s);
+                }
+                if (anchor_cap > 0) {
+                    AnchorRec a; a.chrom = (int32_t)ci;
+                    a.mid2 = (int32_t)p.mid2;
+                    a.g1 = std::move(p.g1); a.h1 = std::move(p.h1);
+                    a.g2 = std::move(p.g2); a.h2 = std::move(p.h2);
+                    anchors.offer(std::move(a), rng_s);
+                }
+            }
+        }
     }
 
     hts_idx_destroy(idx);
@@ -516,6 +632,139 @@ static py::dict parse_cell_site_distance(
     out["gh_matched"] = to_numpy(gh_m);
     out["n_pairs"] = py::int_(n_pairs_total);
     out["n_null_eligible"] = py::int_(n_null_eligible);
+
+    // Samples for the pooled cross-cell null, flattened to CSR so a read end
+    // with an unusual number of sites is never truncated.
+    {
+        std::vector<int32_t> dc, dm;
+        Csr dg, dh;
+        dc.reserve(donors.keep.size()); dm.reserve(donors.keep.size());
+        for (const EndRec& e : donors.keep) {
+            dc.push_back(e.chrom); dm.push_back(e.mid);
+            dg.push(e.g); dh.push(e.h);
+        }
+        py::dict d;
+        d["chrom"] = vec_to_numpy(dc);
+        d["mid"] = vec_to_numpy(dm);
+        dg.into(d, "g"); dh.into(d, "h");
+        out["donors"] = d;
+
+        std::vector<int32_t> ac, am;
+        Csr ag1, ah1, ag2, ah2;
+        ac.reserve(anchors.keep.size()); am.reserve(anchors.keep.size());
+        for (const AnchorRec& a : anchors.keep) {
+            ac.push_back(a.chrom); am.push_back(a.mid2);
+            ag1.push(a.g1); ah1.push(a.h1);
+            ag2.push(a.g2); ah2.push(a.h2);
+        }
+        py::dict an;
+        an["chrom"] = vec_to_numpy(ac);
+        an["mid2"] = vec_to_numpy(am);
+        ag1.into(an, "g1"); ah1.into(an, "h1");
+        ag2.into(an, "g2"); ah2.into(an, "h2");
+        out["anchors"] = an;
+    }
+    return out;
+}
+
+/* Pooled cross-cell null + its matched baseline.
+ *
+ * `anchors` and `donors` are the per-cell samples concatenated over whatever
+ * cells make up the current output group -- so a group figure draws its
+ * substitute partners from that group, and the 'all' figure from every cell.
+ * Donors must arrive sorted by (chrom, mid); the caller does that with lexsort.
+ *
+ * Returns per-cell accumulators, so a cell-level bootstrap can resample them.
+ */
+static py::dict cross_cell_null(py::dict anchors, py::dict donors,
+                                std::vector<double> edges, int window,
+                                int max_site_pairs_per_read, uint64_t seed,
+                                int n_cells)
+{
+    const int nb = (int)edges.size() - 1;
+    auto a_chrom = anchors["chrom"].cast<py::array_t<int32_t>>();
+    auto a_mid2 = anchors["mid2"].cast<py::array_t<int32_t>>();
+    auto a_cell = anchors["cell"].cast<py::array_t<int32_t>>();
+    auto d_chrom = donors["chrom"].cast<py::array_t<int32_t>>();
+    auto d_mid = donors["mid"].cast<py::array_t<int32_t>>();
+    auto d_cell = donors["cell"].cast<py::array_t<int32_t>>();
+    CsrView ag1, ah1, ag2, ah2, dg, dh;
+    ag1.bind(anchors, "g1"); ah1.bind(anchors, "h1");
+    ag2.bind(anchors, "g2"); ah2.bind(anchors, "h2");
+    dg.bind(donors, "g"); dh.bind(donors, "h");
+
+    const int32_t* ac = a_chrom.data(); const int32_t* am = a_mid2.data();
+    const int32_t* acell = a_cell.data();
+    const int32_t* dc = d_chrom.data(); const int32_t* dm = d_mid.data();
+    const int32_t* dcell = d_cell.data();
+    const int64_t na = a_chrom.size(), nd = d_chrom.size();
+
+    std::vector<Acc> null_c, match_c;                 // 3 measures x n_cells
+    null_c.reserve(3 * (size_t)n_cells); match_c.reserve(3 * (size_t)n_cells);
+    for (int i = 0; i < 3 * n_cells; ++i) { null_c.emplace_back(nb); match_c.emplace_back(nb); }
+    uint64_t eligible = 0;
+
+    {
+    py::gil_scoped_release release;
+    std::mt19937_64 rng(seed);
+    SiteVec dgv, dhv, g1, h1, g2, h2;
+
+    // Per-chromosome donor spans; donors are sorted by (chrom, mid).
+    std::vector<int64_t> cstart, cend;
+    {
+        int32_t cur = nd ? dc[0] : 0; int64_t s = 0;
+        for (int64_t i = 1; i <= nd; ++i) {
+            if (i == nd || dc[i] != cur) {
+                if ((size_t)cur >= cstart.size()) {
+                    cstart.resize((size_t)cur + 1, -1);
+                    cend.resize((size_t)cur + 1, -1);
+                }
+                cstart[(size_t)cur] = s; cend[(size_t)cur] = i;
+                if (i < nd) { cur = dc[i]; s = i; }
+            }
+        }
+    }
+
+    for (int64_t i = 0; i < na; ++i) {
+        int32_t c = ac[i];
+        if ((size_t)c >= cstart.size() || cstart[(size_t)c] < 0) continue;
+        int64_t lo0 = cstart[(size_t)c], hi0 = cend[(size_t)c];
+        int64_t lo = std::lower_bound(dm + lo0, dm + hi0, am[i] - window) - dm;
+        int64_t hi = std::upper_bound(dm + lo0, dm + hi0, am[i] + window) - dm;
+        if (hi <= lo) continue;
+
+        // Reject only the anchor's OWN partner end (same cell, same midpoint);
+        // any other end -- same cell or not -- is a valid non-linked partner.
+        int64_t span = hi - lo;
+        int64_t k = lo + (int64_t)(rng() % (uint64_t)span);
+        int64_t tries = 0;
+        while (dcell[k] == acell[i] && dm[k] == am[i] && tries < span) {
+            k = lo + ((k - lo) + 1) % span; ++tries;
+        }
+        if (tries >= span) continue;                  // window held only itself
+        ++eligible;
+
+        const int ci = acell[i];
+        dg.get(k, dgv); dh.get(k, dhv);
+        ag1.get(i, g1); ah1.get(i, h1);
+        ag2.get(i, g2); ah2.get(i, h2);
+        add_pair(null_c[3 * ci + 0], null_c[3 * ci + 1], null_c[3 * ci + 2],
+                 g1, dgv, h1, dhv, edges, max_site_pairs_per_read, rng, true);
+        add_pair(match_c[3 * ci + 0], match_c[3 * ci + 1], match_c[3 * ci + 2],
+                 g1, g2, h1, h2, edges, max_site_pairs_per_read, rng, true);
+    }
+    }   // GIL reacquired
+
+    py::dict out;
+    py::list nl, ml;
+    for (int i = 0; i < 3 * n_cells; ++i) {
+        nl.append(to_numpy(null_c[i]));
+        ml.append(to_numpy(match_c[i]));
+    }
+    out["null_per_cell"] = nl;
+    out["matched_per_cell"] = ml;
+    out["n_eligible"] = py::int_(eligible);
+    out["n_anchors"] = py::int_(na);
     return out;
 }
 
@@ -528,7 +777,15 @@ PYBIND11_MODULE(_site_dist_core, m) {
           py::arg("max_site_pairs_per_read") = 64, py::arg("seed") = 42,
           py::arg("keep_supplementary") = false, py::arg("baseq_min") = 0,
           py::arg("blacklist") = py::dict(),
+          py::arg("donor_cap") = 0, py::arg("anchor_cap") = 0,
           "Parse one cell's BAM and return per-distance-bin Pearson "
           "sufficient statistics for GCH-GCH / HCG-HCG / HCG-GCH, linked and "
           "non-linked.");
+    m.def("cross_cell_null", &cross_cell_null,
+          py::arg("anchors"), py::arg("donors"), py::arg("edges"),
+          py::arg("window") = 100, py::arg("max_site_pairs_per_read") = 64,
+          py::arg("seed") = 42, py::arg("n_cells") = 1,
+          "Pooled cross-cell null: substitute partners are drawn from the "
+          "donor ends of every cell in the group, not just the anchor's own "
+          "cell.  Returns per-cell accumulators for the cell bootstrap.");
 }

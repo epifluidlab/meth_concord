@@ -175,6 +175,107 @@ def test_eligible_never_exceeds_total_pairs(tmp_path):
         assert 0 <= int(res["n_null_eligible"]) <= int(res["n_pairs"])
 
 
+class _Args:
+    """Minimal stand-in for the argparse namespace _pooled_null reads."""
+    null_window = 100
+    max_site_pairs_per_read = 0
+    seed = 42
+
+
+def _parse_with_pools(cpp, bam, ctx, donor_cap, anchor_cap, seed=42):
+    m = _mod()
+    edges = m._build_edges(1, 1_000_000, 3)
+    res = cpp.parse_cell_site_distance(str(bam), ctx, {},
+                                       [float(e) for e in edges],
+                                       5, 30, 100, 0, seed, False, 0, {},
+                                       donor_cap, anchor_cap)
+    return res, edges
+
+
+def test_pooled_null_rescues_pairs_that_are_isolated_within_their_own_cell(tmp_path):
+    """The point of --null-scope pooled.
+
+    Two cells whose ends are far apart WITHIN each cell but within ±100bp of
+    each other ACROSS cells.  The within-cell null finds nothing; pooling the
+    donor ends over the group finds a partner for every anchor.
+    """
+    cpp = _cpp()
+    m = _mod()
+    a_dir = tmp_path / "a"; a_dir.mkdir()
+    b_dir = tmp_path / "b"; b_dir.mkdir()
+    bam_a, ctx_a = _spaced_bam(a_dir, [50_000, 120_000, 200_000])
+    bam_b, ctx_b = _spaced_bam(b_dir, [50_040, 120_040, 200_040])
+
+    # a shared context covering both cells' sites, so chrom ids line up
+    pos = np.union1d(ctx_a["chr1"][0], ctx_b["chr1"][0]).astype(np.int64)
+    ctx = {"chr1": (pos, np.full(len(pos), ord("C"), np.uint8))}
+
+    ra, edges = _parse_with_pools(cpp, bam_a, ctx, 10_000, 10_000)
+    rb, _ = _parse_with_pools(cpp, bam_b, ctx, 10_000, 10_000, seed=43)
+
+    # within-cell: nothing is eligible in either cell
+    assert int(ra["n_null_eligible"]) == 0
+    assert int(rb["n_null_eligible"]) == 0
+
+    res = [({}, int(ra["n_pairs"]), 0, (dict(ra["donors"]), dict(ra["anchors"]))),
+           ({}, int(rb["n_pairs"]), 0, (dict(rb["donors"]), dict(rb["anchors"])))]
+    pooled = m._pooled_null(res, [0, 1], edges, _Args(), len(edges) - 1)
+
+    assert pooled is not None
+    assert pooled["n_anchors"] == 6                  # 3 pairs from each cell
+    assert pooled["n_eligible"] == 6, (
+        "pooling across cells should find a donor for every anchor, got "
+        f"{pooled['n_eligible']}")
+    # and it actually accumulated something
+    assert sum(a.sum() for a in pooled["null_per_cell"]["gg"]) > 0
+
+
+def test_pooled_null_keeps_per_cell_accumulators_for_the_bootstrap(tmp_path):
+    cpp = _cpp()
+    m = _mod()
+    a_dir = tmp_path / "a"; a_dir.mkdir()
+    b_dir = tmp_path / "b"; b_dir.mkdir()
+    bam_a, ctx_a = _spaced_bam(a_dir, [50_000, 120_000, 200_000])
+    bam_b, ctx_b = _spaced_bam(b_dir, [50_040, 120_040, 200_040])
+    pos = np.union1d(ctx_a["chr1"][0], ctx_b["chr1"][0]).astype(np.int64)
+    ctx = {"chr1": (pos, np.full(len(pos), ord("C"), np.uint8))}
+    ra, edges = _parse_with_pools(cpp, bam_a, ctx, 10_000, 10_000)
+    rb, _ = _parse_with_pools(cpp, bam_b, ctx, 10_000, 10_000, seed=43)
+    res = [({}, 0, 0, (dict(ra["donors"]), dict(ra["anchors"]))),
+           ({}, 0, 0, (dict(rb["donors"]), dict(rb["anchors"])))]
+    pooled = m._pooled_null(res, [0, 1], edges, _Args(), len(edges) - 1)
+
+    for key in ("gg", "hh", "gh"):
+        assert len(pooled["null_per_cell"][key]) == 2      # one per cell
+        assert len(pooled["matched_per_cell"][key]) == 2
+    # the pooled total is the sum of the per-cell parts
+    tot = sum(a for a in pooled["null_per_cell"]["gg"])
+    assert np.isfinite(tot).all()
+
+
+def test_csr_concat_and_permute_round_trip():
+    """The CSR plumbing must not scramble which sites belong to which end."""
+    m = _mod()
+    # two "cells", rows of differing width
+    p1 = {"x_pos": np.array([10, 11, 20], np.int32),
+          "x_st": np.array([1, 0, 1], np.int8),
+          "x_ptr": np.array([0, 2, 3], np.int32)}          # rows: [10,11], [20]
+    p2 = {"x_pos": np.array([30, 31, 32], np.int32),
+          "x_st": np.array([0, 1, 0], np.int8),
+          "x_ptr": np.array([0, 0, 3], np.int32)}          # rows: [], [30,31,32]
+    pos, st, ptr = m._concat_csr([p1, p2], "x")
+    rows = [list(pos[ptr[i]:ptr[i + 1]]) for i in range(len(ptr) - 1)]
+    assert rows == [[10, 11], [20], [], [30, 31, 32]]
+
+    order = np.array([3, 0, 2, 1])
+    pos2, st2, ptr2 = m._permute_csr(pos, st, ptr, order)
+    rows2 = [list(pos2[ptr2[i]:ptr2[i + 1]]) for i in range(len(ptr2) - 1)]
+    assert rows2 == [[30, 31, 32], [10, 11], [], [20]]
+    # states travel with their positions
+    st_rows = [list(st2[ptr2[i]:ptr2[i + 1]]) for i in range(len(ptr2) - 1)]
+    assert st_rows == [[0, 1, 0], [1, 0], [], [1]]
+
+
 def test_widening_the_window_admits_more_pairs(tmp_path):
     """The exclusion is a window effect, so a wider window recovers pairs.
 
