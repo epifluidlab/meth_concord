@@ -80,6 +80,7 @@ def apply_batch_correction(
     matrix: pd.DataFrame,
     batch_labels,
     method: str = "combat",
+    random_state: int = 42,
 ) -> pd.DataFrame:
     """Apply batch correction to a cells × bins matrix.
 
@@ -128,7 +129,7 @@ def apply_batch_correction(
 
     if method == "harmony":
         # Harmony models the batch variables jointly.
-        return _harmony_correction(matrix, batch_df)
+        return _harmony_correction(matrix, batch_df, random_state=random_state)
 
     # Single-factor methods: collapse to one composite batch.
     composite = _composite_label(batch_df)
@@ -253,6 +254,7 @@ def _try_import_pycombat():
 def _harmony_correction(
     matrix: pd.DataFrame, batch_df: pd.DataFrame,
     n_components: int = 50,
+    random_state: int = 42,
 ) -> pd.DataFrame:
     """Harmony iterative batch correction (Korsunsky et al. 2019).
 
@@ -289,13 +291,23 @@ def _harmony_correction(
 
     from sklearn.decomposition import PCA
     n_comp = max(1, min(n_components, matrix.shape[0] - 1, matrix.shape[1] - 1))
-    pca = PCA(n_components=n_comp, random_state=42)
+    pca = PCA(n_components=n_comp, random_state=random_state)
     pcs = pca.fit_transform(matrix.to_numpy(dtype=np.float64))
 
     # Harmony aligns meta rows positionally with the PCA rows (matrix order).
     meta = batch_df.reset_index(drop=True)
     vars_use = list(batch_df.columns)
-    harmony_out = hm.run_harmony(pcs, meta, vars_use)
+    # Pass the seed explicitly: harmonypy's k-means init is stochastic, and
+    # relying on its internal default couples our reproducibility to their
+    # version (and makes a --random-seed sweep leave harmony frozen).
+    try:
+        harmony_out = hm.run_harmony(pcs, meta, vars_use,
+                                     random_state=random_state)
+    except TypeError:                       # harmonypy without random_state
+        logger.warning(
+            "harmonypy.run_harmony has no random_state parameter "
+            "(old version); harmony output may not be reproducible.")
+        harmony_out = hm.run_harmony(pcs, meta, vars_use)
     # harmonypy's Z_corr orientation varies across versions: older releases
     # return (n_components, n_cells), newer ones (n_cells, n_components).
     # Orient robustly to (n_cells, n_comp) before reconstructing.

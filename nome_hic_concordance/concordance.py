@@ -9,6 +9,7 @@ or GCH-site thresholds are discarded.
 from __future__ import annotations
 
 import logging
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -838,6 +839,7 @@ def _compute_cell_dm_expected(
     dm_max_ends: int = 400,
     mode: str = "matched",
     max_distance: int = 0,
+    random_state: int = 42,
 ) -> tuple[str, dict[str, dict[str, float]]]:
     """Per-(cell, bin) expected soft counts (``_DM_KEYS``) from a non-contact
     end-pair null.
@@ -899,7 +901,12 @@ def _compute_cell_dm_expected(
     })
 
     counts: dict[str, dict[str, float]] = {}
-    seed_base = abs(hash(cell_name)) % (2 ** 31)
+    # zlib.crc32 (not the builtin hash(): Python salts string hashes per
+    # process via PYTHONHASHSEED, which made this end-pool subsample — and so
+    # the O/E baseline — differ between otherwise identical runs).  Offsetting
+    # by random_state keeps the per-cell decorrelation while letting a
+    # --random-seed sweep actually perturb the subsample.
+    seed_base = (zlib.crc32(cell_name.encode("utf-8")) + int(random_state)) % (2 ** 31)
     for (c, b), og in obs.groupby(["chrom", "bin"], sort=False):
         # Assemble the (optionally windowed) end pool for this bin.
         if dm_window_bins > 0:
@@ -1110,6 +1117,7 @@ def compute_signed_concordance_matrix(
     n_threads: int = 4,
     output_dir: str = "output/05_concordance",
     save_outputs: bool = True,
+    random_state: int = 42,
 ) -> dict[str, object]:
     """Compute the signed (and optionally one-sided) concordance matrix.
 
@@ -1253,6 +1261,7 @@ def compute_signed_concordance_matrix(
                 delayed(_compute_cell_dm_expected)(
                     path, cell_name, bin_size, min_distance, min_gch_sites,
                     dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
+                    random_state,
                 )
                 for cell_name, path in items
             )
@@ -1261,6 +1270,7 @@ def compute_signed_concordance_matrix(
                 _compute_cell_dm_expected(
                     path, cell_name, bin_size, min_distance, min_gch_sites,
                     dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
+                    random_state,
                 )
                 for cell_name, path in items
             ]
@@ -1376,6 +1386,7 @@ def compute_signed_concordance_matrix(
         )
         accessibility_df = _bc_mod.apply_batch_correction(
             accessibility_df, batch_labels, method=batch_correction,
+            random_state=random_state,
         )
         # Post-correction diagnostic.
         f_post = _bc_mod.batch_anova_f_per_bin(accessibility_df, batch_labels)
@@ -1546,6 +1557,7 @@ def compute_signed_concordance_matrix(
                 k=rwr_k, restart_prob=rwr_restart_prob,
                 solver=rwr_solver, max_iter=rwr_max_iter, tol=rwr_tol,
                 output_dir=output_dir if save_outputs else None,
+                random_state=random_state,
             )
         )
     else:

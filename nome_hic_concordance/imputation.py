@@ -328,7 +328,8 @@ def rwr_impute_matrices(
 # ---------------------------------------------------------------------------
 
 
-def _top_eigengap(M: np.ndarray, top_k: int = 10) -> float:
+def _top_eigengap(M: np.ndarray, top_k: int = 10,
+                  random_state: int = 0) -> float:
     """Ratio of the top two SVD eigenvalue shares of ``M``.
 
     Used as the label-free criterion for auto-selecting the number of
@@ -342,7 +343,7 @@ def _top_eigengap(M: np.ndarray, top_k: int = 10) -> float:
     k = min(top_k, M.shape[0] - 1, M.shape[1])
     if k < 2:
         return float("inf")
-    svd = TruncatedSVD(n_components=k, random_state=0).fit(M)
+    svd = TruncatedSVD(n_components=k, random_state=random_state).fit(M)
     vr = svd.explained_variance_ratio_
     return float(vr[0] / vr[1]) if vr[1] > 0 else float("inf")
 
@@ -361,6 +362,7 @@ def run_rwr_pipeline(
     refinement_basis: str = "raw",
     auto_select_passes: bool = False,
     max_auto_passes: int = 5,
+    random_state: int = 0,
 ) -> tuple[dict[str, np.ndarray], pd.DataFrame, dict]:
     """Orchestrate the full RWR + (optional) refinement loop.
 
@@ -518,7 +520,8 @@ def run_rwr_pipeline(
 
         if auto_select_passes:
             eg = _top_eigengap(
-                post_norm_for_knn(delta_df.to_numpy(dtype=np.float64))
+                post_norm_for_knn(delta_df.to_numpy(dtype=np.float64)),
+                random_state=random_state,
             )
             pass_diag["eigengap"] = float(eg)
             improved = eg > best_eg

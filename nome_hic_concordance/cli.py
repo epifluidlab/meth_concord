@@ -1100,6 +1100,7 @@ def run_context(
                 n_threads=args.n_threads,
                 output_dir=str(concordance_dir),
                 save_outputs=True,
+                random_state=args.random_seed,
             )
             # Headline matrix for Step 6/7 is whichever statistic was selected.
             stat = args.concordance_statistic or "signed"

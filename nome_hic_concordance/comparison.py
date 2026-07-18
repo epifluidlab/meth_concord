@@ -97,7 +97,8 @@ _MIN_BINS = 2
 
 
 def _svd_scores(normalized: pd.DataFrame, n_svd: int,
-                skip_top: int = 0) -> tuple[np.ndarray, np.ndarray]:
+                skip_top: int = 0,
+                random_state: int = 42) -> tuple[np.ndarray, np.ndarray]:
     """Column-standardize then TruncatedSVD; return (scores, var_ratio).
 
     ``skip_top`` drops the leading component(s) from the returned SCORES — the
@@ -114,7 +115,7 @@ def _svd_scores(normalized: pd.DataFrame, n_svd: int,
     sd = np.where(sd < 1e-12, 1.0, sd)
     Z = (X - mu) / sd
     k = max(1, min(n_svd, Z.shape[0] - 1, Z.shape[1]))
-    svd = TruncatedSVD(n_components=k, random_state=42).fit(Z)
+    svd = TruncatedSVD(n_components=k, random_state=random_state).fit(Z)
     s = min(max(int(skip_top), 0), max(k - 1, 0))
     return svd.transform(Z)[:, s:], svd.explained_variance_ratio_
 
@@ -284,7 +285,8 @@ def marginal_analysis(
              "skip_top_svd": skip}
         if group_labels is not None:
             common = norm.index.intersection(group_labels.index)
-            scores, vr = _svd_scores(norm.loc[common], n_svd, skip_top=skip)
+            scores, vr = _svd_scores(norm.loc[common], n_svd, skip_top=skip,
+                                     random_state=random_state)
             lab = group_labels.loc[common]
             m["silhouette"] = _silhouette(scores, lab)
             ks = _knn_purity_stats(scores, lab)
@@ -466,7 +468,8 @@ def residual_umap(
     m = {"n_bins": int(norm.shape[1]), "skip_top_svd": int(skip_top)}
     if group_labels is not None:
         common = norm.index.intersection(group_labels.index)
-        scores, _ = _svd_scores(norm.loc[common], n_svd, skip_top=int(skip_top))
+        scores, _ = _svd_scores(norm.loc[common], n_svd, skip_top=int(skip_top),
+                                random_state=random_state)
         lab = group_labels.loc[common]
         m["silhouette"] = _silhouette(scores, lab)
         ks = _knn_purity_stats(scores, lab)
@@ -522,7 +525,8 @@ def classifier_comparison(
                 f"coverage filter — excluding from classification (too sparse).")
             continue
         scores, _ = _svd_scores(norm.loc[common], n_svd,
-                                skip_top=int(skip_map.get(name, 0)))
+                                skip_top=int(skip_map.get(name, 0)),
+                                random_state=random_state)
         blocks[name] = scores
 
     def _auc(names: list[str]) -> tuple[float, float]:
@@ -631,7 +635,8 @@ def classifier_comparison_pairwise(
         if norm.shape[1] < _MIN_BINS:
             continue                              # too sparse — skip (warned elsewhere)
         scores, _ = _svd_scores(norm.loc[common], n_svd,
-                                skip_top=int((skip_top_svd or {}).get(name, 0)))
+                                skip_top=int((skip_top_svd or {}).get(name, 0)),
+                                random_state=random_state)
         blocks[name] = pd.DataFrame(scores, index=cells_index)
 
     present_baselines = [b for b in baseline_names if b in blocks]
@@ -727,7 +732,8 @@ def run_comparison(
             raw = matrices[name]
             logger.info(f"[batch] correcting {name} ({batch_correction})")
             corrected = _bc.apply_batch_correction(raw, batch_labels,
-                                                   method=batch_correction)
+                                                   method=batch_correction,
+                                                   random_state=random_state)
             # harmony/combat NaN-impute internally and hand back a FULL matrix;
             # restore the original NaN mask or --min-cell-coverage (and the
             # _MIN_BINS guard) would silently pass every bin from here on.
