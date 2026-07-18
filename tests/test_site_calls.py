@@ -202,8 +202,10 @@ def test_htslib_backend_matches_pysam_exactly():
     res = cpp.parse_cell_site_distance(str(bam), ctx_g, ctx_h,
                                        [float(e) for e in edges],
                                        5, 30, 100, 0, 42, False)
-    accs_py, n_py = m.process_cell(str(bam), cp, edges, 5, 30, 0, 0, 100, 42)
+    accs_py, n_py, elig_py = m.process_cell(str(bam), cp, edges, 5, 30, 0, 0,
+                                            100, 42)
     assert int(res["n_pairs"]) == n_py
+    assert int(res["n_null_eligible"]) == elig_py
     for key in ("gg", "hh", "gh"):
         a = np.asarray(res[f"{key}_linked"])
         b = accs_py[(key, "linked")]
@@ -211,6 +213,11 @@ def test_htslib_backend_matches_pysam_exactly():
         assert np.allclose(a, b), f"{key}_linked differs between backends"
         assert a[0].sum() > 0, f"{key}: no site pairs accumulated"
         assert np.asarray(res[f"{key}_null"]).shape == b.shape
+        # 'matched' is the true partner on the null-eligible subset, so with no
+        # site-pair cap it involves no RNG and must agree exactly.
+        assert np.allclose(np.asarray(res[f"{key}_matched"]),
+                           accs_py[(key, "matched")]), \
+            f"{key}_matched differs between backends"
 
 
 def _qual_bam(tmp_path):

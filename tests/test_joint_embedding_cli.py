@@ -132,8 +132,10 @@ def test_embedding_cli_end_to_end(tmp_path):
     r, prefix = _run(tmp_path, ["--feature", "delta"])
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     assert "per-channel component AUC" in r.stdout
-    # UMAP/tensor absent in CI -> skipped gracefully, run still succeeds
-    assert "UMAP skipped" in r.stdout
+    # umap-learn is optional at runtime.  Assert the run handled EITHER path --
+    # pinning "UMAP skipped" made this test pass only while the dependency was
+    # missing, so simply installing the project's own deps broke it.
+    assert ("UMAP skipped" in r.stdout) or ("(UMAP)" in r.stdout), r.stdout
 
     scores = Path(f"{prefix}.embedding_scores.csv")
     chauc = Path(f"{prefix}.channel_auc.csv")

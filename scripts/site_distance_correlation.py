@@ -21,12 +21,24 @@ Site pairs come from BOTH arms, giving one continuous curve:
   * WITHIN-read  — two sites on the same read  → the short range (≲ read length)
   * CROSS-end    — a site on end 1 × a site on end 2 → the long range (contact)
 
-Two conditions:
-  * LINKED  — the read pair's true partner end (the real ligation)
+Three conditions:
+  * LINKED  — the read pair's true partner end (the real ligation), ALL pairs
   * NULL    — the partner end is replaced by a DIFFERENT end within
               ±--null-window bp of it (same distance, different molecule), so a
               linked-minus-null gap is same-molecule coordination rather than
               genomic proximity.
+  * MATCHED — the true partner, but restricted to the pairs the null could
+              actually use, and cross-end only.
+
+A pair only enters the NULL if some other end happens to lie within ±window of
+its partner.  A pair with no such neighbour cannot be given one, so it is
+EXCLUDED from the null (it is not carried as NaN) while still counting in
+LINKED.  At single-cell coverage that is the majority of pairs, and the ones
+that survive sit in read-dense loci -- so linked-vs-null would compare two
+different sets of loci, not two partner choices.  MATCHED is the like-for-like
+baseline: same pairs, same anchor end, same arm, differing from the null only
+in whether the partner is the real mate.  The run reports the eligible
+fraction; when it is low, read the null against MATCHED.
 
 Because the null swaps the PARTNER END, it applies to the cross-end arm only.
 Within-read pairs have no non-linked counterpart — both cytosines sit on the
@@ -81,8 +93,14 @@ except Exception:                                           # pragma: no cover
 _MEASURES = (("gg", "GCH–GCH  r(site_i, site_j)"),
              ("hh", "HCG–HCG  r(site_i, site_j)"),
              ("gh", "HCG–GCH  r(CpG, GpC)  [cross-context]"))
-_CONDS = (("linked", "linked (true partner)"),
+_CONDS = (("linked", "linked (true partner, all pairs)"),
+          ("matched", "linked (true partner, null-eligible pairs)"),
           ("null", "non-linked (±window)"))
+# 'matched' is the curve to read AGAINST 'null' — same pairs, same anchor end,
+# cross-end only — so it is drawn in the same weight, with 'linked' heavier.
+_CSTYLE = {"linked":  dict(ls="-", marker="o", ms=3.2, lw=1.6, alpha=1.00),
+           "matched": dict(ls="-.", marker="s", ms=2.6, lw=1.3, alpha=0.85),
+           "null":    dict(ls="--", marker="", lw=1.4, alpha=0.65)}
 _TLAB = {1: "1bp", 10: "10bp", 100: "100bp", 1_000: "1kb", 10_000: "10kb",
          100_000: "100kb", 1_000_000: "1Mb", 10_000_000: "10Mb"}
 _QC = ("high-quality read pairs only: uniquely mapped, no PCR duplicate, "
@@ -226,7 +244,7 @@ def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
     for m, _ in _MEASURES:
         for c, _lab in _CONDS:
             accs[(m, c)] = np.asarray(res[f"{m}_{c}"], dtype=np.float64)
-    return accs, int(res["n_pairs"])
+    return accs, int(res["n_pairs"]), int(res["n_null_eligible"])
 
 
 def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
@@ -247,7 +265,7 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
         bam_path, ctx_positions, trim_ends=trim_ends, mapq_min=mapq_min,
         max_pairs_per_cell=max_pairs, rng=rng))
     if not pairs:
-        return accs, 0
+        return accs, 0, 0
 
     for chrom, mid1, mid2, c1, c2 in pairs:
         _add_pair(accs, "linked", edges, rng, cap, c1, c2)
@@ -262,21 +280,27 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
         order = np.argsort(mids)
         by_chrom[chrom] = (mids[order], np.asarray(idx)[order])
 
-    for i, (chrom, mid1, mid2, c1, _c2) in enumerate(pairs):
+    n_eligible = 0
+    for i, (chrom, mid1, mid2, c1, c2) in enumerate(pairs):
         mids, idx = by_chrom[chrom]
         lo = np.searchsorted(mids, mid2 - null_window, side="left")
         hi = np.searchsorted(mids, mid2 + null_window, side="right")
         if hi - lo < 2:                       # only itself in the window
             continue
-        for _ in range(4):                    # a few draws to avoid self
-            j = int(idx[rng.integers(lo, hi)])
-            if j != i:
-                break
-        else:
-            continue
+        # Deterministic non-self pick (see the C++ backend for why the old
+        # "4 random attempts, else give up" silently dropped eligible pairs).
+        span = int(hi - lo)
+        k = int(rng.integers(lo, hi))
+        if int(idx[k]) == i:
+            k = int(lo) + ((k - int(lo)) + 1) % span
+        j = int(idx[k])
+        n_eligible += 1
         _add_pair(accs, "null", edges, rng, cap, c1, pairs[j][4],
                   cross_only=True)
-    return accs, len(pairs)
+        # Same pair, TRUE partner, cross-end only — the like-for-like baseline
+        # for the null, since the null can only ever see THESE pairs.
+        _add_pair(accs, "matched", edges, rng, cap, c1, c2, cross_only=True)
+    return accs, len(pairs), n_eligible
 
 
 # --------------------------------------------------------------------------
@@ -431,9 +455,8 @@ def _plot(curves, centers, edges, label, n_cells, n_pairs, out):
         ax.axhline(0, color="0.6", lw=0.8, zorder=0)
         for cond, clabel in _CONDS:
             r, n = curves[(key, cond)]
-            ax.plot(centers, r, "-o" if cond == "linked" else "--",
-                    color=colors[key], ms=3.2, lw=1.5,
-                    alpha=1.0 if cond == "linked" else 0.65, label=clabel)
+            ax.plot(centers, r, color=colors[key], label=clabel,
+                    **_CSTYLE[cond])
         _logx(ax, edges[0], edges[-1])
         ax.set_ylabel("Pearson r (phi) of 0/1 calls")
         ax.set_title(title, fontsize=10)
@@ -473,7 +496,7 @@ def _write_tsv(curves, centers, edges, path):
 
 
 def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
-            safe=None):
+            safe=None, n_eligible=0):
     curves = {k: _corr(v, args.min_pairs) for k, v in accs.items()}
     # Build the two paths explicitly: Path.with_suffix() would ALSO mangle a
     # label containing a dot ('A.B' -> '..._A.pdf'), silently.
@@ -483,16 +506,26 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
     _plot(curves, centers, edges, label, n_cells, n_pairs, fig_path)
     _write_tsv(curves, centers, edges, tsv_path)
     print(f"\n=== {label}: {n_cells} cells, {n_pairs:,} read pairs ===")
+    pct = 100.0 * n_eligible / n_pairs if n_pairs else 0.0
+    print(f"  null-eligible: {n_eligible:,} pairs ({pct:.1f}%) had another end "
+          f"within ±{args.null_window}bp")
+    if pct < 25.0:
+        print("  NOTE: most pairs have no nearby non-linked end, and the ones "
+              "that do sit in read-dense loci.\n"
+              "        Compare 'null' against 'matched' (same pairs), NOT "
+              "against 'linked' (all pairs).")
     print(f"  {'distance':>10}{'n(GG)':>12} | "
-          + "".join(f"{m.split('  ')[0]:>22}" for _, m in _MEASURES))
+          + "".join(f"{m.split('  ')[0]:>26}" for _, m in _MEASURES))
+    print(f"  {'':>10}{'':>12} | "
+          + "".join(f"{'linked/matched/null':>26}" for _ in _MEASURES))
     for bi in range(len(centers)):
         if not np.isfinite(curves[("gg", "linked")][0][bi]):
             continue
         cols = ""
         for key, _ in _MEASURES:
-            rl = curves[(key, "linked")][0][bi]
-            rn = curves[(key, "null")][0][bi]
-            cols += f"{rl:+.3f}/{rn:+.3f}".rjust(22)
+            vals = "/".join(
+                f"{curves[(key, c)][0][bi]:+.3f}" for c, _ in _CONDS)
+            cols += vals.rjust(26)
         print(f"  {centers[bi]:>10,.0f}{int(curves[('gg','linked')][1][bi]):>12,d} | {cols}")
     print(f"  wrote {fig_path} and {tsv_path}")
     return curves
@@ -687,12 +720,16 @@ def main():
     for label, idxs in groups.items():
         accs = {k: sum(res[i][0][k] for i in idxs) for k in keys}
         n_pairs = sum(res[i][1] for i in idxs)
+        n_elig = sum(res[i][2] for i in idxs)
         if n_pairs == 0:
             print(f"\n=== {label}: no usable read pairs — skipped ===")
             continue
         _report(accs, len(idxs), n_pairs, centers, edges, label, out_dir, args,
-                safe=safe[label])
+                safe=safe[label], n_eligible=n_elig)
         summary[label] = {"n_cells": len(idxs), "n_read_pairs": int(n_pairs),
+                          "n_null_eligible_pairs": int(n_elig),
+                          "null_eligible_frac": (round(n_elig / n_pairs, 4)
+                                                 if n_pairs else None),
                           "file_stem": f"site_distance_corr_{safe[label]}"}
     with open(out_dir / "site_distance_corr_summary.json", "w") as fh:
         json.dump({"groups": summary, "qc": _QC,
@@ -700,9 +737,17 @@ def main():
     print("\nRead the figures: below ~read length the pairs are WITHIN-read, which "
           "has no\n  non-linked counterpart (both cytosines are on one molecule), "
           "so the null is\n  blank there and the linked curve alone is the 1-D "
-          "co-methylation decay.  At\n  longer range a LINKED curve sitting above "
+          "co-methylation decay.  At\n  longer range a curve sitting above "
           "its non-linked null is same-molecule\n  coordination rather than mere "
-          "genomic proximity.")
+          "genomic proximity.\n"
+          "\n  Compare the null against MATCHED, not against LINKED.  A pair can "
+          "only enter\n  the null if some other end falls within ±window of its "
+          "partner; at single-cell\n  coverage most pairs have no such neighbour "
+          "and are EXCLUDED (not NaN), and the\n  ones that survive sit in "
+          "read-dense loci.  LINKED is all pairs, so linked-vs-null\n  also "
+          "compares two different sets of loci.  MATCHED is the true partner on "
+          "exactly\n  the null-eligible pairs, cross-end only, so matched-vs-null "
+          "differs in one thing:\n  whether the partner was the real mate.")
 
 
 if __name__ == "__main__":

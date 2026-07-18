@@ -308,8 +308,20 @@ static py::dict parse_cell_site_distance(
 {
     const int nb = (int)edges.size() - 1;
     Acc gg_l(nb), hh_l(nb), gh_l(nb), gg_n(nb), hh_n(nb), gh_n(nb);
+    // MATCHED: the TRUE partner, but only for the pairs that were null-eligible.
+    // The null can only use a pair that HAS another end within +-window, which
+    // at single-cell coverage is a minority of pairs and is biased toward
+    // read-dense loci.  Comparing that against the all-pairs linked curve
+    // therefore compares two different sets of loci, not two partner choices.
+    // This third arm restores the paired contrast: same pairs, same anchor end,
+    // cross-end only -- the ONLY difference from the null is whether the
+    // partner is the true mate.
+    Acc gg_m(nb), hh_m(nb), gh_m(nb);
     std::mt19937_64 rng(seed);
-    uint64_t n_pairs_total = 0;
+    // Separate stream, so adding this arm leaves the linked and null draws --
+    // and hence any previously computed result -- bit-identical.
+    std::mt19937_64 rng_m(seed ^ 0x9E3779B97F4A7C15ULL);
+    uint64_t n_pairs_total = 0, n_null_eligible = 0;
 
     // ---- GIL HELD: pull every Python-owned buffer out up front -------------
     // Nothing below may touch the interpreter, so the whole parse can run with
@@ -464,15 +476,25 @@ static py::dict parse_cell_site_distance(
                 size_t hi = (size_t)(std::upper_bound(mids.begin(), mids.end(),
                                                       m + null_window) - mids.begin());
                 if (hi - lo < 2) continue;          // only itself in the window
-                size_t pick = i;
-                for (int attempt = 0; attempt < 4; ++attempt) {
-                    size_t cand = order[lo + rng() % (hi - lo)];
-                    if (cand != i) { pick = cand; break; }
-                }
-                if (pick == i) continue;
+                // Deterministic non-self pick: draw once, and if it lands on
+                // this pair step to the next slot in the window.  The previous
+                // "4 random attempts, else give up" could fail with p=1/16 when
+                // the window holds only 2 ends, silently dropping an ELIGIBLE
+                // pair from the null and making the eligible count depend on
+                // the RNG stream (it differed between the two backends).
+                const size_t span = hi - lo;
+                size_t k = lo + (size_t)(rng() % span);
+                if (order[k] == i) k = lo + ((k - lo) + 1) % span;
+                const size_t pick = order[k];
+                ++n_null_eligible;
                 add_pair(gg_n, hh_n, gh_n, pairs[i].g1, pairs[pick].g2,
                          pairs[i].h1, pairs[pick].h2, edges,
                          max_site_pairs_per_read, rng, true);
+                // Same pair, TRUE partner, cross-end only: the like-for-like
+                // baseline for the null line directly above.
+                add_pair(gg_m, hh_m, gh_m, pairs[i].g1, pairs[i].g2,
+                         pairs[i].h1, pairs[i].h2, edges,
+                         max_site_pairs_per_read, rng_m, true);
             }
         }
     }
@@ -489,7 +511,11 @@ static py::dict parse_cell_site_distance(
     out["gg_null"] = to_numpy(gg_n);
     out["hh_null"] = to_numpy(hh_n);
     out["gh_null"] = to_numpy(gh_n);
+    out["gg_matched"] = to_numpy(gg_m);
+    out["hh_matched"] = to_numpy(hh_m);
+    out["gh_matched"] = to_numpy(gh_m);
     out["n_pairs"] = py::int_(n_pairs_total);
+    out["n_null_eligible"] = py::int_(n_null_eligible);
     return out;
 }
 
