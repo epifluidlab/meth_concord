@@ -49,12 +49,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger("site_distance")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -259,6 +263,58 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
 # Reporting
 # --------------------------------------------------------------------------
 
+def _load_snps_all(dbsnp_vcf, wanted_chroms):
+    """``{chrom: sorted 0-based SNP positions}`` for every wanted chromosome.
+
+    Deliberately NOT reference._load_snp_positions, which needs a tabix index
+    and returns an EMPTY set on any failure — an unindexed .vcf or a chr-naming
+    mismatch then silently disables the filter.  Here an indexed VCF is queried
+    per chromosome, an unindexed one is read in a single sequential pass, and
+    'chr1' / '1' are reconciled.  Returns {} only when the VCF truly has no
+    usable records, which the caller treats as an error.
+    """
+    import pysam
+
+    def _norm(c):
+        return c[3:] if c.startswith("chr") else c
+
+    want = {_norm(c): c for c in wanted_chroms}
+    found: dict[str, set] = {c: set() for c in wanted_chroms}
+    vcf = pysam.VariantFile(dbsnp_vcf)
+    indexed = False
+    try:
+        indexed = vcf.index is not None
+    except (AttributeError, ValueError):
+        indexed = False
+
+    n = 0
+    if indexed:
+        for norm, orig in want.items():
+            for name in (orig, norm, f"chr{norm}"):     # try both conventions
+                try:
+                    it = vcf.fetch(name)
+                except (ValueError, KeyError):
+                    continue
+                for rec in it:
+                    found[orig].add(rec.pos - 1)        # VCF 1-based → 0-based
+                    n += 1
+                if found[orig]:
+                    break
+    else:
+        logger.warning(
+            "%s has no tabix index — reading it sequentially (slower). "
+            "bgzip + tabix it to speed this up.", dbsnp_vcf)
+        for rec in vcf.fetch():                         # whole-file scan
+            orig = want.get(_norm(rec.chrom))
+            if orig is not None:
+                found[orig].add(rec.pos - 1)
+                n += 1
+    vcf.close()
+    logger.info("dbSNP: loaded %s SNP positions over %s chromosomes",
+                f"{n:,}", sum(1 for v in found.values() if v))
+    return {c: v for c, v in found.items() if v}
+
+
 def _drop_snp_sites(ctx_positions, dbsnp_vcf):
     """Remove context sites that coincide with a dbSNP locus.
 
@@ -267,11 +323,17 @@ def _drop_snp_sites(ctx_positions, dbsnp_vcf):
     'unmethylated' call.  ``--reference`` routes through Step-1 extraction,
     which already does this; this is the ``--context-bed`` path.
     """
-    from nome_hic_concordance.reference import _load_snp_positions
-
     out, dropped, kept = {}, 0, 0
     chroms = sorted({c for ctx in ctx_positions.values() for c in ctx})
-    snps = {c: _load_snp_positions(dbsnp_vcf, c) for c in chroms}
+    snps = _load_snps_all(dbsnp_vcf, chroms)
+    if not snps:
+        sys.exit(
+            f"--dbsnp-vcf {dbsnp_vcf}: no SNP positions matched any of the "
+            f"{len(chroms)} context chromosomes (e.g. {chroms[:3]}).\n"
+            f"  Check that the VCF's chromosome names match the context BED's "
+            f"and that the file is a readable VCF.\n"
+            f"  Refusing to continue silently — an unfiltered run would look "
+            f"identical to a filtered one.")
     for ctx, per_chrom in ctx_positions.items():
         out[ctx] = {}
         for chrom, arr in per_chrom.items():
@@ -280,12 +342,17 @@ def _drop_snp_sites(ctx_positions, dbsnp_vcf):
                 out[ctx][chrom] = arr
                 kept += len(arr)
                 continue
-            mask = ~np.isin(arr["pos"], np.fromiter(s, np.int64, len(s)))
+            snp_arr = np.fromiter(s, np.int64, len(s))
+            mask = ~np.isin(arr["pos"], snp_arr)
             out[ctx][chrom] = arr[mask]
             dropped += int((~mask).sum())
             kept += int(mask.sum())
-    print(f"  dbSNP filter: dropped {dropped:,} of {dropped + kept:,} context "
-          f"sites ({100.0 * dropped / max(dropped + kept, 1):.2f}%)")
+    total = dropped + kept
+    print(f"  dbSNP filter: dropped {dropped:,} of {total:,} context sites "
+          f"({100.0 * dropped / max(total, 1):.2f}%)")
+    if dropped == 0:
+        print("  WARNING: 0 sites dropped despite SNPs being loaded — check "
+              "the coordinate convention of the VCF.", file=sys.stderr)
     return out
 
 

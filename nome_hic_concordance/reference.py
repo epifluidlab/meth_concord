@@ -73,8 +73,15 @@ def _load_snp_positions(vcf_path: str, chrom: str) -> set[int]:
     try:
         try:
             fetcher = vcf.fetch(chrom)
-        except ValueError:
-            # Chromosome not present in the VCF index; silently return empty.
+        except ValueError as exc:
+            # No tabix index, or the chromosome is absent / named differently
+            # ('1' vs 'chr1').  Warn rather than returning empty in silence: an
+            # unfiltered run is indistinguishable from a filtered one in the
+            # output, so a quiet no-op here is worse than a noisy failure.
+            logger.warning(
+                f"dbSNP fetch failed for {chrom!r} in {vcf_path} ({exc}); "
+                f"NO SNPs will be filtered on this chromosome. Ensure the VCF "
+                f"is bgzip+tabix indexed and its chromosome names match.")
             return snp_positions
         for record in fetcher:
             # VCF is 1-based, we store 0-based.
