@@ -119,13 +119,18 @@ struct SiteVec {
     inline void clear() { pos.clear(); st.clear(); }
 };
 
-/* Per-site analogue of count_context(): emits (position, state) per site. */
+/* Per-site analogue of count_context(): emits (position, state) per site.
+ * ``baseq_min`` drops individual low-quality basecalls — a miscalled base is a
+ * miscalled methylation state, and unlike coverage there is no downstream step
+ * that can recover from it. */
 static void site_calls(const int64_t* ctx_pos, const uint8_t* ctx_ref,
                        int64_t n_ctx, const bam1_t* b, int trim_ends,
-                       int strand, SiteVec& out) {
+                       int strand, int baseq_min, SiteVec& out) {
     out.clear();
     if (strand == STRAND_UNKNOWN) return;
     uint8_t informative_ref = (strand == STRAND_CT) ? 67 : 71;
+    const uint8_t* qual = bam_get_qual(b);
+    const bool have_qual = (qual != nullptr && qual[0] != 0xff);
 
     int64_t ref_start = b->core.pos + trim_ends;
     int64_t ref_end = bam_endpos(b) - trim_ends;
@@ -161,6 +166,7 @@ static void site_calls(const int64_t* ctx_pos, const uint8_t* ctx_ref,
             if (rb != informative_ref) continue;
             int64_t qp = ctx_pos[j] + offset;
             if (qp < 0 || qp >= seq_len) continue;
+            if (baseq_min > 0 && have_qual && qual[qp] < baseq_min) continue;
             emit(ctx_pos[j], bam_base_at(seq, (int)qp), rb);
         }
     } else {
@@ -183,6 +189,7 @@ static void site_calls(const int64_t* ctx_pos, const uint8_t* ctx_ref,
             if (it == ref_to_query.end()) continue;
             int qp = it->second;
             if (qp < 0 || qp >= seq_len) continue;
+            if (baseq_min > 0 && have_qual && qual[qp] < baseq_min) continue;
             emit(ctx_pos[j], bam_base_at(seq, qp), rb);
         }
     }
@@ -281,13 +288,23 @@ static py::array_t<double> to_numpy(const Acc& a) {
     return out;
 }
 
+/* True iff [start, end) hits any interval of a sorted, merged blacklist. */
+static inline bool hits_blacklist(const std::vector<int64_t>& starts,
+                                  const std::vector<int64_t>& ends,
+                                  int64_t s, int64_t e) {
+    if (starts.empty()) return false;
+    size_t i = (size_t)(std::upper_bound(starts.begin(), starts.end(), e - 1)
+                        - starts.begin());
+    return i > 0 && ends[i - 1] > s;      // merged ⇒ only the predecessor can hit
+}
+
 static py::dict parse_cell_site_distance(
     const std::string& bam_path,
     py::dict ctx_gch, py::dict ctx_hcg,
     std::vector<double> edges,
     int trim_ends, int mapq_min, int null_window,
     int max_site_pairs_per_read, uint64_t seed,
-    bool keep_supplementary)
+    bool keep_supplementary, int baseq_min, py::dict blacklist)
 {
     const int nb = (int)edges.size() - 1;
     Acc gg_l(nb), hh_l(nb), gh_l(nb), gg_n(nb), hh_n(nb), gh_n(nb);
@@ -334,6 +351,15 @@ static py::dict parse_cell_site_distance(
         }
         if (ng == 0 && nh == 0) continue;
 
+        std::vector<int64_t> bl_start, bl_end;
+        if (blacklist.contains(chrom.c_str())) {
+            auto t = blacklist[chrom.c_str()].cast<py::tuple>();
+            auto sa = t[0].cast<py::array_t<int64_t>>();
+            auto ea = t[1].cast<py::array_t<int64_t>>();
+            bl_start.assign(sa.data(), sa.data() + sa.size());
+            bl_end.assign(ea.data(), ea.data() + ea.size());
+        }
+
         int tid = bam_name2id(hdr, chrom.c_str());
         if (tid < 0) continue;
         hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, hdr->target_len[tid]);
@@ -362,17 +388,26 @@ static py::dict parse_cell_site_distance(
             const bam1_t* r1 = (b->core.pos <= mate->core.pos) ? b : mate;
             const bam1_t* r2 = (r1 == b) ? mate : b;
 
+            // Drop the PAIR if EITHER end touches a blacklist interval, matching
+            // bam_parser's read-level blacklist filter.
+            if (!bl_start.empty() &&
+                (hits_blacklist(bl_start, bl_end, r1->core.pos, bam_endpos(r1)) ||
+                 hits_blacklist(bl_start, bl_end, r2->core.pos, bam_endpos(r2)))) {
+                bam_destroy1(mate);
+                continue;
+            }
+
             PairRec rec;
             rec.mid1 = (r1->core.pos + bam_endpos(r1)) / 2;
             rec.mid2 = (r2->core.pos + bam_endpos(r2)) / 2;
             int s1 = infer_conversion_strand(r1), s2 = infer_conversion_strand(r2);
             if (ng) {
-                site_calls(gp, gr, ng, r1, trim_ends, s1, rec.g1);
-                site_calls(gp, gr, ng, r2, trim_ends, s2, rec.g2);
+                site_calls(gp, gr, ng, r1, trim_ends, s1, baseq_min, rec.g1);
+                site_calls(gp, gr, ng, r2, trim_ends, s2, baseq_min, rec.g2);
             }
             if (nh) {
-                site_calls(hp, hr, nh, r1, trim_ends, s1, rec.h1);
-                site_calls(hp, hr, nh, r2, trim_ends, s2, rec.h2);
+                site_calls(hp, hr, nh, r1, trim_ends, s1, baseq_min, rec.h1);
+                site_calls(hp, hr, nh, r2, trim_ends, s2, baseq_min, rec.h2);
             }
             bam_destroy1(mate);
             if (rec.g1.size() || rec.g2.size() || rec.h1.size() || rec.h2.size()) {
@@ -440,7 +475,8 @@ PYBIND11_MODULE(_site_dist_core, m) {
           py::arg("edges"), py::arg("trim_ends") = 5, py::arg("mapq_min") = 30,
           py::arg("null_window") = 100,
           py::arg("max_site_pairs_per_read") = 64, py::arg("seed") = 42,
-          py::arg("keep_supplementary") = false,
+          py::arg("keep_supplementary") = false, py::arg("baseq_min") = 0,
+          py::arg("blacklist") = py::dict(),
           "Parse one cell's BAM and return per-distance-bin Pearson "
           "sufficient statistics for GCH-GCH / HCG-HCG / HCG-GCH, linked and "
           "non-linked.");

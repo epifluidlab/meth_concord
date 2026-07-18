@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -185,16 +186,18 @@ def _add_pair(accs, cond, edges, rng, cap, c1, c2, cross_only=False):
 
 
 def process_cell_cpp(bam_path, ctx_positions, edges, trim_ends, mapq_min,
-                     cap, null_window, seed):
+                     cap, null_window, seed, baseq_min=0, blacklist=None):
     """htslib fast path — same result as :func:`process_cell`, ~100x faster."""
     ctx_g = {c: (a["pos"].astype(np.int64), a["ref_base"].astype(np.uint8))
              for c, a in ctx_positions.get("GCH", {}).items()}
     ctx_h = {c: (a["pos"].astype(np.int64), a["ref_base"].astype(np.uint8))
              for c, a in ctx_positions.get("HCG", {}).items()}
+    bl = {c: (iv[:, 0].astype(np.int64), iv[:, 1].astype(np.int64))
+          for c, iv in (blacklist or {}).items() if len(iv)}
     res = _CPP.parse_cell_site_distance(
         str(bam_path), ctx_g, ctx_h, [float(e) for e in edges],
         int(trim_ends), int(mapq_min), int(null_window), int(cap), int(seed),
-        False)
+        False, int(baseq_min), bl)
     accs = {}
     for m, _ in _MEASURES:
         for c, _lab in _CONDS:
@@ -255,6 +258,36 @@ def process_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
 # --------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------
+
+def _drop_snp_sites(ctx_positions, dbsnp_vcf):
+    """Remove context sites that coincide with a dbSNP locus.
+
+    At a C/T (or G/A) polymorphism the read base is ambiguous: an unconverted
+    C and a genomic T look identical, so the site would contribute a spurious
+    'unmethylated' call.  ``--reference`` routes through Step-1 extraction,
+    which already does this; this is the ``--context-bed`` path.
+    """
+    from nome_hic_concordance.reference import _load_snp_positions
+
+    out, dropped, kept = {}, 0, 0
+    chroms = sorted({c for ctx in ctx_positions.values() for c in ctx})
+    snps = {c: _load_snp_positions(dbsnp_vcf, c) for c in chroms}
+    for ctx, per_chrom in ctx_positions.items():
+        out[ctx] = {}
+        for chrom, arr in per_chrom.items():
+            s = snps.get(chrom)
+            if not s:
+                out[ctx][chrom] = arr
+                kept += len(arr)
+                continue
+            mask = ~np.isin(arr["pos"], np.fromiter(s, np.int64, len(s)))
+            out[ctx][chrom] = arr[mask]
+            dropped += int((~mask).sum())
+            kept += int(mask.sum())
+    print(f"  dbSNP filter: dropped {dropped:,} of {dropped + kept:,} context "
+          f"sites ({100.0 * dropped / max(dropped + kept, 1):.2f}%)")
+    return out
+
 
 def _logx(ax, lo, hi):
     ax.set_xscale("log")
@@ -342,10 +375,29 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--samples", required=True,
                     help="TSV with cell_name, bam_path [, group].")
-    ap.add_argument("--context-bed", required=True,
+    ap.add_argument("--context-bed", default=None,
                     help="'GCH:/path/GCH.bed.gz,HCG:/path/HCG.bed.gz' — same "
-                         "CONTEXT:PATH form as nome_hic_concordance.")
+                         "CONTEXT:PATH form as nome_hic_concordance. Either "
+                         "this or --reference is required.")
     ap.add_argument("--context-bed-offset", type=int, default=0)
+    ap.add_argument("--reference", default=None,
+                    help="Reference .2bit — extracts the GCH/HCG positions "
+                         "directly (same as nome_hic_concordance Step 1) when "
+                         "no --context-bed is given.  Note it does NOT change "
+                         "how methylation is called: the state comes from the "
+                         "read base vs the site's reference base, which the "
+                         "context table already carries.")
+    ap.add_argument("--dbsnp-vcf", default=None,
+                    help="Tabix-indexed dbSNP VCF; context sites overlapping a "
+                         "SNP are dropped (a C/T polymorphism is "
+                         "indistinguishable from a bisulfite conversion).")
+    ap.add_argument("--blacklist-bed", default=None,
+                    help="BED of blacklisted regions; a read PAIR is dropped if "
+                         "EITHER end overlaps one.")
+    ap.add_argument("--baseq-min", type=int, default=0,
+                    help="Drop individual cytosines whose basecall quality is "
+                         "below this (0 = off). A miscalled base is a miscalled "
+                         "methylation state, so this filters loci, not reads.")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--group-column", default=None,
                     help="Column in --samples; also emit a figure per group "
@@ -383,18 +435,37 @@ def main():
     args = ap.parse_args()
 
     from nome_hic_concordance.cli import _parse_context_bed, load_samples
-    from nome_hic_concordance.reference import load_context_from_bed
+    from nome_hic_concordance.reference import (extract_context_positions,
+                                                load_context_from_bed)
     from nome_hic_concordance.utils import ensure_dir
 
     samples = load_samples(args.samples)
     if args.max_cells and args.max_cells > 0:
         samples = samples.iloc[: args.max_cells]
-    bed = _parse_context_bed(args.context_bed)
-    for need in ("GCH", "HCG"):
-        if need not in bed:
-            sys.exit(f"--context-bed must define {need}= (got {list(bed)}).")
-    ctx_positions = load_context_from_bed(bed, n_threads=args.n_threads,
-                                          c_offset=args.context_bed_offset)
+    if not args.context_bed and not args.reference:
+        sys.exit("provide --context-bed or --reference.")
+    if args.context_bed:
+        bed = _parse_context_bed(args.context_bed)
+        for need in ("GCH", "HCG"):
+            if need not in bed:
+                sys.exit(f"--context-bed must define {need}: (got {list(bed)}).")
+        ctx_positions = load_context_from_bed(
+            bed, n_threads=args.n_threads, c_offset=args.context_bed_offset)
+        if args.dbsnp_vcf:
+            ctx_positions = _drop_snp_sites(ctx_positions, args.dbsnp_vcf)
+    else:
+        # Step-1 extraction applies --dbsnp-vcf itself.
+        ctx_positions = extract_context_positions(
+            args.reference, str(Path(args.output_dir) / "context"),
+            contexts=["GCH", "HCG"], dbsnp_vcf=args.dbsnp_vcf,
+            n_threads=args.n_threads)
+
+    blacklist = None
+    if args.blacklist_bed:
+        from nome_hic_concordance.blacklist import load_blacklist_bed
+        blacklist = load_blacklist_bed(args.blacklist_bed)
+        n_iv = sum(len(v) for v in blacklist.values())
+        print(f"  blacklist: {n_iv:,} intervals over {len(blacklist)} chroms")
     out_dir = Path(ensure_dir(args.output_dir))
     edges = _build_edges(args.min_distance, args.max_distance,
                          args.bins_per_decade)
@@ -418,21 +489,38 @@ def main():
     if use_cpp:
         jobs = [(row["bam_path"], ctx_positions, edges, args.trim_ends,
                  args.mapq_min, args.max_site_pairs_per_read,
-                 args.null_window, args.seed + i)
+                 args.null_window, args.seed + i, args.baseq_min, blacklist)
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = process_cell_cpp
     else:
+        if args.baseq_min or blacklist:
+            print("  NOTE: --baseq-min / --blacklist-bed are applied by the "
+                  "htslib backend only; the python fallback ignores them.",
+                  file=sys.stderr)
         jobs = [(row["bam_path"], ctx_positions, edges, args.trim_ends,
                  args.mapq_min, args.max_pairs_per_cell,
                  args.max_site_pairs_per_read, args.null_window, args.seed + i)
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = process_cell
+
+    t0 = time.time()
     if args.n_threads > 1 and len(jobs) > 1:
         from joblib import Parallel, delayed
-        res = Parallel(n_jobs=args.n_threads, verbose=5)(
+        # verbose=10 makes joblib log each completed task, so a long run shows
+        # progress instead of going silent for hours.
+        res = Parallel(n_jobs=args.n_threads, verbose=10)(
             delayed(fn)(*j) for j in jobs)
     else:
-        res = [fn(*j) for j in jobs]
+        res = []
+        for i, j in enumerate(jobs, 1):
+            res.append(fn(*j))
+            el = time.time() - t0
+            eta = el / i * (len(jobs) - i)
+            print(f"  [{i}/{len(jobs)}] {samples.iloc[i-1]['cell_name']}: "
+                  f"{res[-1][1]:,} pairs  ({el:.0f}s elapsed, ETA {eta:.0f}s)",
+                  flush=True)
+    print(f"  parsed {len(res)} cells in {time.time() - t0:.0f}s "
+          f"({sum(r[1] for r in res):,} read pairs total)")
 
     keys = [(m, c) for m, _ in _MEASURES for c, _ in _CONDS]
     groups: dict[str, list[int]] = {"all": list(range(len(res)))}

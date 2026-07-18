@@ -213,6 +213,95 @@ def test_htslib_backend_matches_pysam_exactly():
         assert np.asarray(res[f"{key}_null"]).shape == b.shape
 
 
+def _qual_bam(tmp_path):
+    """BAM where basecall quality varies INDEPENDENTLY of methylation state, so
+    a baseq filter removes sites without removing one state entirely."""
+    pysam = pytest.importorskip("pysam")
+    chrom, clen = "chr1", 5000
+    sites = list(range(1000, 1200, 10)) + list(range(2000, 2200, 10))
+    sset = set(sites)
+    ref = bytearray(b"A" * clen)
+    for p in sites:
+        ref[p] = ord("C")
+    ref = ref.decode()
+    fa = tmp_path / "ref.fa"
+    fa.write_text(f">{chrom}\n" + "\n".join(ref[i:i + 60]
+                                            for i in range(0, clen, 60)) + "\n")
+    pysam.faidx(str(fa))
+    hdr = {"HD": {"VN": "1.6"}, "SQ": [{"SN": chrom, "LN": clen}]}
+    raw = tmp_path / "raw.bam"
+    with pysam.AlignmentFile(raw, "wb", header=hdr) as bam:
+        for i in range(50):
+            for st, is_r1 in ((1000, True), (2000, False)):
+                a = pysam.AlignedSegment()
+                a.query_name = f"r{i}"; a.reference_id = 0
+                a.reference_start = st; a.mapping_quality = 60
+                a.cigarstring = "200M"
+                seq, quals = [], []
+                for k in range(200):
+                    p = st + k
+                    if p in sset:
+                        seq.append("C" if (p // 10) % 2 == 0 else "T")
+                        quals.append(10 if (p % 20) == 0 else 40)
+                    else:
+                        seq.append(ref[p]); quals.append(40)
+                a.query_sequence = "".join(seq)
+                a.query_qualities = pysam.qualitystring_to_array(
+                    "".join(chr(33 + q) for q in quals))
+                a.flag = (0x1 | 0x40) if is_r1 else (0x1 | 0x80)
+                a.next_reference_id = 0
+                a.next_reference_start = 2000 if is_r1 else 1000
+                bam.write(a)
+    srt = tmp_path / "s.bam"
+    pysam.sort("-o", str(srt), str(raw))
+    out = tmp_path / "q.bam"
+    with open(out, "wb") as fh:                       # calmd adds the MD tag
+        fh.write(pysam.calmd("-b", str(srt), str(fa), catch_stdout=True))
+    pysam.index(str(out))
+    return out, np.array(sites, np.int64)
+
+
+def test_baseq_min_drops_low_quality_sites(tmp_path):
+    pytest.importorskip("pysam")
+    import pysam  # noqa: F401 — loads bundled libhts for the extension
+    try:
+        from nome_hic_concordance import _site_dist_core as cpp
+    except Exception:
+        pytest.skip("htslib extension not built")
+    bam, sites = _qual_bam(tmp_path)
+    ctx = {"chr1": (sites, np.full(len(sites), 67, np.uint8))}
+    edges = [1.0, 10.0, 100.0, 1000.0, 10000.0]
+
+    def n_pairs(bq):
+        r = cpp.parse_cell_site_distance(str(bam), ctx, {}, edges, 0, 30, 100,
+                                         0, 42, False, bq, {})
+        return float(np.asarray(r["gg_linked"])[0].sum())
+
+    off, on = n_pairs(0), n_pairs(30)
+    assert off > 0 and on > 0
+    assert on < off, "--baseq-min did not drop any low-quality basecall"
+
+
+def test_blacklist_drops_pairs(tmp_path):
+    """A blacklist covering one end must drop the whole pair."""
+    pytest.importorskip("pysam")
+    import pysam  # noqa: F401
+    try:
+        from nome_hic_concordance import _site_dist_core as cpp
+    except Exception:
+        pytest.skip("htslib extension not built")
+    bam, sites = _qual_bam(tmp_path)
+    ctx = {"chr1": (sites, np.full(len(sites), 67, np.uint8))}
+    edges = [1.0, 10.0, 100.0, 1000.0, 10000.0]
+    base = cpp.parse_cell_site_distance(str(bam), ctx, {}, edges, 0, 30, 100,
+                                        0, 42, False, 0, {})
+    bl = {"chr1": (np.array([1900], np.int64), np.array([2300], np.int64))}
+    masked = cpp.parse_cell_site_distance(str(bam), ctx, {}, edges, 0, 30, 100,
+                                          0, 42, False, 0, bl)
+    assert int(base["n_pairs"]) > 0
+    assert int(masked["n_pairs"]) == 0, "blacklist did not drop the pairs"
+
+
 def test_build_edges_exact_bounds():
     m = _mod()
     e = m._build_edges(1, 1_000_000, 8)
