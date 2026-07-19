@@ -21,39 +21,42 @@ Site pairs come from BOTH arms, giving one continuous curve:
   * WITHIN-read  — two sites on the same read  → the short range (≲ read length)
   * CROSS-end    — a site on end 1 × a site on end 2 → the long range (contact)
 
-Three conditions:
+Two conditions are plotted:
   * LINKED  — the read pair's true partner end (the real ligation), ALL pairs
   * NULL    — the partner end is replaced by a DIFFERENT end within
               ±--null-window bp of it (same distance, different molecule), so a
               linked-minus-null gap is same-molecule coordination rather than
               genomic proximity.
-  * MATCHED — the true partner, but restricted to the pairs the null could
-              actually use, and cross-end only.
 
-A pair only enters the NULL if some other end happens to lie within ±window of
-its partner.  A pair with no such neighbour cannot be given one, so it is
-EXCLUDED from the null (it is not carried as NaN) while still counting in
-LINKED.  At single-cell coverage that is the majority of pairs, and the ones
-that survive sit in read-dense loci -- so linked-vs-null would compare two
-different sets of loci, not two partner choices.  MATCHED is the like-for-like
-baseline: same pairs, same anchor end, same arm, differing from the null only
-in whether the partner is the real mate.  The run reports the eligible
-fraction; when it is low, read the null against MATCHED.
+The question the null answers is whether local methylation at ONE END
+correlates with local methylation at the OTHER end, so Δ = LINKED − NULL is
+taken against the full linked curve over every pair.
 
---null-scope pooled (the default) attacks the same problem at the source: the
+A third arm, MATCHED — the true partner restricted to the pairs the null could
+actually use — is computed and written to the TSV but NOT plotted.  It exists
+only as a check: a pair can enter the null solely if some other end lies within
+±window of its partner, and if that subset were unrepresentative, matched would
+diverge from linked.  It is built from subsampled anchors, so as a control it is
+strictly noisier than linked, and with the pooled null (eligibility near 100%)
+it is near-redundant as well.
+
+--null-scope pooled (the default) is what makes eligibility a non-issue: the
 substitute end is drawn from the read ends of EVERY cell in the group being
 plotted -- the group's own cells for a group figure, all cells for the 'all'
 figure -- which raises donor density by roughly the number of cells.  Each cell
 contributes a bounded reservoir sample, so this costs one BAM pass and a
 predictable amount of memory rather than holding every pair.  --null-scope cell
-restores the old within-cell behaviour.
+restores the old within-cell behaviour, where only a read-density-biased
+minority of pairs is eligible.
 
-Each panel is paired with Δ = matched − null, its 95% CI, and a p-value from a
+Each panel is paired with Δ = linked − null, its 95% CI, and a p-value from a
 CELL-level bootstrap: site pairs are not independent (tens per read, ~1e6 reads
 per cell), so a test that treats them as independent would report significance
 for everything.  Bins with fewer than --min-pairs site pairs on EITHER side are
 masked, which is what keeps a thin, noisy null from putting a lone spike in an
-otherwise smooth curve.
+otherwise smooth curve.  The figure starts at --plot-min-distance (10bp):
+below that the pairs are adjacent-motif artefacts rather than a distance
+relationship.
 
 Because the null swaps the PARTNER END, it applies to the cross-end arm only.
 Within-read pairs have no non-linked counterpart — both cytosines sit on the
@@ -112,11 +115,14 @@ _MEASURES = (("gg", "GCH–GCH  r(site_i, site_j)"),
 _CONDS = (("linked", "linked (true partner, all pairs)"),
           ("matched", "linked (true partner, null-eligible pairs)"),
           ("null", "non-linked (±window)"))
-# 'matched' is the curve to read AGAINST 'null' — same pairs, same anchor end,
-# cross-end only — so it is drawn in the same weight, with 'linked' heavier.
 _CSTYLE = {"linked":  dict(ls="-", marker="o", ms=3.2, lw=1.6, alpha=1.00),
            "matched": dict(ls="-.", marker="s", ms=2.6, lw=1.3, alpha=0.85),
            "null":    dict(ls="--", marker="", lw=1.4, alpha=0.65)}
+# 'matched' is still computed and written to the TSV (it says whether the
+# null-eligible subset is representative) but it is NOT drawn: it is built from
+# subsampled anchors, so as a control it is strictly noisier than linked, and
+# with the pooled null -- eligibility near 100% -- it is near-redundant too.
+_PLOT_CONDS = ("linked", "null")
 _TLAB = {1: "1bp", 10: "10bp", 100: "100bp", 1_000: "1kb", 10_000: "10kb",
          100_000: "100kb", 1_000_000: "1Mb", 10_000_000: "10Mb"}
 _QC = ("high-quality read pairs only: uniquely mapped, no PCR duplicate, "
@@ -606,37 +612,59 @@ def safe_names(labels):
 
 def _logx(ax, lo, hi):
     ax.set_xscale("log")
+    ax.set_xlim(lo, hi)               # pin it: masked bins must not stretch it
     ticks = [t for t in _TLAB if lo <= t <= hi]
     ax.set_xticks(ticks); ax.set_xticklabels([_TLAB[t] for t in ticks])
     ax.set_xlabel("genomic distance between the two cytosines")
 
 
 def _delta(curves, key, min_pairs):
-    """matched − null, masked where EITHER side is too thin to trust.
+    """linked − null, masked where EITHER side is too thin to trust.
+
+    The question the null answers is whether local methylation at one END
+    correlates with local methylation at the OTHER end, so the thing to subtract
+    it from is the full linked curve over ALL pairs.  ('matched' -- the true
+    partner restricted to null-eligible pairs -- is still computed and written
+    to the TSV as a check on whether that subset is representative, but it is
+    built from subsampled anchors and so is the noisier of the two; with the
+    pooled null it is also near-redundant, since eligibility runs close to 100%.)
 
     Masking jointly matters: a bin can hold millions of linked site pairs and a
     few hundred null ones, and differencing an unmasked noisy null is exactly
     what produces a lone spike in an otherwise smooth curve.
     """
-    rm, nm = curves[(key, "matched")]
+    rl, nl = curves[(key, "linked")]
     rn, nn = curves[(key, "null")]
-    ok = (nm >= min_pairs) & (nn >= min_pairs)
-    return np.where(ok, rm - rn, np.nan), ok
+    ok = (nl >= min_pairs) & (nn >= min_pairs)
+    return np.where(ok, rl - rn, np.nan), ok
 
 
-def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs):
+def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
+          plot_min=10.0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     colors = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c"}
     fig, axes = plt.subplots(2, 3, figsize=(15, 8.6), sharex=True)
+    # Below ~10bp the site pairs are adjacent-motif artefacts rather than a
+    # distance relationship -- most sharply the distance-1 HCG-HCG point, which
+    # is one CpG dyad and can only be seen when the two mates disagree on
+    # conversion strand.  Hide them rather than let them anchor the axis.
+    lo_x = max(float(edges[0]), float(plot_min))
+    vis = np.asarray(centers) >= lo_x
+
+    def _show(v):
+        return np.where(vis, v, np.nan)
 
     for col, (key, title) in enumerate(_MEASURES):
         ax = axes[0, col]
         ax.axhline(0, color="0.6", lw=0.8, zorder=0)
         for cond, clabel in _CONDS:
+            if cond not in _PLOT_CONDS:
+                continue
             r, _n = curves[(key, cond)]
-            ax.plot(centers, r, color=colors[key], label=clabel, **_CSTYLE[cond])
+            ax.plot(centers, _show(r), color=colors[key], label=clabel,
+                    **_CSTYLE[cond])
         ax.set_ylabel("Pearson r (phi) of 0/1 calls")
         ax.set_title(title, fontsize=10)
         ax.legend(fontsize=7.5, loc="best")
@@ -645,21 +673,23 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs)
         axd = axes[1, col]
         axd.axhline(0, color="0.6", lw=0.8, zorder=0)
         d, ok = _delta(curves, key, min_pairs)
+        d = _show(d)
         sig = None
         if boot and boot.get(key) is not None:
             lo, hi, p = boot[key]
-            lo = np.where(ok, lo, np.nan); hi = np.where(ok, hi, np.nan)
+            lo = _show(np.where(ok, lo, np.nan))
+            hi = _show(np.where(ok, hi, np.nan))
             axd.fill_between(centers, lo, hi, color=colors[key], alpha=0.20,
                              lw=0, label="95% CI (cell bootstrap)")
             sig = np.isfinite(d) & np.isfinite(p) & (p < 0.05)
         axd.plot(centers, d, "-o", ms=3.2, lw=1.6, color=colors[key],
-                 label="Δ = matched − null")
+                 label="Δ = linked − null")
         # AFTER the line, or the ring is hidden underneath its own marker.
         if sig is not None and sig.any():
             axd.plot(np.asarray(centers)[sig], d[sig], "o", ms=7.5,
                      mfc="none", mec="0.15", mew=1.2, ls="none",
                      label="p < 0.05", zorder=5)
-        _logx(axd, edges[0], edges[-1])
+        _logx(axd, lo_x, edges[-1])
         axd.set_ylabel("Δ Pearson r")
         axd.set_title(f"Δ {title.split('  ')[0]}   (same-molecule excess)",
                       fontsize=9.5)
@@ -670,9 +700,11 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs)
     fig.tight_layout(rect=(0, 0.045, 1, 0.955))
     fig.text(0.5, 0.024, _QC, ha="center", fontsize=7.5, color="0.35")
     fig.text(0.5, 0.008,
-             f"bins with fewer than {min_pairs:,} site pairs on either side are "
-             f"masked; p from a cell-level bootstrap (site pairs are not "
-             f"independent)", ha="center", fontsize=7, color="0.45")
+             f"x starts at {lo_x:,.0f}bp (closer pairs are adjacent-motif "
+             f"artefacts); bins with fewer than {min_pairs:,} site pairs on "
+             f"either side are masked; p from a cell-level bootstrap (site "
+             f"pairs are not independent)", ha="center", fontsize=7,
+             color="0.45")
     fig.savefig(out)
     plt.close(fig)
 
@@ -706,7 +738,7 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
     fig_path = out_dir / f"{stem_name}.{args.plot_format}"
     tsv_path = out_dir / f"{stem_name}.tsv"
     _plot(curves, boot, centers, edges, label, n_cells, n_pairs, fig_path,
-          args.min_pairs)
+          args.min_pairs, args.plot_min_distance)
     _write_tsv(curves, boot, centers, edges, tsv_path, args.min_pairs)
     print(f"\n=== {label}: {n_cells} cells, {n_pairs:,} read pairs ===")
     if scope_note:
@@ -724,26 +756,26 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
               "from every cell in the group.")
     deltas = {k: _delta(curves, k, args.min_pairs)[0] for k, _ in _MEASURES}
     print(f"  {'distance':>10}{'n(GG)':>12} | "
-          + "".join(f"{m.split('  ')[0]:>36}" for _, m in _MEASURES))
+          + "".join(f"{m.split('  ')[0]:>30}" for _, m in _MEASURES))
     print(f"  {'':>10}{'':>12} | "
-          + "".join(f"{'linked/matched/null    Δ':>36}" for _ in _MEASURES))
+          + "".join(f"{'linked/null        Δ':>30}" for _ in _MEASURES))
     for bi in range(len(centers)):
         if not np.isfinite(curves[("gg", "linked")][0][bi]):
             continue
         cols = ""
         for key, _ in _MEASURES:
             vals = "/".join(
-                f"{curves[(key, c)][0][bi]:+.3f}" for c, _ in _CONDS)
+                f"{curves[(key, c)][0][bi]:+.3f}" for c in _PLOT_CONDS)
             dv = deltas[key][bi]
             if np.isfinite(dv):
                 star = _stars(boot[key][2][bi]) if boot and boot.get(key) is not None else ""
                 vals += f"  {dv:+.3f}{star}"
             else:
                 vals += "      ."          # masked: too few pairs on one side
-            cols += vals.rjust(36)
+            cols += vals.rjust(30)
         print(f"  {centers[bi]:>10,.0f}{int(curves[('gg','linked')][1][bi]):>12,d} | {cols}")
     if boot:
-        print("  Δ = matched − null;  * p<0.05  ** p<0.01  *** p<0.001 "
+        print("  Δ = linked − null;  * p<0.05  ** p<0.01  *** p<0.001 "
               f"({args.n_bootstrap} cell-level bootstrap resamples)")
     print(f"  wrote {fig_path} and {tsv_path}")
     return curves
@@ -851,6 +883,14 @@ def main():
                          "complementary base. Raise to 2-3 to drop ambiguous "
                          "reads instead (they become strand-unknown and "
                          "contribute nothing).")
+    ap.add_argument("--plot-min-distance", type=float, default=10.0,
+                    help="Left edge of the x-axis in the FIGURE. Below ~10bp "
+                         "the pairs are adjacent-motif artefacts rather than a "
+                         "distance relationship — most sharply the distance-1 "
+                         "HCG–HCG point, which is a single CpG dyad and only "
+                         "observable when the two mates disagree on conversion "
+                         "strand. The bins are still computed and written to "
+                         "the TSV; use --min-distance to drop them entirely.")
     ap.add_argument("--plot-format", choices=["png", "pdf", "svg"], default="pdf")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
@@ -1061,7 +1101,7 @@ def main():
         if args.n_bootstrap > 0 and len(idxs) >= 3:
             boot = {}
             for m, _ in _MEASURES:
-                boot[m] = _bootstrap_delta(pc[(m, "matched")], pc[(m, "null")],
+                boot[m] = _bootstrap_delta(pc[(m, "linked")], pc[(m, "null")],
                                            args.min_pairs, args.n_bootstrap,
                                            args.seed)
         _report(accs, len(idxs), n_pairs, centers, edges, label, out_dir, args,

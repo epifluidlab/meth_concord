@@ -1,4 +1,4 @@
-"""Δ = matched − null: masking of thin bins, and the cell-level bootstrap.
+"""Δ = linked − null: masking of thin bins, and the cell-level bootstrap.
 
 Two things are being pinned here.
 
@@ -52,7 +52,7 @@ def _corr_pair(rng, n, rho):
 
 def test_delta_is_masked_when_the_null_side_is_thin():
     m = _mod()
-    curves = {("gg", "matched"): (np.array([0.50, 0.40]), np.array([1e6, 1e6])),
+    curves = {("gg", "linked"): (np.array([0.50, 0.40]), np.array([1e6, 1e6])),
               ("gg", "null"): (np.array([0.10, 0.20]), np.array([50.0, 1e6]))}
     d, ok = m._delta(curves, "gg", min_pairs=1000)
     assert not np.isfinite(d[0]), "thin null bin must be masked, not differenced"
@@ -60,9 +60,9 @@ def test_delta_is_masked_when_the_null_side_is_thin():
     assert np.isclose(d[1], 0.20)
 
 
-def test_delta_is_masked_when_the_matched_side_is_thin():
+def test_delta_is_masked_when_the_linked_side_is_thin():
     m = _mod()
-    curves = {("gg", "matched"): (np.array([0.50]), np.array([10.0])),
+    curves = {("gg", "linked"): (np.array([0.50]), np.array([10.0])),
               ("gg", "null"): (np.array([0.10]), np.array([1e6]))}
     d, ok = m._delta(curves, "gg", min_pairs=1000)
     assert not np.isfinite(d[0]) and not ok[0]
@@ -70,7 +70,7 @@ def test_delta_is_masked_when_the_matched_side_is_thin():
 
 def test_delta_survives_when_both_sides_are_thick():
     m = _mod()
-    curves = {("gg", "matched"): (np.array([0.50]), np.array([1e6])),
+    curves = {("gg", "linked"): (np.array([0.50]), np.array([1e6])),
               ("gg", "null"): (np.array([0.12]), np.array([1e6]))}
     d, ok = m._delta(curves, "gg", min_pairs=1000)
     assert ok[0] and np.isclose(d[0], 0.38)
@@ -87,7 +87,7 @@ def test_bootstrap_needs_at_least_three_cells():
 
 
 def test_bootstrap_flags_a_real_difference():
-    """matched strongly correlated, null not: Δ should be significant."""
+    """linked strongly correlated, null not: Δ should be significant."""
     m = _mod()
     rng = np.random.default_rng(1)
     a = [_acc(*_corr_pair(rng, 20_000, 0.60)) for _ in range(12)]
@@ -127,3 +127,42 @@ def test_stars_thresholds():
     assert m._stars(0.03) == "*"
     assert m._stars(0.2) == ""
     assert m._stars(np.nan) == ""
+
+
+# ------------------------------------------------------------- axis floor ---
+
+def test_plot_starts_at_the_requested_distance(tmp_path):
+    """--plot-min-distance must clip the x-axis, not just hide markers.
+
+    Below ~10bp the site pairs are adjacent-motif artefacts; the distance-1
+    HCG-HCG point in particular is a single CpG dyad, visible only when the two
+    mates disagree on conversion strand.  Those bins stay in the TSV.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    m = _mod()
+    edges = m._build_edges(1, 1_000_000, 8)
+    centers = np.sqrt(edges[:-1] * edges[1:])
+    nb = len(centers)
+    curves = {}
+    for key, _ in m._MEASURES:
+        for cond, _lab in m._CONDS:
+            curves[(key, cond)] = (np.full(nb, 0.3), np.full(nb, 1e6))
+    out = tmp_path / "f.png"
+    m._plot(curves, None, centers, edges, "t", 3, 100, out, 100, plot_min=10.0)
+    assert out.exists()
+
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    m._logx(ax, 10.0, 1e6)
+    assert ax.get_xlim()[0] == 10.0, "axis must start exactly at the floor"
+    plt.close(fig)
+
+
+def test_matched_is_kept_out_of_the_plotted_conditions():
+    """It stays in _CONDS (so it reaches the TSV) but must not be drawn."""
+    m = _mod()
+    assert "matched" in dict(m._CONDS)
+    assert "matched" not in m._PLOT_CONDS
+    assert m._PLOT_CONDS == ("linked", "null")
