@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 _SCRIPT = (Path(__file__).resolve().parent.parent / "scripts"
            / "site_distance_correlation.py")
@@ -166,3 +167,71 @@ def test_matched_is_kept_out_of_the_plotted_conditions():
     assert "matched" in dict(m._CONDS)
     assert "matched" not in m._PLOT_CONDS
     assert m._PLOT_CONDS == ("linked", "null")
+
+
+# -------------------------------------------------------------------- FDR ---
+
+def test_bootstrap_p_is_never_exactly_zero():
+    """(1+count)/(1+B), not count/B.
+
+    A finite bootstrap cannot justify p = 0, and an exact zero would sail
+    through any FDR procedure unconditionally.
+    """
+    m = _mod()
+    rng = np.random.default_rng(7)
+    a = [_acc(*_corr_pair(rng, 20_000, 0.9)) for _ in range(15)]
+    b = [_acc(*_corr_pair(rng, 20_000, 0.0)) for _ in range(15)]
+    _lo, _hi, p = m._bootstrap_delta(a, b, 100, 500, 42)
+    assert p[0] > 0.0, "p must be floored at 2/(B+1), never 0"
+    assert p[0] == pytest.approx(2.0 / 501, rel=0.5)
+
+
+def test_bh_is_monotone_and_bounded():
+    m = _mod()
+    p = np.array([0.001, 0.008, 0.02, 0.04, 0.3, 0.9])
+    q = m._fdr(p, "bh")
+    assert np.all(q >= p - 1e-12), "adjusted p can only go up"
+    assert np.all(np.diff(q) >= -1e-12), "q must be monotone in rank"
+    assert q.max() <= 1.0
+
+
+def test_bh_matches_the_textbook_formula():
+    m = _mod()
+    p = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
+    q = m._fdr(p, "bh")
+    # q_i = min over j>=i of (p_j * m / j)
+    n = len(p)
+    want = [min((p[j] * n / (j + 1)) for j in range(i, n)) for i in range(n)]
+    assert q == pytest.approx(want)
+
+
+def test_by_is_stricter_than_bh():
+    m = _mod()
+    p = np.array([0.001, 0.01, 0.02, 0.04])
+    assert np.all(m._fdr(p, "by") >= m._fdr(p, "bh") - 1e-12)
+
+
+def test_fdr_preserves_nan_and_ignores_it_in_the_count():
+    """A masked bin must not inflate m and must stay masked."""
+    m = _mod()
+    p = np.array([0.01, np.nan, 0.02])
+    q = m._fdr(p, "bh")
+    assert not np.isfinite(q[1])
+    # only 2 finite tests, so the smallest is multiplied by 2, not 3
+    assert q[0] == pytest.approx(min(0.01 * 2 / 1, 0.02 * 2 / 2))
+
+
+def test_fdr_none_passes_p_through():
+    m = _mod()
+    p = np.array([0.01, 0.5, np.nan])
+    q = m._fdr(p, "none")
+    assert q[0] == 0.01 and q[1] == 0.5 and not np.isfinite(q[2])
+
+
+def test_fdr_kills_a_lone_marginal_bin_but_keeps_a_pervasive_effect():
+    """The behaviour that makes the correction worth having."""
+    m = _mod()
+    lone = np.concatenate([[0.03], np.full(99, 0.6)])
+    assert m._fdr(lone, "bh")[0] > 0.05, "a single p=0.03 among 100 is noise"
+    pervasive = np.full(100, 0.001)
+    assert np.all(m._fdr(pervasive, "bh") < 0.05), "real, pervasive effects survive"

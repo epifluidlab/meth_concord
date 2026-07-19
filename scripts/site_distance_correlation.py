@@ -52,7 +52,10 @@ minority of pairs is eligible.
 Each panel is paired with Δ = linked − null, its 95% CI, and a p-value from a
 CELL-level bootstrap: site pairs are not independent (tens per read, ~1e6 reads
 per cell), so a test that treats them as independent would report significance
-for everything.  Bins with fewer than --min-pairs site pairs on EITHER side are
+for everything.  One test is made per bin per measure -- ~144 for a single
+group -- so the p-values are FDR-adjusted (--fdr, Benjamini-Hochberg by
+default) across the whole figure and the rings mark q<0.05; the raw p is kept
+in the TSV next to q.  Bins with fewer than --min-pairs site pairs on EITHER side are
 masked, which is what keeps a thin, noisy null from putting a lone spike in an
 otherwise smooth curve.  The figure starts at --plot-min-distance (10bp):
 below that the pairs are adjacent-motif artefacts rather than a distance
@@ -202,11 +205,55 @@ def _bootstrap_delta(per_cell_a, per_cell_b, min_pairs, n_boot, seed):
         warnings.simplefilter("ignore", RuntimeWarning)
         lo, hi = np.nanpercentile(d, [2.5, 97.5], axis=0)
         n_ok = np.sum(np.isfinite(d), axis=0)
-        p = 2.0 * np.minimum(np.sum(d <= 0, axis=0), np.sum(d >= 0, axis=0)) \
-            / np.maximum(n_ok, 1)
+        # (1 + count) / (1 + B), NOT count / B: a finite bootstrap can never
+        # justify p = 0, and an exact zero would then survive any FDR procedure
+        # unconditionally.  This floors the two-sided p at 2/(B+1).
+        p = 2.0 * (1.0 + np.minimum(np.sum(d <= 0, axis=0),
+                                    np.sum(d >= 0, axis=0))) / (n_ok + 1.0)
     # Below ~20 usable resamples the tail is unresolvable; report nothing.
     p = np.where(n_ok >= 20, np.minimum(p, 1.0), np.nan)
     return lo, hi, np.where(n_ok >= 20, p, np.nan)
+
+
+def _fdr(p, method="bh"):
+    """Adjusted p (q) over the finite entries of ``p``; NaN stays NaN.
+
+    The figure makes one test per distance bin per measure -- ~144 for a single
+    group -- so at raw p<0.05 roughly 7 bins would be starred by chance alone.
+
+    'bh' (Benjamini-Hochberg) is the default and is valid under positive
+    regression dependency, which is the right assumption here: adjacent distance
+    bins share reads and cells and trace a smooth curve, so the tests are
+    positively correlated rather than independent.  'by' (Benjamini-Yekutieli)
+    holds under ARBITRARY dependence at the cost of a log(m) penalty.
+    """
+    p = np.asarray(p, float)
+    if method == "none":
+        return p.copy()
+    out = np.full(p.shape, np.nan)
+    ok = np.isfinite(p)
+    m = int(ok.sum())
+    if m == 0:
+        return out
+    ps = p[ok]
+    order = np.argsort(ps)
+    c = np.sum(1.0 / np.arange(1, m + 1)) if method == "by" else 1.0
+    q = ps[order] * c * m / np.arange(1, m + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]      # enforce monotonicity in rank
+    adj = np.empty(m)
+    adj[order] = np.clip(q, 0.0, 1.0)
+    out[ok] = adj
+    return out
+
+
+def _boot_parts(entry):
+    """(lo, hi, p, q) from a bootstrap entry, tolerating a pre-FDR 3-tuple."""
+    if entry is None:
+        return None
+    if len(entry) == 4:
+        return entry
+    lo, hi, p = entry
+    return lo, hi, p, p
 
 
 def _stars(p):
@@ -676,19 +723,19 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
         d = _show(d)
         sig = None
         if boot and boot.get(key) is not None:
-            lo, hi, p = boot[key]
+            lo, hi, _p, q = _boot_parts(boot[key])
             lo = _show(np.where(ok, lo, np.nan))
             hi = _show(np.where(ok, hi, np.nan))
             axd.fill_between(centers, lo, hi, color=colors[key], alpha=0.20,
                              lw=0, label="95% CI (cell bootstrap)")
-            sig = np.isfinite(d) & np.isfinite(p) & (p < 0.05)
+            sig = np.isfinite(d) & np.isfinite(q) & (q < 0.05)
         axd.plot(centers, d, "-o", ms=3.2, lw=1.6, color=colors[key],
                  label="Δ = linked − null")
         # AFTER the line, or the ring is hidden underneath its own marker.
         if sig is not None and sig.any():
             axd.plot(np.asarray(centers)[sig], d[sig], "o", ms=7.5,
                      mfc="none", mec="0.15", mew=1.2, ls="none",
-                     label="p < 0.05", zorder=5)
+                     label="q < 0.05 (FDR)", zorder=5)
         _logx(axd, lo_x, edges[-1])
         axd.set_ylabel("Δ Pearson r")
         axd.set_title(f"Δ {title.split('  ')[0]}   (same-molecule excess)",
@@ -702,9 +749,9 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
     fig.text(0.5, 0.008,
              f"x starts at {lo_x:,.0f}bp (closer pairs are adjacent-motif "
              f"artefacts); bins with fewer than {min_pairs:,} site pairs on "
-             f"either side are masked; p from a cell-level bootstrap (site "
-             f"pairs are not independent)", ha="center", fontsize=7,
-             color="0.45")
+             f"either side are masked; rings mark FDR-adjusted q<0.05 from "
+             f"a cell-level bootstrap (site pairs are not independent)",
+             ha="center", fontsize=7, color="0.45")
     fig.savefig(out)
     plt.close(fig)
 
@@ -721,10 +768,11 @@ def _write_tsv(curves, boot, centers, edges, path, min_pairs):
         d, _ok = _delta(curves, key, min_pairs)
         rows[f"{key}_delta"] = d
         if boot and boot.get(key) is not None:
-            lo, hi, p = boot[key]
+            lo, hi, praw, q = _boot_parts(boot[key])
             rows[f"{key}_delta_ci_lo"] = np.where(np.isfinite(d), lo, np.nan)
             rows[f"{key}_delta_ci_hi"] = np.where(np.isfinite(d), hi, np.nan)
-            rows[f"{key}_delta_p"] = np.where(np.isfinite(d), p, np.nan)
+            rows[f"{key}_delta_p"] = np.where(np.isfinite(d), praw, np.nan)
+            rows[f"{key}_delta_q"] = np.where(np.isfinite(d), q, np.nan)
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, na_rep="nan")
 
 
@@ -768,14 +816,16 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
                 f"{curves[(key, c)][0][bi]:+.3f}" for c in _PLOT_CONDS)
             dv = deltas[key][bi]
             if np.isfinite(dv):
-                star = _stars(boot[key][2][bi]) if boot and boot.get(key) is not None else ""
+                star = (_stars(_boot_parts(boot[key])[3][bi])
+                        if boot and boot.get(key) is not None else "")
                 vals += f"  {dv:+.3f}{star}"
             else:
                 vals += "      ."          # masked: too few pairs on one side
             cols += vals.rjust(30)
         print(f"  {centers[bi]:>10,.0f}{int(curves[('gg','linked')][1][bi]):>12,d} | {cols}")
     if boot:
-        print("  Δ = linked − null;  * p<0.05  ** p<0.01  *** p<0.001 "
+        print(f"  Δ = linked − null;  stars are FDR-adjusted q "
+              f"({args.fdr.upper()}): * q<0.05  ** q<0.01  *** q<0.001 "
               f"({args.n_bootstrap} cell-level bootstrap resamples)")
     print(f"  wrote {fig_path} and {tsv_path}")
     return curves
@@ -872,7 +922,19 @@ def main():
                          "stratified anchor sampling above.")
     ap.add_argument("--n-bootstrap", type=int, default=1000,
                     help="Cell-level bootstrap resamples for the Δ confidence "
-                         "band and p-value. 0 disables.")
+                         "band and p-value. 0 disables. Note the resolution "
+                         "floor: the smallest two-sided p a bootstrap can "
+                         "return is 2/(B+1), so with FDR over ~144 tests you "
+                         "need B>=5000 before an ISOLATED significant bin can "
+                         "clear q<0.05 at all.")
+    ap.add_argument("--fdr", choices=["bh", "by", "none"], default="bh",
+                    help="Multiple-testing correction across every bin of every "
+                         "measure in one figure (~144 tests, so ~7 bins would "
+                         "be starred by chance at raw p<0.05). 'bh' is valid "
+                         "under positive dependence, which fits adjacent "
+                         "distance bins; 'by' holds under arbitrary dependence "
+                         "but costs a log(m) penalty. The raw p is always kept "
+                         "in the TSV alongside q.")
     ap.add_argument("--strand-min-evidence", type=int, default=1,
                     help="How far C>T must lead G>A (or vice versa) in a read's "
                          "MD tag before its conversion strand is trusted. The "
@@ -1104,6 +1166,30 @@ def main():
                 boot[m] = _bootstrap_delta(pc[(m, "linked")], pc[(m, "null")],
                                            args.min_pairs, args.n_bootstrap,
                                            args.seed)
+            # FDR over every bin of every measure in THIS figure — that is the
+            # family a reader looks at together.  Correcting per panel would
+            # under-count by 3x; correcting across groups would be a different
+            # (and much stricter) claim, so it is left to the caller.
+            keys = [k for k, _ in _MEASURES if boot.get(k) is not None]
+            if keys:
+                flat = np.concatenate([boot[k][2] for k in keys])
+                n_test = int(np.isfinite(flat).sum())
+                floor = 2.0 / (args.n_bootstrap + 1.0)
+                if args.fdr != "none" and n_test and floor * n_test > 0.05:
+                    print(f"  NOTE: {args.n_bootstrap:,} resamples floor the "
+                          f"two-sided p at {floor:.4f}; over {n_test} tests "
+                          f"that is q>={floor * n_test:.3f} at rank 1, so an "
+                          f"ISOLATED significant bin cannot reach q<0.05.\n"
+                          f"        Pervasive effects still pass. Raise "
+                          f"--n-bootstrap to ~{int(np.ceil(2 * n_test / 0.05)):,} "
+                          f"to resolve isolated ones.")
+                q = _fdr(flat, args.fdr)
+                off = 0
+                for k in keys:
+                    nb_k = len(boot[k][2])
+                    lo_, hi_, p_ = boot[k]
+                    boot[k] = (lo_, hi_, p_, q[off:off + nb_k])
+                    off += nb_k
         _report(accs, len(idxs), n_pairs, centers, edges, label, out_dir, args,
                 safe=safe[label], n_eligible=n_elig, boot=boot,
                 scope_note=scope_note, n_pairs_for_pct=n_pairs_for_pct)
