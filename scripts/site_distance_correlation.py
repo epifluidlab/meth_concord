@@ -875,6 +875,200 @@ def _write_tsv(curves, boot, centers, edges, path, min_pairs,
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, na_rep="nan")
 
 
+def _read_tsv_curves(path, metric):
+    """Rebuild everything a figure needs from a previously written TSV.
+
+    The parse is the expensive part (~30 min on 1577 cells) and the TSV already
+    carries every metric plus the bootstrap CI and p, so re-drawing never needs
+    to touch a BAM.  Returns None when the requested metric is not present.
+    """
+    df = pd.read_csv(path, sep="\t")
+    need = [f"{k}_{c}_{metric}" for k, _ in _MEASURES for c, _ in _CONDS]
+    if any(col not in df.columns for col in need):
+        return None
+    lo = df["bin_lo"].to_numpy(float)
+    edges = np.concatenate([lo, [float(df["bin_hi"].to_numpy()[-1])]])
+    centers = df["center_bp"].to_numpy(float)
+    curves = {(k, c): (df[f"{k}_{c}_{metric}"].to_numpy(float),
+                       df[f"{k}_{c}_n"].to_numpy(float))
+              for k, _ in _MEASURES for c, _ in _CONDS}
+    boot = {}
+    for k, _ in _MEASURES:
+        cols = (f"{k}_delta_ci_lo", f"{k}_delta_ci_hi",
+                f"{k}_delta_p", f"{k}_delta_q")
+        if all(c in df.columns for c in cols):
+            boot[k] = tuple(df[c].to_numpy(float) for c in cols)
+    env = {}
+    for k, _ in _MEASURES:
+        a, b = f"{k}_phi_min_attainable", f"{k}_phi_max_attainable"
+        if a in df.columns and b in df.columns:
+            env[k] = (df[a].to_numpy(float), df[b].to_numpy(float))
+    return curves, (boot or None), centers, edges, (env or None)
+
+
+def _group_colors(labels, samples=None, color_column=None, group_column=None):
+    """{label: colour}, from a samples-sheet colour column when one is given.
+
+    Matches the --color-column convention the rest of the pipeline already
+    uses, so a cell type keeps the same colour across every figure.
+    """
+    import matplotlib.pyplot as plt
+    out = {}
+    if samples is not None and color_column and group_column:
+        if color_column in samples.columns and group_column in samples.columns:
+            for g, c in zip(samples[group_column].astype(str),
+                            samples[color_column].astype(str)):
+                if c and c.lower() not in ("nan", "none", ""):
+                    out.setdefault(g, c)
+    missing = [g for g in labels if g not in out and g != "all"]
+    if missing:
+        cmap = plt.get_cmap("tab20")
+        for i, g in enumerate(missing):
+            out[g] = cmap(i % 20)
+    return out
+
+
+def _order_groups(labels, group_order):
+    """Legend order: the requested one first, then whatever is left, 'all' last."""
+    rest = [g for g in labels if g != "all"]
+    if group_order:
+        want = [g.strip() for g in group_order.split(",") if g.strip()]
+        head = [g for g in want if g in rest]
+        rest = head + sorted(g for g in rest if g not in head)
+    else:
+        rest = sorted(rest)
+    return rest + (["all"] if "all" in labels else [])
+
+
+def _plot_groups(per_group, out, metric, min_pairs, plot_min, colors, order):
+    """One figure: every cell group overlaid, per measure, on a shared y-scale.
+
+    Sharing the y-axis across the three measures is the point -- it is what
+    makes "GCH-GCH varies more across cell types than HCG-HCG" readable rather
+    than an artefact of three independently autoscaled panels.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.0), sharey="row",
+                             sharex=True)
+    lo_x = None
+    for row, (cond, rlab) in enumerate((("linked", "concordance (linked)"),
+                                        ("delta", "Δ = linked − null"))):
+        for col, (key, title) in enumerate(_MEASURES):
+            ax = axes[row, col]
+            ax.axhline(0, color="0.6", lw=0.8, zorder=0)
+            for label in order:
+                curves, centers, edges = per_group[label]
+                lo_x = max(float(edges[0]), float(plot_min))
+                vis = np.asarray(centers) >= lo_x
+                if cond == "linked":
+                    y = curves[(key, "linked")][0]
+                else:
+                    y, _ok = _delta(curves, key, min_pairs)
+                y = np.where(vis, y, np.nan)
+                is_all = label == "all"
+                ax.plot(centers, y, "-", lw=2.6 if is_all else 1.3,
+                        color="0.25" if is_all else colors.get(label, "0.5"),
+                        alpha=1.0 if is_all else 0.85,
+                        zorder=5 if is_all else 2,
+                        label=label)
+            _logx(ax, lo_x if lo_x else float(plot_min), float(edges[-1]))
+            if row == 0:                      # shared x — label the bottom only
+                ax.set_xlabel("")
+            if col == 0:
+                ax.set_ylabel(f"{rlab}\n{_METRICS[metric]}", fontsize=9)
+            ax.set_title(title.split("  ")[0] if row == 0 else "", fontsize=10)
+
+    handles, labels_ = axes[0, 0].get_legend_handles_labels()
+    ncol = min(8, max(3, len(labels_)))
+    fig.legend(handles, labels_, loc="lower center", ncol=ncol, fontsize=7.5,
+               frameon=False, bbox_to_anchor=(0.5, 0.005))
+    pad = 0.055 + 0.022 * int(np.ceil(len(labels_) / ncol))
+    n_real = len([g for g in order if g != "all"])
+    fig.suptitle(f"Concordance across cell groups — {n_real} groups"
+                 f"{' + pooled' if 'all' in order else ''} "
+                 f"(shared y-scale within each row)", fontsize=12)
+    fig.tight_layout(rect=(0, pad, 1, 0.955))
+    fig.text(0.5, pad - 0.028,
+             f"{_QC}  |  'all' (thick grey) is the pooled reference; "
+             f"x starts at {lo_x:,.0f}bp",
+             ha="center", fontsize=7, color="0.45")
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def _replot(args):
+    """Redraw from existing TSVs — no BAM, no parse."""
+    out_dir = Path(args.output_dir)
+    js = out_dir / "site_distance_corr_summary.json"
+    if not js.exists():
+        sys.exit(f"no {js} — --replot needs the summary written by a full run.")
+    meta = json.loads(js.read_text())
+    groups = meta.get("groups", {})
+    if not groups:
+        sys.exit(f"{js} lists no groups.")
+
+    ran_with = meta.get("metric", "phi")
+    ran_min = meta.get("min_pairs")
+    if args.metric != ran_with:
+        print(f"  metric {args.metric!r} (the run used {ran_with!r}): the "
+              f"stored Δ CI and p belong to {ran_with!r}, so they are dropped "
+              f"rather than mislabelled.")
+    if ran_min is not None and args.min_pairs < ran_min:
+        print(f"  NOTE: --min-pairs {args.min_pairs:,} is below the "
+              f"{ran_min:,} the run used. Bins it masked are already NaN on "
+              f"disk and cannot come back; replot can only tighten the mask.",
+              file=sys.stderr)
+
+    samples = None
+    if args.samples and Path(args.samples).exists():
+        from nome_hic_concordance.cli import load_samples
+        samples = load_samples(args.samples)
+
+    per_group = {}
+    for label, info in groups.items():
+        stem = info.get("file_stem", f"site_distance_corr_{label}")
+        tsv = out_dir / f"{stem}.tsv"
+        if not tsv.exists():
+            print(f"  skipping {label}: {tsv} not found", file=sys.stderr)
+            continue
+        got = _read_tsv_curves(tsv, args.metric)
+        if got is None:
+            print(f"  skipping {label}: no {args.metric!r} column in {tsv.name}",
+                  file=sys.stderr)
+            continue
+        curves, boot, centers, edges, env = got
+        if args.metric != ran_with:
+            boot = None                     # CI/p are metric-specific
+        # re-apply masking so a tightened --min-pairs takes effect
+        curves = {k: (np.where(n >= args.min_pairs, r, np.nan), n)
+                  for k, (r, n) in curves.items()}
+        fig = out_dir / f"{stem}.{args.plot_format}"
+        _plot(curves, boot, centers, edges, label, info.get("n_cells", 0),
+              info.get("n_read_pairs", 0), fig, args.min_pairs,
+              args.plot_min_distance, args.metric, env)
+        per_group[label] = (curves, centers, edges)
+        print(f"  redrew {fig}")
+
+    _maybe_plot_groups(per_group, out_dir, args, samples)
+    print(f"\nreplotted {len(per_group)} group(s) without touching a BAM.")
+
+
+def _maybe_plot_groups(per_group, out_dir, args, samples):
+    """The across-cell-group overlay, when there is more than one group."""
+    labels = [g for g in per_group if g != "all"]
+    if len(labels) < 2:
+        return
+    order = _order_groups(list(per_group), args.group_order)
+    colors = _group_colors(order, samples, args.color_column, args.group_column)
+    out = out_dir / f"site_distance_corr_by_group.{args.plot_format}"
+    _plot_groups(per_group, out, args.metric, args.min_pairs,
+                 args.plot_min_distance, colors, order)
+    print(f"  wrote {out}  ({len(labels)} groups overlaid, shared y-scale)")
+
+
 def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
             safe=None, n_eligible=0, boot=None, scope_note="",
             n_pairs_for_pct=None):
@@ -936,7 +1130,22 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--samples", required=True,
+    ap.add_argument("--replot", action="store_true",
+                    help="Skip the BAM parse entirely and redraw the "
+                         "figures from the TSVs already in --output-dir. "
+                         "Everything a figure needs is in them, so this "
+                         "is seconds instead of the ~30 min parse. Useful "
+                         "for changing --metric, --plot-format, "
+                         "--plot-min-distance or tightening --min-pairs.")
+    ap.add_argument("--color-column", default=None,
+                    help="Column in --samples holding a colour per cell, "
+                         "so a cell group keeps one colour across every "
+                         "figure (same convention as nome_hic_concordance).")
+    ap.add_argument("--group-order", default=None,
+                    help="Comma-separated group order for the legend, "
+                         "e.g. \"IT-L2/3,IT-L4,IT-L5\". Unlisted groups "
+                         "follow alphabetically.")
+    ap.add_argument("--samples", required=False,
                     help="TSV with cell_name, bam_path [, group].")
     ap.add_argument("--context-bed", default=None,
                     help="'GCH:/path/GCH.bed.gz,HCG:/path/HCG.bed.gz' — same "
@@ -1070,6 +1279,12 @@ def main():
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    if args.replot:
+        _replot(args)
+        return
+    if not args.samples:
+        sys.exit("--samples is required (omit it only with --replot).")
 
     from nome_hic_concordance.cli import _parse_context_bed, load_samples
     from nome_hic_concordance.reference import (extract_context_positions,
@@ -1231,7 +1446,7 @@ def main():
         for gi, g in enumerate(samples[args.group_column].to_numpy()):
             groups.setdefault(str(g), []).append(gi)
 
-    summary = {}
+    summary, per_group = {}, {}
     safe = safe_names(groups)          # 'IT-L2/3' -> 'IT-L2_3', collision-proof
     for label, idxs in groups.items():
         accs = {k: sum(res[i][0][k] for i in idxs) for k in keys}
@@ -1307,17 +1522,22 @@ def main():
                     lo_, hi_, p_ = boot[k]
                     boot[k] = (lo_, hi_, p_, q[off:off + nb_k])
                     off += nb_k
-        _report(accs, len(idxs), n_pairs, centers, edges, label, out_dir, args,
-                safe=safe[label], n_eligible=n_elig, boot=boot,
-                scope_note=scope_note, n_pairs_for_pct=n_pairs_for_pct)
+        curves_g = _report(accs, len(idxs), n_pairs, centers, edges, label,
+                           out_dir, args, safe=safe[label], n_eligible=n_elig,
+                           boot=boot, scope_note=scope_note,
+                           n_pairs_for_pct=n_pairs_for_pct)
+        per_group[label] = (curves_g, centers, edges)
         summary[label] = {"n_cells": len(idxs), "n_read_pairs": int(n_pairs),
                           "null_scope": "pooled" if pooled_null else "cell",
                           "n_null_eligible": int(n_elig),
                           "null_eligible_frac": (round(n_elig / n_pairs_for_pct, 4)
                                                  if n_pairs_for_pct else None),
                           "file_stem": f"site_distance_corr_{safe[label]}"}
+    _maybe_plot_groups(per_group, out_dir, args, samples)
     with open(out_dir / "site_distance_corr_summary.json", "w") as fh:
         json.dump({"groups": summary, "qc": _QC,
+                   "metric": args.metric,
+                   "min_pairs": args.min_pairs,
                    "null_window_bp": args.null_window}, fh, indent=2)
     print("\nRead the figures: below ~read length the pairs are WITHIN-read, which "
           "has no\n  non-linked counterpart (both cytosines are on one molecule), "
