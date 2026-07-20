@@ -315,6 +315,11 @@ def _write_tsv(curves, boot, centers, edges, mean_sep, path):
 
 # --------------------------------------------------------------------------
 
+def _add_exclude(ap):
+    from nome_hic_concordance.utils import add_exclude_chrom_arg
+    add_exclude_chrom_arg(ap)
+
+
 def main():
     sdc = _sdc()
     ap = argparse.ArgumentParser(
@@ -325,6 +330,7 @@ def main():
     ap.add_argument("--reference", default=None)
     ap.add_argument("--dbsnp-vcf", default=None)
     ap.add_argument("--blacklist-bed", default=None)
+    _add_exclude(ap)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--group-column", default=None)
     ap.add_argument("--resolution", type=int, default=25_000,
@@ -390,6 +396,14 @@ def main():
                                                   ["GCH", "HCG"])
     if args.dbsnp_vcf:
         ctx_positions = sdc._drop_snp_sites(ctx_positions, args.dbsnp_vcf)
+    if args.exclude_chrom:
+        ctx_positions, dropped = sdc._drop_chroms(ctx_positions,
+                                                  args.exclude_chrom)
+        for k, v in sorted(dropped.items()):
+            print(f"  excluded {k}: {v:,} context sites")
+        if not dropped:
+            print(f"  NOTE: --exclude-chrom {args.exclude_chrom} matched no "
+                  f"contig.", file=sys.stderr)
 
     blacklist = None
     if args.blacklist_bed:

@@ -27,7 +27,8 @@ from . import (
     shrinkage,
     visualization,
 )
-from .utils import ensure_dir, setup_logging
+from .utils import (add_exclude_chrom_arg, chrom_excluded, ensure_dir,
+                    parse_exclude_chroms, report_excluded, setup_logging)
 
 logger = logging.getLogger("nome_hic_concordance")
 
@@ -78,6 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "Defaults to --min-gch-sites if not set; "
                              "consider lowering (e.g. 2) since HCG sites "
                              "are typically sparser than GCH.")
+    add_exclude_chrom_arg(parser)
     parser.add_argument("--bin-size", type=int, default=5_000_000,
                         help="Genomic bin size in bp (default: 5000000).")
     parser.add_argument("--min-pairs-per-bin", type=int, default=None,
@@ -1458,6 +1460,17 @@ def main(argv: list[str] | None = None) -> int:
         first_bam = samples["bam_path"].iloc[0]
         logger.info(f"Reading chromosome sizes from BAM header: {first_bam}")
         chrom_sizes = _get_chrom_sizes_from_bam(first_bam)
+
+    # Applied to chrom_sizes AND the context tables, so an excluded contig
+    # cannot re-enter through either the binning or the site lists.
+    excluded = parse_exclude_chroms(getattr(args, "exclude_chrom", None))
+    if excluded:
+        keep = set(report_excluded(excluded, list(chrom_sizes), "chromosome"))
+        chrom_sizes = {c: n for c, n in chrom_sizes.items() if c in keep}
+        all_context_positions = {
+            ctx: {c: a for c, a in per.items()
+                  if not chrom_excluded(c, excluded)}
+            for ctx, per in all_context_positions.items()}
 
     # ---- Per-context processing (steps 2..7) -----------------------------
     for context in contexts:

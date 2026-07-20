@@ -52,3 +52,81 @@ def chrom_is_autosomal_or_sex(chrom: str) -> bool:
     if chrom in ("X", "Y"):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Chromosome exclusion, shared by every CLI so one spelling works everywhere
+# ---------------------------------------------------------------------------
+
+def chrom_key(chrom: str) -> str:
+    """Canonical form, so 'chr1'/'1' and 'chrM'/'M'/'MT' compare equal.
+
+    Reference sources disagree on naming -- a 2bit may say 'chrM' where a BAM
+    header says 'MT' -- and an exclusion that silently matches nothing is worse
+    than no exclusion at all, because the run still looks like it worked.
+    """
+    c = str(chrom).strip()
+    if c.lower().startswith("chr"):
+        c = c[3:]
+    c = c.upper()
+    return "M" if c in ("M", "MT") else c
+
+
+def parse_exclude_chroms(values) -> set[str]:
+    """``--exclude-chrom`` -> set of canonical keys.
+
+    Accepts the flag repeated, comma-separated, or both:
+    ``--exclude-chrom chrM,chrX --exclude-chrom chrY``.
+    """
+    if not values:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    out: set[str] = set()
+    for v in values:
+        for part in str(v).split(","):
+            if part.strip():
+                out.add(chrom_key(part))
+    return out
+
+
+def chrom_excluded(chrom: str, excluded: set[str]) -> bool:
+    return bool(excluded) and chrom_key(chrom) in excluded
+
+
+def bin_label_chrom(label: str) -> str:
+    """Chromosome out of a bin column label such as ``'chr1:250000'``."""
+    s = str(label)
+    return s.rsplit(":", 1)[0] if ":" in s else s
+
+
+def add_exclude_chrom_arg(parser) -> None:
+    """Register --exclude-chrom identically across the CLIs."""
+    parser.add_argument(
+        "--exclude-chrom", action="append", default=None, metavar="CHROM",
+        help="Contigs to drop from the analysis. Repeatable and/or "
+             "comma-separated: --exclude-chrom chrM,chrX --exclude-chrom chrY. "
+             "chrM/M/MT and chr1/1 are matched interchangeably, and a value "
+             "matching no contig warns rather than silently doing nothing. "
+             "Use 'chrM,chrX,chrY' to restrict the analysis to autosomes.")
+
+
+def report_excluded(excluded: set[str], present, kind: str = "contig"):
+    """Log what was dropped, and warn about anything that matched nothing.
+
+    Returns the subset of ``present`` that survives.
+    """
+    log = logging.getLogger("nome_hic_concordance")
+    if not excluded:
+        return list(present)
+    kept, dropped = [], []
+    for c in present:
+        (dropped if chrom_excluded(c, excluded) else kept).append(c)
+    if dropped:
+        log.info(f"Excluding {len(dropped)} {kind}(s): "
+                    f"{', '.join(map(str, sorted(dropped)))}")
+    unmatched = excluded - {chrom_key(c) for c in dropped}
+    if unmatched:
+        log.warning(f"--exclude-chrom matched no {kind} for: "
+                       f"{', '.join(sorted(unmatched))}")
+    return kept

@@ -880,20 +880,15 @@ def _drop_chroms(ctx_positions, exclude):
     the distance bins below that length and stops dead above it.  mm10 chrM is
     16,299 bp; a spike confined to bins under ~16kb is the signature.
     """
-    drop = {c.strip() for c in exclude.split(",") if c.strip()}
-    if not drop:
+    from nome_hic_concordance.utils import chrom_excluded, parse_exclude_chroms
+    want = parse_exclude_chroms(exclude)
+    if not want:
         return ctx_positions, {}
-    # accept chrM / M / MT interchangeably, as elsewhere in the codebase
-    def _norm(c):
-        c = c[3:] if c.startswith("chr") else c
-        return "M" if c in ("M", "MT") else c
-    want = {_norm(c) for c in drop}
-    removed = {}
-    out = {}
+    removed, out = {}, {}
     for ctx, per_chrom in ctx_positions.items():
         kept = {}
         for chrom, arr in per_chrom.items():
-            if _norm(chrom) in want:
+            if chrom_excluded(chrom, want):
                 removed[f"{ctx}:{chrom}"] = len(arr)
             else:
                 kept[chrom] = arr
@@ -1188,16 +1183,8 @@ def main():
                     help="Tabix-indexed dbSNP VCF; context sites overlapping a "
                          "SNP are dropped (a C/T polymorphism is "
                          "indistinguishable from a bisulfite conversion).")
-    ap.add_argument("--exclude-chrom", default=None,
-                    help="Comma-separated contigs to drop entirely, e.g. "
-                         "\"chrM,chrY\". A short high-copy contig with uniform "
-                         "methylation (chrM above all) injects a block of "
-                         "concordant (0,0) site pairs, which RAISES the odds "
-                         "ratio and so reads as a real association bump. "
-                         "Because the contig is short, the bump is confined to "
-                         "distance bins below its length: mm10 chrM is 16,299 "
-                         "bp, so a spike that stops between 15kb and 20kb is "
-                         "the signature. chrM/M/MT are matched interchangeably.")
+    from nome_hic_concordance.utils import add_exclude_chrom_arg
+    add_exclude_chrom_arg(ap)
     ap.add_argument("--blacklist-bed", default=None,
                     help="BED of blacklisted regions; a read PAIR is dropped if "
                          "EITHER end overlaps one.")
@@ -1354,7 +1341,7 @@ def main():
             for k, v in sorted(dropped.items()):
                 print(f"  excluded {k}: {v:,} context sites")
         else:
-            print(f"  NOTE: --exclude-chrom {args.exclude_chrom!r} matched no "
+            print(f"  NOTE: --exclude-chrom {args.exclude_chrom} matched no "
                   f"contig in the context tables.", file=sys.stderr)
 
     blacklist = None

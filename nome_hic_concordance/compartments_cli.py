@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 
 from . import compartments
+from .utils import (add_exclude_chrom_arg,
+                    parse_exclude_chroms, report_excluded)
 
 logger = logging.getLogger("nome_hic_compartments")
 
@@ -73,6 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help=".2bit reference (alternative to --chrom-sizes).")
     p.add_argument("--resolution", type=int, default=1_000_000,
                    help="Bin size in bp (default 1 Mb, the compartment scale).")
+    add_exclude_chrom_arg(p)
     p.add_argument("--chroms", default=None,
                    help="Comma-separated chromosomes (default: 22 autosomes).")
     p.add_argument("--impute", choices=["rwr", "none"], default="rwr",
@@ -100,6 +103,17 @@ def main(argv: list[str] | None = None) -> int:
     cell_paths = _discover_cells(args.read_pairs_dir)
     chroms = ([c.strip() for c in args.chroms.split(",")]
               if args.chroms else None)
+    # --exclude-chrom subtracts from whatever --chroms resolved to; with the
+    # default (22 autosomes) chrX/chrY are already absent, so this mainly
+    # matters when --chroms was widened.
+    excluded = parse_exclude_chroms(getattr(args, "exclude_chrom", None))
+    if excluded:
+        pool = chroms if chroms is not None else sorted(chrom_sizes)
+        kept = report_excluded(excluded, pool, "chromosome")
+        chroms = kept
+        if not chroms:
+            logger.error("--exclude-chrom removed every chromosome.")
+            return 1
 
     comp = compartments.compute_compartment_matrix(
         cell_paths, chrom_sizes,

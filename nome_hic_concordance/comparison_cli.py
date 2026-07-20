@@ -27,6 +27,8 @@ from pathlib import Path
 import pandas as pd
 
 from . import comparison
+from .utils import (add_exclude_chrom_arg, bin_label_chrom,
+                    chrom_excluded, chrom_key, parse_exclude_chroms)
 
 logger = logging.getLogger("nome_hic_compare")
 
@@ -107,6 +109,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="cells × bins concordance parquet to test, as "
                         "NAME=PATH (repeatable), e.g. gch=.../concordance_signed.parquet "
                         "hcg=.../concordance_signed.parquet.")
+    add_exclude_chrom_arg(p)
     p.add_argument("--samples", default=None,
                    help="samples TSV with 'cell'/'cell_name' + 'group' "
                         "labels (enables silhouette/kNN-purity + classifier).")
@@ -205,6 +208,26 @@ def main(argv: list[str] | None = None) -> int:
         name, path = _parse_named(spec)
         matrices[name] = pd.read_parquet(path)
         concordance_names.append(name)
+
+    # Every matrix is cells x bins with 'chrom:start' columns, so the filter
+    # is a column drop -- applied to ALL of them so baselines and concordance
+    # stay on identical bins (a mismatch would silently shrink the overlap).
+    excluded = parse_exclude_chroms(getattr(args, "exclude_chrom", None))
+    if excluded and matrices:
+        seen = set()
+        for name, df in matrices.items():
+            keep = [c for c in df.columns
+                    if not chrom_excluded(bin_label_chrom(c), excluded)]
+            seen.update(bin_label_chrom(c) for c in df.columns)
+            dropped = df.shape[1] - len(keep)
+            if dropped:
+                logger.info(f"{name}: dropped {dropped:,} of {df.shape[1]:,} "
+                            f"bins on excluded contigs")
+            matrices[name] = df[keep]
+        unmatched = excluded - {chrom_key(c) for c in seen}
+        if unmatched:
+            logger.warning("--exclude-chrom matched no bin for: "
+                           + ", ".join(sorted(unmatched)))
 
     if not matrices:
         logger.error("No matrices provided.")
