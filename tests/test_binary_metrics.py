@@ -229,3 +229,47 @@ def test_unknown_metric_is_rejected():
     m = _mod()
     with pytest.raises(ValueError, match="unknown metric"):
         m._metric(_acc_from_table(10, 10, 10, 10), 1, "spearman")
+
+
+# --------------------------------------------------------- contig exclusion --
+
+def test_exclude_chrom_drops_only_the_named_contigs():
+    """A short high-copy contig (chrM) can dominate the bins below its length."""
+    m = _mod()
+    ctx = {"GCH": {"chr1": np.arange(10), "chrM": np.arange(5),
+                   "chr2": np.arange(3)},
+           "HCG": {"chr1": np.arange(7), "chrM": np.arange(4)}}
+    out, removed = m._drop_chroms(ctx, "chrM")
+    assert sorted(out["GCH"]) == ["chr1", "chr2"]
+    assert sorted(out["HCG"]) == ["chr1"]
+    assert removed == {"GCH:chrM": 5, "HCG:chrM": 4}
+
+
+def test_exclude_chrom_matches_naming_variants():
+    """chrM / M / MT are the same contig; a miss would silently do nothing."""
+    m = _mod()
+    for present in ("chrM", "M", "MT"):
+        ctx = {"GCH": {"chr1": np.arange(4), present: np.arange(2)}}
+        for asked in ("chrM", "M", "MT"):
+            out, removed = m._drop_chroms(ctx, asked)
+            assert sorted(out["GCH"]) == ["chr1"], (present, asked)
+            assert removed, (present, asked)
+
+
+def test_exclude_chrom_accepts_several_and_is_a_noop_when_empty():
+    m = _mod()
+    ctx = {"GCH": {"chr1": np.arange(4), "chrM": np.arange(2),
+                   "chrY": np.arange(3)}}
+    out, _ = m._drop_chroms(ctx, "chrM,chrY")
+    assert sorted(out["GCH"]) == ["chr1"]
+    out2, removed2 = m._drop_chroms(ctx, "")
+    assert out2 is ctx and removed2 == {}
+
+
+def test_exclude_chrom_reports_nothing_for_an_absent_contig():
+    """Empty `removed` is what drives the 'matched no contig' warning."""
+    m = _mod()
+    ctx = {"GCH": {"chr1": np.arange(4)}}
+    out, removed = m._drop_chroms(ctx, "chrM")
+    assert removed == {}
+    assert sorted(out["GCH"]) == ["chr1"]

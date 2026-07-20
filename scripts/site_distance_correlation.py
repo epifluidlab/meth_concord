@@ -869,6 +869,38 @@ def _write_tsv(curves, boot, centers, edges, path, min_pairs,
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, na_rep="nan")
 
 
+def _drop_chroms(ctx_positions, exclude):
+    """Remove whole contigs from the context tables.
+
+    Motivated by a concrete artefact: a small high-copy contig with uniform
+    methylation injects a block of concordant (0,0) site pairs, and adding
+    (0,0) mass to a 2x2 table RAISES a*d/(b*c) -- so it shows up as a genuine
+    association bump rather than a marginal shift.  Because such a contig is
+    short, every read pair on it has a bounded separation, so the bump lands in
+    the distance bins below that length and stops dead above it.  mm10 chrM is
+    16,299 bp; a spike confined to bins under ~16kb is the signature.
+    """
+    drop = {c.strip() for c in exclude.split(",") if c.strip()}
+    if not drop:
+        return ctx_positions, {}
+    # accept chrM / M / MT interchangeably, as elsewhere in the codebase
+    def _norm(c):
+        c = c[3:] if c.startswith("chr") else c
+        return "M" if c in ("M", "MT") else c
+    want = {_norm(c) for c in drop}
+    removed = {}
+    out = {}
+    for ctx, per_chrom in ctx_positions.items():
+        kept = {}
+        for chrom, arr in per_chrom.items():
+            if _norm(chrom) in want:
+                removed[f"{ctx}:{chrom}"] = len(arr)
+            else:
+                kept[chrom] = arr
+        out[ctx] = kept
+    return out, removed
+
+
 def _read_tsv_curves(path, metric):
     """Rebuild everything a figure needs from a previously written TSV.
 
@@ -1156,6 +1188,16 @@ def main():
                     help="Tabix-indexed dbSNP VCF; context sites overlapping a "
                          "SNP are dropped (a C/T polymorphism is "
                          "indistinguishable from a bisulfite conversion).")
+    ap.add_argument("--exclude-chrom", default=None,
+                    help="Comma-separated contigs to drop entirely, e.g. "
+                         "\"chrM,chrY\". A short high-copy contig with uniform "
+                         "methylation (chrM above all) injects a block of "
+                         "concordant (0,0) site pairs, which RAISES the odds "
+                         "ratio and so reads as a real association bump. "
+                         "Because the contig is short, the bump is confined to "
+                         "distance bins below its length: mm10 chrM is 16,299 "
+                         "bp, so a spike that stops between 15kb and 20kb is "
+                         "the signature. chrM/M/MT are matched interchangeably.")
     ap.add_argument("--blacklist-bed", default=None,
                     help="BED of blacklisted regions; a read PAIR is dropped if "
                          "EITHER end overlaps one.")
@@ -1304,6 +1346,16 @@ def main():
             args.reference, str(Path(args.output_dir) / "context"),
             contexts=["GCH", "HCG"], dbsnp_vcf=args.dbsnp_vcf,
             n_threads=args.n_threads)
+
+    # After BOTH context sources, so --exclude-chrom applies either way.
+    if args.exclude_chrom:
+        ctx_positions, dropped = _drop_chroms(ctx_positions, args.exclude_chrom)
+        if dropped:
+            for k, v in sorted(dropped.items()):
+                print(f"  excluded {k}: {v:,} context sites")
+        else:
+            print(f"  NOTE: --exclude-chrom {args.exclude_chrom!r} matched no "
+                  f"contig in the context tables.", file=sys.stderr)
 
     blacklist = None
     if args.blacklist_bed:
