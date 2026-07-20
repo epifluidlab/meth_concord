@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -261,6 +262,24 @@ static void pair_accumulate(Acc& acc, const SiteVec& A, const SiteVec& B,
         for (size_t i = 0; i < na; ++i)
             for (size_t j = 0; j < nbs; ++j) one(i, j);
     }
+}
+
+/* Every cross-end site pair into ONE caller-chosen bin.  The contact analysis
+ * bins by the PAIR's spatial proximity, so the site-site distance -- which is
+ * what pair_accumulate() bins on -- is irrelevant there. */
+static void pair_accumulate_into(Acc& acc, const SiteVec& A, const SiteVec& B,
+                                 int bin, int cap, std::mt19937_64& rng) {
+    size_t na = A.size(), nbs = B.size();
+    if (na == 0 || nbs == 0 || bin < 0) return;
+    size_t total = na * nbs;
+    if (cap > 0 && total > (size_t)cap) {
+        for (int t = 0; t < cap; ++t)
+            acc.add(bin, (double)A.st[rng() % na], (double)B.st[rng() % nbs]);
+        return;
+    }
+    for (size_t i = 0; i < na; ++i)
+        for (size_t j = 0; j < nbs; ++j)
+            acc.add(bin, (double)A.st[i], (double)B.st[j]);
 }
 
 struct PairRec {
@@ -808,6 +827,248 @@ static py::dict cross_cell_null(py::dict anchors, py::dict donors,
     return out;
 }
 
+/* ------------------------------------------------------------------------
+ * Contact-frequency (SPATIAL distance) analysis
+ *
+ * The distance analysis above asks how concordance decays with LINEAR
+ * separation.  This one asks how it varies with SPATIAL proximity, using
+ * pooled contact frequency as the proxy: two loci that ligate together often
+ * are close in 3D.  Contact frequency is only meaningful POOLED -- a single
+ * cell sees each long-range contact about once -- so the pairs have to survive
+ * the parse and be counted across cells afterwards.  That makes this a genuine
+ * two-pass analysis, and the pass-1 job here is simply to keep every
+ * long-range pair whole: both midpoints (for the contact bin-pair) plus the
+ * site calls (for the concordance).
+ * --------------------------------------------------------------------- */
+
+struct ContactRec {
+    int32_t chrom = 0, mid1 = 0, mid2 = 0;
+    SiteVec g1, h1, g2, h2;
+};
+
+static py::dict parse_cell_contacts(
+    const std::string& bam_path,
+    py::dict ctx_gch, py::dict ctx_hcg,
+    int trim_ends, int mapq_min, int64_t min_span,
+    bool keep_supplementary, int baseq_min, py::dict blacklist,
+    int strand_min_evidence, int max_pairs, uint64_t seed)
+{
+    Reservoir<ContactRec> keep;
+    keep.cap = max_pairs > 0 ? max_pairs : std::numeric_limits<int>::max();
+    uint64_t n_scanned = 0, n_long = 0;
+
+    struct ChromCtx {
+        std::string chrom;
+        const int64_t *gp = nullptr, *hp = nullptr;
+        const uint8_t *gr = nullptr, *hr = nullptr;
+        int64_t ng = 0, nh = 0;
+        std::vector<int64_t> bl_start, bl_end;
+    };
+    std::vector<ChromCtx> ctxs;
+    std::vector<py::object> keepalive;
+
+    std::vector<std::string> chroms;
+    for (auto item : ctx_gch) chroms.push_back(py::str(item.first));
+    for (auto item : ctx_hcg) {
+        std::string c = py::str(item.first);
+        if (std::find(chroms.begin(), chroms.end(), c) == chroms.end())
+            chroms.push_back(c);
+    }
+    std::sort(chroms.begin(), chroms.end());
+
+    for (const std::string& chrom : chroms) {
+        ChromCtx cc; cc.chrom = chrom;
+        if (ctx_gch.contains(chrom.c_str())) {
+            auto t = ctx_gch[chrom.c_str()].cast<py::tuple>();
+            auto pa = t[0].cast<py::array_t<int64_t>>();
+            auto ra = t[1].cast<py::array_t<uint8_t>>();
+            cc.gp = pa.data(); cc.gr = ra.data(); cc.ng = pa.size();
+            keepalive.push_back(pa); keepalive.push_back(ra);
+        }
+        if (ctx_hcg.contains(chrom.c_str())) {
+            auto t = ctx_hcg[chrom.c_str()].cast<py::tuple>();
+            auto pa = t[0].cast<py::array_t<int64_t>>();
+            auto ra = t[1].cast<py::array_t<uint8_t>>();
+            cc.hp = pa.data(); cc.hr = ra.data(); cc.nh = pa.size();
+            keepalive.push_back(pa); keepalive.push_back(ra);
+        }
+        if (cc.ng == 0 && cc.nh == 0) continue;
+        if (blacklist.contains(chrom.c_str())) {
+            auto t = blacklist[chrom.c_str()].cast<py::tuple>();
+            auto sa = t[0].cast<py::array_t<int64_t>>();
+            auto ea = t[1].cast<py::array_t<int64_t>>();
+            cc.bl_start.assign(sa.data(), sa.data() + sa.size());
+            cc.bl_end.assign(ea.data(), ea.data() + ea.size());
+        }
+        ctxs.push_back(std::move(cc));
+    }
+
+    // The caller needs index -> name to build a contact matrix that lines up
+    // across cells; returning it explicitly beats asking Python to re-derive
+    // which chromosomes were skipped for having no context sites.
+    py::list chrom_names;
+    for (const ChromCtx& cc : ctxs) chrom_names.append(cc.chrom);
+
+    {
+    py::gil_scoped_release release;
+    std::mt19937_64 rng(seed);
+
+    samFile* fp = sam_open(bam_path.c_str(), "r");
+    if (!fp) throw std::runtime_error("cannot open BAM: " + bam_path);
+    bam_hdr_t* hdr = sam_hdr_read(fp);
+    if (!hdr) { sam_close(fp); throw std::runtime_error("cannot read header"); }
+    hts_idx_t* idx = sam_index_load(fp, bam_path.c_str());
+    if (!idx) {
+        bam_hdr_destroy(hdr); sam_close(fp);
+        throw std::runtime_error("cannot load BAM index for " + bam_path);
+    }
+    const uint16_t skip_flags = keep_supplementary ? SKIP_FLAGS_BASE : SKIP_FLAGS;
+
+    for (size_t ci = 0; ci < ctxs.size(); ++ci) {
+        const ChromCtx& cc = ctxs[ci];
+        int tid = bam_name2id(hdr, cc.chrom.c_str());
+        if (tid < 0) continue;
+        hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, hdr->target_len[tid]);
+        if (!iter) continue;
+
+        std::unordered_map<std::string, bam1_t*> buf;
+        bam1_t* b = bam_init1();
+        while (sam_itr_next(fp, iter, b) >= 0) {
+            if (b->core.flag & skip_flags) continue;
+            if (b->core.qual < mapq_min) continue;
+            if (b->core.mtid != b->core.tid) continue;      // cis only
+
+            std::string qname = bam_get_qname(b);
+            auto it = buf.find(qname);
+            if (it == buf.end()) {
+                buf.emplace(std::move(qname), bam_dup1(b));
+                continue;
+            }
+            bam1_t* mate = it->second;
+            buf.erase(it);
+            if (mate->core.qual < mapq_min) { bam_destroy1(mate); continue; }
+
+            const bam1_t* r1 = (b->core.pos <= mate->core.pos) ? b : mate;
+            const bam1_t* r2 = (r1 == b) ? mate : b;
+            if (!cc.bl_start.empty() &&
+                (hits_blacklist(cc.bl_start, cc.bl_end, r1->core.pos, bam_endpos(r1)) ||
+                 hits_blacklist(cc.bl_start, cc.bl_end, r2->core.pos, bam_endpos(r2)))) {
+                bam_destroy1(mate);
+                continue;
+            }
+            ++n_scanned;
+
+            int64_t m1 = (r1->core.pos + bam_endpos(r1)) / 2;
+            int64_t m2 = (r2->core.pos + bam_endpos(r2)) / 2;
+            int64_t span = m2 > m1 ? m2 - m1 : m1 - m2;
+            if (span < min_span) { bam_destroy1(mate); continue; }
+
+            ContactRec rec;
+            rec.chrom = (int32_t)ci; rec.mid1 = (int32_t)m1; rec.mid2 = (int32_t)m2;
+            int s1 = infer_conversion_strand(r1, strand_min_evidence);
+            int s2 = infer_conversion_strand(r2, strand_min_evidence);
+            if (cc.ng) {
+                site_calls(cc.gp, cc.gr, cc.ng, r1, trim_ends, s1, baseq_min, rec.g1);
+                site_calls(cc.gp, cc.gr, cc.ng, r2, trim_ends, s2, baseq_min, rec.g2);
+            }
+            if (cc.nh) {
+                site_calls(cc.hp, cc.hr, cc.nh, r1, trim_ends, s1, baseq_min, rec.h1);
+                site_calls(cc.hp, cc.hr, cc.nh, r2, trim_ends, s2, baseq_min, rec.h2);
+            }
+            bam_destroy1(mate);
+            // A contact with no site on one side can still count toward the
+            // contact MATRIX, but it carries no concordance, so it is dropped
+            // here and the matrix is built from what is kept -- keeping the
+            // frequency and the concordance over exactly the same pair set.
+            if ((rec.g1.size() || rec.h1.size()) &&
+                (rec.g2.size() || rec.h2.size())) {
+                ++n_long;
+                keep.offer(std::move(rec), rng);
+            }
+        }
+        bam_destroy1(b);
+        for (auto& kv : buf) bam_destroy1(kv.second);
+        hts_itr_destroy(iter);
+    }
+    hts_idx_destroy(idx);
+    bam_hdr_destroy(hdr);
+    sam_close(fp);
+    }   // GIL reacquired
+
+    std::vector<int32_t> ch, a1, a2;
+    Csr g1, h1, g2, h2;
+    ch.reserve(keep.keep.size()); a1.reserve(keep.keep.size());
+    a2.reserve(keep.keep.size());
+    for (const ContactRec& r : keep.keep) {
+        ch.push_back(r.chrom); a1.push_back(r.mid1); a2.push_back(r.mid2);
+        g1.push(r.g1); h1.push(r.h1); g2.push(r.g2); h2.push(r.h2);
+    }
+    py::dict out;
+    out["chrom"] = vec_to_numpy(ch);
+    out["mid1"] = vec_to_numpy(a1);
+    out["mid2"] = vec_to_numpy(a2);
+    g1.into(out, "g1"); h1.into(out, "h1");
+    g2.into(out, "g2"); h2.into(out, "h2");
+    out["chrom_names"] = chrom_names;
+    out["n_pairs_scanned"] = py::int_(n_scanned);
+    out["n_long_range"] = py::int_(n_long);
+    return out;
+}
+
+/* Accumulate every CROSS-END site pair of each contact into the single bin the
+ * caller assigns it (its O/E bin), rather than binning by site-site distance.
+ * Per-cell accumulators come back so the cell-level bootstrap still works. */
+static py::dict accumulate_contacts(py::dict pairs, py::array_t<int32_t> bin_of_pair,
+                                    py::array_t<int32_t> cell_of_pair,
+                                    int n_bins, int n_cells, int cap, uint64_t seed)
+{
+    CsrView g1, h1, g2, h2;
+    g1.bind(pairs, "g1"); h1.bind(pairs, "h1");
+    g2.bind(pairs, "g2"); h2.bind(pairs, "h2");
+    const int32_t* pb = bin_of_pair.data();
+    const int32_t* pc = cell_of_pair.data();
+    const int64_t n = bin_of_pair.size();
+
+    std::vector<Acc> gg, hh, gh;
+    gg.reserve(n_cells); hh.reserve(n_cells); gh.reserve(n_cells);
+    for (int i = 0; i < n_cells; ++i) {
+        gg.emplace_back(n_bins); hh.emplace_back(n_bins); gh.emplace_back(n_bins);
+    }
+    uint64_t used = 0;
+
+    {
+    py::gil_scoped_release release;
+    std::mt19937_64 rng(seed);
+    SiteVec a1, b1, a2, b2;
+    for (int64_t i = 0; i < n; ++i) {
+        int b = pb[i];
+        if (b < 0 || b >= n_bins) continue;
+        int c = pc[i];
+        if (c < 0 || c >= n_cells) continue;
+        ++used;
+        g1.get(i, a1); h1.get(i, b1); g2.get(i, a2); h2.get(i, b2);
+        pair_accumulate_into(gg[c], a1, a2, b, cap, rng);
+        pair_accumulate_into(hh[c], b1, b2, b, cap, rng);
+        // cross-context, both orientations, matching the distance analysis
+        pair_accumulate_into(gh[c], b1, a2, b, cap, rng);
+        pair_accumulate_into(gh[c], b2, a1, b, cap, rng);
+    }
+    }
+
+    py::dict out;
+    py::list lg, lh, lx;
+    for (int i = 0; i < n_cells; ++i) {
+        lg.append(to_numpy(gg[i]));
+        lh.append(to_numpy(hh[i]));
+        lx.append(to_numpy(gh[i]));
+    }
+    out["gg_per_cell"] = lg;
+    out["hh_per_cell"] = lh;
+    out["gh_per_cell"] = lx;
+    out["n_used"] = py::int_(used);
+    return out;
+}
+
 PYBIND11_MODULE(_site_dist_core, m) {
     m.doc() = "htslib backend for site-level distance correlation";
     m.def("parse_cell_site_distance", &parse_cell_site_distance,
@@ -830,4 +1091,18 @@ PYBIND11_MODULE(_site_dist_core, m) {
           "Pooled cross-cell null: substitute partners are drawn from the "
           "donor ends of every cell in the group, not just the anchor's own "
           "cell.  Returns per-cell accumulators for the cell bootstrap.");
+    m.def("parse_cell_contacts", &parse_cell_contacts,
+          py::arg("bam_path"), py::arg("ctx_gch"), py::arg("ctx_hcg"),
+          py::arg("trim_ends") = 5, py::arg("mapq_min") = 30,
+          py::arg("min_span") = 10000, py::arg("keep_supplementary") = false,
+          py::arg("baseq_min") = 0, py::arg("blacklist") = py::dict(),
+          py::arg("strand_min_evidence") = 1, py::arg("max_pairs") = 0,
+          py::arg("seed") = 42,
+          "Keep every long-range pair whole (both midpoints + site calls) so "
+          "contact frequency can be counted across cells afterwards.");
+    m.def("accumulate_contacts", &accumulate_contacts,
+          py::arg("pairs"), py::arg("bin_of_pair"), py::arg("cell_of_pair"),
+          py::arg("n_bins"), py::arg("n_cells"), py::arg("cap") = 0,
+          py::arg("seed") = 42,
+          "Accumulate cross-end site pairs into each contact's assigned bin.");
 }
