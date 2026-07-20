@@ -196,8 +196,9 @@ def _phi_envelope(acc):
 
     phi cannot reach ±1 unless the two marginals match.  With HCG ~0.78 and GCH
     ~0.25 the range is about [-0.92, +0.31] -- so a cross-context phi near zero
-    may be a ceiling, not an absence of association.  Plotting this envelope is
-    what makes that visible instead of implicit.
+    may be a ceiling, not an absence of association.  Written to the TSV (as
+    {measure}_phi_min/max_attainable) so the bound can be checked against the
+    reported phi; not drawn on the figure.
     """
     a, b, c, d, n = _table(acc)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -765,7 +766,7 @@ def _delta(curves, key, min_pairs):
 
 
 def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
-          plot_min=10.0, metric="phi", envelope=None):
+          plot_min=10.0, metric="phi"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -790,13 +791,6 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
             r, _n = curves[(key, cond)]
             ax.plot(centers, _show(r), color=colors[key], label=clabel,
                     **_CSTYLE[cond])
-        if metric == "phi" and envelope is not None and key in envelope:
-            # phi cannot leave this band, whatever the association is.  When the
-            # curve rides the edge, a near-zero phi is a CEILING, not an absence.
-            pmin, pmax = envelope[key]
-            ax.plot(centers, _show(pmax), ls=":", lw=1.1, color="0.45",
-                    label="attainable phi range (marginals)")
-            ax.plot(centers, _show(pmin), ls=":", lw=1.1, color="0.45")
         ax.set_ylabel(_METRICS[metric])
         ax.set_title(title, fontsize=10)
         ax.legend(fontsize=7.5, loc="best")
@@ -1039,7 +1033,7 @@ def _replot(args):
             print(f"  skipping {label}: no {args.metric!r} column in {tsv.name}",
                   file=sys.stderr)
             continue
-        curves, boot, centers, edges, env = got
+        curves, boot, centers, edges, _env = got
         if args.metric != ran_with:
             boot = None                     # CI/p are metric-specific
         # re-apply masking so a tightened --min-pairs takes effect
@@ -1048,7 +1042,7 @@ def _replot(args):
         fig = out_dir / f"{stem}.{args.plot_format}"
         _plot(curves, boot, centers, edges, label, info.get("n_cells", 0),
               info.get("n_read_pairs", 0), fig, args.min_pairs,
-              args.plot_min_distance, args.metric, env)
+              args.plot_min_distance, args.metric)
         per_group[label] = (curves, centers, edges)
         print(f"  redrew {fig}")
 
@@ -1079,9 +1073,8 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
     stem_name = f"site_distance_corr_{safe or label}"
     fig_path = out_dir / f"{stem_name}.{args.plot_format}"
     tsv_path = out_dir / f"{stem_name}.tsv"
-    env = {k: _phi_envelope(accs[(k, "linked")]) for k, _ in _MEASURES}
     _plot(curves, boot, centers, edges, label, n_cells, n_pairs, fig_path,
-          args.min_pairs, args.plot_min_distance, args.metric, env)
+          args.min_pairs, args.plot_min_distance, args.metric)
     _write_tsv(curves, boot, centers, edges, tsv_path, args.min_pairs, accs,
                args.metric)
     print(f"\n=== {label}: {n_cells} cells, {n_pairs:,} read pairs ===")
