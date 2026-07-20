@@ -1170,9 +1170,13 @@ def main():
             # family a reader looks at together.  Correcting per panel would
             # under-count by 3x; correcting across groups would be a different
             # (and much stricter) claim, so it is left to the caller.
-            keys = [k for k, _ in _MEASURES if boot.get(k) is not None]
-            if keys:
-                flat = np.concatenate([boot[k][2] for k in keys])
+            # NOT `keys` — that name holds the (measure, condition) tuples this
+            # loop rebuilds `accs` from on EVERY iteration, so shadowing it here
+            # let the 'all' figure succeed and then killed the first per-group
+            # one with KeyError: 'gg'.
+            mkeys = [k for k, _ in _MEASURES if boot.get(k) is not None]
+            if mkeys:
+                flat = np.concatenate([boot[k][2] for k in mkeys])
                 n_test = int(np.isfinite(flat).sum())
                 floor = 2.0 / (args.n_bootstrap + 1.0)
                 if args.fdr != "none" and n_test and floor * n_test > 0.05:
@@ -1185,7 +1189,7 @@ def main():
                           f"to resolve isolated ones.")
                 q = _fdr(flat, args.fdr)
                 off = 0
-                for k in keys:
+                for k in mkeys:
                     nb_k = len(boot[k][2])
                     lo_, hi_, p_ = boot[k]
                     boot[k] = (lo_, hi_, p_, q[off:off + nb_k])
