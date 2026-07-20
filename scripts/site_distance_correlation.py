@@ -169,6 +169,83 @@ def _corr(acc, min_pairs):
     return r, n
 
 
+_METRICS = {
+    "phi": "Pearson r (phi) of 0/1 calls",
+    "yule_q": "Yule's Q  (marginal-free)",
+    "log_or": "log odds ratio  (marginal-free)",
+    "phi_norm": "phi / phi$_{max}$  (marginal-normalised)",
+}
+
+
+def _table(acc):
+    """2×2 counts (n11, n10, n01, n00) from the sufficient statistics.
+
+    Nothing extra had to be stored: for 0/1 data the accumulator ALREADY is the
+    table.  Σxy is n11, Σx and Σy are the row and column totals, and n closes
+    it.  So every 2×2 measure below is available on existing runs without
+    re-parsing a single BAM.
+    """
+    acc = np.asarray(acc, dtype=np.float64)
+    take = (lambda i: acc[i]) if acc.ndim == 2 else (lambda i: acc[:, i])
+    n, sx, sy, sxy = take(0), take(1), take(2), take(5)
+    return sxy, sx - sxy, sy - sxy, n - sx - sy + sxy, n
+
+
+def _phi_envelope(acc):
+    """(phi_min, phi_max) attainable GIVEN the marginals.
+
+    phi cannot reach ±1 unless the two marginals match.  With HCG ~0.78 and GCH
+    ~0.25 the range is about [-0.92, +0.31] -- so a cross-context phi near zero
+    may be a ceiling, not an absence of association.  Plotting this envelope is
+    what makes that visible instead of implicit.
+    """
+    a, b, c, d, n = _table(acc)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        p1 = np.where(n > 0, (a + b) / np.where(n > 0, n, 1), np.nan)
+        p2 = np.where(n > 0, (a + c) / np.where(n > 0, n, 1), np.nan)
+        lo, hi = np.minimum(p1, p2), np.maximum(p1, p2)
+        pmax = np.sqrt(lo * (1 - hi) / ((1 - lo) * hi))
+        pmin = np.where(p1 + p2 <= 1,
+                        -np.sqrt(p1 * p2 / ((1 - p1) * (1 - p2))),
+                        -np.sqrt((1 - p1) * (1 - p2) / (p1 * p2)))
+    return pmin, pmax
+
+
+def _metric(acc, min_pairs, metric="phi"):
+    """(value, n) per bin for any supported 2×2 association measure.
+
+    Works on a single (6, nb) accumulator and on a stacked (B, 6, nb) one, so
+    the bootstrap uses exactly the same code path as the point estimate.
+
+    phi is Pearson r on 0/1 data, which is what the pipeline has always
+    reported -- but it is bounded by the marginals, so it is NOT comparable
+    across measures with different methylation rates.  yule_q and log_or are
+    functions of the odds ratio and are invariant to the marginals, which makes
+    them the honest choice for comparing GCH-GCH against HCG-GCH.
+    """
+    if metric not in _METRICS:
+        raise ValueError(f"unknown metric {metric!r}; pick from {list(_METRICS)}")
+    a, b, c, d, n = _table(acc)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        if metric in ("phi", "phi_norm"):
+            den = np.sqrt((a + b) * (c + d) * (a + c) * (b + d))
+            v = np.where(den > 0, (a * d - b * c) / np.where(den > 0, den, 1.0),
+                         np.nan)
+            if metric == "phi_norm":
+                pmin, pmax = _phi_envelope(acc)
+                bound = np.where(v >= 0, pmax, np.abs(pmin))
+                v = np.where(bound > 0, v / np.where(bound > 0, bound, 1.0),
+                             np.nan)
+        else:
+            # Haldane-Anscombe: +0.5 per cell keeps a zero cell from sending
+            # the odds ratio to 0 or infinity.
+            A, B, C, D = a + 0.5, b + 0.5, c + 0.5, d + 0.5
+            v = ((A * D - B * C) / (A * D + B * C) if metric == "yule_q"
+                 else np.log((A * D) / (B * C)))
+        v = np.where(n >= min_pairs, v, np.nan)
+    return v, n
+
+
 def _corr_stack(acc, min_pairs):
     """:func:`_corr` vectorised over a leading (bootstrap) axis: (B, 6, nb) → r."""
     n, sx, sy, sxx, syy, sxy = (acc[:, i] for i in range(6))
@@ -180,7 +257,8 @@ def _corr_stack(acc, min_pairs):
                         cov / np.where(den > 0, den, 1.0), np.nan)
 
 
-def _bootstrap_delta(per_cell_a, per_cell_b, min_pairs, n_boot, seed):
+def _bootstrap_delta(per_cell_a, per_cell_b, min_pairs, n_boot, seed,
+                     metric="phi"):
     """Cell-level bootstrap of r(a) − r(b) per bin → (lo, hi, p).
 
     The unit of resampling is the CELL, not the site pair.  Site pairs are
@@ -197,8 +275,8 @@ def _bootstrap_delta(per_cell_a, per_cell_b, min_pairs, n_boot, seed):
         return None
     rng = np.random.default_rng(seed)
     w = rng.multinomial(k, np.full(k, 1.0 / k), size=n_boot).astype(np.float64)
-    d = (_corr_stack((w @ a.reshape(k, -1)).reshape(n_boot, 6, -1), min_pairs)
-         - _corr_stack((w @ b.reshape(k, -1)).reshape(n_boot, 6, -1), min_pairs))
+    d = (_metric((w @ a.reshape(k, -1)).reshape(n_boot, 6, -1), min_pairs, metric)[0]
+         - _metric((w @ b.reshape(k, -1)).reshape(n_boot, 6, -1), min_pairs, metric)[0])
     with np.errstate(invalid="ignore"), warnings.catch_warnings():
         # A bin masked in every resample is an all-NaN slice — expected, not an
         # error; it simply has no Δ to report.
@@ -687,7 +765,7 @@ def _delta(curves, key, min_pairs):
 
 
 def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
-          plot_min=10.0):
+          plot_min=10.0, metric="phi", envelope=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -712,7 +790,14 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
             r, _n = curves[(key, cond)]
             ax.plot(centers, _show(r), color=colors[key], label=clabel,
                     **_CSTYLE[cond])
-        ax.set_ylabel("Pearson r (phi) of 0/1 calls")
+        if metric == "phi" and envelope is not None and key in envelope:
+            # phi cannot leave this band, whatever the association is.  When the
+            # curve rides the edge, a near-zero phi is a CEILING, not an absence.
+            pmin, pmax = envelope[key]
+            ax.plot(centers, _show(pmax), ls=":", lw=1.1, color="0.45",
+                    label="attainable phi range (marginals)")
+            ax.plot(centers, _show(pmin), ls=":", lw=1.1, color="0.45")
+        ax.set_ylabel(_METRICS[metric])
         ax.set_title(title, fontsize=10)
         ax.legend(fontsize=7.5, loc="best")
 
@@ -737,7 +822,7 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
                      mfc="none", mec="0.15", mew=1.2, ls="none",
                      label="q < 0.05 (FDR)", zorder=5)
         _logx(axd, lo_x, edges[-1])
-        axd.set_ylabel("Δ Pearson r")
+        axd.set_ylabel(f"Δ {_METRICS[metric].split(chr(32))[0]}")
         axd.set_title(f"Δ {title.split('  ')[0]}   (same-molecule excess)",
                       fontsize=9.5)
         axd.legend(fontsize=7, loc="best")
@@ -756,15 +841,29 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
     plt.close(fig)
 
 
-def _write_tsv(curves, boot, centers, edges, path, min_pairs):
+def _write_tsv(curves, boot, centers, edges, path, min_pairs,
+               accs=None, metric="phi"):
     rows = {"bin_lo": edges[:-1].astype(np.int64),
             "bin_hi": edges[1:].astype(np.int64),
             "center_bp": np.round(centers).astype(np.int64)}
     for key, _ in _MEASURES:
         for cond, _lab in _CONDS:
             r, n = curves[(key, cond)]
-            rows[f"{key}_{cond}_r"] = r
+            rows[f"{key}_{cond}_{metric}"] = r
             rows[f"{key}_{cond}_n"] = n.astype(np.int64)
+            if accs is not None:
+                # All 2x2 measures come free from the same sufficient
+                # statistics, so write them all rather than force a re-run to
+                # see whether a conclusion survives a different metric.
+                for alt in _METRICS:
+                    if alt == metric:
+                        continue
+                    rows[f"{key}_{cond}_{alt}"] = _metric(
+                        accs[(key, cond)], min_pairs, alt)[0]
+                if cond == "linked":
+                    pmin, pmax = _phi_envelope(accs[(key, cond)])
+                    rows[f"{key}_phi_min_attainable"] = pmin
+                    rows[f"{key}_phi_max_attainable"] = pmax
         d, _ok = _delta(curves, key, min_pairs)
         rows[f"{key}_delta"] = d
         if boot and boot.get(key) is not None:
@@ -779,15 +878,18 @@ def _write_tsv(curves, boot, centers, edges, path, min_pairs):
 def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
             safe=None, n_eligible=0, boot=None, scope_note="",
             n_pairs_for_pct=None):
-    curves = {k: _corr(v, args.min_pairs) for k, v in accs.items()}
+    curves = {k: _metric(v, args.min_pairs, args.metric)
+              for k, v in accs.items()}
     # Build the two paths explicitly: Path.with_suffix() would ALSO mangle a
     # label containing a dot ('A.B' -> '..._A.pdf'), silently.
     stem_name = f"site_distance_corr_{safe or label}"
     fig_path = out_dir / f"{stem_name}.{args.plot_format}"
     tsv_path = out_dir / f"{stem_name}.tsv"
+    env = {k: _phi_envelope(accs[(k, "linked")]) for k, _ in _MEASURES}
     _plot(curves, boot, centers, edges, label, n_cells, n_pairs, fig_path,
-          args.min_pairs, args.plot_min_distance)
-    _write_tsv(curves, boot, centers, edges, tsv_path, args.min_pairs)
+          args.min_pairs, args.plot_min_distance, args.metric, env)
+    _write_tsv(curves, boot, centers, edges, tsv_path, args.min_pairs, accs,
+               args.metric)
     print(f"\n=== {label}: {n_cells} cells, {n_pairs:,} read pairs ===")
     if scope_note:
         print(f"  {scope_note}")
@@ -953,6 +1055,17 @@ def main():
                          "observable when the two mates disagree on conversion "
                          "strand. The bins are still computed and written to "
                          "the TSV; use --min-distance to drop them entirely.")
+    ap.add_argument("--metric", choices=list(_METRICS), default="phi",
+                    help="Association measure for 0/1 calls. 'phi' is Pearson "
+                         "r (identical on binary data) and is the historical "
+                         "default, but it is BOUNDED BY THE MARGINALS: at HCG "
+                         "~0.78 vs GCH ~0.25 it can only reach [-0.92, +0.31], "
+                         "and a fixed odds ratio of 9 reads anywhere from 0.10 "
+                         "to 0.50 depending on rates alone. 'yule_q' and "
+                         "'log_or' are functions of the odds ratio and are "
+                         "marginal-free, so they compare across contexts; "
+                         "'phi_norm' rescales phi by its attainable bound. "
+                         "ALL of them are written to the TSV regardless.")
     ap.add_argument("--plot-format", choices=["png", "pdf", "svg"], default="pdf")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
@@ -1165,7 +1278,7 @@ def main():
             for m, _ in _MEASURES:
                 boot[m] = _bootstrap_delta(pc[(m, "linked")], pc[(m, "null")],
                                            args.min_pairs, args.n_bootstrap,
-                                           args.seed)
+                                           args.seed, args.metric)
             # FDR over every bin of every measure in THIS figure — that is the
             # family a reader looks at together.  Correcting per panel would
             # under-count by 3x; correcting across groups would be a different
