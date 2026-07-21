@@ -37,6 +37,34 @@ VALID_METHODS = ("none", "center", "zscore", "combat", "harmony")
 _UNKNOWN = "__unknown_batch__"
 
 
+def _impute_for_dense_solver(matrix: pd.DataFrame, who: str) -> pd.DataFrame:
+    """Fill NaNs so a solver that rejects them (PCA, ComBat) can run.
+
+    Per-bin mean is the first pass, but a bin that NO cell covers has a NaN
+    mean, so that pass leaves it NaN and the solver still rejects the whole
+    matrix.  This is routine for the compartment baseline: a 250 kb bin at a
+    chromosome end or low-contact region can be empty for every cell.  Such a
+    column carries no signal, so zero-fill it -- PCA centres per feature and
+    ComBat standardises per feature, so a constant column is inert either way.
+
+    The caller re-masks the corrected matrix with the ORIGINAL NaN pattern
+    (``corrected.where(raw.notna())``), so these filled positions never reach
+    the regression; the fill exists only to let the dense solver run.
+    """
+    if not matrix.isna().any().any():
+        return matrix
+    logger.info(f"  {who}: NaN-imputing with per-bin means.")
+    filled = matrix.fillna(matrix.mean(axis=0))
+    dead = filled.columns[filled.isna().any(axis=0)]
+    if len(dead):
+        logger.info(
+            f"  {who}: {len(dead)} bin(s) empty for every cell — zero-filled "
+            f"for the solver (inert; re-masked to NaN afterward)."
+        )
+        filled = filled.fillna(0.0)
+    return filled
+
+
 def _coerce_batch_df(batch_labels, index: pd.Index) -> pd.DataFrame:
     """Normalize batch labels to a cells × batch-variables DataFrame.
 
@@ -201,14 +229,8 @@ def _combat_correction(
     ComBat expects features × samples, so the matrix is transposed
     before being passed in and the result is transposed back.
     """
-    # NaN-impute (ComBat doesn't tolerate NaNs).  Use per-bin mean.
-    if matrix.isna().any().any():
-        logger.info(
-            "  ComBat: NaN-imputing the accessibility matrix with per-bin means "
-            "(ComBat doesn't tolerate NaNs)."
-        )
-        col_means = matrix.mean(axis=0)
-        matrix = matrix.fillna(col_means)
+    # NaN-impute (ComBat doesn't tolerate NaNs).
+    matrix = _impute_for_dense_solver(matrix, "ComBat")
 
     pycombat = _try_import_pycombat()
     # Most pycombat APIs accept (data: features × samples DataFrame, batch: list[str]).
@@ -283,11 +305,7 @@ def _harmony_correction(
             "--batch-correction combat instead."
         )
 
-    if matrix.isna().any().any():
-        logger.info(
-            "  Harmony: NaN-imputing the accessibility matrix with per-bin means."
-        )
-        matrix = matrix.fillna(matrix.mean(axis=0))
+    matrix = _impute_for_dense_solver(matrix, "Harmony")
 
     from sklearn.decomposition import PCA
     n_comp = max(1, min(n_components, matrix.shape[0] - 1, matrix.shape[1] - 1))

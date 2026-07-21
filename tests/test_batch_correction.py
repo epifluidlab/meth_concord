@@ -297,3 +297,78 @@ def test_harmony_accepts_multiple_batch_vars():
     mat, bdf = _make_two_factor(n_per=20, n_bins=40, shift=8.0)
     out = bc.apply_batch_correction(mat, bdf, method="harmony")
     assert out.shape == mat.shape
+
+
+# --------------------------------------------------------------------------
+# All-NaN bins (an empty compartment bin) must not crash the dense solvers.
+# Regression: PCA/ComBat reject NaN, and per-bin-mean imputation cannot fill a
+# column whose mean is itself NaN, so an all-NaN bin slipped through to the
+# solver and raised "Input X contains NaN" on real compartment matrices.
+# --------------------------------------------------------------------------
+
+def test_impute_zero_fills_all_nan_columns_and_mean_fills_the_rest():
+    X = pd.DataFrame({"dead": [np.nan, np.nan, np.nan],
+                      "sparse": [np.nan, 5.0, 7.0],
+                      "full": [1.0, 2.0, 3.0]})
+    out = bc._impute_for_dense_solver(X, "test")
+    assert np.isfinite(out.to_numpy()).all()
+    assert (out["dead"] == 0.0).all(), "an all-NaN bin must become 0, not stay NaN"
+    assert out["sparse"].iloc[0] == pytest.approx(6.0), "sparse NaN -> per-bin mean"
+    assert list(out["full"]) == [1.0, 2.0, 3.0], "observed values untouched"
+
+
+def test_impute_is_a_noop_without_nans():
+    X = pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+    out = bc._impute_for_dense_solver(X, "test")
+    assert out.equals(X)
+
+
+def test_impute_preserves_shape_and_columns():
+    X = pd.DataFrame(np.arange(12.0).reshape(4, 3),
+                     columns=["chr1:0", "chr1:250000", "chr1:500000"])
+    X.iloc[:, 1] = np.nan
+    out = bc._impute_for_dense_solver(X, "test")
+    assert out.shape == X.shape
+    assert list(out.columns) == list(X.columns)
+
+
+def _batched(n_cells=200, n_bins=60, seed=0):
+    rng = np.random.default_rng(seed)
+    M = pd.DataFrame(
+        rng.normal(0, 1, (n_cells, n_bins)),
+        columns=[f"chr1:{i * 250000}" for i in range(n_bins)],
+        index=[f"c{i}" for i in range(n_cells)])
+    half = n_cells // 2
+    M += np.where(np.arange(n_cells)[:, None] < half, 0.8, -0.8)
+    batch = pd.DataFrame(
+        {"exp_batch": np.where(np.arange(n_cells) < half, "a", "b")},
+        index=M.index)
+    return M, batch
+
+
+def test_harmony_survives_an_all_nan_bin():
+    pytest.importorskip("harmonypy")
+    M, batch = _batched()
+    M.iloc[:, 7] = np.nan                       # a bin no cell covers
+    M.iloc[M.to_numpy() != M.to_numpy()] = np.nan
+    rng = np.random.default_rng(1)
+    M.values[rng.random(M.shape) < 0.05] = np.nan   # ordinary dropout too
+    try:
+        out = bc.apply_batch_correction(M, batch, method="harmony",
+                                        random_state=0)
+    except Exception as e:                      # pragma: no cover
+        if "has no len" in str(e):
+            pytest.skip("local harmonypy version bug unrelated to NaN handling")
+        raise
+    assert out.shape == M.shape
+    assert np.isfinite(out.to_numpy()).all(), "no NaN may reach the solver"
+
+
+def test_combat_survives_an_all_nan_bin():
+    if not _have_combat():
+        pytest.skip("pycombat/inmoose not installed")
+    M, batch = _batched()
+    M.iloc[:, 3] = np.nan
+    out = bc.apply_batch_correction(M, batch, method="combat", random_state=0)
+    assert out.shape == M.shape
+    assert np.isfinite(out.to_numpy()).all()
