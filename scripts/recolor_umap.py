@@ -26,9 +26,13 @@ Usage
         --coords cmp/umap_gch_residual_coordinates.tsv \\
         --metadata metadata_with_cell_type.txt --cell-column cell \\
         --color-by sample --color-by library_prep_date \\
-        --color-by mapq30rate --color-by 'log10(mapq30num)' \\
+        --color-by mapq30rate --log10 mapq30num \\
         --color-by noncpg_chrM --color-by cis1kbrate \\
         --output-dir output/umap_technical
+
+``--log10 mapq30num`` colours by log10 of that one column (equivalent to the
+quoting-free form of ``--color-by 'log10(mapq30num)'``); no other factor is
+transformed.
 """
 
 from __future__ import annotations
@@ -202,10 +206,21 @@ def main():
     ap.add_argument("--metadata", required=True)
     ap.add_argument("--cell-column", default="cell",
                     help="Metadata column matching the coordinates' 'cell'.")
-    ap.add_argument("--color-by", action="append", required=True,
+    ap.add_argument("--color-by", action="append", default=None,
                     metavar="COL|log10(COL)|LABEL=EXPR",
                     help="Factor to colour by. Repeatable. log10()/log2()/"
                          "log1p() wrap a column; LABEL= renames the panel.")
+    ap.add_argument("--log10", action="append", default=None, metavar="COL",
+                    help="Colour by log10 of COL — a quoting-free shorthand for "
+                         "--color-by 'log10(COL)'. The transform touches ONLY "
+                         "this column; other factors are untouched. Repeatable. "
+                         "Use for large counts like mapq30num. Non-positive "
+                         "values become NaN (drawn grey).")
+    ap.add_argument("--log2", action="append", default=None, metavar="COL",
+                    help="Colour by log2 of COL. Repeatable.")
+    ap.add_argument("--log1p", action="append", default=None, metavar="COL",
+                    help="Colour by log1p (log10(1+x)-style, base e) of COL, "
+                         "for counts that include zeros. Repeatable.")
     ap.add_argument("--type", action="append", default=None,
                     metavar="COL=categorical|continuous",
                     help="Force a factor's type instead of auto-detecting.")
@@ -230,7 +245,19 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    specs = [parse_color_spec(s) for s in args.color_by]
+    # The --log10/--log2/--log1p flags are quoting-free sugar for the
+    # log10(COL) functional form; each names ONE column to transform, so no
+    # other factor is affected.
+    color_specs = list(args.color_by or [])
+    for fn_name, cols in (("log10", args.log10), ("log2", args.log2),
+                          ("log1p", args.log1p)):
+        for col in (cols or []):
+            color_specs.append(f"{fn_name}({col})")
+    if not color_specs:
+        sys.exit("give at least one factor via --color-by / --log10 / --log2 / "
+                 "--log1p.")
+
+    specs = [parse_color_spec(s) for s in color_specs]
     for _label, col, _fn in specs:
         if col not in meta.columns:
             sys.exit(f"column {col!r} not in metadata "

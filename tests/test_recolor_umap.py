@@ -216,3 +216,59 @@ def test_unmatched_cells_are_not_dropped(tmp_path):
     meta_df = m.load_metadata(str(meta), "cell")
     matched = cdf["cell"].astype(str).isin(meta_df.index).sum()
     assert matched == 88, f"expected 12 unmatched, got {100 - matched}"
+
+
+# --------------------------------------------------- --log10 convenience flag --
+
+def test_log10_flag_is_sugar_for_the_functional_form(tmp_path):
+    """--log10 COL must equal --color-by 'log10(COL)', and touch only COL."""
+    coords, meta = _fixture(tmp_path)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coords", str(coords),
+         "--metadata", str(meta), "--color-by", "cis1kbrate",
+         "--log10", "mapq30num", "--output-dir", str(out),
+         "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    # the log-scaled panel is named from the transform ...
+    assert (out / "umap_gch.by_log10_mapq30num.png").exists()
+    # ... and the OTHER factor is left untransformed (its own plain panel)
+    assert (out / "umap_gch.by_cis1kbrate.png").exists()
+    assert "log10(mapq30num)" in r.stdout
+
+
+def test_log10_flag_alone_needs_no_color_by(tmp_path):
+    coords, meta = _fixture(tmp_path)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coords", str(coords),
+         "--metadata", str(meta), "--log10", "mapq30num",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (out / "umap_gch.by_log10_mapq30num.png").exists()
+
+
+def test_no_factor_at_all_is_an_error(tmp_path):
+    coords, meta = _fixture(tmp_path)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coords", str(coords),
+         "--metadata", str(meta), "--output-dir", str(tmp_path / "o")],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "at least one factor" in (r.stdout + r.stderr)
+
+
+def test_log2_and_log1p_flags_map_to_their_transforms(tmp_path):
+    coords, meta = _fixture(tmp_path)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coords", str(coords),
+         "--metadata", str(meta), "--log2", "mapq30num",
+         "--log1p", "cis1kbrate", "--output-dir", str(out),
+         "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (out / "umap_gch.by_log2_mapq30num.png").exists()
+    assert (out / "umap_gch.by_log1p_cis1kbrate.png").exists()
