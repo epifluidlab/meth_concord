@@ -68,7 +68,7 @@ def test_selection_prefers_markers_and_excludes_batch_bins():
     m = _mod()
     X, ct, batch, classes = _data()
     sel, ct_icc, b_icc, _nclean = m.select_marker_bins(
-        X, ct, 4, batch, 2, _icc(), _Args())
+        X, ct, 4, [(batch, 2)], _icc(), _Args())
     picked = classes[sel]
     # markers have the highest cell-type ICC, so the TOP of the ranking is them
     # (the weaker 'pervasive' bins legitimately fill the rest -- they are also
@@ -94,14 +94,14 @@ def test_selection_respects_the_batch_cut():
     class Loose(_Args):
         max_batch_icc = 1.01                       # no batch filtering
         n_bins = 200
-    sel, *_rest = m.select_marker_bins(X, ct, 4, batch, 2, _icc(), Loose())
+    sel, *_rest = m.select_marker_bins(X, ct, 4, [(batch, 2)], _icc(), Loose())
     assert "batchy" in classes[sel], "with no cut, batch bins can be selected"
 
 
 def test_selection_ranks_by_celltype_icc():
     m = _mod()
     X, ct, batch, classes = _data()
-    sel, ct_icc, _, _ = m.select_marker_bins(X, ct, 4, batch, 2, _icc(), _Args())
+    sel, ct_icc, _, _ = m.select_marker_bins(X, ct, 4, [(batch, 2)], _icc(), _Args())
     assert np.all(np.diff(ct_icc[sel]) <= 1e-9), "selected bins in ICC order"
     # everything selected must beat the median non-selected cell-type ICC
     rest = np.setdiff1d(np.arange(X.shape[1]), sel)
