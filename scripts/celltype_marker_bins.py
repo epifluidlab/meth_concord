@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cell-type-variable concordance bins: a marker heatmap + an out-of-selection UMAP.
+"""Cell-type-variable concordance bins: a marker heatmap (F5C).
 
 Two panels that together make -- and DEFEND -- the claim that long-range
 concordance is cell-type-specific:
@@ -10,12 +10,15 @@ concordance is cell-type-specific:
                  cell-type variance AND against batch variance is what makes the
                  blocks track biology rather than sample.
 
-  UMAP (F5D)     the SAME cells embedded on the bins that were NOT selected.
-                 This is the control that keeps the heatmap honest: picking the
-                 top cell-type-variable bins and then showing they separate cell
-                 types is CIRCULAR -- it works on pure noise.  If the bins we did
-                 NOT pick still separate cell types, the structure is genome-
-                 wide, not an artefact of selection.
+  CONTROL        the out-of-selection honesty check: do the bins we did NOT
+                 select still separate cell types?  Picking the top cell-type-
+                 variable bins and then showing they separate cell types is
+                 CIRCULAR -- it works on pure noise.  So the non-selected bins
+                 are scored by cell-type silhouette against a permutation null;
+                 if they separate too (p<0.05), the heatmap is real.  The UMAP
+                 of the full / non-selected bins (F5D) is already produced by
+                 nome_hic_concordance and nome_hic_compare, so only the NUMBER
+                 is emitted here.
 
 Selection is done on a TRAIN split of cells and everything is displayed on the
 HELD-OUT split, so even the heatmap is a genuine out-of-sample demonstration
@@ -97,13 +100,19 @@ def _stratified_split(labels, frac, seed):
     return train
 
 
-def _svd_umap(M, n_svd, skip_top, seed):
-    """SVD (drop the top `skip_top`) then UMAP; returns (n,2) or None."""
-    try:
-        import umap
-    except Exception:
-        return None
+def _nonselected_separation(M, labels, n_svd, skip_top, seed, n_perm):
+    """Do the NON-selected bins still separate cell types?  (silhouette + perm)
+
+    This is the out-of-selection control that keeps the heatmap honest -- picking
+    the top cell-type-variable bins and showing they separate cell types is
+    circular, but if the bins we did NOT pick separate cell types too, the
+    structure is genome-wide.  The UMAP of these bins is already produced by
+    nome_hic_concordance / nome_hic_compare, so this returns just the NUMBER:
+    the cell-type silhouette on the non-selected-bin SVD scores, against a
+    label-permutation null.  Returns (silhouette, perm_p).
+    """
     from sklearn.decomposition import TruncatedSVD
+    from sklearn.metrics import silhouette_score
     X = M.to_numpy(np.float64)
     X = np.where(np.isfinite(X), X, np.nanmean(X, axis=0, keepdims=True))
     X = np.where(np.isfinite(X), X, 0.0)
@@ -111,20 +120,16 @@ def _svd_umap(M, n_svd, skip_top, seed):
     if k > 1:
         emb = TruncatedSVD(n_components=k, random_state=seed).fit_transform(X)
         X = emb[:, skip_top:]
-    nn = min(15, max(2, X.shape[0] - 1))
-    return umap.UMAP(n_neighbors=nn, random_state=seed).fit_transform(X)
-
-
-def _celltype_r2(coords, labels):
-    ok = pd.notna(labels)
-    P = np.asarray(coords)[ok]
-    lab = np.asarray(labels)[ok]
-    if len(np.unique(lab)) < 2:
-        return np.nan
-    tot = ((P - P.mean(0)) ** 2).sum()
-    w = sum(((P[lab == g] - P[lab == g].mean(0)) ** 2).sum()
-            for g in np.unique(lab))
-    return float(1 - w / tot) if tot > 0 else np.nan
+    lab = np.asarray(labels)
+    if len(np.unique(lab)) < 2 or X.shape[0] <= len(np.unique(lab)):
+        return np.nan, np.nan
+    obs = float(silhouette_score(X, lab))
+    rng = np.random.default_rng(seed)
+    null = np.array([silhouette_score(X, rng.permutation(lab))
+                     for _ in range(n_perm)])
+    # (1 + count)/(1 + B): a finite permutation cannot justify p = 0
+    p = (1 + int((null >= obs).sum())) / (1 + n_perm)
+    return obs, float(p)
 
 
 def select_marker_bins(X, cell_type_ids, n_ct, batch_ids, n_batch, icc_fn,
@@ -221,31 +226,6 @@ def _heatmap(M, cells_order, bins_order, ct_labels, batch_labels, ct_colors,
                  title="cell type", title_fontsize=7, frameon=False)
     fig.suptitle(title, fontsize=12)
     fig.savefig(out, bbox_inches="tight", dpi=150)
-    plt.close(fig)
-
-
-def _umap_plot(coords, ct_labels, batch_labels, ct_colors, title, out, note):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5))
-    for ax, (labels, name, colors) in zip(
-            axes, [(ct_labels, "cell type", ct_colors),
-                   (batch_labels, "batch", None)]):
-        uniq = list(dict.fromkeys(labels))
-        cmap = plt.get_cmap("tab20" if len(uniq) > 10 else "tab10")
-        for i, g in enumerate(uniq):
-            m = (labels == g).to_numpy()
-            c = (colors.get(g) if colors else None) or cmap(i % cmap.N)
-            ax.scatter(coords[m, 0], coords[m, 1], s=14, color=c, alpha=0.8,
-                       edgecolors="none", label=str(g))
-        ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
-        ax.set_title(f"coloured by {name}", fontsize=10)
-        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
-    fig.suptitle(title, fontsize=12)
-    fig.tight_layout(rect=(0, 0.05, 1, 0.96))
-    fig.text(0.5, 0.01, note, ha="center", fontsize=8.5, color="0.35")
-    fig.savefig(out, dpi=150)
     plt.close(fig)
 
 
@@ -357,28 +337,12 @@ def main():
                  ct_colors, f"{name.upper()}: {len(sel_bins)} cell-type-variable, "
                  f"batch-invariant bins (held-out cells)", fig_hm)
 
-        # F5D: UMAP on the NON-selected bins, held-out cells
-        coords = _svd_umap(M.loc[test_cells, rest_bins], args.n_svd,
-                           args.skip_top_svd, args.seed)
-        umap_r2 = perm_p = np.nan
-        if coords is not None:
-            umap_r2 = _celltype_r2(coords, ct.loc[test_cells])
-            rng = np.random.default_rng(args.seed)
-            null = []
-            lab = ct.loc[test_cells].to_numpy()
-            for _ in range(args.n_permutations):
-                null.append(_celltype_r2(coords, pd.Series(rng.permutation(lab))))
-            null = np.array([x for x in null if np.isfinite(x)])
-            if null.size:
-                perm_p = (1 + int((null >= umap_r2).sum())) / (1 + null.size)
-            fig_um = out_dir / f"nonselected_umap_{name}.{args.plot_format}"
-            _umap_plot(coords, ct.loc[test_cells], batch.loc[test_cells],
-                       ct_colors,
-                       f"{name.upper()}: UMAP on NON-selected bins "
-                       f"({len(rest_bins)}), held-out cells",
-                       fig_um,
-                       f"cell-type R²={umap_r2:.3f} (perm p={perm_p:.3f}) on bins "
-                       f"NOT chosen as markers — the out-of-selection control")
+        # Out-of-selection CONTROL (number only; the UMAP itself is already
+        # produced by nome_hic_concordance / nome_hic_compare): do the bins we
+        # did NOT pick still separate cell types?
+        sil, perm_p = _nonselected_separation(
+            M.loc[test_cells, rest_bins], ct.loc[test_cells].to_numpy(),
+            args.n_svd, args.skip_top_svd, args.seed, args.n_permutations)
 
         pd.DataFrame({"bin": M.columns, "celltype_icc": ct_icc,
                       "batch_icc": b_icc,
@@ -391,20 +355,20 @@ def main():
             "n_selected": int(sel.size),
             "median_celltype_icc_selected": _nanmedian(ct_icc[sel]),
             "median_batch_icc_selected": _nanmedian(b_icc[sel]),
-            "nonselected_umap_celltype_r2": (None if not np.isfinite(umap_r2)
-                                             else float(umap_r2)),
-            "nonselected_umap_perm_p": (None if not np.isfinite(perm_p)
-                                        else float(perm_p))}
+            "nonselected_silhouette": (None if not np.isfinite(sil)
+                                       else float(sil)),
+            "nonselected_perm_p": (None if not np.isfinite(perm_p)
+                                   else float(perm_p))}
         print(f"\n=== {name}: {M.shape[0]} cells x {M.shape[1]} bins ===")
         print(f"  selected {sel.size} bins (train n={int(train.sum())}): "
               f"median cell-type ICC {_nanmedian(ct_icc[sel]):.3f}, "
               f"median batch ICC {_nanmedian(b_icc[sel]):.3f}")
         print(f"  heatmap on {int(test.sum())} held-out cells -> {fig_hm.name}")
-        if np.isfinite(umap_r2):
-            verdict = ("SEPARATES" if perm_p < 0.05 else "does NOT separate")
-            print(f"  NON-selected bins {verdict} cell types: "
-                  f"R²={umap_r2:.3f} (perm p={perm_p:.3f}) -> the "
-                  f"non-circular proof")
+        if np.isfinite(sil):
+            verdict = "SEPARATES" if perm_p < 0.05 else "does NOT separate"
+            print(f"  out-of-selection control: NON-selected bins {verdict} "
+                  f"cell types (silhouette={sil:.3f}, perm p={perm_p:.3f}) — "
+                  f"see the nome_hic_concordance/compare UMAP for the figure")
 
     if not summary:
         sys.exit("no matrix produced output.")
@@ -412,14 +376,16 @@ def main():
         json.dump({"matrices": summary, "n_bins": args.n_bins,
                    "max_batch_icc": args.max_batch_icc,
                    "train_frac": args.train_frac,
-                   "note": "bins selected on the TRAIN split; heatmap and UMAP "
-                           "on the HELD-OUT split; UMAP uses NON-selected bins"},
+                   "note": "bins selected on the TRAIN split; heatmap on the "
+                           "HELD-OUT split; nonselected_* validates the claim "
+                           "on the bins NOT selected (the UMAP figure itself is "
+                           "produced by nome_hic_concordance / nome_hic_compare)"},
                   fh, indent=2)
     print(f"\nRead it: the heatmap shows cell-type-variable, batch-invariant "
-          "concordance on\n  HELD-OUT cells; the UMAP proves the structure is "
-          "genome-wide by separating\n  cell types on the bins that were NOT "
-          "selected.  If the UMAP does NOT separate,\n  the heatmap was a "
-          "selection artefact and the claim fails.")
+          "concordance on\n  HELD-OUT cells.  The nonselected_* silhouette + "
+          "permutation p is the honesty\n  check: if the bins NOT selected also "
+          "separate cell types (p<0.05), the heatmap\n  is not a selection "
+          "artefact.  If they do NOT, the claim fails.")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Cell-type marker-bin selection + the out-of-selection UMAP control.
+"""Cell-type marker-bin selection + the out-of-selection control.
 
 The statistical trap this figure must avoid is circular analysis: pick the bins
 most variable across cell types, then 'show' they separate cell types.  That is
@@ -128,14 +128,24 @@ def test_stratified_split_is_reproducible():
 
 # ----------------------------------------------------------------- r2 metric --
 
-def test_celltype_r2_high_for_separated_low_for_mixed():
+def test_nonselected_separation_fires_on_structure_not_noise():
+    """The out-of-selection control: real cell-type structure -> low perm p."""
     m = _mod()
     rng = np.random.default_rng(0)
-    ctr = np.array([[-6, 0], [0, 6], [6, 0]])
-    gid = rng.integers(0, 3, 300)
-    P = ctr[gid] + rng.normal(0, 0.4, (300, 2))
-    assert m._celltype_r2(P, pd.Series([f"g{g}" for g in gid])) > 0.85
-    assert m._celltype_r2(P, pd.Series(rng.choice(list("xyz"), 300))) < 0.1
+    n_ct, n_per, nb = 4, 40, 60
+    ct = np.repeat(np.arange(n_ct), n_per)
+    # bins carry a real (weaker) cell-type signal
+    X = rng.normal(0, 1, (n_ct, nb))[ct] + rng.normal(0, 0.8, (len(ct), nb))
+    M = pd.DataFrame(X, columns=[f"chr1:{i}" for i in range(nb)])
+    sil, p = m._nonselected_separation(M, np.array([f"c{c}" for c in ct]),
+                                       10, 1, 0, 100)
+    assert p < 0.05 and sil > 0, f"structured bins should separate: sil={sil}, p={p}"
+    # pure noise: no separation, p not significant
+    Mn = pd.DataFrame(rng.normal(0, 1, (len(ct), nb)),
+                      columns=M.columns)
+    _siln, pn = m._nonselected_separation(Mn, np.array([f"c{c}" for c in ct]),
+                                          10, 1, 0, 100)
+    assert pn > 0.05, f"noise must not separate, got p={pn}"
 
 
 def test_nanmedian_is_warning_free_on_all_nan():
@@ -150,7 +160,6 @@ def test_nanmedian_is_warning_free_on_all_nan():
 # ------------------------------------------------------------- end to end ----
 
 def test_end_to_end_marker_and_control(tmp_path):
-    pytest.importorskip("umap")
     m = _mod()
     X, ct, batch, classes = _data(seed=1, n_per=60)
     cts = [f"CT{c}" for c in ct]
@@ -173,12 +182,11 @@ def test_end_to_end_marker_and_control(tmp_path):
         capture_output=True, text=True)
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     assert (out / "marker_heatmap_gch.png").exists()
-    assert (out / "nonselected_umap_gch.png").exists()
     scores = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
     assert scores["selected"].sum() == 30
     # the out-of-selection control must fire: non-selected bins separate types
     import json
     s = json.loads((out / "marker_bins_summary.json").read_text())["matrices"]["gch"]
-    assert s["nonselected_umap_perm_p"] is not None
-    assert s["nonselected_umap_perm_p"] < 0.05
+    assert s["nonselected_perm_p"] is not None
+    assert s["nonselected_perm_p"] < 0.05
     assert s["median_celltype_icc_selected"] > 0.5
