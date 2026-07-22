@@ -196,7 +196,7 @@ ax.text(dx + 45, axis_y - 3.0, "contact distance", ha="right", fontsize=8.2,
         color=MUT)
 thx = dx + 21
 ax.plot([thx, thx], [axis_y - 1.4, axis_y + 12], color=ACC, lw=1.4, ls="--")
-ax.text(thx, axis_y + 13, r"$d_0\,(\approx\!20\,\mathrm{kb})$", ha="center",
+ax.text(thx, axis_y + 13, r"$d_0\,(\approx\!1\,\mathrm{kb})$", ha="center",
         fontsize=8.4, color=ACC)
 ax.plot([dx + 8, dx + 15], [axis_y, axis_y], color=DNA, lw=2.4,
         solid_capstyle="round")
@@ -274,10 +274,9 @@ ax.text(fx + PW / 2, TIER2 + 3.0,
 # =====================================================================
 # Tier 3 — the payoff (identical mean, opposite concordance)
 # =====================================================================
-ax.text(82, 37.6,
-        "Result:  identical mean methylation / accessibility, opposite "
-        "long-range concordance", fontsize=11.5, fontweight="bold",
-        ha="center", va="center")
+ax.text(74, 37.6,
+        "Same mean methylation / accessibility, opposite long-range concordance",
+        fontsize=11.5, fontweight="bold", ha="center", va="center")
 
 # ---- two toy cell states (left) -----------------------------------------
 def state_box(x, y, w, h, color, name, grid, conc):
@@ -295,9 +294,7 @@ def state_box(x, y, w, h, color, name, grid, conc):
     for r, row in zip(cys, grid):
         for c, (sl, sr) in zip(cxs, row):
             loop(c, r, sl, sr)
-    ax.text(x + w / 2, y + 5.4, "mean HCG = 0.5", fontsize=8.6, color=MUT,
-            ha="center", va="center")
-    ax.text(x + w / 2, y + 2.4, f"concordance = {conc}", fontsize=10.2,
+    ax.text(x + w / 2, y + 4.2, f"concordance = {conc}", fontsize=10.4,
             fontweight="bold", color=INK, ha="center", va="center")
 
 
@@ -309,8 +306,8 @@ state_box(41, 3, 33, 30, S2, "cell state 2",
           [[(1, 0), (0, 1)], [(1, 0), (0, 1)]], "0.0")
 
 # ---- bridge: apply the workflow -----------------------------------------
-flow(75.5, 18, 82.5, 18, color=ACC, lw=2.2)
-ax.text(79, 20.4, "workflow", ha="center", va="bottom", fontsize=7.8,
+flow(76, 18, 84, 18, color=ACC, lw=2.2)
+ax.text(80, 20.6, "workflow", ha="center", va="bottom", fontsize=7.8,
         color=ACC, style="italic")
 
 # ---- two UMAPs (right): mean overlaps, concordance separates -------------
@@ -321,23 +318,22 @@ def umap_box(x, y, w, h, title, sep, caption):
     ax.text(x + w / 2, y + h - 2.6, title, fontsize=9.6, fontweight="bold",
             ha="center", va="top")
     cxc, cyc = x + w / 2, y + h / 2 - 1.5
+    off = w * 0.17
     rng2 = np.random.default_rng(4)
     if sep:
-        a = rng2.normal([cxc - 6.5, cyc], [2.2, 3.0], (22, 2))
-        b = rng2.normal([cxc + 6.5, cyc], [2.2, 3.0], (22, 2))
+        a = rng2.normal([cxc - off, cyc], [2.4, 3.2], (24, 2))
+        b = rng2.normal([cxc + off, cyc], [2.4, 3.2], (24, 2))
     else:
-        a = rng2.normal([cxc, cyc], [3.4, 3.2], (22, 2))
-        b = rng2.normal([cxc, cyc], [3.4, 3.2], (22, 2))
+        a = rng2.normal([cxc, cyc], [3.4, 3.2], (24, 2))
+        b = rng2.normal([cxc, cyc], [3.4, 3.2], (24, 2))
     ax.scatter(a[:, 0], a[:, 1], s=12, c=S1, edgecolors="none", zorder=4)
     ax.scatter(b[:, 0], b[:, 1], s=12, c=S2, edgecolors="none", zorder=4)
     ax.text(x + w / 2, y + 2.4, caption, fontsize=8.2, color=MUT,
             ha="center", va="center", style="italic")
 
 
-umap_box(84, 3, 37, 30, "UMAP: mean HCG / GCH", False,
-         "states overlap — not separable")
-umap_box(124, 3, 37, 30, "UMAP: signed concordance", True,
-         "states separate")
+umap_box(86, 3, 58, 30, "UMAP: signed concordance", True,
+         "the two states separate")
 
 # =====================================================================
 # flow arrows between tiers / panels
@@ -352,7 +348,7 @@ ax.add_patch(FancyArrowPatch(path=_wrap, arrowstyle="-|>", mutation_scale=15,
                              lw=1.8, color=ACC, zorder=6))
 flow(XS[0] + PW, TIER2 + PH / 2, XS[1], TIER2 + PH / 2)          # P4 -> P5
 flow(XS[1] + PW, TIER2 + PH / 2, XS[2], TIER2 + PH / 2)          # P5 -> P6
-flow(XS[2] + PW / 2, TIER2 - 0.3, 142, 34, rad=0.0, lw=1.8)     # P6 -> UMAPs
+flow(XS[2] + PW / 2, TIER2 - 0.3, 126, 34, rad=0.0, lw=1.8)     # P6 -> UMAP
 
 # =====================================================================
 # legend
