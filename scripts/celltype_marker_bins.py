@@ -216,30 +216,6 @@ def _remove_batch(M, ct_labels, batch_df):
     return df
 
 
-def _order_cells(M, ct_labels, sel_bins, block_order):
-    """Cells grouped into cell-type blocks (block_order), clustered WITHIN each.
-
-    Clustering within a block (rather than the cell-name sort) means the batch
-    strip reflects real structure -- after --remove-batch it looks random -- and
-    is not an artefact of names that happen to encode the batch.
-    """
-    try:
-        from scipy.cluster.hierarchy import leaves_list, linkage
-        have_scipy = True
-    except Exception:
-        have_scipy = False
-    out = []
-    for g in block_order:
-        cells_g = [c for c in M.index if ct_labels[c] == g]
-        if have_scipy and len(cells_g) > 2:
-            sub = M.loc[cells_g, sel_bins].to_numpy(np.float64)
-            sub = np.where(np.isfinite(sub), sub, 0.0)
-            leaves = leaves_list(linkage(sub, method="average",
-                                         metric="euclidean"))
-            cells_g = [cells_g[i] for i in leaves]
-        out.extend(cells_g)
-    return out
-
 
 def _row_linkage(Z):
     """Linkage for the bins, or None; returns (linkage, leaf_order)."""
@@ -263,45 +239,62 @@ def _strip_colors(labels_in_order, plt):
     return row, cols, uniq
 
 
-def _heatmap(M, cells_order, bins_order, ct_labels, batch_df, ct_colors,
+def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
              title, out, cmap, legend_order=None):
-    """Marker heatmap: bins x cells, with a cell-type strip and one strip PER
-    batch variable (exp/plate/lib), so it is visible that the blocks track cell
-    type and not any batch.  A row dendrogram (bins) is drawn on the left."""
+    """Marker heatmap: bins x cells.  Cells (columns) are hierarchically
+    clustered and the COLUMN dendrogram is drawn on top of the cell-type strip;
+    no cell names are shown.  A cell-type strip and one strip per batch variable
+    (exp/plate/lib) sit below it, so it is visible that the cell clustering
+    tracks cell type and not any batch."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.patches as mp
     from matplotlib.gridspec import GridSpec
 
-    Z = M.loc[cells_order, bins_order].to_numpy(np.float64).T   # bins x cells
+    # Cluster the CELLS (columns) on the selected-bin values and order columns by
+    # that clustering; the dendrogram drawn on top uses the same linkage.
+    Yc = M.loc[cells, bins_order].to_numpy(np.float64)
+    Yc = np.where(np.isfinite(Yc), Yc, 0.0)
+    col_lk, col_order = _row_linkage(Yc)          # cluster over cells
+    cells_o = [cells[i] for i in col_order]
+
+    Z = M.loc[cells_o, bins_order].to_numpy(np.float64).T   # bins x cells
     mu = np.nanmean(Z, axis=1, keepdims=True)
     sd = np.nanstd(Z, axis=1, keepdims=True)
     Z = np.where(sd > 0, (Z - mu) / np.where(sd > 0, sd, 1), 0.0)
     Z = np.clip(np.where(np.isfinite(Z), Z, 0.0), -2.5, 2.5)
-    # Rows (bins) hierarchically clustered on the CELL-TYPE-MEAN pattern, not the
-    # per-cell values -- so bins band by which cell types they mark, and within-
-    # cell-type (batch) variation cannot drive the row order.  The same linkage
-    # draws the row dendrogram on the left.
-    ct_arr = np.asarray(ct_labels.loc[cells_order])
+    # Rows (bins) ordered by clustering on the cell-type-MEAN pattern (no row
+    # dendrogram drawn), so bins band by which cell types they mark.
+    ct_arr = np.asarray(ct_labels.loc[cells_o])
     means = np.stack([Z[:, ct_arr == g].mean(1) for g in
                       dict.fromkeys(ct_arr)], axis=1)
-    lk, order = _row_linkage(means)
-    Z = Z[order]
+    Z = Z[_row_linkage(means)[1]]
 
     strips = [("cell type", ct_labels)] + [(c, batch_df[c]) for c in
                                            batch_df.columns]
     n_strip = len(strips)
-    uniq_ct = (legend_order or list(dict.fromkeys(ct_labels.loc[cells_order])))
-    fig = plt.figure(figsize=(12.5 + 0.13 * len(uniq_ct), 8.5 + 0.3 * n_strip))
-    # left column = row dendrogram, middle = heatmap/strips, right = colour bar.
-    gs = GridSpec(n_strip + 1, 3, height_ratios=[0.5] * n_strip + [12],
-                  width_ratios=[2.5, 24, 1], hspace=0.06, wspace=0.03)
+    uniq_ct = (legend_order or list(dict.fromkeys(ct_labels.loc[cells_o])))
+    fig = plt.figure(figsize=(12.5 + 0.13 * len(uniq_ct), 9.0 + 0.3 * n_strip))
+    # top row = column dendrogram, then the strips, then the heatmap.
+    gs = GridSpec(n_strip + 2, 2,
+                  height_ratios=[1.6] + [0.5] * n_strip + [12],
+                  width_ratios=[24, 1], hspace=0.06, wspace=0.03)
+
+    # Column dendrogram (cells), aligned to the heatmap columns.
+    if col_lk is not None:
+        from scipy.cluster.hierarchy import dendrogram
+        ax_d = fig.add_subplot(gs[0, 0])
+        dendrogram(col_lk, ax=ax_d, no_labels=True, color_threshold=0,
+                   above_threshold_color="0.4")
+        ax_d.set_xticks([]); ax_d.set_yticks([])
+        for s in ax_d.spines.values():
+            s.set_visible(False)
 
     legends = []          # (title, {level: colour}, levels)
     for r, (sname, labels) in enumerate(strips):
-        ax_s = fig.add_subplot(gs[r, 1])
-        ordered = labels.loc[cells_order]
+        ax_s = fig.add_subplot(gs[r + 1, 0])
+        ordered = labels.loc[cells_o]
         if sname == "cell type":
             uniq = list(dict.fromkeys(ordered))
             cols = {g: ct_colors.get(g, plt.get_cmap("tab20")(i % 20))
@@ -314,24 +307,13 @@ def _heatmap(M, cells_order, bins_order, ct_labels, batch_df, ct_colors,
         ax_s.set_ylabel(sname, rotation=0, ha="right", va="center", fontsize=8)
         legends.append((sname, cols, uniq))
 
-    # Row dendrogram (bins), aligned to the heatmap rows.
-    if lk is not None:
-        from scipy.cluster.hierarchy import dendrogram
-        ax_d = fig.add_subplot(gs[n_strip, 0])
-        dendrogram(lk, ax=ax_d, orientation="left", no_labels=True,
-                   color_threshold=0, above_threshold_color="0.4")
-        ax_d.invert_yaxis()          # match imshow's top-to-bottom row order
-        ax_d.set_xticks([]); ax_d.set_yticks([])
-        for s in ax_d.spines.values():
-            s.set_visible(False)
-
-    ax = fig.add_subplot(gs[n_strip, 1])
+    ax = fig.add_subplot(gs[n_strip + 1, 0])
     im = ax.imshow(Z, aspect="auto", cmap=cmap, vmin=-2.5, vmax=2.5,
                    interpolation="nearest")
-    ax.set_xlabel(f"cells (n={len(cells_order)}, ordered by cell type)")
+    ax.set_xlabel(f"cells (n={len(cells_o)}, clustered)")
     ax.set_ylabel(f"selected bins (n={len(bins_order)}, clustered)")
     ax.set_xticks([]); ax.set_yticks([])
-    fig.colorbar(im, cax=fig.add_subplot(gs[n_strip, 2]),
+    fig.colorbar(im, cax=fig.add_subplot(gs[n_strip + 1, 1]),
                  label="concordance (z per bin)")
 
     # Legends to the RIGHT of the colour bar, stacked top-to-bottom.  The cell
@@ -504,21 +486,19 @@ def main():
         sel_bins = M.columns[sel]
         rest_bins = M.columns[np.setdiff1d(np.arange(M.shape[1]), sel)]
 
-        # Column order: cell-type BLOCKS in --group-order, cells CLUSTERED
-        # within each block (so the within-type order reflects similarity, not
-        # the cell-name sort that made the batch strip look artificially blocked).
+        # Cells (columns) are clustered inside _heatmap; --group-order only sets
+        # the legend order now.
         want = ([g.strip() for g in args.group_order.split(",") if g.strip()]
                 if args.group_order else [])
         block_order = [g for g in want if g in set(ct_u)] + \
                       [g for g in ct_u if g not in want]
-        order = _order_cells(M, ct, sel_bins, block_order)
         cmap = (cmap_override.get(name.lower())
                 or _CMAPS.get(name.lower(),
                               _CMAP_FALLBACK[mi % len(_CMAP_FALLBACK)]))
         fig_hm = out_dir / f"marker_heatmap_{name}.{args.plot_format}"
         clean_note = ("batch-invariant" if n_clean >= sel.size
                       else f"{n_clean}/{sel.size} batch-invariant")
-        _heatmap(M, order, list(sel_bins), ct, batch_df, ct_colors,
+        _heatmap(M, list(M.index), list(sel_bins), ct, batch_df, ct_colors,
                  f"{name.upper()}: {len(sel_bins)} cell-type-variable "
                  f"({clean_note}) bins", fig_hm, cmap, legend_order=block_order)
 
