@@ -248,6 +248,8 @@ def marginal_analysis(
     per_cell_norm: str = "off",
     post_norm_recenter: bool = False,
     plot_format: str = "png",
+    batch_labels=None,
+    batch_correction: str = "none",
 ) -> dict[str, dict]:
     """Per-matrix UMAP + silhouette/kNN-purity.  Returns metrics per matrix."""
     skip_map = skip_top_svd or {}
@@ -280,6 +282,7 @@ def marginal_analysis(
             random_state=random_state,
             group_colors=group_colors, group_order=group_order,
             plot_format=plot_format,
+            batch_labels=batch_labels, batch_correction=batch_correction,
         )
         m = {"n_cells": int(norm.shape[0]), "n_bins": int(norm.shape[1]),
              "skip_top_svd": skip}
@@ -447,6 +450,8 @@ def residual_umap(
     per_cell_norm: str = "off",
     post_norm_recenter: bool = False,
     plot_format: str = "png",
+    batch_labels=None,
+    batch_correction: str = "none",
 ) -> dict:
     """UMAP + cluster metrics on the residual matrix."""
     out = ensure_dir(output_dir)
@@ -464,6 +469,7 @@ def residual_umap(
         random_state=random_state,
         group_colors=group_colors, group_order=group_order,
         plot_format=plot_format,
+        batch_labels=batch_labels, batch_correction=batch_correction,
     )
     m = {"n_bins": int(norm.shape[1]), "skip_top_svd": int(skip_top)}
     if group_labels is not None:
@@ -725,21 +731,18 @@ def run_comparison(
     # variance-partition regression (and hence the residual) and the classifier
     # all see harmonised inputs — mirroring nome_hic_concordance, which corrects
     # the mean-accessibility matrix before it is normalised/consumed.
+    # Batch correction is applied on the UMAP SCORES (see run_umap_and_plot),
+    # NOT on the raw matrix here.  The old placement -- correct the matrix, then
+    # per-cell rank / quantile normalise -- was undone by those normalisations,
+    # so a 'corrected' UMAP still split every cell type by batch.  Harmony now
+    # runs on the SVD scores that feed each UMAP, after all normalisation.  The
+    # regression below therefore sees RAW (un-harmonised) inputs, which also
+    # avoids the separate-PC-space leak of harmonising each matrix independently
+    # and then differencing them.
     if batch_labels is not None and batch_correction != "none":
-        from . import batch_correction as _bc
-
-        for name in list(matrices):
-            raw = matrices[name]
-            logger.info(f"[batch] correcting {name} ({batch_correction})")
-            corrected = _bc.apply_batch_correction(raw, batch_labels,
-                                                   method=batch_correction,
-                                                   random_state=random_state)
-            # harmony/combat NaN-impute internally and hand back a FULL matrix;
-            # restore the original NaN mask or --min-cell-coverage (and the
-            # _MIN_BINS guard) would silently pass every bin from here on.
-            matrices[name] = corrected.where(raw.notna())
         summary["batch_correction"] = {
-            "method": batch_correction, "matrices": sorted(matrices)}
+            "method": batch_correction, "applied_on": "umap_svd_scores",
+            "matrices": sorted(matrices)}
 
     # (a) Marginal.
     summary["marginal"] = marginal_analysis(
@@ -747,7 +750,8 @@ def run_comparison(
         min_cell_coverage, random_state,
         group_colors=group_colors, group_order=group_order,
         skip_top_svd=skip_top_svd, per_cell_norm=per_cell_norm,
-        post_norm_recenter=post_norm_recenter, plot_format=plot_format)
+        post_norm_recenter=post_norm_recenter, plot_format=plot_format,
+        batch_labels=batch_labels, batch_correction=batch_correction)
 
     # (b)+(c) Variance partition + residual UMAP for each concordance matrix.
     present_baselines = [b for b in baseline_names if b in matrices]
@@ -785,7 +789,8 @@ def run_comparison(
                 group_colors=group_colors, group_order=group_order,
                 skip_top=int((skip_top_svd or {}).get(f"residual_{cn}", 0)),
                 per_cell_norm=per_cell_norm, post_norm_recenter=post_norm_recenter,
-                plot_format=plot_format)
+                plot_format=plot_format,
+                batch_labels=batch_labels, batch_correction=batch_correction)
     else:
         logger.warning("No usable baseline matrices; skipping (b)/(c).")
 

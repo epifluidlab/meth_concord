@@ -273,6 +273,55 @@ def _try_import_pycombat():
 # ---------------------------------------------------------------------------
 
 
+def harmonize_embedding(
+    scores, batch_labels, random_state: int = 42,
+):
+    """Harmony on an existing low-dim embedding (the SVD/PCA scores).
+
+    This is the STANDARD harmony workflow (scanpy's ``harmony_integrate``):
+    correct the components that feed UMAP, AFTER all normalisation.
+
+    Why it must be here and not on the raw matrix: applying harmony to the raw
+    values and THEN normalising (per-cell rank / quantile) UNDOES the
+    correction -- those per-cell transforms discard harmony's cross-cell value
+    alignment and keep only the within-cell rank structure, which still carries
+    the batch.  Harmony also has to operate on the SAME representation that
+    feeds UMAP; correcting its own internal PCA and then running a separate SVD
+    corrects the wrong space.  Both were happening, which is why a
+    harmony-'corrected' UMAP still split every cell type by batch.
+
+    ``scores`` is (n_cells, n_components) and is returned corrected, same shape.
+    """
+    scores = np.ascontiguousarray(np.asarray(scores, dtype=np.float64))
+    n_cells, n_comp = scores.shape
+    batch_df = _coerce_batch_df(batch_labels, pd.RangeIndex(n_cells))
+    # Nothing to align if every cell shares one batch level in every variable.
+    if all(batch_df[c].nunique() < 2 for c in batch_df.columns):
+        return scores
+    try:
+        import harmonypy as hm
+    except ImportError:
+        raise ImportError(
+            "Harmony correction requires the 'harmonypy' package "
+            "(pip install harmonypy)."
+        )
+    meta = batch_df.reset_index(drop=True)
+    vars_use = list(batch_df.columns)
+    try:
+        out = hm.run_harmony(scores, meta, vars_use, random_state=random_state)
+    except TypeError:
+        logger.warning("harmonypy.run_harmony has no random_state (old "
+                       "version); harmony output may not be reproducible.")
+        out = hm.run_harmony(scores, meta, vars_use)
+    Z = np.asarray(out.Z_corr)
+    if Z.shape == (n_comp, n_cells):
+        Z = Z.T
+    elif Z.shape != (n_cells, n_comp):
+        raise ValueError(f"Unexpected harmonypy Z_corr shape {Z.shape}; "
+                         f"expected ({n_cells}, {n_comp}) or transpose.")
+    return np.ascontiguousarray(Z, dtype=np.float64)
+
+
 def _harmony_correction(
     matrix: pd.DataFrame, batch_df: pd.DataFrame,
     n_components: int = 50,

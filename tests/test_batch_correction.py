@@ -372,3 +372,90 @@ def test_combat_survives_an_all_nan_bin():
     out = bc.apply_batch_correction(M, batch, method="combat", random_state=0)
     assert out.shape == M.shape
     assert np.isfinite(out.to_numpy()).all()
+
+
+# --------------------------------------------------------------------------
+# harmonize_embedding: harmony on the SVD scores (the STANDARD placement).
+# The old code corrected the raw matrix and THEN per-cell/quantile normalised,
+# which undid it — a 'corrected' UMAP still split every cell type by batch.
+# --------------------------------------------------------------------------
+
+def _scores_with_batch(n=300, seed=0):
+    rng = np.random.default_rng(seed)
+    ct = rng.integers(0, 3, n)
+    batch = np.where(np.arange(n) % 2 == 0, "a", "b")
+    X = np.zeros((n, 8))
+    X[:, 0] = ct * 5 + rng.normal(0, .5, n)                 # PC1 = cell type
+    X[:, 1] = np.where(batch == "a", 4, -4) + rng.normal(0, .5, n)  # PC2 = batch
+    return X, ct, pd.DataFrame({"batch": batch})
+
+
+def _r2(x, lab):
+    tot = ((x - x.mean()) ** 2).sum()
+    within = sum(((x[lab == g] - x[lab == g].mean()) ** 2).sum()
+                 for g in np.unique(lab))
+    return 1 - within / tot
+
+
+def test_harmonize_embedding_reduces_batch_and_keeps_biology():
+    pytest.importorskip("harmonypy")
+    X, ct, bdf = _scores_with_batch()
+    corr = bc.harmonize_embedding(X, bdf, random_state=0)
+    assert corr.shape == X.shape
+    assert _r2(corr[:, 1], bdf["batch"].to_numpy()) < \
+        _r2(X[:, 1], bdf["batch"].to_numpy()) - 0.2, "batch axis must shrink"
+    assert _r2(corr[:, 0], ct) > 0.8, "cell-type axis must be preserved"
+
+
+def test_harmonize_embedding_is_a_noop_for_a_single_batch():
+    X = np.random.default_rng(1).normal(0, 1, (50, 6))
+    out = bc.harmonize_embedding(X, pd.DataFrame({"batch": ["a"] * 50}))
+    assert np.array_equal(out, X), "one batch level -> nothing to align"
+
+
+def test_harmonize_embedding_is_reproducible():
+    pytest.importorskip("harmonypy")
+    X, _ct, bdf = _scores_with_batch()
+    a = bc.harmonize_embedding(X, bdf, random_state=7)
+    b = bc.harmonize_embedding(X, bdf, random_state=7)
+    assert np.allclose(a, b), "same seed must give the same correction"
+
+
+def test_run_umap_applies_batch_correction_on_scores(tmp_path):
+    """End to end through run_umap_and_plot: the embedding must de-mix batch."""
+    pytest.importorskip("harmonypy")
+    pytest.importorskip("umap")
+    from nome_hic_concordance import visualization as viz
+    rng = np.random.default_rng(2)
+    n, nbins = 240, 300
+    ct = rng.integers(0, 3, n)
+    batch = np.where(np.arange(n) % 2 == 0, "a", "b")
+    # cell-type signal + a strong batch offset across many bins
+    M = (ct[:, None] * rng.normal(0, 1, (3, nbins))[ct]
+         + np.where(batch == "a", 1, -1)[:, None] * rng.normal(1, .2, nbins)
+         + rng.normal(0, .3, (n, nbins)))
+    df = pd.DataFrame(M, index=[f"c{i}" for i in range(n)],
+                      columns=[f"chr1:{i}" for i in range(nbins)])
+    blab = pd.Series(batch, index=df.index)
+
+    def batch_r2(coords):
+        P = coords[["UMAP1", "UMAP2"]].to_numpy()
+        tot = ((P - P.mean(0)) ** 2).sum()
+        w = sum(((P[batch == g] - P[batch == g].mean(0)) ** 2).sum()
+                for g in np.unique(batch))
+        return 1 - w / tot
+
+    raw = viz.run_umap_and_plot(df, output_prefix="raw",
+                                output_dir=str(tmp_path), n_svd=10,
+                                random_state=0, plot_format="png")
+    # center-on-scores is deterministic per-batch mean removal: for balanced
+    # composition it de-mixes batch while preserving PC variance structure.
+    corr = viz.run_umap_and_plot(df, output_prefix="corr",
+                                 output_dir=str(tmp_path), n_svd=10,
+                                 random_state=0, plot_format="png",
+                                 batch_labels=blab, batch_correction="center")
+    assert batch_r2(corr) < batch_r2(raw) and batch_r2(corr) < 0.05, (
+        f"batch correction on scores must reduce batch: "
+        f"{batch_r2(raw):.3f} -> {batch_r2(corr):.3f}")
+    # and it must not have destroyed the coordinates (still a real embedding)
+    assert np.isfinite(corr[["UMAP1", "UMAP2"]].to_numpy()).all()

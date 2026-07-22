@@ -165,6 +165,8 @@ def run_umap_and_plot(
     group_colors: dict | None = None,
     group_order: list | None = None,
     plot_format: str = "png",
+    batch_labels=None,
+    batch_correction: str = "none",
 ) -> pd.DataFrame:
     """Embed ``matrix`` via UMAP and save a coordinate table + scatter plot.
 
@@ -245,6 +247,37 @@ def run_umap_and_plot(
         X = emb[:, skip:]
         n_svd_used = X.shape[1]
         var_explained = float(svd.explained_variance_ratio_[skip:].sum())
+
+        # Batch-correct HERE -- on the SVD scores that feed UMAP, after all
+        # normalisation and after the top-component skip.  This is the standard
+        # harmony workflow; correcting the raw matrix before per-cell rank /
+        # quantile normalisation (as the callers used to) is undone by those
+        # transforms, so the UMAP still splits by batch.
+        if batch_labels is not None and batch_correction not in (None, "none"):
+            from . import batch_correction as _bc
+            logger.info(
+                f"Batch correction ({batch_correction}) on {X.shape[1]} SVD "
+                f"scores ({matrix.shape[0]} cells) before UMAP.")
+            if batch_correction == "harmony":
+                # Align to the matrix's cell order and make it POSITIONAL:
+                # harmonize_embedding coerces against a RangeIndex, so a
+                # cell-indexed frame would reindex to all-NaN (one batch, no-op).
+                bl = batch_labels
+                if isinstance(bl, (pd.Series, pd.DataFrame)):
+                    bl = bl.reindex(matrix.index).reset_index(drop=True)
+                X = _bc.harmonize_embedding(X, bl, random_state=random_state)
+            else:
+                # center / zscore / combat: per-batch mean (or z) removal per
+                # component.  For BALANCED composition this removes the batch
+                # shift without moving cell-type centroids, and unlike harmony
+                # it cannot fail when batch dominates a component.
+                bl = (batch_labels.reindex(matrix.index)
+                      if isinstance(batch_labels, (pd.Series, pd.DataFrame))
+                      else batch_labels)
+                score_df = pd.DataFrame(X, index=matrix.index)
+                X = _bc.apply_batch_correction(
+                    score_df, bl, method=batch_correction,
+                    random_state=random_state).to_numpy()
         if skip > 0:
             logger.info(
                 f"SVD: fitted {k_total} components, dropped top {skip} "
@@ -258,6 +291,13 @@ def run_umap_and_plot(
                 f"{k_total} components "
                 f"(cumulative variance explained: {var_explained:.1%})"
             )
+
+    if (batch_labels is not None and batch_correction not in (None, "none")
+            and n_svd_used == 0):
+        logger.warning(
+            "Batch correction on the UMAP scores needs an SVD reduction; pass "
+            "--n-svd (or --skip-top-svd). No SVD ran, so batch correction was "
+            "SKIPPED and the embedding is uncorrected.")
 
     logger.info(
         f"Running UMAP on {matrix.shape[0]} cells x {X.shape[1]} "
