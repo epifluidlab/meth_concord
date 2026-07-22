@@ -338,6 +338,32 @@ def _design_matrix(Xcols: np.ndarray, level_control: str) -> np.ndarray:
     return np.column_stack(parts)
 
 
+def _batch_design(batch_labels, cells: pd.Index):
+    """One-hot batch design (n_cells, k), first level dropped, mean-centred.
+
+    Added to the residual regression as a NUISANCE covariate so the residual is
+    'concordance not explained by 1D + 3D + BATCH', which is what the figure
+    actually claims.  Without it the residual regresses concordance on the RAW,
+    batch-contaminated baselines and their batch leaks straight back into the
+    residual -- the reason a residual UMAP can be MORE batch-split than the
+    concordance it came from.
+    """
+    if batch_labels is None:
+        return None
+    df = (batch_labels.to_frame() if isinstance(batch_labels, pd.Series)
+          else pd.DataFrame(batch_labels))
+    df = df.reindex(cells).astype(str)
+    parts = []
+    for c in df.columns:
+        d = pd.get_dummies(df[c], prefix=str(c), drop_first=True, dummy_na=False)
+        if d.shape[1]:
+            parts.append(d)
+    if not parts:
+        return None
+    B = pd.concat(parts, axis=1).to_numpy(dtype=np.float64)
+    return B - B.mean(axis=0, keepdims=True)      # centre: leave intercept free
+
+
 def variance_partition(
     target: pd.DataFrame,
     predictors: dict[str, pd.DataFrame],
@@ -345,6 +371,7 @@ def variance_partition(
     output_dir: str,
     level_control: str = "linear",
     plot_format: str = "png",
+    batch_labels=None,
 ) -> pd.DataFrame:
     """Per-bin OLS of ``target`` on ``predictors`` (aligned to target grid).
 
@@ -371,6 +398,7 @@ def variance_partition(
     n_cells, n_bins = Y.shape
     pred_arrays = {pn: a.to_numpy(dtype=np.float64) for pn, a in aligned.items()}
 
+    B = _batch_design(batch_labels, cells)          # nuisance covariate or None
     r2 = np.full(n_bins, np.nan)
     coefs = {pn: np.full(n_bins, np.nan) for pn in predictors}
     residual = Y.copy()
@@ -388,15 +416,24 @@ def variance_partition(
         if good.sum() < Xg.shape[1] + 1:
             continue
         yg = y[good]
+        # R² and the reported coefficients come from the BASELINE-ONLY fit, so
+        # "1D/3D explain X%" keeps its meaning.
         beta, *_ = np.linalg.lstsq(Xg, yg, rcond=None)
         yhat = Xg @ beta
-        ss_res = float(np.sum((yg - yhat) ** 2))
         ss_tot = float(np.sum((yg - yg.mean()) ** 2))
-        r2[j] = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+        r2[j] = 1.0 - float(np.sum((yg - yhat) ** 2)) / ss_tot if ss_tot > 0 else np.nan
         for pi, pn in enumerate(predictors):
             coefs[pn][j] = beta[1 + pi]
-        # Residual for the good cells; leave others as the original (centered).
-        residual[good, j] = yg - yhat
+        # The RESIDUAL additionally regresses out batch, so it is what 1D + 3D
+        # AND batch leave behind.  Batch enters only here, never in the R²/coef
+        # accounting above.
+        Xr, yhat_r = Xg, yhat
+        if B is not None:
+            Xf = np.column_stack([Xg, B[good]])
+            if good.sum() >= Xf.shape[1] + 1:
+                bf, *_ = np.linalg.lstsq(Xf, yg, rcond=None)
+                yhat_r = Xf @ bf
+        residual[good, j] = yg - yhat_r
 
     reg_df = pd.DataFrame({"bin": bins, "R2": r2,
                            **{f"beta_{pn}": coefs[pn] for pn in predictors}})
@@ -782,7 +819,10 @@ def run_comparison(
                 continue
             resid = variance_partition(tnorm, base_norm, cn, output_dir,
                                        level_control=level_control,
-                                       plot_format=plot_format)
+                                       plot_format=plot_format,
+                                       batch_labels=(batch_labels
+                                                     if batch_correction != "none"
+                                                     else None))
             summary["residual"][cn] = residual_umap(
                 resid, labels, cn, output_dir, matrix_norm, n_svd,
                 min_cell_coverage, random_state,

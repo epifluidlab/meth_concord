@@ -261,3 +261,56 @@ def test_pairwise_finds_headroom_where_aggregate_ceilings():
 import tempfile
 def _tmp():
     return tempfile.mkdtemp()
+
+
+def test_variance_partition_regresses_out_batch():
+    """The residual must be 'not explained by baselines AND batch'.
+
+    Without batch as a covariate, the residual regresses concordance on the
+    RAW batch-contaminated baseline and the baseline's batch leaks back in --
+    which is why a residual UMAP could be MORE batch-split than its input.
+    """
+    import numpy as np, pandas as pd, tempfile
+    from nome_hic_concordance import comparison as C
+    rng = np.random.default_rng(1)
+    n, nb = 200, 40
+    cells = [f"c{i}" for i in range(n)]
+    batch = np.where(np.arange(n) % 2 == 0, "a", "b")
+    ct = rng.integers(0, 3, n)
+    sig = ct[:, None] * rng.normal(0, 1, (3, nb))[ct]
+    conc = sig + np.where(batch == "a", 1.5, -1.5)[:, None] + rng.normal(0, .3, (n, nb))
+    base = 0.8 * sig + np.where(batch == "a", 1.0, -1.0)[:, None] + rng.normal(0, .3, (n, nb))
+    cols = [f"chr1:{i}" for i in range(nb)]
+    tdf = pd.DataFrame(conc, index=cells, columns=cols)
+    bdf = pd.DataFrame(base, index=cells, columns=cols)
+    blab = pd.Series(batch, index=cells)
+
+    def batch_r2(resid):
+        X = resid.to_numpy()
+        tot = ((X - X.mean(0)) ** 2).sum()
+        w = sum(((X[batch == g] - X[batch == g].mean(0)) ** 2).sum()
+                for g in ("a", "b"))
+        return 1 - w / tot
+
+    with tempfile.TemporaryDirectory() as d:
+        no = C.variance_partition(tdf, {"base": bdf}, "t", d, plot_format="png")
+        bt = C.variance_partition(tdf, {"base": bdf}, "t", d, plot_format="png",
+                                  batch_labels=blab)
+    assert batch_r2(bt) < batch_r2(no) - 0.05, (batch_r2(no), batch_r2(bt))
+    assert batch_r2(bt) < 0.05
+
+
+def test_batch_design_shapes_and_centering():
+    import numpy as np, pandas as pd
+    from nome_hic_concordance import comparison as C
+    cells = pd.Index([f"c{i}" for i in range(6)])
+    # two batch variables, 2 and 3 levels -> (2-1)+(3-1) = 3 dummy columns
+    bl = pd.DataFrame({"exp": ["a", "a", "b", "b", "a", "b"],
+                       "plate": ["p1", "p2", "p3", "p1", "p2", "p3"]}, index=cells)
+    B = C._batch_design(bl, cells)
+    assert B.shape == (6, 3)
+    assert np.allclose(B.mean(axis=0), 0.0), "columns must be mean-centred"
+    assert C._batch_design(None, cells) is None
+    # a single-level batch contributes no columns -> None
+    one = pd.Series(["a"] * 6, index=cells)
+    assert C._batch_design(one, cells) is None
