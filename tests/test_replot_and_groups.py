@@ -221,12 +221,8 @@ def test_groups_without_a_colour_still_get_one():
     assert len({str(got[k]) for k in ("A", "B", "C")}) == 3
 
 
-def test_group_overlay_shares_the_y_axis_across_measures(tmp_path):
-    """The point of the figure: cross-measure variation must be comparable."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    m = _mod()
+def _overlay_fixture(m, gh_small=True):
+    """per_group with GCH-GCH large, HCG-HCG mid, HCG-GCH near-zero + a null."""
     edges = m._build_edges(1, 1_000_000, 4)
     centers = np.sqrt(edges[:-1] * edges[1:])
     nb = len(centers)
@@ -234,13 +230,69 @@ def test_group_overlay_shares_the_y_axis_across_measures(tmp_path):
     for i, g in enumerate(("A", "B", "all")):
         curves = {}
         for k, _ in m._MEASURES:
+            base = {"gg": 0.4 + 0.1 * i, "hh": 0.3, "gh": 0.02 + 0.01 * i}[k]
             for c, _l in m._CONDS:
-                base = 0.4 + 0.1 * i if k == "gg" else 0.2
-                curves[(k, c)] = (np.full(nb, base if c == "linked" else 0.02),
-                                  np.full(nb, 1e6))
+                lv = base if c == "linked" else base * 0.2
+                curves[(k, c)] = (np.full(nb, lv), np.full(nb, 1e6))
         per_group[g] = (curves, centers, edges)
+    return per_group, centers, edges
+
+
+def _grab_fig(monkeypatch, plt):
+    """Capture the Figure _plot_groups would close, so its axes stay inspectable."""
+    cap = {}
+    monkeypatch.setattr(plt, "close",
+                        lambda a=None: cap.__setitem__("fig", a)
+                        if hasattr(a, "get_axes") else None)
+    return cap
+
+
+def test_group_overlay_yscale_shared_gg_hh_but_gh_independent(tmp_path, monkeypatch):
+    """GCH-GCH & HCG-HCG must share a y-scale (so their variation is
+    comparable), but the near-zero HCG-GCH panel gets its OWN autoscaled axis so
+    its small cell-type spread is visible rather than flattened."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    m = _mod()
+    per_group, _c, _e = _overlay_fixture(m)
+    cap = _grab_fig(monkeypatch, plt)
     out = tmp_path / "g.png"
     m._plot_groups(per_group, out, "phi", 100, 10.0,
                    {"A": "#111111", "B": "#222222"}, ["A", "B", "all"])
     assert out.exists()
+    axes = cap["fig"].get_axes()          # row-major: gg, hh, gh, then delta row
+    gg, hh, gh = axes[0].get_ylim(), axes[1].get_ylim(), axes[2].get_ylim()
+    assert gg == hh, "GCH-GCH and HCG-HCG must share a y-scale"
+    assert gh != gg, "HCG-GCH must be on its own (autoscaled) y-scale"
+    # its own scale is actually tighter around zero than the shared one
+    assert (gh[1] - gh[0]) < (gg[1] - gg[0])
+    monkeypatch.undo()
+    plt.close("all")
+
+
+def test_group_overlay_draws_pooled_null_dashed_in_linked_row(tmp_path, monkeypatch):
+    """The across-all-cells null is overlaid as a dashed line in the linked row."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    m = _mod()
+    per_group, _c, _e = _overlay_fixture(m)
+    cap = _grab_fig(monkeypatch, plt)
+    m._plot_groups(per_group, tmp_path / "g.png", "phi", 100, 10.0,
+                   {"A": "#111111", "B": "#222222"}, ["A", "B", "all"])
+    linked_gg = cap["fig"].get_axes()[0]
+    dashed = [ln for ln in linked_gg.get_lines()
+              if ln.get_label() == "null (all cells)"]
+    assert len(dashed) == 1, "linked row must carry the pooled-null line"
+    assert dashed[0].get_linestyle() in ("--", (0, (6.4, 1.6)))
+    # no pooled 'all' present -> no null line, and still renders
+    per_group.pop("all")
+    cap.clear()
+    m._plot_groups(per_group, tmp_path / "g2.png", "phi", 100, 10.0,
+                   {"A": "#111111", "B": "#222222"}, ["A", "B"])
+    assert (tmp_path / "g2.png").exists()
+    assert not [ln for ln in cap["fig"].get_axes()[0].get_lines()
+                if ln.get_label() == "null (all cells)"]
+    monkeypatch.undo()
     plt.close("all")

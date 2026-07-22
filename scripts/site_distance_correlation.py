@@ -962,18 +962,28 @@ def _order_groups(labels, group_order):
 
 
 def _plot_groups(per_group, out, metric, min_pairs, plot_min, colors, order):
-    """One figure: every cell group overlaid, per measure, on a shared y-scale.
+    """One figure: every cell group overlaid, per measure.
 
-    Sharing the y-axis across the three measures is the point -- it is what
-    makes "GCH-GCH varies more across cell types than HCG-HCG" readable rather
-    than an artefact of three independently autoscaled panels.
+    GCH-GCH and HCG-HCG are kept on a SHARED y-scale within each row -- that is
+    what makes "GCH-GCH varies more across cell types than HCG-HCG" a real
+    comparison rather than an artefact of independently autoscaled panels.  The
+    cross-context HCG-GCH panel, however, hugs zero an order of magnitude
+    smaller, so on that shared scale its variation is invisible; it is therefore
+    given its OWN autoscaled y-axis (its tick labels are shown to flag the
+    different scale).
+
+    The pooled across-all-cells null is overlaid in the linked (upper) row as a
+    dashed grey line -- as in site_distance_corr_all -- so each group's linked
+    curve can be read against the non-linked baseline.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.0), sharey="row",
-                             sharex=True)
+    # No sharey: GCH-GCH & HCG-HCG get one explicit shared limit per row (set
+    # below), while HCG-GCH (col 2) is autoscaled to its own near-zero range.
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.0), sharex=True)
+    has_all = "all" in per_group
     lo_x = None
     for row, (cond, rlab) in enumerate((("linked", "concordance (linked)"),
                                         ("delta", "Δ = linked − null"))):
@@ -995,12 +1005,49 @@ def _plot_groups(per_group, out, metric, min_pairs, plot_min, colors, order):
                         alpha=1.0 if is_all else 0.85,
                         zorder=5 if is_all else 2,
                         label=label)
+            # pooled across-all-cells null, dashed, in the linked row only
+            # (the null swaps the partner end, so it is a cross-end/long-range
+            # baseline and is NaN at short range -- drawn where defined).
+            if cond == "linked" and has_all:
+                acurves, acenters, aedges = per_group["all"]
+                avis = np.asarray(acenters) >= (lo_x if lo_x else float(plot_min))
+                yn = np.where(avis, acurves[(key, "null")][0], np.nan)
+                ax.plot(acenters, yn, ls="--", lw=1.6, color="0.25", alpha=0.9,
+                        zorder=4, label="null (all cells)")
             _logx(ax, lo_x if lo_x else float(plot_min), float(edges[-1]))
             if row == 0:                      # shared x — label the bottom only
                 ax.set_xlabel("")
             if col == 0:
                 ax.set_ylabel(f"{rlab}\n{_METRICS[metric]}", fontsize=9)
-            ax.set_title(title.split("  ")[0] if row == 0 else "", fontsize=10)
+            t = title.split("  ")[0]
+            if row == 0 and col == 2:
+                t += "  (own y-scale)"
+            ax.set_title(t if row == 0 else "", fontsize=10)
+
+    # y-limits: GCH-GCH & HCG-HCG share an explicit range per row; HCG-GCH is
+    # autoscaled to its own data so its near-zero variation is legible.
+    def _yrange(cols, r):
+        ys = [v[np.isfinite(v)] for c in cols
+              for v in (np.asarray(ln.get_ydata(), float)
+                        for ln in axes[r, c].get_lines())]
+        ys = [v for v in ys if v.size]
+        if not ys:
+            return None
+        v = np.concatenate(ys)
+        lo, hi = float(v.min()), float(v.max())
+        pad = 0.05 * ((hi - lo) or 1.0)
+        return lo - pad, hi + pad
+
+    for r in range(2):
+        shared = _yrange((0, 1), r)
+        if shared:
+            axes[r, 0].set_ylim(*shared)
+            axes[r, 1].set_ylim(*shared)
+        axes[r, 1].tick_params(labelleft=False)    # shares the col-0 scale
+        own = _yrange((2,), r)
+        if own:
+            axes[r, 2].set_ylim(*own)
+        axes[r, 2].tick_params(labelleft=True)      # its own, different scale
 
     handles, labels_ = axes[0, 0].get_legend_handles_labels()
     ncol = min(8, max(3, len(labels_)))
@@ -1009,12 +1056,13 @@ def _plot_groups(per_group, out, metric, min_pairs, plot_min, colors, order):
     pad = 0.055 + 0.022 * int(np.ceil(len(labels_) / ncol))
     n_real = len([g for g in order if g != "all"])
     fig.suptitle(f"Concordance across cell groups — {n_real} groups"
-                 f"{' + pooled' if 'all' in order else ''} "
-                 f"(shared y-scale within each row)", fontsize=12)
+                 f"{' + pooled' if 'all' in order else ''}  "
+                 f"(GCH-GCH & HCG-HCG share a y-scale; HCG-GCH autoscaled)",
+                 fontsize=12)
     fig.tight_layout(rect=(0, pad, 1, 0.955))
     fig.text(0.5, pad - 0.028,
-             f"{_QC}  |  'all' (thick grey) is the pooled reference; "
-             f"x starts at {lo_x:,.0f}bp",
+             f"{_QC}  |  'all' (thick grey) is the pooled reference, dashed grey "
+             f"its across-all-cells non-linked null;  x starts at {lo_x:,.0f}bp",
              ha="center", fontsize=7, color="0.45")
     fig.savefig(out)
     plt.close(fig)
