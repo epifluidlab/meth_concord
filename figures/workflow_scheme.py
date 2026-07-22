@@ -149,7 +149,7 @@ stage(70.5, "measure")
 
 # ---- site_distance_correlation (left, site-level) -----------------------
 sx, sy, sw, sh = 14, 53, 40, 33
-tool(sx, sy, sw, sh, C_SITE, "site_distance_\ncorrelation", tag="Fig 5B")
+tool(sx, sy, sw, sh, C_SITE, "site_distance_\ncorrelation")
 ax.text(sx + sw / 2, sy + sh - 9.4,
         "individual-cytosine phi (0/1)\nvs. genomic distance",
         fontsize=8.2, color=INK, ha="center", va="top", linespacing=1.28)
@@ -240,7 +240,7 @@ stage(22.5, "interpret")
 
 # ---- celltype_marker_bins (F5C) -----------------------------------------
 kx, ky, kw, kh = 46, 8, 55, 29
-tool(kx, ky, kw, kh, C_MARK, "celltype_marker_bins", tag="Fig 5C")
+tool(kx, ky, kw, kh, C_MARK, "celltype_marker_bins")
 ax.text(kx + 3.4, ky + kh - 9.0,
         "bins with high between-cell-type\n"
         "variance, low within-type batch\n"
@@ -277,7 +277,7 @@ ax.text(kx + 3.4, ky + 3.0,
 
 # ---- nome_hic_compare (F5D) ---------------------------------------------
 qx, qy, qw, qh = 108, 8, 44, 29
-tool(qx, qy, qw, qh, C_CMP, "nome_hic_compare", tag="Fig 5D")
+tool(qx, qy, qw, qh, C_CMP, "nome_hic_compare")
 ax.text(qx + qw / 2, qy + qh - 9.0,
         "regress Δ on 1D mean accessibility\n+ 3D scHi-C compartments",
         fontsize=8.0, color=INK, ha="center", va="top", linespacing=1.3)
