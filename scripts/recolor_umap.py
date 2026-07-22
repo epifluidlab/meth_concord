@@ -149,6 +149,43 @@ def assoc_categorical(coords, labels):
     return float(1.0 - within / tot) if tot > 0 else None
 
 
+def within_report(coords, values, strata, label, categorical):
+    """Association of a factor with position computed WITHIN each stratum.
+
+    A global R² averages over the whole embedding, so a batch effect confined
+    to one cell type (typical: harmony merges discrete glial clusters but
+    under-corrects the excitatory-neuron CONTINUUM) is hidden by the
+    well-mixed rest.  Stratifying by cell type exposes it, and -- crucially --
+    the per-stratum SAMPLE COMPOSITION separates the two explanations:
+
+      * balanced composition + high R²  -> uncorrected batch (fixable)
+      * one sample dominates the stratum -> confounded composition (a batch
+        effect cannot be corrected away; the cell type is simply from one run)
+    """
+    rows = []
+    for s in pd.Index(strata.dropna().unique()).sort_values():
+        m = (strata == s).to_numpy()
+        if m.sum() < 10:
+            continue
+        sub = coords.loc[m, ["UMAP1", "UMAP2"]].reset_index(drop=True)
+        v = values[m].reset_index(drop=True)
+        row = {"stratum": s, "n": int(m.sum())}
+        if categorical:
+            counts = v.value_counts()
+            row["assoc_R2"] = assoc_categorical(sub, v)
+            top = counts.idxmax() if len(counts) else None
+            row["dominant"] = top
+            row["dominant_frac"] = (round(float(counts.max() / counts.sum()), 3)
+                                    if len(counts) else np.nan)
+            row["n_levels"] = int(v.nunique())
+        else:
+            rr = assoc_continuous(sub, v.to_numpy(float))
+            row["rho_UMAP1"] = None if rr is None else round(rr[0], 3)
+            row["rho_UMAP2"] = None if rr is None else round(rr[1], 3)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _plot(coords, values, label, categorical, out, args, note):
     import matplotlib
     matplotlib.use("Agg")
@@ -227,6 +264,14 @@ def main():
     ap.add_argument("--max-levels", type=int, default=20,
                     help="A numeric column with more distinct values than this "
                          "is treated as continuous.")
+    ap.add_argument("--within", default=None, metavar="COL",
+                    help="Also report each factor's association WITHIN every "
+                         "level of this metadata column (e.g. cell_type). A "
+                         "global R² hides a batch effect confined to one cell "
+                         "type; this exposes it, and the per-stratum sample "
+                         "composition tells uncorrected batch (balanced + high "
+                         "R²) from confounded composition (one sample "
+                         "dominates). Written as a .within_<COL>.tsv per factor.")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--plot-format", choices=["png", "pdf", "svg"],
                     default="pdf")
@@ -262,6 +307,9 @@ def main():
         if col not in meta.columns:
             sys.exit(f"column {col!r} not in metadata "
                      f"(columns: {meta.columns.tolist()})")
+    if args.within and args.within not in meta.columns:
+        sys.exit(f"--within {args.within!r} not in metadata "
+                 f"(columns: {meta.columns.tolist()})")
 
     n_written = 0
     for coords_path in args.coords:
@@ -307,6 +355,26 @@ def main():
             kind = "categorical" if cat else "continuous"
             print(f"  {label:<22} {kind:<12} {note}")
             print(f"      -> {out}")
+
+            if args.within:
+                strata = meta[args.within].reindex(coords["cell"]).reset_index(
+                    drop=True)
+                wr = within_report(coords, values, strata, label, cat)
+                if not wr.empty:
+                    wpath = (out_dir / f"{stem}.by_{_safe_name(label)}"
+                             f".within_{_safe_name(args.within)}.tsv")
+                    wr.to_csv(wpath, sep="\t", index=False)
+                    print(f"      within {args.within}:")
+                    print("        " + wr.to_string(index=False).replace(
+                        "\n", "\n        "))
+                    if cat and "assoc_R2" in wr and "dominant_frac" in wr:
+                        # the specific verdict the user needs
+                        bad = wr[(wr["assoc_R2"].fillna(0) > 0.10)
+                                 & (wr["dominant_frac"] < 0.8)]
+                        if len(bad):
+                            print(f"        -> uncorrected batch in: "
+                                  f"{', '.join(map(str, bad['stratum']))} "
+                                  f"(balanced composition, high R²)")
 
     if n_written == 0:
         sys.exit("no panels written — check --coords paths and --cell-column.")

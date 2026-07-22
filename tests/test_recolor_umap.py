@@ -272,3 +272,94 @@ def test_log2_and_log1p_flags_map_to_their_transforms(tmp_path):
     assert r.returncode == 0, r.stderr
     assert (out / "umap_gch.by_log2_mapq30num.png").exists()
     assert (out / "umap_gch.by_log1p_cis1kbrate.png").exists()
+
+
+# ------------------------------------------------------- --within diagnostic --
+
+def test_within_report_separates_batch_from_confounded_composition():
+    """The load-bearing diagnostic: a global R² can't tell these apart.
+
+    Balanced composition + high R² = uncorrected batch (fixable).
+    One sample dominates the stratum = confounded composition (not a batch
+    artefact; the cell type is simply from one run).
+    """
+    m = _mod()
+    rng = np.random.default_rng(0)
+    rows, C = [], []
+    def add(ct, n, p, split, cx, cy):
+        for _ in range(n):
+            s = rng.choice(["batch2", "scNH"], p=p)
+            dx = (3 if s == "batch2" else -3) if split else 0
+            C.append((cx + dx + rng.normal(0, .5), cy + rng.normal(0, .5)))
+            rows.append((s, ct))
+    add("bal_split", 150, [.5, .5], True, 0, 0)     # balanced + split
+    add("one_sample", 120, [.95, .05], True, 5, 5)  # dominated by one sample
+    add("mixed", 100, [.5, .5], False, -8, 4)       # corrected
+    coords = pd.DataFrame(C, columns=["UMAP1", "UMAP2"])
+    values = pd.Series([r[0] for r in rows])
+    strata = pd.Series([r[1] for r in rows])
+
+    wr = m.within_report(coords, values, strata, "sample", categorical=True)
+    wr = wr.set_index("stratum")
+    assert wr.loc["bal_split", "assoc_R2"] > 0.5
+    assert wr.loc["bal_split", "dominant_frac"] < 0.7          # balanced
+    assert wr.loc["one_sample", "dominant_frac"] > 0.9         # confounded
+    assert wr.loc["mixed", "assoc_R2"] < 0.1                   # corrected
+
+
+def test_within_report_handles_a_continuous_factor():
+    m = _mod()
+    rng = np.random.default_rng(1)
+    coords = pd.DataFrame({"UMAP1": np.r_[np.linspace(-5, 5, 100),
+                                          rng.normal(0, 1, 100)],
+                           "UMAP2": rng.normal(0, 1, 200)})
+    values = pd.Series(np.r_[coords["UMAP1"][:100].to_numpy()
+                             + rng.normal(0, .1, 100),
+                             rng.normal(0, 1, 100)])
+    strata = pd.Series(["gradient"] * 100 + ["noise"] * 100)
+    wr = m.within_report(coords, values, strata, "depth",
+                         categorical=False).set_index("stratum")
+    assert abs(wr.loc["gradient", "rho_UMAP1"]) > 0.8
+    assert abs(wr.loc["noise", "rho_UMAP1"]) < 0.4
+
+
+def test_within_report_skips_tiny_strata():
+    m = _mod()
+    coords = pd.DataFrame({"UMAP1": range(20), "UMAP2": range(20)})
+    values = pd.Series(["a", "b"] * 10)
+    strata = pd.Series(["big"] * 15 + ["tiny"] * 5)          # tiny < 10
+    wr = m.within_report(coords, values, strata, "s", categorical=True)
+    assert list(wr["stratum"]) == ["big"]
+
+
+def test_within_end_to_end_flags_the_right_stratum(tmp_path):
+    rng = np.random.default_rng(2)
+    rows, C = [], []
+    def add(ct, n, p, split, cx):
+        for i in range(n):
+            s = rng.choice(["batch2", "scNH"], p=p)
+            dx = (3 if s == "batch2" else -3) if split else 0
+            C.append((f"{ct}_{i}", cx + dx + rng.normal(0, .5),
+                      rng.normal(0, .5), ct))
+            rows.append((f"{ct}_{i}", s, ct))
+    add("exc", 150, [.5, .5], True, 0)
+    add("glia", 120, [.5, .5], False, -8)
+    coords = tmp_path / "umap_gch_coordinates.tsv"
+    pd.DataFrame(C, columns=["cell", "UMAP1", "UMAP2", "group"]).to_csv(
+        coords, sep="\t", index=False)
+    meta = tmp_path / "meta.txt"
+    pd.DataFrame([(i, c, s, ct) for i, (c, s, ct) in enumerate(rows)],
+                 columns=["", "cell", "sample", "cell_type"]).to_csv(
+        meta, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coords", str(coords),
+         "--metadata", str(meta), "--color-by", "sample",
+         "--within", "cell_type", "--output-dir", str(out),
+         "--plot-format", "png"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    wtsv = out / "umap_gch.by_sample.within_cell_type.tsv"
+    assert wtsv.exists()
+    wr = pd.read_csv(wtsv, sep="\t").set_index("stratum")
+    assert wr.loc["exc", "assoc_R2"] > wr.loc["glia", "assoc_R2"]
+    assert "uncorrected batch in: exc" in r.stdout
