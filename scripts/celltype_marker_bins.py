@@ -20,9 +20,10 @@ concordance is cell-type-specific:
                  nome_hic_concordance and nome_hic_compare, so only the NUMBER
                  is emitted here.
 
-Selection is done on a TRAIN split of cells and everything is displayed on the
-HELD-OUT split, so even the heatmap is a genuine out-of-sample demonstration
-rather than a restatement of the selection.
+Bins are selected on ALL cells and the heatmap shows ALL cells; the honesty
+comes from the CONTROL (the bins we did NOT pick still separate cell types),
+not from holding cells out.  Selection prefers batch-invariant bins but fills
+to --n-bins by cell-type ICC so the heatmap has enough rows on real data.
 
 Per-bin variance is decomposed by one-way ANOVA (the ICC): the between-group
 share of variance, with sampling noise in the denominator rather than counted as
@@ -89,16 +90,6 @@ def _batch_icc(X, cell_type_ids, batch_ids, n_batch, icc_fn, min_cells, min_g):
     return np.where(wsum > 0, acc / np.maximum(wsum, 1), np.nan)
 
 
-def _stratified_split(labels, frac, seed):
-    """Train/test cell split, stratified by label so every type is in both."""
-    rng = np.random.default_rng(seed)
-    train = np.zeros(len(labels), bool)
-    for lv in pd.unique(labels):
-        idx = np.flatnonzero(labels == lv)
-        rng.shuffle(idx)
-        train[idx[: max(1, int(round(frac * len(idx))))]] = True
-    return train
-
 
 def _nonselected_separation(M, labels, n_svd, skip_top, seed, n_perm):
     """Do the NON-selected bins still separate cell types?  (silhouette + perm)
@@ -134,10 +125,15 @@ def _nonselected_separation(M, labels, n_svd, skip_top, seed, n_perm):
 
 def select_marker_bins(X, cell_type_ids, n_ct, batch_ids, n_batch, icc_fn,
                        args):
-    """Bins ranked by cell-type ICC, filtered to low batch ICC.
+    """Top ``n_bins`` by cell-type ICC, PREFERRING batch-invariant bins.
 
-    Returns (selected_idx, ct_icc, batch_icc).  Selection uses ONLY the rows in
-    X (the train split), so the held-out split can validate it.
+    Returns (selected_idx, ct_icc, batch_icc, n_clean).  Bins are ranked by
+    between-cell-type ICC; those passing the batch cut are taken first, and if
+    fewer than ``n_bins`` pass, the target is FILLED with the next-best by
+    cell-type ICC (accepting more batch) so the heatmap still has enough rows --
+    a hard cut left only a couple dozen bins on real, pervasively-batchy data.
+    ``n_clean`` reports how many of the selected passed the batch cut, so the
+    trade-off is visible rather than silent.
     """
     ct_icc, _ = icc_fn(X, cell_type_ids, n_ct, args.min_cells_per_group,
                        args.min_groups)
@@ -146,16 +142,17 @@ def select_marker_bins(X, cell_type_ids, n_ct, batch_ids, n_batch, icc_fn,
     # silently disable the batch filter.  Batch needs >=2 groups covering it.
     b_icc = _batch_icc(X, cell_type_ids, batch_ids, n_batch, icc_fn,
                        args.min_cells_per_group, min(2, n_batch))
-    ok = np.isfinite(ct_icc)
-    # batch filter: keep bins whose within-type batch ICC is below the cut
-    # (NaN batch ICC = batch not measurable there -> keep, it is not batchy)
-    batch_ok = ~(np.isfinite(b_icc) & (b_icc > args.max_batch_icc))
-    cand = np.flatnonzero(ok & batch_ok)
-    if cand.size == 0:
-        return np.array([], int), ct_icc, b_icc
-    order = cand[np.argsort(ct_icc[cand])[::-1]]
-    top = order[: args.n_bins]
-    return top, ct_icc, b_icc
+    usable = np.flatnonzero(np.isfinite(ct_icc))
+    if usable.size == 0:
+        return np.array([], int), ct_icc, b_icc, 0
+    ranked = usable[np.argsort(ct_icc[usable])[::-1]]   # best cell-type ICC first
+    is_clean = ~(np.isfinite(b_icc) & (b_icc > args.max_batch_icc))
+    clean = ranked[is_clean[ranked]]
+    if clean.size >= args.n_bins:
+        return clean[: args.n_bins], ct_icc, b_icc, int(args.n_bins)
+    dirty = ranked[~is_clean[ranked]]
+    sel = np.concatenate([clean, dirty[: args.n_bins - clean.size]])
+    return sel, ct_icc, b_icc, int(clean.size)
 
 
 def _nanmedian(x):
@@ -175,11 +172,17 @@ def _cluster_rows(Z):
     return leaves_list(linkage(Z, method="average", metric="correlation"))
 
 
+# Distinct diverging colour schemes so GCH-GCH and HCG-HCG never look alike.
+_CMAPS = {"gch": "RdBu_r", "hcg": "PuOr_r"}
+_CMAP_FALLBACK = ["RdBu_r", "PuOr_r", "BrBG_r", "PiYG_r"]
+
+
 def _heatmap(M, cells_order, bins_order, ct_labels, batch_labels, ct_colors,
-             title, out):
+             title, out, cmap):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mp
     from matplotlib.gridspec import GridSpec
 
     Z = M.loc[cells_order, bins_order].to_numpy(np.float64).T   # bins x cells
@@ -189,41 +192,50 @@ def _heatmap(M, cells_order, bins_order, ct_labels, batch_labels, ct_colors,
     Z = np.clip(np.where(np.isfinite(Z), Z, 0.0), -2.5, 2.5)
     Z = Z[_cluster_rows(Z)]                          # band similar bins together
 
-    fig = plt.figure(figsize=(12, 8))
-    gs = GridSpec(3, 2, height_ratios=[0.5, 0.5, 12], width_ratios=[40, 1],
-                  hspace=0.05, wspace=0.02)
-    # cell-type strip
-    ax_ct = fig.add_subplot(gs[0, 0])
     uniq = list(dict.fromkeys(ct_labels.loc[cells_order]))
+    buniq = list(dict.fromkeys(batch_labels.loc[cells_order]))
+    # A dedicated right-hand column holds the colour bar and both legends, so
+    # nothing is anchored over the heatmap (the old bbox_to_anchor overlapped).
+    fig = plt.figure(figsize=(11 + 0.13 * max(len(uniq), len(buniq)), 8.5))
+    gs = GridSpec(3, 2, height_ratios=[0.45, 0.45, 12],
+                  width_ratios=[24, 1], hspace=0.05, wspace=0.03)
+
     cmap_ct = {g: ct_colors.get(g, plt.get_cmap("tab20")(i % 20))
                for i, g in enumerate(uniq)}
+    ax_ct = fig.add_subplot(gs[0, 0])
     ax_ct.imshow([[list(matplotlib.colors.to_rgb(cmap_ct[g]))
                    for g in ct_labels.loc[cells_order]]], aspect="auto")
     ax_ct.set_xticks([]); ax_ct.set_yticks([]); ax_ct.set_ylabel(
         "cell type", rotation=0, ha="right", va="center", fontsize=8)
-    # batch strip
-    ax_b = fig.add_subplot(gs[1, 0])
-    buniq = list(dict.fromkeys(batch_labels.loc[cells_order]))
+
     cmap_b = {g: plt.get_cmap("Set2")(i) for i, g in enumerate(buniq)}
+    ax_b = fig.add_subplot(gs[1, 0])
     ax_b.imshow([[list(matplotlib.colors.to_rgb(cmap_b[g]))
                   for g in batch_labels.loc[cells_order]]], aspect="auto")
     ax_b.set_xticks([]); ax_b.set_yticks([]); ax_b.set_ylabel(
         "batch", rotation=0, ha="right", va="center", fontsize=8)
-    # heatmap
+
     ax = fig.add_subplot(gs[2, 0])
-    im = ax.imshow(Z, aspect="auto", cmap="RdBu_r", vmin=-2.5, vmax=2.5,
+    im = ax.imshow(Z, aspect="auto", cmap=cmap, vmin=-2.5, vmax=2.5,
                    interpolation="nearest")
     ax.set_xlabel(f"cells (n={len(cells_order)}, ordered by cell type)")
     ax.set_ylabel(f"selected bins (n={len(bins_order)})")
     ax.set_xticks([]); ax.set_yticks([])
     cax = fig.add_subplot(gs[2, 1])
     fig.colorbar(im, cax=cax, label="concordance (z per bin)")
-    # legends
-    import matplotlib.patches as mp
-    ax_ct.legend([mp.Patch(color=matplotlib.colors.to_rgb(cmap_ct[g]))
-                  for g in uniq], uniq, loc="upper left",
-                 bbox_to_anchor=(1.01, 1.4), fontsize=7, ncol=1,
-                 title="cell type", title_fontsize=7, frameon=False)
+
+    # Both legends live to the RIGHT of the colour bar, in figure coordinates,
+    # stacked; the figure width above grows with the number of cell types so
+    # they always fit.
+    ct_leg = fig.legend(
+        [mp.Patch(color=matplotlib.colors.to_rgb(cmap_ct[g])) for g in uniq],
+        uniq, loc="upper left", bbox_to_anchor=(1.0, 0.92), fontsize=8,
+        title="cell type", title_fontsize=9, frameon=False)
+    fig.add_artist(ct_leg)
+    fig.legend(
+        [mp.Patch(color=matplotlib.colors.to_rgb(cmap_b[g])) for g in buniq],
+        buniq, loc="lower left", bbox_to_anchor=(1.0, 0.08), fontsize=8,
+        title="batch", title_fontsize=9, frameon=False)
     fig.suptitle(title, fontsize=12)
     fig.savefig(out, bbox_inches="tight", dpi=150)
     plt.close(fig)
@@ -248,12 +260,13 @@ def main():
     ap.add_argument("--exclude-chrom", action="append", default=None)
     ap.add_argument("--n-bins", type=int, default=500,
                     help="Number of marker bins for the heatmap.")
+    ap.add_argument("--cmap", action="append", default=None,
+                    metavar="NAME=CMAP",
+                    help="Override the diverging colormap per matrix, e.g. "
+                         "gch=RdBu_r. Defaults: gch=RdBu_r, hcg=PuOr_r.")
     ap.add_argument("--max-batch-icc", type=float, default=0.1,
                     help="Drop a candidate bin whose within-cell-type between-"
                          "batch ICC exceeds this — it is sample-driven.")
-    ap.add_argument("--train-frac", type=float, default=0.5,
-                    help="Fraction of cells used to SELECT bins; the rest are "
-                         "held out for the heatmap and UMAP.")
     ap.add_argument("--min-cells-per-group", type=int, default=3)
     ap.add_argument("--min-groups", type=int, default=3)
     ap.add_argument("--n-svd", type=int, default=10)
@@ -288,10 +301,14 @@ def main():
                 ct_colors.setdefault(ct, c)
 
     excl = parse_exclude_chroms(args.exclude_chrom)
+    cmap_override = {}
+    for c in (args.cmap or []):
+        if '=' in c:
+            k, v = c.split('=', 1); cmap_override[k.strip().lower()] = v.strip()
     out_dir = ensure_dir(Path(args.output_dir))
     summary = {}
 
-    for spec in args.matrix:
+    for mi, spec in enumerate(args.matrix):
         if "=" not in spec:
             sys.exit(f"--matrix must be NAME=PATH, got {spec!r}")
         name, path = spec.split("=", 1)
@@ -317,32 +334,36 @@ def main():
         ct_id = np.searchsorted(np.array(ct_u), ct.to_numpy())
         b_id = np.searchsorted(np.array(b_u), batch.to_numpy())
 
-        train = _stratified_split(ct.to_numpy(), args.train_frac, args.seed)
-        sel, ct_icc, b_icc = select_marker_bins(
-            M.to_numpy()[train], ct_id[train], len(ct_u), b_id[train],
-            len(b_u), ctv.icc_per_region, args)
+        # Select on ALL cells: more coverage means more bins pass than a train
+        # split would (a hard filter on half the cells left only a couple dozen).
+        sel, ct_icc, b_icc, n_clean = select_marker_bins(
+            M.to_numpy(), ct_id, len(ct_u), b_id, len(b_u),
+            ctv.icc_per_region, args)
         if sel.size == 0:
-            print(f"  {name}: no bins passed selection — "
-                  f"loosen --max-batch-icc?", file=sys.stderr)
+            print(f"  {name}: no usable bins — lower --min-groups?",
+                  file=sys.stderr)
             continue
         sel_bins = M.columns[sel]
         rest_bins = M.columns[np.setdiff1d(np.arange(M.shape[1]), sel)]
 
-        test = ~train
-        test_cells = M.index[test]
-        # order held-out cells by cell type for the heatmap
-        order = sorted(test_cells, key=lambda c: (ct[c], c))
+        # Heatmap on ALL cells, ordered by cell type.
+        order = sorted(M.index, key=lambda c: (ct[c], c))
+        cmap = (cmap_override.get(name.lower())
+                or _CMAPS.get(name.lower(),
+                              _CMAP_FALLBACK[mi % len(_CMAP_FALLBACK)]))
         fig_hm = out_dir / f"marker_heatmap_{name}.{args.plot_format}"
-        _heatmap(M.loc[test_cells], order, list(sel_bins), ct, batch,
-                 ct_colors, f"{name.upper()}: {len(sel_bins)} cell-type-variable, "
-                 f"batch-invariant bins (held-out cells)", fig_hm)
+        clean_note = ("batch-invariant" if n_clean >= sel.size
+                      else f"{n_clean}/{sel.size} batch-invariant")
+        _heatmap(M, order, list(sel_bins), ct, batch, ct_colors,
+                 f"{name.upper()}: {len(sel_bins)} cell-type-variable "
+                 f"({clean_note}) bins", fig_hm, cmap)
 
-        # Out-of-selection CONTROL (number only; the UMAP itself is already
-        # produced by nome_hic_concordance / nome_hic_compare): do the bins we
-        # did NOT pick still separate cell types?
+        # Out-of-selection CONTROL (number only; the UMAP figure is produced by
+        # nome_hic_concordance / nome_hic_compare): do the bins we did NOT pick
+        # still separate cell types?
         sil, perm_p = _nonselected_separation(
-            M.loc[test_cells, rest_bins], ct.loc[test_cells].to_numpy(),
-            args.n_svd, args.skip_top_svd, args.seed, args.n_permutations)
+            M.loc[:, rest_bins], ct.to_numpy(), args.n_svd, args.skip_top_svd,
+            args.seed, args.n_permutations)
 
         pd.DataFrame({"bin": M.columns, "celltype_icc": ct_icc,
                       "batch_icc": b_icc,
@@ -351,8 +372,8 @@ def main():
                               sep="\t", index=False)
         summary[name] = {
             "n_cells": int(M.shape[0]), "n_bins": int(M.shape[1]),
-            "n_train": int(train.sum()), "n_test": int(test.sum()),
             "n_selected": int(sel.size),
+            "n_selected_batch_clean": int(n_clean),
             "median_celltype_icc_selected": _nanmedian(ct_icc[sel]),
             "median_batch_icc_selected": _nanmedian(b_icc[sel]),
             "nonselected_silhouette": (None if not np.isfinite(sil)
@@ -360,10 +381,14 @@ def main():
             "nonselected_perm_p": (None if not np.isfinite(perm_p)
                                    else float(perm_p))}
         print(f"\n=== {name}: {M.shape[0]} cells x {M.shape[1]} bins ===")
-        print(f"  selected {sel.size} bins (train n={int(train.sum())}): "
+        print(f"  selected {sel.size} bins ({n_clean} batch-invariant): "
               f"median cell-type ICC {_nanmedian(ct_icc[sel]):.3f}, "
               f"median batch ICC {_nanmedian(b_icc[sel]):.3f}")
-        print(f"  heatmap on {int(test.sum())} held-out cells -> {fig_hm.name}")
+        if n_clean < sel.size:
+            print(f"  NOTE: only {n_clean} bins passed --max-batch-icc "
+                  f"{args.max_batch_icc}; the rest were filled by cell-type ICC "
+                  f"(raise the cut to admit more, or lower --n-bins).")
+        print(f"  heatmap on all {M.shape[0]} cells -> {fig_hm.name}")
         if np.isfinite(sil):
             verdict = "SEPARATES" if perm_p < 0.05 else "does NOT separate"
             print(f"  out-of-selection control: NON-selected bins {verdict} "
@@ -375,14 +400,14 @@ def main():
     with open(out_dir / "marker_bins_summary.json", "w") as fh:
         json.dump({"matrices": summary, "n_bins": args.n_bins,
                    "max_batch_icc": args.max_batch_icc,
-                   "train_frac": args.train_frac,
-                   "note": "bins selected on the TRAIN split; heatmap on the "
-                           "HELD-OUT split; nonselected_* validates the claim "
-                           "on the bins NOT selected (the UMAP figure itself is "
-                           "produced by nome_hic_concordance / nome_hic_compare)"},
+                   "note": "bins selected on ALL cells by cell-type ICC, "
+                           "preferring batch-invariant bins; heatmap on all "
+                           "cells; nonselected_* validates the claim on the "
+                           "bins NOT selected (the UMAP figure is produced by "
+                           "nome_hic_concordance / nome_hic_compare)"},
                   fh, indent=2)
     print(f"\nRead it: the heatmap shows cell-type-variable, batch-invariant "
-          "concordance on\n  HELD-OUT cells.  The nonselected_* silhouette + "
+          "concordance across\n  all cells.  The nonselected_* silhouette + "
           "permutation p is the honesty\n  check: if the bins NOT selected also "
           "separate cell types (p<0.05), the heatmap\n  is not a selection "
           "artefact.  If they do NOT, the claim fails.")

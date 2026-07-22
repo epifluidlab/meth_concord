@@ -67,7 +67,7 @@ def _data(seed=0, n_per=40, n_ct=4, n_marker=30, n_pervasive=40, n_batchy=30):
 def test_selection_prefers_markers_and_excludes_batch_bins():
     m = _mod()
     X, ct, batch, classes = _data()
-    sel, ct_icc, b_icc = m.select_marker_bins(
+    sel, ct_icc, b_icc, _nclean = m.select_marker_bins(
         X, ct, 4, batch, 2, _icc(), _Args())
     picked = classes[sel]
     # markers have the highest cell-type ICC, so the TOP of the ranking is them
@@ -94,14 +94,14 @@ def test_selection_respects_the_batch_cut():
     class Loose(_Args):
         max_batch_icc = 1.01                       # no batch filtering
         n_bins = 200
-    sel, *_ = m.select_marker_bins(X, ct, 4, batch, 2, _icc(), Loose())
+    sel, *_rest = m.select_marker_bins(X, ct, 4, batch, 2, _icc(), Loose())
     assert "batchy" in classes[sel], "with no cut, batch bins can be selected"
 
 
 def test_selection_ranks_by_celltype_icc():
     m = _mod()
     X, ct, batch, classes = _data()
-    sel, ct_icc, _ = m.select_marker_bins(X, ct, 4, batch, 2, _icc(), _Args())
+    sel, ct_icc, _, _ = m.select_marker_bins(X, ct, 4, batch, 2, _icc(), _Args())
     assert np.all(np.diff(ct_icc[sel]) <= 1e-9), "selected bins in ICC order"
     # everything selected must beat the median non-selected cell-type ICC
     rest = np.setdiff1d(np.arange(X.shape[1]), sel)
@@ -109,22 +109,6 @@ def test_selection_ranks_by_celltype_icc():
 
 
 # --------------------------------------------------------------------- split --
-
-def test_stratified_split_covers_every_type_in_both_halves():
-    m = _mod()
-    labels = np.repeat(["a", "b", "c"], [30, 10, 4])
-    train = m._stratified_split(labels, 0.5, seed=0)
-    for lv in ("a", "b", "c"):
-        mask = labels == lv
-        assert train[mask].any() and (~train[mask]).any(), f"{lv} missing a half"
-
-
-def test_stratified_split_is_reproducible():
-    m = _mod()
-    labels = np.repeat(["a", "b"], 20)
-    assert np.array_equal(m._stratified_split(labels, 0.5, 1),
-                          m._stratified_split(labels, 0.5, 1))
-
 
 # ----------------------------------------------------------------- r2 metric --
 
