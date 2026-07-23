@@ -364,6 +364,19 @@ def _batch_design(batch_labels, cells: pd.Index):
     return B - B.mean(axis=0, keepdims=True)      # centre: leave intercept free
 
 
+def _corr(a, b):
+    """Pearson r over finite pairs; NaN if <3 pairs or either side constant."""
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    m = np.isfinite(a) & np.isfinite(b)
+    if int(m.sum()) < 3:
+        return np.nan
+    a, b = a[m], b[m]
+    if a.std() < 1e-12 or b.std() < 1e-12:
+        return np.nan
+    return float(np.corrcoef(a, b)[0, 1])
+
+
 def variance_partition(
     target: pd.DataFrame,
     predictors: dict[str, pd.DataFrame],
@@ -402,6 +415,10 @@ def variance_partition(
     r2 = np.full(n_bins, np.nan)
     coefs = {pn: np.full(n_bins, np.nan) for pn in predictors}
     residual = Y.copy()
+    # Per-bin corr(concordance, baseline) BEFORE vs (residual, baseline) AFTER,
+    # for the decorrelation density plot that shows the baseline signal is gone.
+    corr_before = {pn: np.full(n_bins, np.nan) for pn in predictors}
+    corr_after = {pn: np.full(n_bins, np.nan) for pn in predictors}
 
     for j in range(n_bins):
         y = Y[:, j]
@@ -427,13 +444,21 @@ def variance_partition(
         # The RESIDUAL additionally regresses out batch, so it is what 1D + 3D
         # AND batch leave behind.  Batch enters only here, never in the R²/coef
         # accounting above.
-        Xr, yhat_r = Xg, yhat
+        yhat_r = yhat
         if B is not None:
             Xf = np.column_stack([Xg, B[good]])
             if good.sum() >= Xf.shape[1] + 1:
                 bf, *_ = np.linalg.lstsq(Xf, yg, rcond=None)
                 yhat_r = Xf @ bf
-        residual[good, j] = yg - yhat_r
+        res_j = yg - yhat_r
+        residual[good, j] = res_j
+        # corr with each baseline before (raw target) and after (residual).  The
+        # AFTER value is ~0 by OLS orthogonality -- a check that the baseline is
+        # regressed out; the BEFORE spread shows how much there was to remove.
+        for pn in predictors:
+            xj = pred_arrays[pn][good, j]
+            corr_before[pn][j] = _corr(yg, xj)
+            corr_after[pn][j] = _corr(res_j, xj)
 
     reg_df = pd.DataFrame({"bin": bins, "R2": r2,
                            **{f"beta_{pn}": coefs[pn] for pn in predictors}})
@@ -441,6 +466,21 @@ def variance_partition(
 
     residual_df = pd.DataFrame(residual, index=cells, columns=bins)
     residual_df.to_parquet(out / f"delta_residual_{target_name}.parquet")
+
+    # Decorrelation diagnostic: per-bin correlation with each baseline, before
+    # vs after the regression (written out + a before/after density plot).
+    dec = {"bin": bins}
+    for pn in predictors:
+        dec[f"corr_before_{pn}"] = corr_before[pn]
+        dec[f"corr_after_{pn}"] = corr_after[pn]
+    pd.DataFrame(dec).to_parquet(
+        out / f"baseline_decorrelation_{target_name}.parquet")
+    _decorr_density(corr_before, corr_after, target_name, out, plot_format)
+    for pn in predictors:
+        mb = float(np.nanmedian(np.abs(corr_before[pn])))
+        ma = float(np.nanmedian(np.abs(corr_after[pn])))
+        logger.info(f"[decorrelation] {target_name} vs {pn}: median |r| "
+                    f"{mb:.3f} → {ma:.3f} after regressing out the baselines.")
 
     _r2_hist(r2, target_name, out, plot_format)
     med = float(np.nanmedian(r2))
@@ -469,6 +509,56 @@ def _r2_hist(r2: np.ndarray, target_name: str, out: Path,
     ax.legend()
     plt.tight_layout()
     plt.savefig(out / f"regression_R2_hist_{target_name}.{plot_format}", dpi=150)
+    plt.close(fig)
+
+
+def _decorr_density(before, after, target_name, out, plot_format="png"):
+    """Before/after density of per-bin corr(concordance, baseline).
+
+    One panel per baseline: the BEFORE distribution (blue) is spread — that is
+    the baseline↔concordance correlation the regression targets — and the AFTER
+    distribution (red) collapses to a narrow spike at 0, i.e. the residual is
+    decorrelated from the baseline.  (For OLS the after-spike at 0 is exact by
+    construction, so this panel is a *correctness* check that the baseline was
+    removed; the claim that something MEANINGFUL survives is carried by the
+    residual UMAP still separating cell types.)
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    pns = list(before)
+    if not pns:
+        return
+    fig, axes = plt.subplots(1, len(pns), figsize=(5.4 * len(pns), 4.4),
+                             squeeze=False)
+    edges = np.linspace(-1, 1, 61)
+    grid = np.linspace(-1, 1, 400)
+    for ax, pn in zip(axes[0], pns):
+        for vals, col, lab in ((before[pn], "#4C72B0", "before"),
+                               (after[pn], "#C44E52", "after")):
+            v = vals[np.isfinite(vals)]
+            if v.size == 0:
+                continue
+            ax.hist(v, bins=edges, density=True, color=col, alpha=0.45,
+                    label=f"{lab}  (median |r|={np.median(np.abs(v)):.3f}, "
+                          f"sd={v.std():.3f})")
+            if v.std() > 0.02 and v.size > 5:      # smooth curve when spread
+                try:
+                    from scipy.stats import gaussian_kde
+                    ax.plot(grid, gaussian_kde(v)(grid), color=col, lw=1.8)
+                except Exception:
+                    pass
+        ax.axvline(0, color="0.35", lw=1.0, ls="--")
+        ax.set_xlim(-1, 1)
+        ax.set_xlabel(f"per-bin Pearson r:  {target_name}  vs  {pn}")
+        ax.set_ylabel("density (over bins)")
+        ax.set_title(pn)
+        ax.legend(fontsize=8)
+    fig.suptitle(f"{target_name}: per-bin correlation with baseline, before vs "
+                 f"after regressing it out", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(out / f"baseline_decorrelation_{target_name}.{plot_format}",
+                dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
