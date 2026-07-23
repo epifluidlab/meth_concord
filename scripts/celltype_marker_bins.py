@@ -229,18 +229,40 @@ def _row_linkage(Z):
     return lk, leaves_list(lk)
 
 
-def _strip_colors(labels_in_order, plt):
-    """(rgb row for imshow, {level: colour}) for one annotation strip."""
-    uniq = list(dict.fromkeys(labels_in_order))
-    cmap = plt.get_cmap("tab20" if len(uniq) > 8 else "Set2")
-    cols = {g: cmap(i % cmap.N) for i, g in enumerate(uniq)}
+def _qual_palette():
+    """A stable list of ~60 visually distinct RGB colours (tab20 x3).
+
+    Used to give each batch level a colour by its position in a FIXED, sorted
+    level order -- so the same label gets the same colour (and legend slot) in
+    every heatmap (gch, hcg, ...), instead of an order-of-appearance colour that
+    differs when the cell clustering differs between matrices.
+    """
     import matplotlib
-    row = [list(matplotlib.colors.to_rgb(cols[g])) for g in labels_in_order]
-    return row, cols, uniq
+    out = []
+    for name in ("tab20", "tab20b", "tab20c"):
+        out += [matplotlib.colors.to_rgb(c)
+                for c in matplotlib.colormaps[name].colors]
+    return out
+
+
+def _batch_color_maps(batch_df, bcols):
+    """Shared {column: {level: rgb}} and {column: [levels]} across ALL matrices.
+
+    Built once from the full samples sheet, with levels in a deterministic
+    sorted order, so batch colours and legend order are identical between the
+    GCH and HCG heatmaps.
+    """
+    pal = _qual_palette()
+    order = {c: sorted(batch_df[c].dropna().astype(str).unique().tolist())
+             for c in bcols}
+    colors = {c: {lev: pal[i % len(pal)] for i, lev in enumerate(order[c])}
+              for c in bcols}
+    return colors, order
 
 
 def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
-             title, out, cmap, legend_order=None):
+             batch_colors, batch_order, title, out, cmap, legend_order=None,
+             legend_max=40):
     """Marker heatmap: bins x cells.  Cells (columns) are hierarchically
     clustered and the COLUMN dendrogram is drawn on top of the cell-type strip;
     no cell names are shown.  A cell-type strip and one strip per batch variable
@@ -301,7 +323,16 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
                     for i, g in enumerate(uniq)}
             row = [list(matplotlib.colors.to_rgb(cols[g])) for g in ordered]
         else:
-            row, cols, uniq = _strip_colors(list(ordered), plt)
+            # Batch strips use the SHARED per-level colours and the SHARED
+            # sorted level order, so gch and hcg match exactly.
+            gray = (0.75, 0.75, 0.75)
+            shared = batch_colors.get(sname, {})
+            uniq = list(batch_order.get(sname, list(dict.fromkeys(ordered))))
+            for g in dict.fromkeys(ordered):        # any stray level -> append
+                if g not in uniq:
+                    uniq.append(g)
+            cols = {g: shared.get(g, gray) for g in uniq}
+            row = [list(shared.get(g, gray)) for g in ordered]
         ax_s.imshow([row], aspect="auto")
         ax_s.set_xticks([]); ax_s.set_yticks([])
         ax_s.set_ylabel(sname, rotation=0, ha="right", va="center", fontsize=8)
@@ -324,17 +355,25 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
         if sname == "cell type" and legend_order:
             uniq = [g for g in legend_order if g in cols] + \
                    [g for g in uniq if g not in legend_order]
-        if len(uniq) > 12:
-            fig.text(1.0, y, f"{sname}: {len(uniq)} levels", fontsize=8,
-                     transform=fig.transFigure, va="top")
+        n = len(uniq)
+        # Too many levels (e.g. lib_batch) to name legibly: colours are still on
+        # the strip and consistent between heatmaps, but a legend of dozens of
+        # near-duplicate swatches is unreadable, so just report the count.
+        if n > legend_max:
+            fig.text(1.0, y, f"{sname}: {n} levels (see strip; legend omitted)",
+                     fontsize=8, transform=fig.transFigure, va="top")
             y -= 0.05
             continue
+        # Wrap many-but-plottable levels into columns of <=12 so the legend
+        # stays compact instead of running off the bottom.
+        ncol = 1 if n <= 12 else int(np.ceil(n / 12))
         leg = fig.legend([mp.Patch(color=matplotlib.colors.to_rgb(cols[g]))
                           for g in uniq], uniq, loc="upper left",
                          bbox_to_anchor=(1.0, y), fontsize=7.5, title=sname,
-                         title_fontsize=8, frameon=False)
+                         title_fontsize=8, frameon=False, ncol=ncol,
+                         columnspacing=1.0, handletextpad=0.5)
         fig.add_artist(leg)
-        y -= 0.06 + 0.035 * len(uniq)
+        y -= 0.06 + 0.035 * int(np.ceil(n / ncol))
     fig.suptitle(title, fontsize=12)
     fig.savefig(out, bbox_inches="tight", dpi=150)
     plt.close(fig)
@@ -370,6 +409,11 @@ def main():
                          "batch ICC exceeds this — it is sample-driven.")
     ap.add_argument("--min-cells-per-group", type=int, default=3)
     ap.add_argument("--min-groups", type=int, default=3)
+    ap.add_argument("--max-legend-levels", type=int, default=40,
+                    help="A batch strip with more levels than this (e.g. "
+                         "lib_batch) is drawn but its legend is replaced by a "
+                         "count; at/below it, the legend wraps into columns of "
+                         "12.  Colours on the strip stay consistent regardless.")
     ap.add_argument("--matrix-norm", default="quantile",
                     choices=["quantile", "zscore", "none"],
                     help="Per-bin normalisation, matching the pipeline "
@@ -416,6 +460,9 @@ def main():
     ct_of = dict(zip(samples["cell_name"], samples[args.cell_type_column].astype(str)))
     bcols = [c.strip() for c in args.batch_column.split(",") if c.strip()]
     batch_df_full = samples.set_index("cell_name")[bcols].astype(str)
+    # One shared colour + legend order per batch level, across ALL matrices, so
+    # a given batch label is the same colour and legend slot in every heatmap.
+    batch_colors, batch_order = _batch_color_maps(batch_df_full, bcols)
     ct_colors = {}
     if args.color_column and args.color_column in samples.columns:
         for ct, c in zip(samples[args.cell_type_column].astype(str),
@@ -499,8 +546,10 @@ def main():
         clean_note = ("batch-invariant" if n_clean >= sel.size
                       else f"{n_clean}/{sel.size} batch-invariant")
         _heatmap(M, list(M.index), list(sel_bins), ct, batch_df, ct_colors,
+                 batch_colors, batch_order,
                  f"{name.upper()}: {len(sel_bins)} cell-type-variable "
-                 f"({clean_note}) bins", fig_hm, cmap, legend_order=block_order)
+                 f"({clean_note}) bins", fig_hm, cmap, legend_order=block_order,
+                 legend_max=args.max_legend_levels)
 
         # Out-of-selection CONTROL (number only; the UMAP figure is produced by
         # nome_hic_concordance / nome_hic_compare): do the bins we did NOT pick
