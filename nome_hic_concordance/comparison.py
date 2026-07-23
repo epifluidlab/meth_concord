@@ -415,10 +415,6 @@ def variance_partition(
     r2 = np.full(n_bins, np.nan)
     coefs = {pn: np.full(n_bins, np.nan) for pn in predictors}
     residual = Y.copy()
-    # Per-bin corr(concordance, baseline) BEFORE vs (residual, baseline) AFTER,
-    # for the decorrelation density plot that shows the baseline signal is gone.
-    corr_before = {pn: np.full(n_bins, np.nan) for pn in predictors}
-    corr_after = {pn: np.full(n_bins, np.nan) for pn in predictors}
 
     for j in range(n_bins):
         y = Y[:, j]
@@ -450,15 +446,7 @@ def variance_partition(
             if good.sum() >= Xf.shape[1] + 1:
                 bf, *_ = np.linalg.lstsq(Xf, yg, rcond=None)
                 yhat_r = Xf @ bf
-        res_j = yg - yhat_r
-        residual[good, j] = res_j
-        # corr with each baseline before (raw target) and after (residual).  The
-        # AFTER value is ~0 by OLS orthogonality -- a check that the baseline is
-        # regressed out; the BEFORE spread shows how much there was to remove.
-        for pn in predictors:
-            xj = pred_arrays[pn][good, j]
-            corr_before[pn][j] = _corr(yg, xj)
-            corr_after[pn][j] = _corr(res_j, xj)
+        residual[good, j] = yg - yhat_r
 
     reg_df = pd.DataFrame({"bin": bins, "R2": r2,
                            **{f"beta_{pn}": coefs[pn] for pn in predictors}})
@@ -466,21 +454,6 @@ def variance_partition(
 
     residual_df = pd.DataFrame(residual, index=cells, columns=bins)
     residual_df.to_parquet(out / f"delta_residual_{target_name}.parquet")
-
-    # Decorrelation diagnostic: per-bin correlation with each baseline, before
-    # vs after the regression (written out + a before/after density plot).
-    dec = {"bin": bins}
-    for pn in predictors:
-        dec[f"corr_before_{pn}"] = corr_before[pn]
-        dec[f"corr_after_{pn}"] = corr_after[pn]
-    pd.DataFrame(dec).to_parquet(
-        out / f"baseline_decorrelation_{target_name}.parquet")
-    _decorr_density(corr_before, corr_after, target_name, out, plot_format)
-    for pn in predictors:
-        mb = float(np.nanmedian(np.abs(corr_before[pn])))
-        ma = float(np.nanmedian(np.abs(corr_after[pn])))
-        logger.info(f"[decorrelation] {target_name} vs {pn}: median |r| "
-                    f"{mb:.3f} → {ma:.3f} after regressing out the baselines.")
 
     _r2_hist(r2, target_name, out, plot_format)
     med = float(np.nanmedian(r2))
@@ -513,15 +486,15 @@ def _r2_hist(r2: np.ndarray, target_name: str, out: Path,
 
 
 def _decorr_density(before, after, target_name, out, plot_format="png"):
-    """Before/after density of per-bin corr(concordance, baseline).
+    """Density of per-bin corr(embedded value, baseline): concordance vs residual.
 
-    One panel per baseline: the BEFORE distribution (blue) is spread — that is
-    the baseline↔concordance correlation the regression targets — and the AFTER
-    distribution (red) collapses to a narrow spike at 0, i.e. the residual is
-    decorrelated from the baseline.  (For OLS the after-spike at 0 is exact by
-    construction, so this panel is a *correctness* check that the baseline was
-    removed; the claim that something MEANINGFUL survives is carried by the
-    residual UMAP still separating cell types.)
+    One panel per baseline.  ``before`` (blue) is the correlation of the
+    concordance the concordance-UMAP embeds; ``after`` (red) is the correlation
+    of the residual the residual-UMAP embeds.  Both are correlations of the
+    ACTUAL matrices fed to the UMAPs (post-normalisation) against the baseline —
+    nothing is forced to zero.  A correct regression makes ``after`` collapse to
+    a narrow peak near 0 while ``before`` is spread; a fat/off-centre ``after``
+    would flag that the baseline is not actually removed from what gets embedded.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -534,8 +507,8 @@ def _decorr_density(before, after, target_name, out, plot_format="png"):
     edges = np.linspace(-1, 1, 61)
     grid = np.linspace(-1, 1, 400)
     for ax, pn in zip(axes[0], pns):
-        for vals, col, lab in ((before[pn], "#4C72B0", "before"),
-                               (after[pn], "#C44E52", "after")):
+        for vals, col, lab in ((before[pn], "#4C72B0", "concordance"),
+                               (after[pn], "#C44E52", "residual")):
             v = vals[np.isfinite(vals)]
             if v.size == 0:
                 continue
@@ -550,16 +523,56 @@ def _decorr_density(before, after, target_name, out, plot_format="png"):
                     pass
         ax.axvline(0, color="0.35", lw=1.0, ls="--")
         ax.set_xlim(-1, 1)
-        ax.set_xlabel(f"per-bin Pearson r:  {target_name}  vs  {pn}")
+        ax.set_xlabel(f"per-bin Pearson r  vs  {pn}")
         ax.set_ylabel("density (over bins)")
         ax.set_title(pn)
         ax.legend(fontsize=8)
-    fig.suptitle(f"{target_name}: per-bin correlation with baseline, before vs "
-                 f"after regressing it out", fontsize=11)
+    fig.suptitle(f"{target_name}: per-bin correlation with baseline — "
+                 f"concordance vs residual (as embedded in the UMAPs)",
+                 fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(out / f"baseline_decorrelation_{target_name}.{plot_format}",
                 dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def baseline_decorrelation(conc_norm, resid_norm, baselines, target_name,
+                           output_dir, plot_format="png"):
+    """QC that the 1D/3D baseline signal is gone from the residual-UMAP input.
+
+    For every bin, correlate — across cells — each baseline with (a) the
+    normalised concordance the concordance-UMAP embeds and (b) the normalised
+    residual the residual-UMAP embeds, on the residual's grid.  Writes
+    baseline_decorrelation_<target>.parquet and a concordance-vs-residual density
+    plot per baseline.  Both are correlations of the real embedded matrices, so
+    'residual' is a MEASURED near-zero (the per-cell re-normalisation the UMAP
+    applies is nonlinear and leaves a little), not an OLS-forced exact zero.
+    """
+    out = ensure_dir(output_dir)
+    cells = resid_norm.index
+    bins = list(resid_norm.columns)
+    conc = conc_norm.reindex(index=cells, columns=bins).to_numpy(np.float64)
+    res = resid_norm.to_numpy(np.float64)
+    before, after = {}, {}
+    for name, bdf in baselines.items():
+        base = align_to_grid(bdf.reindex(index=cells), bins).to_numpy(np.float64)
+        before[name] = np.array([_corr(conc[:, j], base[:, j])
+                                 for j in range(len(bins))])
+        after[name] = np.array([_corr(res[:, j], base[:, j])
+                                for j in range(len(bins))])
+    dec = {"bin": bins}
+    for name in baselines:
+        dec[f"corr_concordance_{name}"] = before[name]
+        dec[f"corr_residual_{name}"] = after[name]
+    pd.DataFrame(dec).to_parquet(
+        out / f"baseline_decorrelation_{target_name}.parquet")
+    _decorr_density(before, after, target_name, out, plot_format)
+    for name in baselines:
+        mb = float(np.nanmedian(np.abs(before[name])))
+        ma = float(np.nanmedian(np.abs(after[name])))
+        logger.info(f"[decorrelation] {target_name} vs {name}: per-bin median "
+                    f"|r| {mb:.3f} (concordance) → {ma:.3f} (residual UMAP input).")
+    return dec
 
 
 def residual_umap(
@@ -921,6 +934,15 @@ def run_comparison(
                 per_cell_norm=per_cell_norm, post_norm_recenter=post_norm_recenter,
                 plot_format=plot_format,
                 batch_labels=batch_labels, batch_correction=batch_correction)
+            # QC: does the baseline correlation survive into what the UMAPs
+            # embed?  Correlate the SAME normalised matrices the concordance and
+            # residual UMAPs use (residual re-normalised exactly as residual_umap
+            # does it) against each baseline, per bin.
+            resid_norm = _prep_matrix(
+                resid, f"residual_{cn}", output_dir, matrix_norm,
+                min_cell_coverage, per_cell_norm, post_norm_recenter)
+            baseline_decorrelation(tnorm, resid_norm, base_norm, cn,
+                                   output_dir, plot_format)
     else:
         logger.warning("No usable baseline matrices; skipping (b)/(c).")
 
