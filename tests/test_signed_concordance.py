@@ -437,6 +437,50 @@ def test_baseline_unlinked_alias_equals_short_range(tmp_path):
     np.testing.assert_allclose(a.to_numpy(), b.to_numpy())
 
 
+def _both_open_paths(tmp_path, n_cells=8):
+    """Fixture where BOTH the linked and the short-range pools are co-open, so
+    the baseline (E) carries the same signal as the observed (O)."""
+    paths = {}
+    for c in range(n_cells):
+        recs = []
+        for i in range(20):        # linked long-range: both ends open
+            recs.append({"chrom": "chr1", "pos1": 100 + i * 2,
+                         "pos2": 500 + i * 2, "n1": 5, "n2": 5,
+                         "posterior1": 0.95, "posterior2": 0.95,
+                         "distance": 400})
+        for i in range(20):        # short-range baseline: ALSO both ends open
+            recs.append({"chrom": "chr1", "pos1": 700 + i * 2,
+                         "pos2": 720 + i * 2, "n1": 5, "n2": 5,
+                         "posterior1": 0.95, "posterior2": 0.95,
+                         "distance": 20})
+        p = tmp_path / f"c{c}.parquet"
+        _make_posteriors(recs).to_parquet(p)
+        paths[f"c{c}"] = str(p)
+    return paths
+
+
+def test_combine_linked_only_skips_the_baseline(tmp_path):
+    """'linked-only' uses O_open-O_closed with NO baseline subtracted.
+
+    With the short-range pool ALSO co-open, 'signed-diff' cancels to ~0 (the
+    baseline removes the marginal), while 'linked-only' keeps the raw co-open
+    signal — the diagnostic that shows how much the baseline is doing.
+    """
+    paths = _both_open_paths(tmp_path)
+    common = dict(bin_size=1000, min_distance=100, min_gch_sites=2,
+                  min_pairs_per_bin=1, use_rwr=False, eb_min_obs=2,
+                  n_threads=1, save_outputs=False)
+    sd = concordance.compute_signed_concordance_matrix(
+        paths, concordance_combine="signed-diff",
+        output_dir=str(tmp_path / "sd"), **common)["delta_signed"]["chr1:0"]
+    lo = concordance.compute_signed_concordance_matrix(
+        paths, concordance_combine="linked-only",
+        output_dir=str(tmp_path / "lo"), **common)["delta_signed"]["chr1:0"]
+    assert sd.abs().mean() < 0.15, "baseline should cancel the co-open marginal"
+    assert lo.mean() > 0.7, "linked-only keeps the raw co-open signal"
+    assert (lo > sd + 0.5).all(), "linked-only must exceed the baselined Δ"
+
+
 def test_baseline_and_combine_invalid_raise(tmp_path):
     paths = _focal_active_paths(tmp_path, n_cells=3)
     with pytest.raises(ValueError, match="baseline"):

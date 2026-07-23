@@ -178,12 +178,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "cost of distance control.",
     )
     parser.add_argument(
-        "--concordance-combine", choices=["auto", "signed-diff", "log2-ratio"],
+        "--concordance-combine",
+        choices=["auto", "signed-diff", "log2-ratio", "linked-only"],
         default="auto",
-        help="How O and E are combined.  'signed-diff' = "
+        help="How the long-range observed (O) and baseline (E) co-state rates "
+             "are combined.  'signed-diff' = "
              "(O_open−O_closed)−(E_open−E_closed) (legacy).  'log2-ratio' = "
              "log2(O_open/E_open)−log2(O_closed/E_closed) (symmetric, "
-             "scale-free, Hi-C O/E convention).  'auto' (default): "
+             "scale-free, Hi-C O/E convention).  'linked-only' = "
+             "(O_open−O_closed) with NO baseline subtracted (--baseline is "
+             "ignored) — a diagnostic to check whether the concordance UMAP is "
+             "driven by the short-range baseline; note this is the raw "
+             "marginal-laden score and typically correlates MORE with 1D "
+             "accessibility, not less.  'auto' (default): "
              "'log2-ratio' for the distance-matched / distance-pooled O/E "
              "baselines, 'signed-diff' otherwise (preserves the validated "
              "default).",

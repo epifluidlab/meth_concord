@@ -1210,10 +1210,10 @@ def compute_signed_concordance_matrix(
     # and share the downstream O/E handling; they differ only in how each
     # bin's expected RATE is formed (see _compute_cell_dm_expected mode).
     uses_expected = baseline in ("distance-matched", "distance-pooled")
-    if concordance_combine not in ("signed-diff", "log2-ratio"):
+    if concordance_combine not in ("signed-diff", "log2-ratio", "linked-only"):
         raise ValueError(
-            f"concordance_combine must be 'signed-diff' or 'log2-ratio'; "
-            f"got {concordance_combine!r}.")
+            f"concordance_combine must be 'signed-diff', 'log2-ratio', or "
+            f"'linked-only'; got {concordance_combine!r}.")
 
     out_path = ensure_dir(output_dir) if save_outputs else None
     items = list(cell_posterior_paths.items())
@@ -1509,7 +1509,14 @@ def compute_signed_concordance_matrix(
                 imputed["k_u_mixed"], imputed["n_unlinked"], alpha_u)
 
         # Combine observed (O) and expected (E).
-        if concordance_combine == "log2-ratio":
+        if concordance_combine == "linked-only":
+            # Long-range (linked) contacts ONLY — the baseline E is NOT
+            # subtracted.  A diagnostic to see whether the concordance UMAP is
+            # driven by the short-range baseline: this is the raw marginal-laden
+            # (O_open − O_closed), which is expected to correlate MORE strongly
+            # with the 1D accessibility baseline, not less.
+            delta_signed = o_open - o_closed
+        elif concordance_combine == "log2-ratio":
             # log2(O/E) per co-state, then the open-vs-closed contrast.  DM
             # keeps rates strictly in (0,1); for MLE we floor with a tiny eps.
             eps = 1e-6
