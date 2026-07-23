@@ -88,10 +88,15 @@ def _parse_named(spec: str) -> tuple[str, str]:
     return "concordance", spec.strip()
 
 
+class _DefaultsRawFormatter(argparse.ArgumentDefaultsHelpFormatter,
+                            argparse.RawDescriptionHelpFormatter):
+    """Keep the raw multi-line description AND mark every option's default."""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="nome_hic_compare", description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_DefaultsRawFormatter,
     )
     p.add_argument("--accessibility-matrix", default=None,
                    help="cells × bins mean-accessibility parquet (baseline).")
@@ -148,25 +153,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "'IT-L2/3,IT-L4,ODC'.  Groups not listed are appended in "
                         "data order; names not in the data are ignored.")
     p.add_argument("--matrix-norm", choices=["zscore", "quantile"],
-                   default="quantile")
+                   default="quantile",
+                   help="Per-bin normalization applied to every matrix before "
+                        "the UMAP.  'quantile' = rank-based QN (matches the "
+                        "nome_hic_concordance signed default); 'zscore' = "
+                        "classical.")
     p.add_argument("--per-cell-norm", choices=["off", "rank", "center"],
-                   default="off",
+                   default="rank",
                    help="Per-cell normalization applied to EVERY matrix before "
-                        "the per-bin norm.  Default 'off' (historical compare "
-                        "behaviour); use 'rank' to mirror the "
+                        "the per-bin norm.  'rank' mirrors the "
                         "nome_hic_concordance step-7 stack so the UMAPs are "
-                        "directly comparable.")
-    p.add_argument("--post-norm-recenter", choices=["off", "on"], default="off",
+                        "directly comparable; 'off' is the historical compare "
+                        "behaviour.")
+    p.add_argument("--post-norm-recenter", choices=["off", "on"], default="on",
                    help="Subtract each cell's row-mean after normalization "
                         "(fixes the non-commutativity of per-cell rank + per-bin "
-                        "QN).  Default 'off'; set 'on' with --per-cell-norm rank "
-                        "to match nome_hic_concordance's signed step-7 default.")
+                        "QN).  Use 'on' with --per-cell-norm rank to match "
+                        "nome_hic_concordance's signed step-7 stack.")
     p.add_argument("--plot-format", choices=["png", "pdf", "svg"], default="png",
                    help="Figure format for the UMAP and SVD-scree plots. "
-                        "'pdf'/'svg' write vector figures.  Default 'png'.")
-    p.add_argument("--n-svd", type=int, default=10)
-    p.add_argument("--min-cell-coverage", type=float, default=0.5)
-    p.add_argument("--n-folds", type=int, default=5)
+                        "'pdf'/'svg' write vector figures.")
+    p.add_argument("--n-svd", type=int, default=10,
+                   help="SVD components for the UMAP pre-reduction.")
+    p.add_argument("--min-cell-coverage", type=float, default=0.5,
+                   help="Fraction of cells non-NA required to retain a bin.")
+    p.add_argument("--n-folds", type=int, default=5,
+                   help="Cross-validation folds for the cell-type classifier.")
     p.add_argument("--level-control", choices=["linear", "quadratic"],
                    default="linear",
                    help="Variance-partition regression of concordance on the "
@@ -174,8 +186,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "the residual is cleansed of NONLINEAR level dependence "
                         "— the conservative control for 'does concordance carry "
                         "structure beyond marginal levels?'.")
-    p.add_argument("--random-seed", type=int, default=42)
-    p.add_argument("--log-level", default="INFO")
+    p.add_argument("--random-seed", type=int, default=42,
+                   help="Random seed (SVD / UMAP / CV).")
+    p.add_argument("--log-level", default="INFO",
+                   help="Logging verbosity (DEBUG, INFO, WARNING, ...).")
     return p.parse_args(argv)
 
 

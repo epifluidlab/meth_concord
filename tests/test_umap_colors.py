@@ -344,8 +344,9 @@ def test_compare_cli_norm_and_plot_flags():
     assert a.per_cell_norm == "rank" and a.post_norm_recenter == "on"
     assert a.plot_format == "pdf"
     d = cmp_args(["--output-dir", "o"])
+    # Defaults mirror the nome_hic_concordance signed step-7 stack.
     assert (d.per_cell_norm, d.post_norm_recenter, d.plot_format) == (
-        "off", "off", "png")
+        "rank", "on", "png")
     with pytest.raises(SystemExit):
         cmp_args(["--output-dir", "o", "--plot-format", "jpeg"])
 

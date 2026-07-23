@@ -42,6 +42,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="nome_hic_concordance",
         description="NOMe-HiC Long-Range Chromatin Accessibility Concordance Pipeline",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Required
@@ -57,8 +58,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Output directory (will be created).")
 
     # Filtering
-    parser.add_argument("--min-distance", type=int, default=20_000,
-                        help="Min genomic distance for qualifying pairs (default: 20000).")
+    parser.add_argument("--min-distance", type=int, default=1_000,
+                        help="Min genomic distance for qualifying pairs.")
     parser.add_argument("--max-distance", type=int, default=0,
                         help="Max genomic distance for the long-range (linked) "
                              "pool (signed method).  Default 0 = no upper bound. "
@@ -69,19 +70,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-gch-sites", type=int, default=2,
                         help="Min informative GCH sites per read end "
                              "(only applied when processing context GCH; "
-                             "default: 2, design-doc §6 #14 — empirically "
-                             "the sweet spot for NOMe-HiC: 1.48× more pairs "
-                             "than the previous default of 3 with no measurable "
-                             "loss of per-pair sharpness).")
-    parser.add_argument("--min-hcg-sites", type=int, default=None,
+                             "design-doc §6 #14 — empirically the sweet spot "
+                             "for NOMe-HiC: 1.48× more pairs than a value of 3 "
+                             "with no measurable loss of per-pair sharpness).")
+    parser.add_argument("--min-hcg-sites", type=int, default=2,
                         help="Min informative HCG sites per read end "
                              "(only applied when processing context HCG). "
-                             "Defaults to --min-gch-sites if not set; "
-                             "consider lowering (e.g. 2) since HCG sites "
-                             "are typically sparser than GCH.")
+                             "HCG (CpG) sites are typically sparser than GCH, "
+                             "so 2 is a good floor.")
     add_exclude_chrom_arg(parser)
-    parser.add_argument("--bin-size", type=int, default=5_000_000,
-                        help="Genomic bin size in bp (default: 5000000).")
+    parser.add_argument("--bin-size", type=int, default=250_000,
+                        help="Genomic bin size in bp.")
     parser.add_argument("--min-pairs-per-bin", type=int, default=None,
                         help="Min pairs per bin to compute Δ. "
                              "Default depends on --concordance-method: "
@@ -89,7 +88,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "shrinkage works with n=1), 5 for 'pearson' "
                              "(correlation needs ≥5 pairs).")
     parser.add_argument("--min-cell-coverage", type=float, default=0.8,
-                        help="Fraction of cells non-NA to retain a bin (default: 0.8).")
+                        help="Fraction of cells non-NA to retain a bin.")
     parser.add_argument(
         "--min-cell-pairs", type=int, default=0,
         help="Signed method only: pre-imputation cell QC.  Drop cells whose "
@@ -120,7 +119,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--concordance-method", choices=["pearson", "betabinom", "signed"],
         default="signed",
-        help="Per-bin concordance feature. 'signed' (default, new): "
+        help="Per-bin concordance feature. 'signed' (new): "
              "Dirichlet-Multinomial signed Δ = (E[π_l_open]−E[π_l_closed]) − "
              "(E[π_u_open]−E[π_u_closed]) per (cell, bin) using U-3 soft "
              "counts and a short-range pair baseline. Captures direction "
@@ -132,16 +131,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--concordance-statistic", choices=["signed", "open", "both"],
         default=None,
         help="Alias / refinement of --concordance-method for the new "
-             "DM-based pipeline. 'signed' = directional Δ (default when "
+             "DM-based pipeline. 'signed' = directional Δ (when "
              "--concordance-method=signed). 'open' = legacy one-sided Δ. "
              "'both' = compute and save both matrices in one run.",
     )
     parser.add_argument(
-        "--matrix-norm", choices=["auto", "zscore", "quantile"], default="auto",
+        "--matrix-norm", choices=["auto", "zscore", "quantile"], default="quantile",
         help="Per-bin normalization across cells in Step 7.  'zscore' "
              "for the classical pipeline; 'quantile' for rank-based QN, matching "
              "the bulk-style preprocessing that's robust to outliers in sparse "
-             "single-cell data.  'auto' (default): 'quantile' for "
+             "single-cell data.  'auto' resolves to 'quantile' for "
              "--concordance-method signed, 'zscore' otherwise.",
     )
     parser.add_argument(
@@ -162,7 +161,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--baseline",
         choices=["short-range", "unlinked", "distance-matched",
                  "distance-pooled"],
-        default="short-range",
+        default="distance-pooled",
         help="Baseline E that the long-range observed concordance O is "
              "compared against (signed method).  'short-range' = the "
              "short-distance (<min-distance) same-bin pool (legacy; these are "
@@ -180,7 +179,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--concordance-combine",
         choices=["auto", "signed-diff", "log2-ratio", "linked-only"],
-        default="auto",
+        default="log2-ratio",
         help="How the long-range observed (O) and baseline (E) co-state rates "
              "are combined.  'signed-diff' = "
              "(O_open−O_closed)−(E_open−E_closed) (legacy).  'log2-ratio' = "
@@ -190,23 +189,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "ignored) — a diagnostic to check whether the concordance UMAP is "
              "driven by the short-range baseline; note this is the raw "
              "marginal-laden score and typically correlates MORE with 1D "
-             "accessibility, not less.  'auto' (default): "
+             "accessibility, not less.  'auto' resolves to "
              "'log2-ratio' for the distance-matched / distance-pooled O/E "
-             "baselines, 'signed-diff' otherwise (preserves the validated "
-             "default).",
+             "baselines, 'signed-diff' otherwise (the legacy behaviour).",
     )
     parser.add_argument(
         "--dm-window-mb", type=float, default=0.0,
         help="For --baseline distance-matched / distance-pooled: pool the "
              "null end-pool over ±this many Mb of neighbouring bins "
-             "(default 0 = the bin's own ends only).  Set e.g. 1.0 for a "
+             "(0 = the bin's own ends only).  Set e.g. 1.0 for a "
              "smoother expected at long distances where a single bin's "
              "end-pairs thin out.",
     )
     parser.add_argument(
         "--dm-dist-bin-bp", type=int, default=10_000,
         help="Distance-bin width (bp) for the distance-matched expected "
-             "(default 10 kb).",
+             "(10 kb).",
     )
     parser.add_argument(
         "--refinement-basis", choices=["auto", "raw", "postnorm"], default="auto",
@@ -286,7 +284,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-correction",
         choices=["auto", "none", "center", "zscore", "combat", "harmony"],
-        default="auto",
+        default="harmony",
         help="Batch-correction method applied to the mean accessibility "
              "matrix when --batch-column is set.  "
              "'center' = per-batch column-mean subtraction (no deps).  "
@@ -303,9 +301,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "improve cell-type clustering under the DM default (DM+harmony"
              "+skip1 0.926 vs DM+none+skip1 0.937); its lone marginal win "
              "needs --skip-top-svd 0.  "
-             "'auto' (default): 'none' (correction off; opt into 'harmony' "
-             "with --skip-top-svd 0 if a within-cell-type batch effect must "
-             "be removed for downstream use).",
+             "Default 'harmony' (needs --batch-column + `harmonypy`); it falls "
+             "back to 'none' with a warning when no --batch-column is given.  "
+             "'auto' resolves to 'harmony' when --batch-column is set, else "
+             "'none'.",
     )
     parser.add_argument(
         "--post-norm-recenter", choices=["auto", "on", "off"], default="auto",
@@ -345,19 +344,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--posterior-threshold-open", type=float, default=0.6,
         help="Diagnostic-only threshold for calling an end 'open' "
-             "(default: 0.6, design-doc §6 #1). Used in QC summaries; "
+             "(design-doc §6 #1). Used in QC summaries; "
              "the signed-Δ computation itself uses un-thresholded "
              "posteriors via U-3 soft counts.",
     )
     parser.add_argument(
         "--posterior-threshold-closed", type=float, default=0.4,
         help="Diagnostic-only threshold for calling an end 'closed' "
-             "(default: 0.4, design-doc §6 #1). See --posterior-threshold-open.",
+             "(design-doc §6 #1). See --posterior-threshold-open.",
     )
     parser.add_argument(
         "--min-linked-pairs-per-cell", type=int, default=100,
         help="Drop cells with fewer than this many qualifying linked "
-             "pairs (default: 100, design-doc §6 #14). Applied right "
+             "pairs (design-doc §6 #14). Applied right "
              "after Step 2 so bad cells don't contaminate the mixture "
              "model, posterior calls, or downstream matrices. Set to 0 "
              "to disable.",
@@ -373,9 +372,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "signed; ignored for pearson and betabinom.",
     )
     parser.add_argument("--rwr-k", type=int, default=15,
-                        help="Number of nearest neighbours per cell (default: 15).")
+                        help="Number of nearest neighbours per cell.")
     parser.add_argument("--rwr-restart-prob", type=float, default=0.5,
-                        help="RWR restart probability r (default: 0.5).")
+                        help="RWR restart probability r.")
     parser.add_argument("--rwr-refine-passes", type=str, default=None,
                         help="Iterative refinement passes: an integer (fixed "
                              "count) or 'auto'.  Each pass rebuilds the k-NN "
@@ -390,7 +389,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "--concordance-method signed, 0 otherwise.")
     parser.add_argument("--rwr-max-auto-passes", type=int, default=5,
                         help="Upper bound on refinement passes when "
-                             "--rwr-refine-passes auto (default: 5).")
+                             "--rwr-refine-passes auto.")
     parser.add_argument("--rwr-solver", choices=["auto", "direct", "iterative"],
                         default="auto",
                         help="RWR linear solver. 'auto' uses direct (closed-"
@@ -420,17 +419,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--svd-scree-max", type=int, default=50,
         help="Number of top SVD components to fit for the scree-plot "
-             "diagnostic (default: 50). Clamped to min(this, n_cells-1, "
+             "diagnostic. Clamped to min(this, n_cells-1, "
              "n_bins).",
     )
 
     # EM
-    parser.add_argument("--em-max-iter", type=int, default=200)
-    parser.add_argument("--em-tol", type=float, default=1e-6)
+    parser.add_argument("--em-max-iter", type=int, default=200,
+                        help="Max EM iterations for the beta-binomial mixture.")
+    parser.add_argument("--em-tol", type=float, default=1e-6,
+                        help="EM convergence tolerance (log-likelihood delta).")
     parser.add_argument("--em-restarts", type=int, default=5,
-                        help="Random restarts for EM fitting (default: 5).")
+                        help="Random restarts for EM fitting.")
     parser.add_argument("--short-range-max", type=int, default=1_000,
-                        help="Max distance for short-range diagnostic class (default: 1000).")
+                        help="Max distance for short-range diagnostic class.")
 
     # Shrinkage
     parser.add_argument("--shrinkage-n0", type=str, default="auto",
@@ -440,7 +441,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dbsnp-vcf", type=str, default=None,
                         help="Tabix-indexed dbSNP VCF for SNP filtering of context sites.")
     parser.add_argument("--contexts", type=str, default="GCH",
-                        help='Comma-separated IUPAC cytosine contexts to analyse (default: "GCH").')
+                        help='Comma-separated IUPAC cytosine contexts to analyse.')
     parser.add_argument(
         "--context-bed", type=str, default=None,
         help=(
@@ -469,11 +470,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Read processing
     parser.add_argument("--trim-ends", type=int, default=5,
-                        help="Bases to trim from read ends (default: 5).")
+                        help="Bases to trim from read ends.")
     parser.add_argument("--mapq-min", type=int, default=30,
-                        help="Minimum mapping quality on both ends (default: 30).")
+                        help="Minimum mapping quality on both ends.")
     parser.add_argument("--require-proper-pair", action="store_true",
-                        help="Require BAM proper-pair flag (default: off). "
+                        help="Require BAM proper-pair flag. "
                              "BWA-MEM does NOT flag long-range Hi-C ligation "
                              "products as proper pairs, so enabling this filter "
                              "silently discards most cis Hi-C contacts. Only "
@@ -486,20 +487,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # EM fitting options
     parser.add_argument("--em-subsample", type=int, default=10_000_000,
-                        help="Max read ends for EM fitting (default: 10000000). "
+                        help="Max read ends for EM fitting. "
                              "Use 0 to disable subsampling and fit on all read ends.")
     parser.add_argument("--em-cell-specific", action="store_true",
                         help="Also fit EM per-cell for diagnostic comparison.")
 
     # Execution
     parser.add_argument("--n-threads", type=int, default=4,
-                        help="Number of parallel threads (default: 4).")
+                        help="Number of parallel threads.")
     parser.add_argument("--steps", type=str, default="all",
                         help='Steps to run: comma-separated (1-7) or "all".')
     parser.add_argument("--random-seed", type=int, default=42,
-                        help="Random seed for reproducibility (default: 42).")
+                        help="Random seed for reproducibility.")
     parser.add_argument("--log-file", type=str, default=None,
-                        help="Additional log file (default: stderr only).")
+                        help="Additional log file.")
 
     return parser.parse_args(argv)
 
@@ -1014,14 +1015,20 @@ def run_context(
                 batch_labels = (idx[batch_cols[0]] if len(batch_cols) == 1
                                 else idx[batch_cols])
             if args.batch_correction == "auto":
-                batch_correction = "none"
+                batch_correction = ("harmony" if batch_labels is not None
+                                    else "none")
             else:
                 batch_correction = args.batch_correction
-                if batch_correction != "none" and batch_labels is None:
-                    raise ValueError(
-                        f"--batch-correction {batch_correction!r} was set "
-                        f"but --batch-column was not provided."
-                    )
+            # Batch correction needs labels.  Since the default is now 'harmony',
+            # a run without --batch-column would otherwise fail; fall back to
+            # 'none' with a warning instead so the default is safe.
+            if batch_correction != "none" and batch_labels is None:
+                logger.warning(
+                    f"--batch-correction {batch_correction!r} needs "
+                    f"--batch-column, which was not provided; running with "
+                    f"batch correction OFF."
+                )
+                batch_correction = "none"
 
             # Resolve signed-method auto-defaults.  These ship as a coherent
             # bundle: MLE keeps RWR's cell-type-aware smoothing intact (vs DM
@@ -1369,7 +1376,7 @@ def main(argv: list[str] | None = None) -> int:
     # Legacy --concordance-method betabinom aliases to the new
     # --concordance-statistic open with a deprecation warning (design-doc
     # §6 #10).  --concordance-method signed (the new default) pairs with
-    # --concordance-statistic (default 'signed', or 'both' if user opts in).
+    # --concordance-statistic ('signed', or 'both' if user opts in).
     if args.concordance_statistic is None:
         if args.concordance_method == "betabinom":
             args.concordance_statistic = "open"
