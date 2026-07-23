@@ -230,16 +230,24 @@ def _row_linkage(Z):
 
 
 def _qual_palette():
-    """A stable list of ~60 visually distinct RGB colours (tab20 x3).
+    """A stable list of ~50 visually distinct RGB colours for batch strips.
 
-    Used to give each batch level a colour by its position in a FIXED, sorted
-    level order -- so the same label gets the same colour (and legend slot) in
-    every heatmap (gch, hcg, ...), instead of an order-of-appearance colour that
-    differs when the cell clustering differs between matrices.
+    Leads with 10 DISTINCT-HUE colours (tab10, reordered so the first two are
+    green then orange) so a 2-level strip like exp_batch gets HIGH-CONTRAST
+    colours (green vs orange) instead of the dark/light same-hue pair tab20's
+    first two slots give (dark blue vs light blue); the same reorder makes
+    plate_batch's first levels distinct hues too.  tab20b + tab20c extend it for
+    many-level strips (e.g. lib_batch).  Levels are coloured by position in a
+    FIXED, sorted order, so a label keeps its colour (and legend slot) across
+    every heatmap (gch, hcg, ...).
     """
     import matplotlib
-    out = []
-    for name in ("tab20", "tab20b", "tab20c"):
+    tab10 = [matplotlib.colors.to_rgb(c)
+             for c in matplotlib.colormaps["tab10"].colors]
+    # tab10 is [blue, orange, green, red, purple, brown, pink, grey, olive, cyan]
+    # -> reorder to [green, orange, blue, red, ...] so slot 0/1 = green/orange.
+    out = [tab10[i] for i in (2, 1, 0, 3, 4, 5, 6, 7, 8, 9)]
+    for name in ("tab20b", "tab20c"):
         out += [matplotlib.colors.to_rgb(c)
                 for c in matplotlib.colormaps[name].colors]
     return out
