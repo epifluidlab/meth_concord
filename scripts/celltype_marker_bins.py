@@ -232,14 +232,15 @@ def _row_linkage(Z):
 def _qual_palette():
     """A stable list of ~50 visually distinct RGB colours for batch strips.
 
-    Leads with 10 DISTINCT-HUE colours (tab10, reordered so the first two are
-    green then orange) so a 2-level strip like exp_batch gets HIGH-CONTRAST
-    colours (green vs orange) instead of the dark/light same-hue pair tab20's
-    first two slots give (dark blue vs light blue); the same reorder makes
-    plate_batch's first levels distinct hues too.  tab20b + tab20c extend it for
-    many-level strips (e.g. lib_batch).  Levels are coloured by position in a
-    FIXED, sorted order, so a label keeps its colour (and legend slot) across
-    every heatmap (gch, hcg, ...).
+    This is the family for the FIRST batch column (e.g. exp_batch).  Leads with
+    10 DISTINCT-HUE colours (tab10, reordered so the first two are green then
+    orange) so a 2-level strip like exp_batch gets HIGH-CONTRAST colours (green
+    vs orange) instead of the dark/light same-hue pair tab20's first two slots
+    give (dark blue vs light blue).  tab20b + tab20c extend it for many-level
+    strips.  Levels are coloured by position in a FIXED, sorted order, so a
+    label keeps its colour (and legend slot) across every heatmap (gch, hcg, …).
+    Later batch columns use their OWN distinct colormaps (see _column_palette),
+    so the stacked strips never share a palette.
     """
     import matplotlib
     tab10 = [matplotlib.colors.to_rgb(c)
@@ -253,18 +254,50 @@ def _qual_palette():
     return out
 
 
+# One distinct colour FAMILY per batch-column POSITION, so stacked batch strips
+# (exp_batch / plate_batch / lib_batch ...) are easy to tell apart at a glance.
+# Position 0 keeps the qualitative green/orange-lead hues from _qual_palette (so
+# exp_batch stays batch2=green, scNH=orange); each later column samples a
+# DIFFERENT sequential colormap -- visually unmistakable from the qualitative
+# strip and from one another, with unlimited distinct levels for a
+# high-cardinality column like lib_batch (dates) and a natural dark->light
+# ordering for ordered levels (plates, dates).
+_BATCH_CMAPS = ("viridis", "plasma", "cividis", "spring", "winter", "copper")
+
+
+def _column_palette(index, n):
+    """``n`` RGB colours for the batch column at position ``index``.
+
+    Column 0 uses the qualitative distinct-hue palette (green/orange lead);
+    columns 1+ each sample a DIFFERENT sequential colormap, so no two batch
+    strips share a palette and a many-level column (e.g. lib_batch dates) still
+    gets ``n`` distinct, naturally-ordered colours.
+    """
+    import matplotlib
+    n = max(int(n), 1)
+    if index <= 0:
+        pal = _qual_palette()
+        return [pal[i % len(pal)] for i in range(n)]
+    cmap = matplotlib.colormaps[_BATCH_CMAPS[(index - 1) % len(_BATCH_CMAPS)]]
+    if n == 1:
+        return [tuple(cmap(0.5)[:3])]
+    return [tuple(cmap(t)[:3]) for t in np.linspace(0.06, 0.96, n)]
+
+
 def _batch_color_maps(batch_df, bcols):
     """Shared {column: {level: rgb}} and {column: [levels]} across ALL matrices.
 
     Built once from the full samples sheet, with levels in a deterministic
     sorted order, so batch colours and legend order are identical between the
-    GCH and HCG heatmaps.
+    GCH and HCG heatmaps.  Each batch COLUMN gets its OWN colour family (see
+    _column_palette / _BATCH_CMAPS) so the stacked strips are easy to tell apart.
     """
-    pal = _qual_palette()
     order = {c: sorted(batch_df[c].dropna().astype(str).unique().tolist())
              for c in bcols}
-    colors = {c: {lev: pal[i % len(pal)] for i, lev in enumerate(order[c])}
-              for c in bcols}
+    colors = {}
+    for i, c in enumerate(bcols):
+        pal = _column_palette(i, len(order[c]))
+        colors[c] = {lev: pal[j] for j, lev in enumerate(order[c])}
     return colors, order
 
 

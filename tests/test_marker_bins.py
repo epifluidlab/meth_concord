@@ -174,3 +174,56 @@ def test_end_to_end_marker_and_control(tmp_path):
     assert s["nonselected_perm_p"] is not None
     assert s["nonselected_perm_p"] < 0.05
     assert s["median_celltype_icc_selected"] > 0.5
+
+
+# ------------------------------------------------------------ batch palettes --
+
+def _rgb(t):
+    return tuple(round(float(x), 4) for x in t)
+
+
+def test_each_batch_column_gets_a_distinct_palette():
+    """Stacked batch strips must be easy to tell apart: every batch COLUMN draws
+    from its own colour family, so no two columns share a colour."""
+    m = _mod()
+    df = pd.DataFrame({
+        "exp_batch":   ["batch2", "scNH"] * 10,
+        "plate_batch": [f"plate{9 + (i % 4)}" for i in range(20)],
+        "lib_batch":   [f"2024-02-{1 + (i % 12):02d}" for i in range(20)],
+    })
+    bcols = ["exp_batch", "plate_batch", "lib_batch"]
+    colors, order = m._batch_color_maps(df, bcols)
+
+    # Disjoint palettes across columns.
+    sets = {c: {_rgb(v) for v in colors[c].values()} for c in bcols}
+    assert not (sets["exp_batch"] & sets["plate_batch"])
+    assert not (sets["exp_batch"] & sets["lib_batch"])
+    assert not (sets["plate_batch"] & sets["lib_batch"])
+    # A many-level column still gets one distinct colour per level.
+    assert len(sets["lib_batch"]) == len(order["lib_batch"]) == 12
+
+
+def test_first_batch_column_keeps_green_orange():
+    """exp_batch (column 0) preserves the convention batch2=green, scNH=orange."""
+    import matplotlib
+    m = _mod()
+    tab10 = [matplotlib.colors.to_rgb(c)
+             for c in matplotlib.colormaps["tab10"].colors]
+    df = pd.DataFrame({"exp_batch": ["batch2", "scNH"] * 5})
+    colors, _ = m._batch_color_maps(df, ["exp_batch"])
+    assert _rgb(colors["exp_batch"]["batch2"]) == _rgb(tab10[2])   # green
+    assert _rgb(colors["exp_batch"]["scNH"]) == _rgb(tab10[1])     # orange
+
+
+def test_batch_colors_are_deterministic_across_matrices():
+    """Colours must be identical between the GCH and HCG heatmaps -> the map is
+    a pure function of the (full) samples sheet and column order."""
+    m = _mod()
+    df = pd.DataFrame({
+        "exp_batch":   ["batch2", "scNH"] * 6,
+        "plate_batch": [f"p{i % 5}" for i in range(12)],
+    })
+    bcols = ["exp_batch", "plate_batch"]
+    a, _ = m._batch_color_maps(df, bcols)
+    b, _ = m._batch_color_maps(df, bcols)
+    assert all(a[c] == b[c] for c in bcols)
