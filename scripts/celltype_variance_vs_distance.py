@@ -69,13 +69,18 @@ def _parse_matrix_spec(spec):
 
 
 def icc_per_region(X, group_ids, n_groups, min_cells_per_group=3,
-                   min_groups=3):
+                   min_groups=3, return_stats=False):
     """One-way ANOVA ICC per column (region), NaN-aware.
 
     Returns (icc, usable_mask).  A region is usable only when enough groups
     carry enough cells; otherwise ICC is undefined rather than 0, because an
     unmeasurable region and a region with no cell-type structure are different
     statements.
+
+    ``return_stats=True`` additionally returns (F_statistic, p_value) from the
+    SAME one-way ANOVA that defines the ICC -- F = MS_between / MS_within, tested
+    against the F(k-1, N-k) null (the p-value that the between-group variance the
+    ICC measures is > 0).  p is NaN for unusable regions or if SciPy is absent.
     """
     X = np.asarray(X, dtype=np.float64)
     n_reg = X.shape[1]
@@ -117,7 +122,23 @@ def icc_per_region(X, group_ids, n_groups, min_cells_per_group=3,
         var_b = np.maximum((ms_b - ms_w) / n0, 0.0)   # negative -> no structure
         icc = var_b / (var_b + ms_w)
         icc = np.where(np.isfinite(icc), icc, np.nan)
-    return np.where(usable, icc, np.nan), usable
+    icc = np.where(usable, icc, np.nan)
+    if not return_stats:
+        return icc, usable
+    # ANOVA F-test on the SAME one-way model: F = MS_between / MS_within.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fstat = np.where(ms_w > 0, ms_b / np.where(ms_w > 0, ms_w, np.nan),
+                         np.nan)
+    pval = np.full(n_reg, np.nan)
+    try:
+        from scipy.stats import f as _fdist
+        good = usable & np.isfinite(fstat)
+        if good.any():
+            pval[good] = _fdist.sf(fstat[good], df_b[good], df_w[good])
+    except Exception:                              # SciPy missing -> p stays NaN
+        pass
+    fstat = np.where(usable, fstat, np.nan)
+    return icc, usable, fstat, pval
 
 
 def _summarise(X, group_ids, n_groups, args, rng, n_perm):

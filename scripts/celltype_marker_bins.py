@@ -191,6 +191,43 @@ def _nanmedian(x):
     return float(np.median(x)) if x.size else np.nan
 
 
+def _bh_fdr(p):
+    """Benjamini-Hochberg FDR (q-values) over the FINITE p-values; NaN in ->
+    NaN out, so unusable bins do not enter the multiple-testing correction."""
+    p = np.asarray(p, float)
+    out = np.full(p.shape, np.nan)
+    idx = np.flatnonzero(np.isfinite(p))
+    if idx.size == 0:
+        return out
+    pv = p[idx]
+    order = np.argsort(pv)
+    m = pv.size
+    q = pv[order] * m / np.arange(1, m + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]          # enforce monotonicity
+    out[idx[order]] = np.clip(q, 0.0, 1.0)
+    return out
+
+
+def _bins_to_bed(bins, bin_size):
+    """(chrom, start, end) per bin label 'chrom:start' (0-based, half-open).
+
+    ``bin_size`` sets the end; if it could not be inferred, end = start + 1."""
+    width = int(bin_size) if bin_size else 1
+    rows = []
+    for b in bins:
+        s = str(b)
+        if ":" in s:
+            chrom, pos = s.rsplit(":", 1)
+            try:
+                start = int(pos)
+            except ValueError:
+                chrom, start = s, 0
+        else:
+            chrom, start = s, 0
+        rows.append((chrom, start, start + width))
+    return rows
+
+
 
 # Distinct diverging colour schemes so GCH-GCH and HCG-HCG never look alike.
 _CMAPS = {"gch": "RdBu_r", "hcg": "PuOr_r"}
@@ -681,6 +718,7 @@ def main():
     from nome_hic_concordance.cli import load_samples
     from nome_hic_concordance.utils import (bin_label_chrom, chrom_excluded,
                                             ensure_dir, parse_exclude_chroms)
+    from nome_hic_concordance.blacklist import infer_bin_size
 
     samples = load_samples(args.samples)
     for col in (args.cell_type_column, *args.batch_column.split(",")):
@@ -860,11 +898,34 @@ def main():
             M.loc[:, rest_bins], ct.to_numpy(), args.n_svd, args.skip_top_svd,
             args.seed, args.n_permutations)
 
-        pd.DataFrame({"bin": M.columns, "celltype_icc": ct_icc,
-                      "batch_icc": b_icc,
-                      "selected": M.columns.isin(sel_bins)}
-                     ).to_csv(out_dir / f"bin_scores_{name}.tsv",
-                              sep="\t", index=False)
+        # Per-bin statistics: the cell-type ICC (the ranking statistic) with its
+        # one-way ANOVA F-test p-value + BH-FDR (same model as the ICC), plus the
+        # within-cell-type batch ICC (the filter statistic).  Computed on the
+        # SAME matrix used for selection (batch-removed if --remove-batch).
+        _, _, _ct_f, ct_p = ctv.icc_per_region(
+            M.to_numpy(), ct_id, len(ct_u), args.min_cells_per_group,
+            args.min_groups, return_stats=True)
+        ct_fdr = _bh_fdr(ct_p)
+        scores_df = pd.DataFrame({
+            "bin": M.columns, "celltype_icc": ct_icc,
+            "celltype_pvalue": ct_p, "celltype_fdr": ct_fdr,
+            "batch_icc": b_icc, "selected": M.columns.isin(sel_bins)})
+        scores_df.to_csv(out_dir / f"bin_scores_{name}.tsv", sep="\t",
+                         index=False)
+
+        # BED files (0-based, half-open) with the same statistics: one with ALL
+        # bins, one with only the bins used in the plot (selected).
+        coords = _bins_to_bed(M.columns, infer_bin_size(M.columns))
+        bed = pd.DataFrame(coords, columns=["chrom", "start", "end"])
+        for c in ("celltype_icc", "celltype_pvalue", "celltype_fdr",
+                  "batch_icc", "selected"):
+            bed[c] = scores_df[c].values
+        bed = bed.sort_values(["chrom", "start"]).reset_index(drop=True)
+        bed.to_csv(out_dir / f"bin_scores_{name}.all.bed", sep="\t",
+                   index=False, na_rep="NA")
+        bed[bed["selected"]].drop(columns="selected").to_csv(
+            out_dir / f"bin_scores_{name}.selected.bed", sep="\t", index=False,
+            na_rep="NA")
         summary[name] = {
             "n_cells": int(M.shape[0]), "n_bins": int(M.shape[1]),
             "n_selected": int(sel.size),
@@ -884,6 +945,8 @@ def main():
                   f"{args.max_batch_icc}; the rest were filled by cell-type ICC "
                   f"(raise the cut to admit more, or lower --n-bins).")
         print(f"  heatmap on all {M.shape[0]} cells -> {fig_hm.name}")
+        print(f"  per-bin stats -> bin_scores_{name}.{{all,selected}}.bed "
+              f"(chrom/start/end, cell-type ICC, ANOVA p, BH-FDR, batch ICC)")
         if np.isfinite(sil):
             verdict = "SEPARATES" if perm_p < 0.05 else "does NOT separate"
             print(f"  out-of-selection control: NON-selected bins {verdict} "

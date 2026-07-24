@@ -179,6 +179,18 @@ def test_end_to_end_marker_and_control(tmp_path):
     assert not (out / "marker_heatmap_gch_compartment_fixedorder.png").exists()
     scores = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
     assert scores["selected"].sum() == 30
+    assert {"celltype_pvalue", "celltype_fdr"} <= set(scores.columns)
+    # BED files: all bins + selected-only, with chrom/start/end + the stats.
+    allb = pd.read_csv(out / "bin_scores_gch.all.bed", sep="\t")
+    selb = pd.read_csv(out / "bin_scores_gch.selected.bed", sep="\t")
+    assert list(allb.columns[:3]) == ["chrom", "start", "end"]
+    assert {"celltype_icc", "celltype_pvalue", "celltype_fdr", "batch_icc"} \
+        <= set(allb.columns)
+    assert len(allb) == len(scores)               # all bins
+    assert len(selb) == 30                         # only the plotted bins
+    assert "selected" not in selb.columns          # implied for the selected file
+    assert (allb["end"] - allb["start"] == 250000).all()   # 0-based half-open
+    assert allb[["chrom", "start"]].apply(tuple, axis=1).is_monotonic_increasing
     # the out-of-selection control must fire: non-selected bins separate types
     import json
     s = json.loads((out / "marker_bins_summary.json").read_text())["matrices"]["gch"]
@@ -249,6 +261,47 @@ def test_compartment_companions_with_coarser_grid(tmp_path):
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     for suffix in ("fixedorder", "reclustered", "reclustered_batchcorrected"):
         assert (out / f"marker_heatmap_gch_compartment_{suffix}.png").exists()
+
+
+# --------------------------------------------------------- per-bin statistics --
+
+def test_icc_pvalue_tracks_structure_and_bh_fdr():
+    """icc_per_region(return_stats=True) gives an ANOVA p-value that is tiny for
+    cell-type-structured bins and ~uniform for noise; _bh_fdr(q) >= p, in [0,1],
+    and NaN p -> NaN q (unusable bins excluded from the correction)."""
+    pytest.importorskip("scipy")
+    icc_fn = _icc()
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n, n_ct, n_struct, n_noise = 240, 4, 10, 30
+    ct = np.repeat(np.arange(n_ct), n // n_ct)
+    struct = rng.normal(0, 3, (n_ct, n_struct))[ct] + rng.normal(0, .3, (n, n_struct))
+    noise = rng.normal(0, 1, (n, n_noise))
+    X = np.hstack([struct, noise])
+    icc, usable, fstat, pval = icc_fn(X, ct, n_ct, return_stats=True)
+    assert pval.shape == (n_struct + n_noise,)
+    assert np.nanmax(pval[:n_struct]) < 1e-6                 # structured -> tiny p
+    assert np.mean(pval[n_struct:] > 0.05) > 0.7            # noise -> mostly n.s.
+
+    fdr = m._bh_fdr(pval)
+    fin = np.isfinite(pval)
+    assert np.all(fdr[fin] + 1e-12 >= pval[fin])           # BH q >= p
+    assert np.all((fdr[fin] >= 0) & (fdr[fin] <= 1))
+    p2 = pval.copy(); p2[0] = np.nan
+    assert np.isnan(m._bh_fdr(p2)[0])
+
+
+def test_icc_per_region_return_stats_is_backward_compatible():
+    """The 2-tuple default is unchanged; return_stats just appends F + p."""
+    icc_fn = _icc()
+    rng = np.random.default_rng(1)
+    ct = np.repeat(np.arange(3), 20)
+    X = rng.normal(size=(60, 5))
+    two = icc_fn(X, ct, 3)
+    four = icc_fn(X, ct, 3, return_stats=True)
+    assert len(two) == 2 and len(four) == 4
+    assert np.allclose(two[0], four[0], equal_nan=True)     # same ICC
+    assert np.array_equal(two[1], four[1])                   # same usable mask
 
 
 # ------------------------------------------------------------ batch palettes --
