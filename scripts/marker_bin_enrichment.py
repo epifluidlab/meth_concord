@@ -638,6 +638,54 @@ def _chrom_page(ax, df):
                  fontsize=11)
 
 
+def _signal_figure(series, fg, df, name, out_path):
+    """Publication figure: per-bin signal DISTRIBUTION, foreground vs
+    background, one grouped violin pair per track (ordered as the enrichment
+    table), with the BH-FDR significance annotated."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    order = df["annotation"].tolist()
+    n = len(order)
+    fg_c, bg_c = "#c0392b", "#95a5a6"
+    fig, ax = plt.subplots(figsize=(max(4.5, 1.15 * n + 1.5), 4.4))
+    for i, lab in enumerate(order):
+        v = np.asarray(series[lab], dtype=float)
+        groups = [(v[(~fg) & np.isfinite(v)], 0.22, bg_c),
+                  (v[fg & np.isfinite(v)], -0.22, fg_c)]
+        top = np.nan
+        for data, off, color in groups:
+            if data.size < 2:
+                continue
+            pc = ax.violinplot([data], positions=[i + off], widths=0.38,
+                               showmeans=True, showextrema=False)
+            pc["bodies"][0].set_facecolor(color)
+            pc["bodies"][0].set_alpha(0.8)
+            pc["bodies"][0].set_edgecolor("none")
+            pc["cmeans"].set_color("black")
+            pc["cmeans"].set_linewidth(1.0)
+            top = np.nanmax([top, np.nanpercentile(data, 98)])
+        q = df.loc[df["annotation"] == lab, "fdr"].iloc[0]
+        s = _stars(q) if np.isfinite(q) else "ns"
+        ax.text(i, top, s or "ns", ha="center", va="bottom", fontsize=9)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(order, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("per-bin mean signal")
+    ax.set_title(f"{name.upper()}: signal at cell-type-variable bins vs the rest",
+                 fontsize=11)
+    ax.legend(handles=[
+        plt.Line2D([], [], color=fg_c, lw=7, alpha=0.8,
+                   label=f"foreground ({int(fg.sum())})"),
+        plt.Line2D([], [], color=bg_c, lw=7, alpha=0.8,
+                   label=f"background ({int((~fg).sum())})")],
+        frameon=False, fontsize=8, loc="upper right")
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ------------------------------------------------------------------- driver --
 
 def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
@@ -719,9 +767,19 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
 
     # (4b) continuous signal tracks (replication timing, ...) --------------
     if signal_tracks:
-        sig_df, _ = _signal_enrichment(bins, fg, signal_tracks)
+        sig_df, series = _signal_enrichment(bins, fg, signal_tracks)
         sig_df.to_csv(tsv("signal_enrichment"), sep="\t", index=False)
         pages.append(("signal", ("Continuous signals (fg - bg mean)", sig_df)))
+        # Per-bin values (for custom re-plotting) + a standalone publication
+        # figure of the foreground-vs-background distributions.
+        vals = bins[["chrom", "start", "end"]].copy()
+        vals["foreground"] = fg
+        for lab, v in series.items():
+            vals[lab] = v
+        vals.to_csv(out_dir / f"{name}_signal_bin_values.tsv.gz", sep="\t",
+                    index=False)
+        _signal_figure(series, fg, sig_df, name,
+                       out_dir / f"{name}_signal_figure.pdf")
 
     # (5) gene-set (GO / KEGG / ...) over-representation --------------------
     if gene_sets and fg_genes is not None:

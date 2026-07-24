@@ -377,6 +377,10 @@ def test_signal_enrichment_end_to_end_bedgraph(tmp_path):
     row = sig[sig["annotation"] == "RT"].iloc[0]
     assert row["mean_signal_fg"] > row["mean_signal_bg"]   # fg is 'early'
     assert row["difference"] > 1.5 and row["fdr"] < 0.05
+    # the publication figure + per-bin values are written for custom plotting
+    assert (out / "gch_signal_figure.pdf").exists()
+    vals = pd.read_csv(out / "gch_signal_bin_values.tsv.gz", sep="\t")
+    assert {"foreground", "RT"} <= set(vals.columns) and len(vals) == 200
 
 
 def test_signal_enrichment_bigwig(tmp_path):
