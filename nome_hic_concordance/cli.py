@@ -315,6 +315,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'none'.",
     )
     parser.add_argument(
+        "--harmony-theta", type=float, default=None,
+        help="Harmony batch-correction STRENGTH (diversity-clustering penalty) "
+             "for the Step-7 concordance-UMAP correction under "
+             "--batch-correction harmony.  Higher mixes batches more "
+             "aggressively; lower is gentler.  Broadcast to every --batch-column "
+             "variable; omit to use harmonypy's default (2.0).")
+    parser.add_argument(
         "--post-norm-recenter", choices=["auto", "on", "off"], default="auto",
         help="Apply per-cell mean re-centering as a FINAL step after "
              "per-bin normalization in Step 7.  Fixes the per-cell mean "
@@ -817,19 +824,38 @@ def run_context(
         min_sites = args.min_gch_sites
     logger.info(f"Using min sites per end = {min_sites} for context {context}")
 
-    # Batch correction (signed method) is applied in STEP 5 -- to the mean-
-    # accessibility matrix that seeds the RWR graph -- and is baked into the
-    # concordance matrix, NOT re-applied in Step 7's UMAP.  Warn if the user
-    # asked for it but is skipping Step 5, so it isn't silently ignored.
-    if (5 not in steps and args.batch_correction != "none"
-            and args.batch_column is not None):
+    # Resolve batch correction ONCE, so it is available to BOTH Step 5 (the
+    # mean-accessibility / RWR-basis correction) AND Step 7 (the concordance-
+    # UMAP correction) -- even on a Step-7-only rerun.
+    batch_labels = None
+    if args.batch_column is not None:
+        batch_cols = [c.strip() for c in args.batch_column.split(",")
+                      if c.strip()]
+        missing = [c for c in batch_cols if c not in samples.columns]
+        if missing:
+            raise ValueError(
+                f"--batch-column {missing} not in {args.samples}. "
+                f"Available columns: {samples.columns.tolist()}")
+        idx = samples.set_index("cell_name")
+        batch_labels = (idx[batch_cols[0]] if len(batch_cols) == 1
+                        else idx[batch_cols])
+    if args.batch_correction == "auto":
+        batch_correction = "harmony" if batch_labels is not None else "none"
+    else:
+        batch_correction = args.batch_correction
+    # Batch correction needs labels.  Since the default is 'harmony', a run
+    # without --batch-column would otherwise fail; fall back to 'none' safely.
+    if batch_correction != "none" and batch_labels is None:
         logger.warning(
-            f"--batch-correction {args.batch_correction!r} is applied in Step 5 "
-            f"(to the mean-accessibility RWR basis) and baked into the "
-            f"concordance matrix — it is NOT (re-)applied in Step 7's UMAP.  "
-            f"Step 5 is not in --steps, so no batch correction runs now; the "
-            f"UMAP reflects whatever correction the concordance matrix was "
-            f"originally computed with.  Re-run with step 5 to (re-)apply it.")
+            f"--batch-correction {batch_correction!r} needs --batch-column, "
+            f"which was not provided; running with batch correction OFF.")
+        batch_correction = "none"
+    if batch_correction != "none" and 5 not in steps:
+        logger.info(
+            f"Batch correction ({batch_correction}): Step 5 not in --steps, so "
+            f"the mean-accessibility / RWR-basis correction is not re-applied "
+            f"(already baked into the concordance matrix on disk); the Step 7 "
+            f"concordance-UMAP correction still runs.")
 
     ensure_dir(ctx_out)
 
@@ -1010,48 +1036,12 @@ def run_context(
                 output_dir=str(concordance_dir),
             )
         elif args.concordance_method == "signed":
-            # Resolve batch correction: 'auto' → 'none'.  In the full-set
-            # comparison, batch correction did NOT improve cell-type
-            # clustering under the DM default: DM+none+skip1 = 0.937 vs
-            # DM+harmony+skip1 = 0.926 (harmony + skip double-handle the
-            # confound).  The lone marginal win was DM+harmony+skip0 = 0.940
-            # (≈1 cell over none+skip1), not worth the harmonypy dependency.
-            # ComBat/center/zscore remain harmful under composition imbalance
-            # (they delete the cell-type axis).  So 'auto' leaves correction
-            # off; opt into 'harmony' (with --skip-top-svd 0) explicitly if a
-            # within-cell-type batch effect must be removed for downstream use.
-            batch_labels = None
-            if args.batch_column is not None:
-                # One or more comma-separated batch columns (e.g. cell-culture
-                # + library-prep + sequencing batch).  Harmony harmonizes over
-                # all of them jointly; the other methods use the composite.
-                batch_cols = [c.strip() for c in args.batch_column.split(",")
-                              if c.strip()]
-                missing = [c for c in batch_cols if c not in samples.columns]
-                if missing:
-                    raise ValueError(
-                        f"--batch-column {missing} not in {args.samples}. "
-                        f"Available columns: {samples.columns.tolist()}"
-                    )
-                # Single column -> Series; multiple -> DataFrame.
-                idx = samples.set_index("cell_name")
-                batch_labels = (idx[batch_cols[0]] if len(batch_cols) == 1
-                                else idx[batch_cols])
-            if args.batch_correction == "auto":
-                batch_correction = ("harmony" if batch_labels is not None
-                                    else "none")
-            else:
-                batch_correction = args.batch_correction
-            # Batch correction needs labels.  Since the default is now 'harmony',
-            # a run without --batch-column would otherwise fail; fall back to
-            # 'none' with a warning instead so the default is safe.
-            if batch_correction != "none" and batch_labels is None:
-                logger.warning(
-                    f"--batch-correction {batch_correction!r} needs "
-                    f"--batch-column, which was not provided; running with "
-                    f"batch correction OFF."
-                )
-                batch_correction = "none"
+            # batch_labels / batch_correction were resolved once at the top of
+            # run_context (shared with Step 7's concordance-UMAP correction).
+            # Step 5 applies that correction to the mean-accessibility matrix
+            # that seeds the RWR graph (harmony harmonizes over all
+            # comma-separated --batch-column variables jointly; the other
+            # methods use the composite).
 
             # Resolve signed-method auto-defaults.  These ship as a coherent
             # bundle: MLE keeps RWR's cell-type-aware smoothing intact (vs DM
@@ -1362,6 +1352,17 @@ def run_context(
             if skip_top_svd and skip_top_svd > 0:
                 svd_title += f" (skip top {skip_top_svd})"
 
+            # Step 7 concordance-UMAP batch correction (in addition to the
+            # Step 5 accessibility/RWR-basis correction).  Applied to the
+            # NORMALIZED matrix only -- it is THE analysis UMAP.  The
+            # un-normalized UMAP is left uncorrected on purpose, so it stays an
+            # honest raw-structure (incl. raw batch) diagnostic that its
+            # "un-normalized" title truthfully describes.
+            bc_suffix = (f"_{batch_correction}" if batch_correction != "none"
+                         else "")
+            bc_title = (f" + {batch_correction}" if batch_correction != "none"
+                        else "")
+
             visualization.run_umap_and_plot(
                 matrices["imputed"], group_labels,
                 title=f"UMAP (un-normalized{svd_title}, {context})",
@@ -1377,8 +1378,8 @@ def run_context(
             )
             visualization.run_umap_and_plot(
                 matrices["zscore"], group_labels,
-                title=f"UMAP ({norm_title}{svd_title}, {context})",
-                output_prefix=f"{norm_prefix}{svd_suffix}",
+                title=f"UMAP ({norm_title}{svd_title}{bc_title}, {context})",
+                output_prefix=f"{norm_prefix}{svd_suffix}{bc_suffix}",
                 output_dir=str(umap_dir),
                 n_svd=n_svd,
                 skip_top_svd=skip_top_svd,
@@ -1386,6 +1387,9 @@ def run_context(
                 random_state=args.random_seed,
                 group_colors=group_colors,
                 group_order=group_order,
+                batch_labels=batch_labels,
+                batch_correction=batch_correction,
+                harmony_theta=args.harmony_theta,
                 plot_format=args.plot_format,
             )
     else:

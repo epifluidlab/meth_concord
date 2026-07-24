@@ -169,6 +169,29 @@ def test_cli_defaults_are_none():
     assert args.color_column is None and args.group_order is None
 
 
+def test_cli_harmony_theta_flag():
+    """--harmony-theta feeds the Step-7 concordance-UMAP harmony strength;
+    default None so harmonypy's own default (2.0) is used."""
+    d = parse_args(["--samples", "s.tsv", "--output-dir", "out"])
+    assert d.harmony_theta is None
+    a = parse_args(["--samples", "s.tsv", "--output-dir", "out",
+                    "--harmony-theta", "4"])
+    assert a.harmony_theta == 4.0
+
+
+def test_run_umap_and_plot_exposes_step7_batch_kwargs():
+    """Step 7 threads batch correction into the NORMALIZED concordance UMAP;
+    run_umap_and_plot must accept the kwargs the CLI passes (the wiring
+    target -- guards against accidental signature drift)."""
+    import inspect
+
+    from nome_hic_concordance import visualization
+
+    params = inspect.signature(visualization.run_umap_and_plot).parameters
+    for kw in ("batch_labels", "batch_correction", "harmony_theta"):
+        assert kw in params, kw
+
+
 # --------------------------------------------------------------------------
 # nome_hic_compare: same colour/order flags, same '#' handling
 # --------------------------------------------------------------------------
