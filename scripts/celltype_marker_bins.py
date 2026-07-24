@@ -196,6 +196,10 @@ def _nanmedian(x):
 _CMAPS = {"gch": "RdBu_r", "hcg": "PuOr_r"}
 _CMAP_FALLBACK = ["RdBu_r", "PuOr_r", "BrBG_r", "PiYG_r"]
 
+# What the mean-signal companion heatmaps display (GCH=accessibility,
+# HCG=methylation; both stored as accessibility_mean.parquet per context).
+_MEAN_LABEL = {"gch": "mean accessibility", "hcg": "mean methylation"}
+
 
 def _remove_batch(M, ct_labels, batch_df):
     """Center each (cell type, batch) group to its cell-type mean, per bin.
@@ -303,12 +307,16 @@ def _batch_color_maps(batch_df, bcols):
 
 def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
              batch_colors, batch_order, title, out, cmap, legend_order=None,
-             legend_max=40):
+             legend_max=40, order=None, value_label="concordance (z per bin)"):
     """Marker heatmap: bins x cells.  Cells (columns) are hierarchically
     clustered and the COLUMN dendrogram is drawn on top of the cell-type strip;
     no cell names are shown.  A cell-type strip and one strip per batch variable
     (exp/plate/lib) sit below it, so it is visible that the cell clustering
-    tracks cell type and not any batch."""
+    tracks cell type and not any batch.
+
+    Returns ``(cells_order, bins_order, col_linkage)`` -- the exact layout it
+    drew.  Pass that tuple back as ``order`` to render a DIFFERENT matrix (e.g.
+    mean accessibility) in the IDENTICAL layout instead of re-clustering."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -316,23 +324,34 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
     from matplotlib.gridspec import GridSpec
 
     # Cluster the CELLS (columns) on the selected-bin values and order columns by
-    # that clustering; the dendrogram drawn on top uses the same linkage.
-    Yc = M.loc[cells, bins_order].to_numpy(np.float64)
-    Yc = np.where(np.isfinite(Yc), Yc, 0.0)
-    col_lk, col_order = _row_linkage(Yc)          # cluster over cells
-    cells_o = [cells[i] for i in col_order]
+    # that clustering; the dendrogram drawn on top uses the same linkage.  When
+    # `order` is supplied (a previous heatmap's layout), reuse it verbatim so a
+    # second matrix appears in the EXACT same row/column order.
+    if order is None:
+        Yc = M.loc[cells, bins_order].to_numpy(np.float64)
+        Yc = np.where(np.isfinite(Yc), Yc, 0.0)
+        col_lk, col_order = _row_linkage(Yc)          # cluster over cells
+        cells_o = [cells[i] for i in col_order]
+        bins_seq = list(bins_order)
+    else:
+        cells_o, bins_seq, col_lk = order
+        cells_o = list(cells_o)
+        bins_seq = list(bins_seq)
 
-    Z = M.loc[cells_o, bins_order].to_numpy(np.float64).T   # bins x cells
+    Z = M.loc[cells_o, bins_seq].to_numpy(np.float64).T   # bins x cells
     mu = np.nanmean(Z, axis=1, keepdims=True)
     sd = np.nanstd(Z, axis=1, keepdims=True)
     Z = np.where(sd > 0, (Z - mu) / np.where(sd > 0, sd, 1), 0.0)
     Z = np.clip(np.where(np.isfinite(Z), Z, 0.0), -2.5, 2.5)
-    # Rows (bins) ordered by clustering on the cell-type-MEAN pattern (no row
-    # dendrogram drawn), so bins band by which cell types they mark.
-    ct_arr = np.asarray(ct_labels.loc[cells_o])
-    means = np.stack([Z[:, ct_arr == g].mean(1) for g in
-                      dict.fromkeys(ct_arr)], axis=1)
-    Z = Z[_row_linkage(means)[1]]
+    if order is None:
+        # Rows (bins) ordered by clustering on the cell-type-MEAN pattern (no row
+        # dendrogram drawn), so bins band by which cell types they mark.
+        ct_arr = np.asarray(ct_labels.loc[cells_o])
+        means = np.stack([Z[:, ct_arr == g].mean(1) for g in
+                          dict.fromkeys(ct_arr)], axis=1)
+        row_perm = _row_linkage(means)[1]
+        Z = Z[row_perm]
+        bins_seq = [bins_seq[i] for i in row_perm]
 
     strips = [("cell type", ct_labels)] + [(c, batch_df[c]) for c in
                                            batch_df.columns]
@@ -382,11 +401,12 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
     ax = fig.add_subplot(gs[n_strip + 1, 0])
     im = ax.imshow(Z, aspect="auto", cmap=cmap, vmin=-2.5, vmax=2.5,
                    interpolation="nearest")
-    ax.set_xlabel(f"cells (n={len(cells_o)}, clustered)")
-    ax.set_ylabel(f"selected bins (n={len(bins_order)}, clustered)")
+    layout_note = "clustered" if order is None else "borrowed order"
+    ax.set_xlabel(f"cells (n={len(cells_o)}, {layout_note})")
+    ax.set_ylabel(f"selected bins (n={len(bins_seq)}, {layout_note})")
     ax.set_xticks([]); ax.set_yticks([])
     fig.colorbar(im, cax=fig.add_subplot(gs[n_strip + 1, 1]),
-                 label="concordance (z per bin)")
+                 label=value_label)
 
     # Legends to the RIGHT of the colour bar, stacked top-to-bottom.  The cell
     # type legend follows --group-order; a strip with many levels (plate/lib)
@@ -418,6 +438,7 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
     fig.suptitle(title, fontsize=12)
     fig.savefig(out, bbox_inches="tight", dpi=150)
     plt.close(fig)
+    return cells_o, bins_seq, col_lk
 
 
 def main():
@@ -429,6 +450,23 @@ def main():
                     metavar="NAME=PATH", help="cells x bins concordance "
                     "parquet, e.g. gch=.../concordance_signed.parquet. "
                     "Repeatable.")
+    ap.add_argument("--mean-matrix", action="append", default=None,
+                    metavar="NAME=PATH",
+                    help="cells x bins MEAN-signal parquet (accessibility for "
+                         "gch, methylation for hcg) matching a --matrix NAME, "
+                         "e.g. gch=.../accessibility_mean.parquet.  Used for the "
+                         "two companion heatmaps (see --mean-heatmaps).  If "
+                         "omitted, accessibility_mean.parquet beside the "
+                         "concordance parquet is used automatically.  Repeatable.")
+    ap.add_argument("--mean-heatmaps", choices=["auto", "on", "off"],
+                    default="auto",
+                    help="For each --matrix, also write two mean-signal "
+                         "heatmaps: '<name>_mean_fixedorder' (the concordance "
+                         "heatmap's EXACT cell+bin order, recoloured by the mean "
+                         "value) and '<name>_mean_reclustered' (same cells+bins, "
+                         "clustered on the mean value itself).  'auto' (default) "
+                         "makes them when a mean matrix is found, else skips; "
+                         "'on' errors if none is found; 'off' disables them.")
     ap.add_argument("--samples", required=True)
     ap.add_argument("--cell-type-column", default="cell_type")
     ap.add_argument("--batch-column", default="exp_batch,plate_batch,lib_batch",
@@ -516,6 +554,11 @@ def main():
     for c in (args.cmap or []):
         if '=' in c:
             k, v = c.split('=', 1); cmap_override[k.strip().lower()] = v.strip()
+    mean_explicit = {}
+    for c in (args.mean_matrix or []):
+        if "=" not in c:
+            sys.exit(f"--mean-matrix must be NAME=PATH, got {c!r}")
+        k, v = c.split("=", 1); mean_explicit[k.strip()] = v.strip()
     out_dir = ensure_dir(Path(args.output_dir))
     summary = {}
 
@@ -526,6 +569,15 @@ def main():
         name = name.strip()
         if not Path(path).exists():
             sys.exit(f"no such matrix: {path}")
+        # Resolve the mean-signal matrix for the companion heatmaps: explicit
+        # --mean-matrix NAME=PATH wins; else auto-derive the accessibility_mean
+        # sibling written next to the concordance parquet.
+        mean_path = mean_explicit.get(name)
+        if mean_path and not Path(mean_path).exists():
+            sys.exit(f"no such --mean-matrix for {name}: {mean_path}")
+        if not mean_path:
+            cand = Path(path).with_name("accessibility_mean.parquet")
+            mean_path = str(cand) if cand.exists() else None
         M = pd.read_parquet(path)
         M.index = M.index.astype(str)
         keep = [c for c in M.index if c in ct_of]
@@ -586,11 +638,59 @@ def main():
         fig_hm = out_dir / f"marker_heatmap_{name}.{args.plot_format}"
         clean_note = ("batch-invariant" if n_clean >= sel.size
                       else f"{n_clean}/{sel.size} batch-invariant")
-        _heatmap(M, list(M.index), list(sel_bins), ct, batch_df, ct_colors,
-                 batch_colors, batch_order,
-                 f"{name.upper()}: {len(sel_bins)} cell-type-variable "
-                 f"({clean_note}) bins", fig_hm, cmap, legend_order=block_order,
-                 legend_max=args.max_legend_levels)
+        main_order = _heatmap(
+            M, list(M.index), list(sel_bins), ct, batch_df, ct_colors,
+            batch_colors, batch_order,
+            f"{name.upper()}: {len(sel_bins)} cell-type-variable "
+            f"({clean_note}) bins", fig_hm, cmap, legend_order=block_order,
+            legend_max=args.max_legend_levels)
+
+        # Companion mean-signal heatmaps (accessibility for gch, methylation for
+        # hcg): (A) the concordance heatmap's EXACT layout recoloured by the mean
+        # value -> is the concordance structure present in the mean signal?  (B)
+        # the same cells+bins clustered on the mean value itself -> what layout
+        # does the mean signal make on its own?  Both show the RAW mean value
+        # (no concordance normalisation / batch removal), z-scored per bin for
+        # display like the main heatmap.
+        macc = None
+        if args.mean_heatmaps != "off" and mean_path:
+            macc = pd.read_parquet(mean_path)
+            macc.index = macc.index.astype(str)
+            miss_b = sum(b not in macc.columns for b in sel_bins)
+            miss_c = sum(c not in macc.index for c in M.index)
+            if miss_b == len(sel_bins) or miss_c == M.shape[0]:
+                print(f"  {name}: mean matrix {mean_path} shares no "
+                      f"{'bins' if miss_b == len(sel_bins) else 'cells'} with "
+                      f"the concordance matrix — skipping companion heatmaps "
+                      f"(wrong --mean-matrix?).", file=sys.stderr)
+                macc = None
+            elif miss_b or miss_c:
+                print(f"  {name}: mean matrix is missing {miss_b}/{len(sel_bins)}"
+                      f" bins and {miss_c}/{M.shape[0]} cells (shown blank).",
+                      file=sys.stderr)
+        if macc is not None:
+            macc = macc.reindex(index=list(M.index), columns=list(sel_bins))
+            lab = _MEAN_LABEL.get(name.lower(), "mean level")
+            vlabel = f"{lab} (z per bin)"
+            fig_a = out_dir / f"marker_heatmap_{name}_mean_fixedorder.{args.plot_format}"
+            _heatmap(macc, list(macc.index), list(sel_bins), ct, batch_df,
+                     ct_colors, batch_colors, batch_order,
+                     f"{name.upper()}: {lab}, concordance order "
+                     f"({len(sel_bins)} marker bins)", fig_a, cmap,
+                     legend_order=block_order, legend_max=args.max_legend_levels,
+                     order=main_order, value_label=vlabel)
+            fig_b = out_dir / f"marker_heatmap_{name}_mean_reclustered.{args.plot_format}"
+            _heatmap(macc, list(macc.index), list(sel_bins), ct, batch_df,
+                     ct_colors, batch_colors, batch_order,
+                     f"{name.upper()}: {lab}, own clustering "
+                     f"({len(sel_bins)} marker bins)", fig_b, cmap,
+                     legend_order=block_order, legend_max=args.max_legend_levels,
+                     value_label=vlabel)
+            print(f"  mean-signal companions -> {fig_a.name}, {fig_b.name}")
+        elif args.mean_heatmaps == "on":
+            sys.exit(f"--mean-heatmaps on but no mean matrix for {name!r}: pass "
+                     f"--mean-matrix {name}=PATH or place "
+                     f"accessibility_mean.parquet beside {path}.")
 
         # Out-of-selection CONTROL (number only; the UMAP figure is produced by
         # nome_hic_concordance / nome_hic_compare): do the bins we did NOT pick

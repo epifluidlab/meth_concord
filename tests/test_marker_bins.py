@@ -148,10 +148,13 @@ def test_end_to_end_marker_and_control(tmp_path):
     X, ct, batch, classes = _data(seed=1, n_per=60)
     cts = [f"CT{c}" for c in ct]
     samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
     mat = tmp_path / "gch.parquet"
-    pd.DataFrame(X, index=samples,
-                 columns=[f"chr1:{i * 250000}" for i in range(X.shape[1])]
-                 ).to_parquet(mat)
+    pd.DataFrame(X, index=samples, columns=bins).to_parquet(mat)
+    # A mean-signal sibling so --mean-heatmaps auto-derives it (a DIFFERENT
+    # matrix over the same cells/bins, so the companion heatmaps have content).
+    pd.DataFrame(np.abs(X), index=samples, columns=bins).to_parquet(
+        tmp_path / "accessibility_mean.parquet")
     stab = tmp_path / "s.tsv"
     pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
                   "cell_type": cts,
@@ -166,6 +169,9 @@ def test_end_to_end_marker_and_control(tmp_path):
         capture_output=True, text=True)
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     assert (out / "marker_heatmap_gch.png").exists()
+    # the two mean-signal companion heatmaps were auto-produced
+    assert (out / "marker_heatmap_gch_mean_fixedorder.png").exists()
+    assert (out / "marker_heatmap_gch_mean_reclustered.png").exists()
     scores = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
     assert scores["selected"].sum() == 30
     # the out-of-selection control must fire: non-selected bins separate types
@@ -227,3 +233,38 @@ def test_batch_colors_are_deterministic_across_matrices():
     a, _ = m._batch_color_maps(df, bcols)
     b, _ = m._batch_color_maps(df, bcols)
     assert all(a[c] == b[c] for c in bcols)
+
+
+# ------------------------------------------------------- companion heatmaps --
+
+def test_heatmap_order_roundtrip(tmp_path):
+    """_heatmap returns its (cells, bins, linkage) layout, and re-passing it as
+    order= reproduces the EXACT cell + bin order on a DIFFERENT matrix -- the
+    mechanism behind the fixed-order mean-signal companion heatmap."""
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("scipy")
+    m = _mod()
+    rng = np.random.default_rng(0)
+    cells = [f"c{i}" for i in range(24)]
+    bins = [f"chr1:{i * 250000}" for i in range(8)]
+    ct = pd.Series([f"CT{i % 3}" for i in range(24)], index=cells)
+    batch_df = pd.DataFrame({"b": ["x", "y"] * 12}, index=cells)
+    bcolors, border = m._batch_color_maps(batch_df, ["b"])
+    conc = pd.DataFrame(rng.normal(size=(24, 8)), index=cells, columns=bins)
+    mean = pd.DataFrame(rng.normal(size=(24, 8)), index=cells, columns=bins)
+
+    o1 = m._heatmap(conc, cells, bins, ct, batch_df, {}, bcolors, border,
+                    "main", tmp_path / "a.png", "RdBu_r")
+    # Fixed order: a DIFFERENT matrix, same layout returned verbatim.
+    o2 = m._heatmap(mean, cells, bins, ct, batch_df, {}, bcolors, border,
+                    "fixed", tmp_path / "b.png", "RdBu_r", order=o1,
+                    value_label="mean accessibility (z per bin)")
+    assert list(o2[0]) == list(o1[0])                 # identical cell order
+    assert list(o2[1]) == list(o1[1])                 # identical bin order
+    # Reclustered: fresh clustering on the mean matrix; still all bins/cells.
+    o3 = m._heatmap(mean, cells, bins, ct, batch_df, {}, bcolors, border,
+                    "reclust", tmp_path / "c.png", "RdBu_r")
+    assert sorted(o3[0]) == sorted(cells)
+    assert sorted(o3[1]) == sorted(bins)
+    for f in ("a.png", "b.png", "c.png"):
+        assert (tmp_path / f).exists()
