@@ -255,16 +255,34 @@ def test_heatmap_order_roundtrip(tmp_path):
 
     o1 = m._heatmap(conc, cells, bins, ct, batch_df, {}, bcolors, border,
                     "main", tmp_path / "a.png", "RdBu_r")
-    # Fixed order: a DIFFERENT matrix, same layout returned verbatim.
+    # Fixed order: a DIFFERENT matrix, same layout returned verbatim; the
+    # companion shows the RAW level (zscore=False) on a sequential cmap.
     o2 = m._heatmap(mean, cells, bins, ct, batch_df, {}, bcolors, border,
-                    "fixed", tmp_path / "b.png", "RdBu_r", order=o1,
-                    value_label="mean accessibility (z per bin)")
+                    "fixed", tmp_path / "b.png", m._mean_cmap("gch"), order=o1,
+                    value_label="mean accessibility", zscore=False)
     assert list(o2[0]) == list(o1[0])                 # identical cell order
     assert list(o2[1]) == list(o1[1])                 # identical bin order
     # Reclustered: fresh clustering on the mean matrix; still all bins/cells.
     o3 = m._heatmap(mean, cells, bins, ct, batch_df, {}, bcolors, border,
-                    "reclust", tmp_path / "c.png", "RdBu_r")
+                    "reclust", tmp_path / "c.png", m._mean_cmap("gch"),
+                    value_label="mean accessibility", zscore=False)
     assert sorted(o3[0]) == sorted(cells)
     assert sorted(o3[1]) == sorted(bins)
     for f in ("a.png", "b.png", "c.png"):
         assert (tmp_path / f).exists()
+
+
+def test_mean_cmap_endpoints_match_nomeseq_convention():
+    """GCH accessibility: white(low) -> teal(high); HCG methylation: blue(low)
+    -> yellow(high).  Check the palette endpoints encode that."""
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    m = _mod()
+    acc = matplotlib.colormaps.get_cmap(m._mean_cmap("gch"))
+    lo, hi = acc(0.0)[:3], acc(1.0)[:3]
+    assert lo == (1.0, 1.0, 1.0)                       # low accessibility = white
+    assert hi[1] > 0.3 and hi[2] > 0.3 and hi[0] < 0.3   # high = teal (G+B, low R)
+    meth = matplotlib.colormaps.get_cmap(m._mean_cmap("hcg"))
+    b_lo, y_hi = meth(0.0)[:3], meth(1.0)[:3]
+    assert b_lo[2] > b_lo[0]                           # low methylation = blue-ish
+    assert y_hi[0] > 0.7 and y_hi[1] > 0.7 and y_hi[2] < 0.5   # high = yellow

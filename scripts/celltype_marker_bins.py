@@ -201,6 +201,23 @@ _CMAP_FALLBACK = ["RdBu_r", "PuOr_r", "BrBG_r", "PiYG_r"]
 _MEAN_LABEL = {"gch": "mean accessibility", "hcg": "mean methylation"}
 
 
+def _mean_cmap(name):
+    """Sequential colormap for a mean-signal companion heatmap, matching the
+    conventional NOMe-seq view: GCH accessibility is white(low) -> teal(high);
+    HCG methylation is blue(low) -> yellow(high).
+
+    GCH is a custom white->teal ramp; HCG uses matplotlib's 'cividis', the
+    canonical perceptually-uniform, colour-blind-safe blue->yellow map."""
+    from matplotlib.colors import LinearSegmentedColormap
+    n = name.lower()
+    if n == "gch":
+        return LinearSegmentedColormap.from_list(
+            "acc_white_teal", ["#ffffff", "#7fcccc", "#1f9e9e", "#0b5c5c"])
+    if n == "hcg":
+        return "cividis"
+    return "cividis"
+
+
 def _remove_batch(M, ct_labels, batch_df):
     """Center each (cell type, batch) group to its cell-type mean, per bin.
 
@@ -307,12 +324,22 @@ def _batch_color_maps(batch_df, bcols):
 
 def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
              batch_colors, batch_order, title, out, cmap, legend_order=None,
-             legend_max=40, order=None, value_label="concordance (z per bin)"):
+             legend_max=40, order=None, value_label="concordance (z per bin)",
+             zscore=True):
     """Marker heatmap: bins x cells.  Cells (columns) are hierarchically
     clustered and the COLUMN dendrogram is drawn on top of the cell-type strip;
     no cell names are shown.  A cell-type strip and one strip per batch variable
     (exp/plate/lib) sit below it, so it is visible that the cell clustering
     tracks cell type and not any batch.
+
+    ``zscore`` (default) z-scores each bin across cells for display (diverging
+    cmap, +/-2.5).  Set False to show the RAW value on a sequential scale (the
+    mean accessibility / methylation companions), with a robust 2-98 percentile
+    range.
+
+    When ``order`` is supplied (a previous heatmap's layout) the columns are NOT
+    re-clustered, so the dendrogram is OMITTED -- drawing one would falsely imply
+    clustering was done on this matrix.
 
     Returns ``(cells_order, bins_order, col_linkage)`` -- the exact layout it
     drew.  Pass that tuple back as ``order`` to render a DIFFERENT matrix (e.g.
@@ -339,10 +366,25 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
         bins_seq = list(bins_seq)
 
     Z = M.loc[cells_o, bins_seq].to_numpy(np.float64).T   # bins x cells
-    mu = np.nanmean(Z, axis=1, keepdims=True)
-    sd = np.nanstd(Z, axis=1, keepdims=True)
-    Z = np.where(sd > 0, (Z - mu) / np.where(sd > 0, sd, 1), 0.0)
-    Z = np.clip(np.where(np.isfinite(Z), Z, 0.0), -2.5, 2.5)
+    if zscore:
+        mu = np.nanmean(Z, axis=1, keepdims=True)
+        sd = np.nanstd(Z, axis=1, keepdims=True)
+        Z = np.where(sd > 0, (Z - mu) / np.where(sd > 0, sd, 1), 0.0)
+        Z = np.clip(np.where(np.isfinite(Z), Z, 0.0), -2.5, 2.5)
+        vmin, vmax = -2.5, 2.5
+    else:
+        # Raw value (mean accessibility / methylation): keep the LEVEL, pick a
+        # robust display range for contrast; missing -> the low (white) end.
+        finite = Z[np.isfinite(Z)]
+        if finite.size:
+            vmin, vmax = (float(v) for v in np.percentile(finite, [2, 98]))
+            if vmax <= vmin:
+                vmin, vmax = float(finite.min()), float(finite.max())
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+        else:
+            vmin, vmax = 0.0, 1.0
+        Z = np.where(np.isfinite(Z), Z, vmin)
     if order is None:
         # Rows (bins) ordered by clustering on the cell-type-MEAN pattern (no row
         # dendrogram drawn), so bins band by which cell types they mark.
@@ -356,15 +398,20 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
     strips = [("cell type", ct_labels)] + [(c, batch_df[c]) for c in
                                            batch_df.columns]
     n_strip = len(strips)
+    # Draw the dendrogram ONLY when we clustered here (order is None).  A
+    # borrowed layout must NOT show one -- it would falsely imply this matrix was
+    # clustered.
+    show_dend = order is None and col_lk is not None
+    n_top = 1 if show_dend else 0
     uniq_ct = (legend_order or list(dict.fromkeys(ct_labels.loc[cells_o])))
     fig = plt.figure(figsize=(12.5 + 0.13 * len(uniq_ct), 9.0 + 0.3 * n_strip))
-    # top row = column dendrogram, then the strips, then the heatmap.
-    gs = GridSpec(n_strip + 2, 2,
-                  height_ratios=[1.6] + [0.5] * n_strip + [12],
-                  width_ratios=[24, 1], hspace=0.06, wspace=0.03)
+    # (optional dendrogram row), then the strips, then the heatmap.
+    gs = GridSpec(n_strip + 1 + n_top, 2,
+                  height_ratios=([1.6] if show_dend else []) + [0.5] * n_strip
+                  + [12], width_ratios=[24, 1], hspace=0.06, wspace=0.03)
 
     # Column dendrogram (cells), aligned to the heatmap columns.
-    if col_lk is not None:
+    if show_dend:
         from scipy.cluster.hierarchy import dendrogram
         ax_d = fig.add_subplot(gs[0, 0])
         dendrogram(col_lk, ax=ax_d, no_labels=True, color_threshold=0,
@@ -375,7 +422,7 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
 
     legends = []          # (title, {level: colour}, levels)
     for r, (sname, labels) in enumerate(strips):
-        ax_s = fig.add_subplot(gs[r + 1, 0])
+        ax_s = fig.add_subplot(gs[r + n_top, 0])
         ordered = labels.loc[cells_o]
         if sname == "cell type":
             uniq = list(dict.fromkeys(ordered))
@@ -398,14 +445,14 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
         ax_s.set_ylabel(sname, rotation=0, ha="right", va="center", fontsize=8)
         legends.append((sname, cols, uniq))
 
-    ax = fig.add_subplot(gs[n_strip + 1, 0])
-    im = ax.imshow(Z, aspect="auto", cmap=cmap, vmin=-2.5, vmax=2.5,
+    ax = fig.add_subplot(gs[n_strip + n_top, 0])
+    im = ax.imshow(Z, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax,
                    interpolation="nearest")
     layout_note = "clustered" if order is None else "borrowed order"
     ax.set_xlabel(f"cells (n={len(cells_o)}, {layout_note})")
     ax.set_ylabel(f"selected bins (n={len(bins_seq)}, {layout_note})")
     ax.set_xticks([]); ax.set_yticks([])
-    fig.colorbar(im, cax=fig.add_subplot(gs[n_strip + 1, 1]),
+    fig.colorbar(im, cax=fig.add_subplot(gs[n_strip + n_top, 1]),
                  label=value_label)
 
     # Legends to the RIGHT of the colour bar, stacked top-to-bottom.  The cell
@@ -647,11 +694,13 @@ def main():
 
         # Companion mean-signal heatmaps (accessibility for gch, methylation for
         # hcg): (A) the concordance heatmap's EXACT layout recoloured by the mean
-        # value -> is the concordance structure present in the mean signal?  (B)
-        # the same cells+bins clustered on the mean value itself -> what layout
-        # does the mean signal make on its own?  Both show the RAW mean value
-        # (no concordance normalisation / batch removal), z-scored per bin for
-        # display like the main heatmap.
+        # value (NO dendrogram -- the order is borrowed, not clustered here) ->
+        # is the concordance structure present in the mean signal?  (B) the same
+        # cells+bins clustered on the mean value itself -> what layout does the
+        # mean signal make on its own?  Both show the RAW mean LEVEL (no
+        # concordance normalisation / batch removal) on the conventional NOMe-seq
+        # sequential palette (white->teal for accessibility, blue->yellow for
+        # methylation), not the z-scored diverging scale of the main heatmap.
         macc = None
         if args.mean_heatmaps != "off" and mean_path:
             macc = pd.read_parquet(mean_path)
@@ -671,21 +720,21 @@ def main():
         if macc is not None:
             macc = macc.reindex(index=list(M.index), columns=list(sel_bins))
             lab = _MEAN_LABEL.get(name.lower(), "mean level")
-            vlabel = f"{lab} (z per bin)"
+            mcmap = _mean_cmap(name)
             fig_a = out_dir / f"marker_heatmap_{name}_mean_fixedorder.{args.plot_format}"
             _heatmap(macc, list(macc.index), list(sel_bins), ct, batch_df,
                      ct_colors, batch_colors, batch_order,
                      f"{name.upper()}: {lab}, concordance order "
-                     f"({len(sel_bins)} marker bins)", fig_a, cmap,
+                     f"({len(sel_bins)} marker bins)", fig_a, mcmap,
                      legend_order=block_order, legend_max=args.max_legend_levels,
-                     order=main_order, value_label=vlabel)
+                     order=main_order, value_label=lab, zscore=False)
             fig_b = out_dir / f"marker_heatmap_{name}_mean_reclustered.{args.plot_format}"
             _heatmap(macc, list(macc.index), list(sel_bins), ct, batch_df,
                      ct_colors, batch_colors, batch_order,
                      f"{name.upper()}: {lab}, own clustering "
-                     f"({len(sel_bins)} marker bins)", fig_b, cmap,
+                     f"({len(sel_bins)} marker bins)", fig_b, mcmap,
                      legend_order=block_order, legend_max=args.max_legend_levels,
-                     value_label=vlabel)
+                     value_label=lab, zscore=False)
             print(f"  mean-signal companions -> {fig_a.name}, {fig_b.name}")
         elif args.mean_heatmaps == "on":
             sys.exit(f"--mean-heatmaps on but no mean matrix for {name!r}: pass "
