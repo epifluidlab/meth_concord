@@ -208,11 +208,37 @@ def _bh_fdr(p):
     return out
 
 
-def _bins_to_bed(bins, bin_size):
+def _canon_chrom(c):
+    """Contig name with a leading 'chr'/'Chr' stripped, so chr1 == 1."""
+    s = str(c)
+    return s[3:] if s[:3].lower() == "chr" else s
+
+
+def _read_chrom_sizes(path):
+    """{contig (without 'chr'): length} from a chrom.sizes / .fai (first 2
+    columns)."""
+    sizes = {}
+    with open(path) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    sizes[_canon_chrom(parts[0])] = int(parts[1])
+                except ValueError:
+                    continue
+    return sizes
+
+
+def _bins_to_bed(bins, bin_size, chrom_sizes=None):
     """(chrom, start, end) per bin label 'chrom:start' (0-based, half-open).
 
-    ``bin_size`` sets the end; if it could not be inferred, end = start + 1."""
+    ``bin_size`` sets the end; if it could not be inferred, end = start + 1.
+    When ``chrom_sizes`` is given (keyed by the 'chr'-stripped contig name), the
+    last bin of each chromosome is clamped so its end never runs past the
+    chromosome length -- otherwise a fixed-width grid overshoots the final bin
+    and breaks downstream tools (bedtools, enrichment)."""
     width = int(bin_size) if bin_size else 1
+    sizes = chrom_sizes or {}
     rows = []
     for b in bins:
         s = str(b)
@@ -224,7 +250,11 @@ def _bins_to_bed(bins, bin_size):
                 chrom, start = s, 0
         else:
             chrom, start = s, 0
-        rows.append((chrom, start, start + width))
+        end = start + width
+        size = sizes.get(_canon_chrom(chrom))
+        if size is not None:
+            end = max(min(end, int(size)), start + 1)   # clamp; keep end > start
+        rows.append((chrom, start, end))
     return rows
 
 
@@ -673,6 +703,14 @@ def main():
     ap.add_argument("--color-column", default=None,
                     help="Samples-sheet column giving a colour per cell type.")
     ap.add_argument("--exclude-chrom", action="append", default=None)
+    ap.add_argument("--chrom-sizes", default=None, metavar="FILE",
+                    help="Chromosome sizes (a UCSC chrom.sizes or .fai; the "
+                         "first two columns 'contig<TAB>length' are read).  Used "
+                         "to clamp the last bin of each chromosome in the output "
+                         "BEDs so it never overshoots the chromosome end.  "
+                         "Strongly recommended -- without it a fixed-width bin "
+                         "grid produces a final bin that runs past the contig "
+                         "and breaks bedtools / enrichment tools.")
     ap.add_argument("--n-bins", type=int, default=500,
                     help="Number of marker bins for the heatmap.")
     ap.add_argument("--cmap", action="append", default=None,
@@ -753,6 +791,15 @@ def main():
                 ct_colors.setdefault(ct, c)
 
     excl = parse_exclude_chroms(args.exclude_chrom)
+    chrom_sizes = None
+    if args.chrom_sizes:
+        chrom_sizes = _read_chrom_sizes(args.chrom_sizes)
+        print(f"chrom sizes: {len(chrom_sizes)} contigs (last bins clamped to "
+              f"the contig end)", file=sys.stderr)
+    else:
+        print("NOTE: --chrom-sizes not given; the last bin of each chromosome "
+              "in the output BEDs may run past the contig end (pass "
+              "--chrom-sizes to clamp it).", file=sys.stderr)
     cmap_override = {}
     for c in (args.cmap or []):
         if '=' in c:
@@ -936,7 +983,7 @@ def main():
 
         # BED files (0-based, half-open) with the same statistics: one with ALL
         # bins, one with only the bins used in the plot (selected).
-        coords = _bins_to_bed(M.columns, infer_bin_size(M.columns))
+        coords = _bins_to_bed(M.columns, infer_bin_size(M.columns), chrom_sizes)
         bed = pd.DataFrame(coords, columns=["chrom", "start", "end"])
         for c in ("celltype_icc", "celltype_pvalue", "celltype_fdr",
                   "batch_icc", "selected"):

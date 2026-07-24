@@ -316,6 +316,60 @@ def test_icc_per_region_return_stats_is_backward_compatible():
     assert np.array_equal(two[1], four[1])                   # same usable mask
 
 
+def test_bins_to_bed_clamps_last_bin_to_chrom_size():
+    """The final fixed-width bin must not overshoot the contig length; contigs
+    without a size, and chr / no-chr naming, are handled."""
+    m = _mod()
+    sizes = {"1": 24_900_000}                    # keyed WITHOUT 'chr' (fai/sizes)
+    bins = ["chr1:0", "chr1:24500000", "chr1:24750000", "chr2:0"]
+    rows = m._bins_to_bed(bins, 250_000, sizes)
+    assert rows[0] == ("chr1", 0, 250_000)                     # interior unchanged
+    assert rows[2] == ("chr1", 24_750_000, 24_900_000)         # last bin clamped
+    assert rows[3] == ("chr2", 0, 250_000)                      # no size -> unchanged
+    assert all(e > s for _, s, e in rows)
+    # without sizes -> original full-width behaviour
+    assert m._bins_to_bed(["chr1:24750000"], 250_000)[0] == \
+        ("chr1", 24_750_000, 25_000_000)
+
+
+def test_read_chrom_sizes_parses_sizes_and_fai(tmp_path):
+    m = _mod()
+    p = tmp_path / "g.sizes"
+    p.write_text("chr1\t195471971\nchr2\t182113224\n")
+    assert m._read_chrom_sizes(str(p)) == {"1": 195471971, "2": 182113224}
+    fai = tmp_path / "g.fai"                     # .fai has extra columns
+    fai.write_text("chr1\t195471971\t7\t60\t61\n")
+    assert m._read_chrom_sizes(str(fai))["1"] == 195471971
+
+
+def test_chrom_sizes_clamps_bed_output(tmp_path):
+    """--chrom-sizes clamps the last bin of each chromosome in the BED output."""
+    X, ct, batch, _ = _data(seed=3, n_per=60)
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    size = X.shape[1] * 250000 - 100000          # contig ends 100 kb before the
+    pd.DataFrame(X, index=samples, columns=bins  # full-width end of the last bin
+                 ).to_parquet(tmp_path / "gch.parquet")
+    (tmp_path / "chrom.sizes").write_text(f"chr1\t{size}\n")
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["batch2" if b == 0 else "scNH" for b in batch]}
+                 ).to_csv(tmp_path / "s.tsv", sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={tmp_path/'gch.parquet'}",
+         "--samples", str(tmp_path / "s.tsv"), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "20",
+         "--chrom-sizes", str(tmp_path / "chrom.sizes"),
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    allb = pd.read_csv(out / "bin_scores_gch.all.bed", sep="\t")
+    assert (allb["end"] <= size).all()                # nothing past the contig
+    assert allb["end"].max() == size                  # last bin clamped to it
+    assert (allb["end"] > allb["start"]).all()        # still valid intervals
+
+
 # ------------------------------------------------------------ batch palettes --
 
 def _rgb(t):
