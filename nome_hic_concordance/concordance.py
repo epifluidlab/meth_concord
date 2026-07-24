@@ -1210,10 +1210,11 @@ def compute_signed_concordance_matrix(
     # and share the downstream O/E handling; they differ only in how each
     # bin's expected RATE is formed (see _compute_cell_dm_expected mode).
     uses_expected = baseline in ("distance-matched", "distance-pooled")
-    if concordance_combine not in ("signed-diff", "log2-ratio", "linked-only"):
+    if concordance_combine not in ("signed-diff", "log2-ratio", "linked-only",
+                                   "concordant-diff"):
         raise ValueError(
-            f"concordance_combine must be 'signed-diff', 'log2-ratio', or "
-            f"'linked-only'; got {concordance_combine!r}.")
+            f"concordance_combine must be 'signed-diff', 'log2-ratio', "
+            f"'linked-only', or 'concordant-diff'; got {concordance_combine!r}.")
 
     out_path = ensure_dir(output_dir) if save_outputs else None
     items = list(cell_posterior_paths.items())
@@ -1523,6 +1524,16 @@ def compute_signed_concordance_matrix(
             log2 = lambda x: np.log2(np.clip(x, eps, None))
             delta_signed = (log2(o_open) - log2(e_open)) \
                 - (log2(o_closed) - log2(e_closed))
+        elif concordance_combine == "concordant-diff":
+            # Excess CONCORDANT mass (co-open + co-closed) over the null =
+            # the mixed DEFICIT (E_mixed − O_mixed) = 2·Cov(p_i, p_j): the
+            # marginal-free coordination MAGNITUDE (sign = concordant vs
+            # anti-concordant).  Unlike 'signed-diff', the (open − closed)
+            # contrast does NOT cancel the coordination here; unlike
+            # 'log2-ratio' there is no marginal-dependent scaling, so it stays
+            # sensitive at ~50% level where log2-ratio vanishes.  This is the
+            # theoretically cleanest coordination statistic against an O/E null.
+            delta_signed = (o_open + o_closed) - (e_open + e_closed)
         else:  # 'signed-diff' (legacy): (O_open−O_closed) − (E_open−E_closed)
             delta_signed = (o_open - o_closed) - (e_open - e_closed)
 

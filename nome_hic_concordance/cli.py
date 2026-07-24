@@ -178,13 +178,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--concordance-combine",
-        choices=["auto", "signed-diff", "log2-ratio", "linked-only"],
+        choices=["auto", "signed-diff", "log2-ratio", "linked-only",
+                 "concordant-diff"],
         default="log2-ratio",
         help="How the long-range observed (O) and baseline (E) co-state rates "
              "are combined.  'signed-diff' = "
-             "(O_open−O_closed)−(E_open−E_closed) (legacy).  'log2-ratio' = "
+             "(O_open−O_closed)−(E_open−E_closed) (legacy; NOTE with an O/E null "
+             "the open−closed contrast cancels the coordination — it measures "
+             "only the marginal).  'log2-ratio' = "
              "log2(O_open/E_open)−log2(O_closed/E_closed) (symmetric, "
-             "scale-free, Hi-C O/E convention).  'linked-only' = "
+             "scale-free, Hi-C O/E convention; retains coordination but with a "
+             "marginal-dependent scaling that vanishes near the 0.5 level).  "
+             "'concordant-diff' = (O_open+O_closed)−(E_open+E_closed), the "
+             "excess concordant mass / mixed deficit = 2·Cov: the marginal-free "
+             "coordination magnitude (theoretically the cleanest against an O/E "
+             "null; sign = concordant vs anti-concordant).  'linked-only' = "
              "(O_open−O_closed) with NO baseline subtracted (--baseline is "
              "ignored) — a diagnostic to check whether the concordance UMAP is "
              "driven by the short-range baseline; note this is the raw "
