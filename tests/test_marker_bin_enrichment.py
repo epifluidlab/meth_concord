@@ -166,6 +166,25 @@ def test_fetch_and_resolve_with_file_url(tmp_path):
     assert m._resolve("file:///no/such/file.bed", cache, "x") is None
 
 
+def test_label_to_group_collapses_via_mnemonic(tmp_path):
+    """Full-stack-style '<N>_<mnemonic>' labels collapse to groups via the
+    mnemonic (auto-detected column), NOT the leading number."""
+    m = _mod()
+    ann = pd.DataFrame({
+        "state": ["1", "2", "3"],                 # numbering differs from the BED
+        "mneumonics": ["mHET9", "mTSS3", "mEnhWk1"],
+        "group": ["HET", "TSS", "WkEnh"]})
+    labels = ["15_mHET9", "100_mTSS3", "1_mEnhWk1"]
+    mp, hit, tot, col = m._label_to_group(labels, ann, "group")
+    assert col == "mneumonics" and hit == 3 and tot == 3
+    assert mp == {"15_mHET9": "HET", "100_mTSS3": "TSS", "1_mEnhWk1": "WkEnh"}
+    # the leading number must NOT be used (BED '1' maps by mnemonic, not state 1)
+    assert mp["1_mEnhWk1"] == "WkEnh"              # state col says 1->HET; ignored
+    # an unknown label falls through to 'unmapped'
+    mp2, *_ = m._label_to_group(["99_mXYZ"], ann, "group")
+    assert mp2["99_mXYZ"] == "unmapped"
+
+
 def test_parse_pairs_label_vs_bare_url():
     m = _mod()
     d = m._parse_pairs(["GO=https://x.org/lib?libraryName=GO_BP", "local.gmt"], "x")
@@ -271,3 +290,43 @@ def test_fdr_foreground_selection(tmp_path):
             "--output-dir", str(out)])
     s = __import__("json").loads((out / "enrichment_summary.json").read_text())
     assert s["gch"]["n_foreground"] == 5                      # by FDR, not 'selected'
+
+
+def test_chromhmm_group_collapse_end_to_end(tmp_path):
+    """A fine-grained state BED ('<N>_<mnemonic>') + a groups TSV is enriched by
+    GROUP -- redundant enhancer states collapse to one 'enhancers' row."""
+    pytest.importorskip("scipy")
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    BS = 250_000
+    rows = [(c, i * BS, (i + 1) * BS) for c in ("chr1", "chr2")
+            for i in range(100)]
+    bins = _bins(rows)
+    sel = np.zeros(len(bins), bool); sel[:30] = True
+    bins["celltype_icc"] = 0.5; bins["celltype_pvalue"] = 1e-3
+    bins["celltype_fdr"] = 1e-3; bins["batch_icc"] = 0.01; bins["selected"] = sel
+    bins.to_csv(tmp_path / "bins.all.bed", sep="\t", index=False)
+    # 3 redundant enhancer states over the fg (chr1[0:30]); quiescent elsewhere.
+    seg = [("chr1", i * BS, (i + 1) * BS, f"{1 + i % 3}_mEnhA{1 + i % 3}")
+           for i in range(30)]
+    seg += [("chr1", i * BS, (i + 1) * BS, "9_mQuies1") for i in range(30, 100)]
+    seg += [("chr2", i * BS, (i + 1) * BS, "9_mQuies1") for i in range(100)]
+    pd.DataFrame(seg).to_csv(tmp_path / "seg.bed", sep="\t", index=False,
+                             header=False)
+    pd.DataFrame({"state": ["1", "2", "3", "9"],
+                  "mneumonics": ["mEnhA1", "mEnhA2", "mEnhA3", "mQuies1"],
+                  "group": ["enhancers", "enhancers", "enhancers", "quiescent"]}
+                 ).to_csv(tmp_path / "ann.tsv", sep="\t", index=False)
+    out = tmp_path / "out"
+    m.main(["--bed", f"gch={tmp_path/'bins.all.bed'}",
+            "--chromhmm", str(tmp_path / "seg.bed"),
+            "--chromhmm-groups", str(tmp_path / "ann.tsv"),
+            "--chromhmm-per-state", "--output-dir", str(out)])
+    hmm = pd.read_csv(out / "gch_chromhmm_enrichment.tsv", sep="\t")
+    assert set(hmm["annotation"]) == {"enhancers", "quiescent"}   # collapsed
+    enh = hmm[hmm["annotation"] == "enhancers"].iloc[0]
+    assert enh["log2_fold_change"] > 0 and enh["fdr"] < 0.05      # enriched in fg
+    assert hmm[hmm["annotation"] == "quiescent"].iloc[0]["log2_fold_change"] < 0
+    # --chromhmm-per-state also wrote the un-collapsed table (4 states)
+    st = pd.read_csv(out / "gch_chromhmm_state_enrichment.tsv", sep="\t")
+    assert len(st) == 4

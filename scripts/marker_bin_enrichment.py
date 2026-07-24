@@ -210,6 +210,33 @@ def _read_cytoband(path):
     return out
 
 
+def _label_to_group(labels, ann, group_col, state_col=None):
+    """Map each ChromHMM state label to its biological group, so a fine-grained
+    model (e.g. the 100-state full-stack, whose states are semantically
+    redundant) collapses to a handful of interpretable groups.
+
+    A state BED label is often '<N>_<mnemonic>' (e.g. '15_mHET9'); it is matched
+    to the annotation by the FULL label or by the mnemonic (the suffix after the
+    first '_'), NEVER by the leading number -- the segmentation's numbering can
+    differ from the annotation's.  ``state_col`` is auto-detected when omitted:
+    the annotation column that matches the most labels wins.  Returns
+    (label->group, n_matched, n_total, column_used)."""
+    labels = list(dict.fromkeys(str(x) for x in labels))
+    suffix = {x: (x.split("_", 1)[1] if "_" in x else x) for x in labels}
+    cand = ([state_col] if state_col else
+            [c for c in ann.columns if c != group_col])
+    best, best_hits, best_col = {}, -1, None
+    for c in cand:
+        if c not in ann.columns:
+            continue
+        mp = dict(zip(ann[c].astype(str), ann[group_col].astype(str)))
+        hits = sum((x in mp) or (suffix[x] in mp) for x in labels)
+        if hits > best_hits:
+            best_hits, best, best_col = hits, mp, c
+    out = {x: best.get(x, best.get(suffix[x], "unmapped")) for x in labels}
+    return out, best_hits, len(labels), best_col
+
+
 # --------------------------------------------------- annotation auto-download -
 
 # Reference URLs per genome for the standard annotations (validated; a coarser
@@ -219,6 +246,8 @@ def _read_cytoband(path):
 _ENRICHR = "https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName="
 _UCSC = "https://hgdownload.soe.ucsc.edu/goldenPath"
 _GENCODE = "https://ftp.ebi.ac.uk/pub/databases/gencode"
+_FULLSTACK = ("https://public.hoffman2.idre.ucla.edu/ernst/2K9RS//full_stack/"
+              "full_stack_annotation_public_release")
 _GENOME = {
     "mm10": {
         "chrom_sizes": f"{_UCSC}/mm10/bigZips/mm10.chrom.sizes",
@@ -226,6 +255,9 @@ _GENOME = {
                            f"gencode.vM25.annotation.gtf.gz",
         "cytoband": f"{_UCSC}/mm10/database/cytoBand.txt.gz",
         "cpg_islands": f"{_UCSC}/mm10/database/cpgIslandExt.txt.gz",
+        # Ernst-lab full-stack ChromHMM (universal, 100 states -> 16 groups).
+        "chromhmm": f"{_FULLSTACK}/mm10/mm10_100_segments_segments.bed.gz",
+        "chromhmm_groups": f"{_FULLSTACK}/mm10/state_annotation_processed.tsv",
         "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
                       "KEGG": f"{_ENRICHR}KEGG_2019_Mouse"},
     },
@@ -558,12 +590,23 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
         print(f"  genes covered: {len(fg_genes)} foreground / "
               f"{len(bg_genes)} universe -> {tsv('foreground_genes').name}")
 
-    # (3) chromatin states -------------------------------------------------
+    # (3) chromatin states -- collapse to biological GROUPS when a mapping is
+    # available (e.g. the 100-state full-stack model -> ~16 groups), which is
+    # interpretable and higher-powered than testing 100 redundant states.
     if chromhmm is not None:
-        states = {f"state:{s}": g for s, g in chromhmm.groupby("name")}
-        hmm_df, _ = _region_enrichment(bins, fg, states)
+        grouped = "group" in chromhmm.columns
+        if grouped:                              # group name directly (HET, ...)
+            cats = {s: g for s, g in chromhmm.groupby("group")}
+        else:                                    # per state, back-compat label
+            cats = {f"state:{s}": g for s, g in chromhmm.groupby("name")}
+        hmm_df, _ = _region_enrichment(bins, fg, cats)
         hmm_df.to_csv(tsv("chromhmm_enrichment"), sep="\t", index=False)
-        pages.append(("region", ("Chromatin-state coverage", hmm_df)))
+        pages.append(("region", (
+            f"Chromatin states (by {'group' if grouped else 'state'})", hmm_df)))
+        if args.chromhmm_per_state and grouped:
+            st = {f"state:{s}": g for s, g in chromhmm.groupby("name")}
+            _region_enrichment(bins, fg, st)[0].to_csv(
+                tsv("chromhmm_state_enrichment"), sep="\t", index=False)
 
     # (4) other annotations ------------------------------------------------
     if annotations:
@@ -683,7 +726,25 @@ def main(argv=None):
                          "2000).")
     ap.add_argument("--chromhmm", default=None, metavar="BED|URL",
                     help="ChromHMM (or any state) BED; column 4 is the state "
-                         "label.  Coverage enrichment per state.  Path or URL.")
+                         "label.  Coverage enrichment per state.  Path or URL.  "
+                         "Auto-filled by --genome mm10 (the 100-state full-stack "
+                         "model).")
+    ap.add_argument("--chromhmm-groups", default=None, metavar="TSV|URL",
+                    help="State-annotation TSV that maps each ChromHMM state to a "
+                         "biological GROUP, so a fine-grained model (e.g. the "
+                         "100-state full-stack, whose states are semantically "
+                         "redundant) is collapsed to a handful of interpretable "
+                         "groups for the enrichment.  Matched to the BED state "
+                         "label by the full label or its mnemonic (suffix after "
+                         "'N_').  Auto-filled by --genome mm10.")
+    ap.add_argument("--chromhmm-group-col", default="group",
+                    help="Group column in --chromhmm-groups (default 'group').")
+    ap.add_argument("--chromhmm-state-col", default=None,
+                    help="Column in --chromhmm-groups to match the state label "
+                         "against (default: auto-detect, e.g. 'mneumonics').")
+    ap.add_argument("--chromhmm-per-state", action="store_true",
+                    help="Also write the per-state (un-collapsed) enrichment "
+                         "table alongside the per-group one.")
     ap.add_argument("--annotation", action="append", default=None,
                     metavar="LABEL=BED|URL",
                     help="Any functional annotation BED (enhancers, CpG islands, "
@@ -738,13 +799,30 @@ def main(argv=None):
             "gene_body": genes[["chrom", "start", "end"]].copy()}
         print(f"gene annotation: {len(genes)} genes", file=sys.stderr)
 
-    # Chromatin states (user-supplied only; no canonical per-tissue preset).
+    # Chromatin states.  A fine-grained model is collapsed to biological groups
+    # via --chromhmm-groups (auto-filled for mm10 = the full-stack model).
     chromhmm = None
-    ch = _resolve(args.chromhmm, cache, "chromhmm")
+    ch = _resolve(args.chromhmm or preset.get("chromhmm"), cache, "chromhmm")
     if ch:
         chromhmm = _read_bed(ch, want_name=True)
-        print(f"chromhmm: {chromhmm['name'].nunique()} states, "
-              f"{len(chromhmm)} intervals", file=sys.stderr)
+        gtsv = _resolve(args.chromhmm_groups or preset.get("chromhmm_groups"),
+                        cache, "chromhmm-groups")
+        if gtsv:
+            ann = pd.read_csv(gtsv, sep="\t", dtype=str)
+            if args.chromhmm_group_col not in ann.columns:
+                sys.exit(f"--chromhmm-group-col {args.chromhmm_group_col!r} not "
+                         f"in {gtsv}: {list(ann.columns)}")
+            mp, hit, tot, col = _label_to_group(
+                chromhmm["name"].unique(), ann, args.chromhmm_group_col,
+                args.chromhmm_state_col)
+            chromhmm["group"] = chromhmm["name"].map(mp)
+            print(f"chromhmm groups: matched {hit}/{tot} states via column "
+                  f"{col!r} -> {chromhmm['group'].nunique()} groups",
+                  file=sys.stderr)
+        print(f"chromhmm: {chromhmm['name'].nunique()} states"
+              + (f", {chromhmm['group'].nunique()} groups"
+                 if "group" in chromhmm.columns else "")
+              + f", {len(chromhmm)} intervals", file=sys.stderr)
 
     # Generic annotations: the user's, plus the genome's cytoBand (per Giemsa
     # band -> heterochromatin gpos* vs euchromatin gneg) and CpG islands.
