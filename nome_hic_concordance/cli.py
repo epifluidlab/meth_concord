@@ -817,6 +817,20 @@ def run_context(
         min_sites = args.min_gch_sites
     logger.info(f"Using min sites per end = {min_sites} for context {context}")
 
+    # Batch correction (signed method) is applied in STEP 5 -- to the mean-
+    # accessibility matrix that seeds the RWR graph -- and is baked into the
+    # concordance matrix, NOT re-applied in Step 7's UMAP.  Warn if the user
+    # asked for it but is skipping Step 5, so it isn't silently ignored.
+    if (5 not in steps and args.batch_correction != "none"
+            and args.batch_column is not None):
+        logger.warning(
+            f"--batch-correction {args.batch_correction!r} is applied in Step 5 "
+            f"(to the mean-accessibility RWR basis) and baked into the "
+            f"concordance matrix — it is NOT (re-)applied in Step 7's UMAP.  "
+            f"Step 5 is not in --steps, so no batch correction runs now; the "
+            f"UMAP reflects whatever correction the concordance matrix was "
+            f"originally computed with.  Re-run with step 5 to (re-)apply it.")
+
     ensure_dir(ctx_out)
 
     read_pair_dir = ctx_out / "02_read_pair_counts"
