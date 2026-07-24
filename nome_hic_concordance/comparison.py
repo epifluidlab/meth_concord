@@ -250,6 +250,7 @@ def marginal_analysis(
     plot_format: str = "png",
     batch_labels=None,
     batch_correction: str = "none",
+    harmony_theta=None,
 ) -> dict[str, dict]:
     """Per-matrix UMAP + silhouette/kNN-purity.  Returns metrics per matrix."""
     skip_map = skip_top_svd or {}
@@ -283,6 +284,7 @@ def marginal_analysis(
             group_colors=group_colors, group_order=group_order,
             plot_format=plot_format,
             batch_labels=batch_labels, batch_correction=batch_correction,
+            harmony_theta=harmony_theta,
         )
         m = {"n_cells": int(norm.shape[0]), "n_bins": int(norm.shape[1]),
              "skip_top_svd": skip}
@@ -585,6 +587,7 @@ def residual_umap(
     plot_format: str = "png",
     batch_labels=None,
     batch_correction: str = "none",
+    harmony_theta=None,
 ) -> dict:
     """UMAP + cluster metrics on the residual matrix."""
     out = ensure_dir(output_dir)
@@ -603,6 +606,7 @@ def residual_umap(
         group_colors=group_colors, group_order=group_order,
         plot_format=plot_format,
         batch_labels=batch_labels, batch_correction=batch_correction,
+        harmony_theta=harmony_theta,
     )
     m = {"n_bins": int(norm.shape[1]), "skip_top_svd": int(skip_top)}
     if group_labels is not None:
@@ -839,6 +843,7 @@ def run_comparison(
     per_cell_norm: str = "off",
     post_norm_recenter: bool = False,
     plot_format: str = "png",
+    harmony_theta=None,
 ) -> dict:
     """Run the full §4.2 suite; write summary.json; return the headline dict."""
     out = ensure_dir(output_dir)
@@ -884,7 +889,8 @@ def run_comparison(
         group_colors=group_colors, group_order=group_order,
         skip_top_svd=skip_top_svd, per_cell_norm=per_cell_norm,
         post_norm_recenter=post_norm_recenter, plot_format=plot_format,
-        batch_labels=batch_labels, batch_correction=batch_correction)
+        batch_labels=batch_labels, batch_correction=batch_correction,
+        harmony_theta=harmony_theta)
 
     # (b)+(c) Variance partition + residual UMAP for each concordance matrix.
     present_baselines = [b for b in baseline_names if b in matrices]
@@ -926,7 +932,8 @@ def run_comparison(
                 skip_top=int((skip_top_svd or {}).get(f"residual_{cn}", 0)),
                 per_cell_norm=per_cell_norm, post_norm_recenter=post_norm_recenter,
                 plot_format=plot_format,
-                batch_labels=batch_labels, batch_correction=batch_correction)
+                batch_labels=batch_labels, batch_correction=batch_correction,
+                harmony_theta=harmony_theta)
     else:
         logger.warning("No usable baseline matrices; skipping (b)/(c).")
 

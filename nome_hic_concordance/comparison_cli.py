@@ -142,7 +142,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "hence the residual) and the classifier all see "
                         "harmonised inputs — mirroring nome_hic_concordance, "
                         "which corrects the mean-accessibility matrix before it "
-                        "is normalised.  Default 'none'.")
+                        "is normalised.")
+    p.add_argument("--harmony-theta", type=float, default=None,
+                   help="Harmony batch-correction STRENGTH (diversity-clustering "
+                        "penalty) for --batch-correction harmony.  Higher mixes "
+                        "batches more aggressively; lower is gentler and keeps "
+                        "more of the original structure.  Broadcast to every "
+                        "--batch-column variable; omit to use harmonypy's "
+                        "default (2.0).")
     p.add_argument("--color-column", type=str, default=None,
                    help="Column in --samples holding the plot colour per cell "
                         "(hex like '#1f77b4' or a matplotlib name).  Each group "
@@ -294,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         skip_top_svd=skip_top_svd,
         batch_labels=batch_labels,
         batch_correction=args.batch_correction,
+        harmony_theta=args.harmony_theta,
         per_cell_norm=args.per_cell_norm,
         post_norm_recenter=args.post_norm_recenter == "on",
         plot_format=args.plot_format,

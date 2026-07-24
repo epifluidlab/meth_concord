@@ -167,6 +167,7 @@ def run_umap_and_plot(
     plot_format: str = "png",
     batch_labels=None,
     batch_correction: str = "none",
+    harmony_theta=None,
 ) -> pd.DataFrame:
     """Embed ``matrix`` via UMAP and save a coordinate table + scatter plot.
 
@@ -265,7 +266,8 @@ def run_umap_and_plot(
                 bl = batch_labels
                 if isinstance(bl, (pd.Series, pd.DataFrame)):
                     bl = bl.reindex(matrix.index).reset_index(drop=True)
-                X = _bc.harmonize_embedding(X, bl, random_state=random_state)
+                X = _bc.harmonize_embedding(X, bl, random_state=random_state,
+                                            theta=harmony_theta)
             else:
                 # center / zscore / combat: per-batch mean (or z) removal per
                 # component.  For BALANCED composition this removes the batch

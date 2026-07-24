@@ -299,6 +299,24 @@ def test_harmony_accepts_multiple_batch_vars():
     assert out.shape == mat.shape
 
 
+@pytest.mark.skipif(not _have_harmony(), reason="harmonypy not installed")
+def test_harmonize_embedding_theta_controls_strength():
+    """--harmony-theta: a larger theta mixes batches more aggressively."""
+    rng = np.random.default_rng(0)
+    n = 160
+    batch = np.tile([0, 1], n // 2)
+    ct = np.repeat([0, 1], n // 2)
+    scores = np.c_[ct * 3.0 + rng.normal(0, 0.3, n), rng.normal(0, 0.3, n)]
+    scores[:, 0] += batch * 2.0                      # a batch shift on PC0
+    bl = pd.Series(batch.astype(str), name="batch")
+    gap = lambda Z: abs(Z[batch == 0, 0].mean() - Z[batch == 1, 0].mean())
+    gentle = bc.harmonize_embedding(scores, bl, theta=0.5)
+    strong = bc.harmonize_embedding(scores, bl, theta=8.0)
+    assert gentle.shape == scores.shape
+    assert not np.allclose(gentle, strong), "theta must change the correction"
+    assert gap(strong) < gap(gentle), "higher theta -> more batch mixing"
+
+
 # --------------------------------------------------------------------------
 # All-NaN bins (an empty compartment bin) must not crash the dense solvers.
 # Regression: PCA/ComBat reject NaN, and per-bin-mean imputation cannot fill a

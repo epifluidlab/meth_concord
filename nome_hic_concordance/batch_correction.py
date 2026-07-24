@@ -274,9 +274,15 @@ def _try_import_pycombat():
 
 
 def harmonize_embedding(
-    scores, batch_labels, random_state: int = 42,
+    scores, batch_labels, random_state: int = 42, theta=None,
 ):
     """Harmony on an existing low-dim embedding (the SVD/PCA scores).
+
+    ``theta`` is harmony's diversity-clustering penalty — the batch-correction
+    STRENGTH.  Higher theta mixes batches more aggressively (default in
+    harmonypy is 2.0); lower theta is gentler and preserves more of the
+    original structure.  A scalar is broadcast to one value per batch variable;
+    ``None`` uses harmonypy's default.
 
     This is the STANDARD harmony workflow (scanpy's ``harmony_integrate``):
     correct the components that feed UMAP, AFTER all normalisation.
@@ -307,12 +313,16 @@ def harmonize_embedding(
         )
     meta = batch_df.reset_index(drop=True)
     vars_use = list(batch_df.columns)
+    kw = {}
+    if theta is not None:                     # broadcast the strength per var
+        kw["theta"] = [float(theta)] * len(vars_use)
     try:
-        out = hm.run_harmony(scores, meta, vars_use, random_state=random_state)
+        out = hm.run_harmony(scores, meta, vars_use, random_state=random_state,
+                             **kw)
     except TypeError:
         logger.warning("harmonypy.run_harmony has no random_state (old "
                        "version); harmony output may not be reproducible.")
-        out = hm.run_harmony(scores, meta, vars_use)
+        out = hm.run_harmony(scores, meta, vars_use, **kw)
     Z = np.asarray(out.Z_corr)
     if Z.shape == (n_comp, n_cells):
         Z = Z.T
