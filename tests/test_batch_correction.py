@@ -300,6 +300,39 @@ def test_harmony_accepts_multiple_batch_vars():
 
 
 @pytest.mark.skipif(not _have_harmony(), reason="harmonypy not installed")
+def test_harmony_runs_on_full_matrix_when_no_svd(tmp_path):
+    """--n-svd 0 + harmony must correct the FULL bin matrix (not skip it).
+
+    Regression: harmony was nested inside the SVD block, so --n-svd 0 skipped
+    it entirely.  Now it runs on whatever feeds UMAP — with an SVD it corrects
+    the scores, without one it corrects the full matrix — so the embedding must
+    differ from an uncorrected run.
+    """
+    import warnings
+    from nome_hic_concordance import visualization as viz
+    rng = np.random.default_rng(0)
+    n = 60
+    cells = [f"c{i}" for i in range(n)]
+    batch = np.tile([0, 1], n // 2)
+    M = pd.DataFrame(rng.normal(0, 1, (n, 120)) + batch[:, None] * 3.0,
+                     index=cells,
+                     columns=[f"chr1:{i * 1000}" for i in range(120)])
+    labels = pd.Series([f"T{i % 2}" for i in range(n)], index=cells)
+    bl = pd.Series([f"e{b}" for b in batch], index=cells, name="batch")
+    kw = dict(n_svd=0, skip_top_svd=0, n_threads=2, batch_labels=bl,
+              output_dir=str(tmp_path), random_state=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        none = viz.run_umap_and_plot(M, labels, output_prefix="none",
+                                     batch_correction="none", **kw)
+        harm = viz.run_umap_and_plot(M, labels, output_prefix="harm",
+                                     batch_correction="harmony", **kw)
+    a = none[["UMAP1", "UMAP2"]].to_numpy()
+    b = harm[["UMAP1", "UMAP2"]].to_numpy()
+    assert not np.allclose(a, b), "harmony must correct the full matrix (no SVD)"
+
+
+@pytest.mark.skipif(not _have_harmony(), reason="harmonypy not installed")
 def test_harmonize_embedding_theta_controls_strength():
     """--harmony-theta: a larger theta mixes batches more aggressively."""
     rng = np.random.default_rng(0)

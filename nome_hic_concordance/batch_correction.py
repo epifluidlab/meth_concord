@@ -274,9 +274,15 @@ def _try_import_pycombat():
 
 
 def harmonize_embedding(
-    scores, batch_labels, random_state: int = 42, theta=None,
+    scores, batch_labels, random_state: int = 42, theta=None, n_threads=None,
 ):
     """Harmony on an existing low-dim embedding (the SVD/PCA scores).
+
+    ``n_threads`` parallelises harmony: it is passed to harmonypy's ``ncores``
+    (its own clustering parallelism) AND used to raise the numpy/BLAS thread
+    count for the correction matrix algebra (via threadpoolctl).  This matters
+    most when harmony runs on the FULL bin matrix (--n-svd 0), where there are
+    thousands of features instead of a handful of SVD components.
 
     ``theta`` is harmony's diversity-clustering penalty — the batch-correction
     STRENGTH.  Higher theta mixes batches more aggressively (default in
@@ -316,13 +322,26 @@ def harmonize_embedding(
     kw = {}
     if theta is not None:                     # broadcast the strength per var
         kw["theta"] = [float(theta)] * len(vars_use)
+    if n_threads and int(n_threads) > 0:
+        kw["ncores"] = int(n_threads)         # harmonypy's own parallelism
+    # Also let the numpy/BLAS matrix algebra (the bulk of harmony) use n_threads.
+    from contextlib import nullcontext
     try:
-        out = hm.run_harmony(scores, meta, vars_use, random_state=random_state,
-                             **kw)
-    except TypeError:
-        logger.warning("harmonypy.run_harmony has no random_state (old "
-                       "version); harmony output may not be reproducible.")
-        out = hm.run_harmony(scores, meta, vars_use, **kw)
+        from threadpoolctl import threadpool_limits
+        tp = (threadpool_limits(int(n_threads))
+              if n_threads and int(n_threads) > 0 else nullcontext())
+    except Exception:
+        tp = nullcontext()
+    with tp:
+        try:
+            out = hm.run_harmony(scores, meta, vars_use,
+                                 random_state=random_state, **kw)
+        except TypeError:
+            logger.warning("harmonypy.run_harmony rejected random_state / "
+                           "ncores (old version); harmony may be "
+                           "single-threaded and non-reproducible.")
+            kw.pop("ncores", None)
+            out = hm.run_harmony(scores, meta, vars_use, **kw)
     Z = np.asarray(out.Z_corr)
     if Z.shape == (n_comp, n_cells):
         Z = Z.T
