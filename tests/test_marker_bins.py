@@ -263,6 +263,18 @@ def test_compartment_companions_with_coarser_grid(tmp_path):
         assert (out / f"marker_heatmap_gch_compartment_{suffix}.png").exists()
 
 
+def test_compartment_cmap_distinct_from_concordance_and_per_context():
+    """The compartment palette differs from the concordance map of the SAME
+    context and between gch and hcg; all are valid diverging colormaps."""
+    import matplotlib
+    m = _mod()
+    assert m._COMPARTMENT_CMAPS["gch"] != m._CMAPS["gch"]        # != gch main
+    assert m._COMPARTMENT_CMAPS["hcg"] != m._CMAPS["hcg"]        # != hcg main
+    assert m._COMPARTMENT_CMAPS["gch"] != m._COMPARTMENT_CMAPS["hcg"]   # gch != hcg
+    for c in list(m._COMPARTMENT_CMAPS.values()) + m._COMPARTMENT_FALLBACK:
+        matplotlib.colormaps.get_cmap(c)                         # valid names
+
+
 # --------------------------------------------------------- per-bin statistics --
 
 def test_icc_pvalue_tracks_structure_and_bh_fdr():

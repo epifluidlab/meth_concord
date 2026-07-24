@@ -233,6 +233,12 @@ def _bins_to_bed(bins, bin_size):
 _CMAPS = {"gch": "RdBu_r", "hcg": "PuOr_r"}
 _CMAP_FALLBACK = ["RdBu_r", "PuOr_r", "BrBG_r", "PiYG_r"]
 
+# Compartment (A/B) heatmaps: diverging + centred at 0, but a DIFFERENT hue
+# family per context, so they are distinct from the concordance maps above AND
+# from each other (gch purple<->green, hcg brown<->teal).
+_COMPARTMENT_CMAPS = {"gch": "PRGn_r", "hcg": "BrBG_r"}
+_COMPARTMENT_FALLBACK = ["PRGn_r", "BrBG_r", "PiYG_r", "RdGy_r"]
+
 # What the mean-signal companion heatmaps display (GCH=accessibility,
 # HCG=methylation; both stored as accessibility_mean.parquet per context).
 _MEAN_LABEL = {"gch": "mean accessibility", "hcg": "mean methylation"}
@@ -673,6 +679,12 @@ def main():
                     metavar="NAME=CMAP",
                     help="Override the diverging colormap per matrix, e.g. "
                          "gch=RdBu_r. Defaults: gch=RdBu_r, hcg=PuOr_r.")
+    ap.add_argument("--compartment-cmap", action="append", default=None,
+                    metavar="NAME=CMAP",
+                    help="Override the diverging colormap for the COMPARTMENT "
+                         "companion heatmaps per matrix, e.g. gch=PRGn_r. "
+                         "Defaults: gch=PRGn_r, hcg=BrBG_r (kept distinct from "
+                         "the concordance maps and from each other).")
     ap.add_argument("--max-batch-icc", type=float, default=0.1,
                     help="Drop a candidate bin whose within-cell-type between-"
                          "batch ICC exceeds this — it is sample-driven.")
@@ -745,6 +757,11 @@ def main():
     for c in (args.cmap or []):
         if '=' in c:
             k, v = c.split('=', 1); cmap_override[k.strip().lower()] = v.strip()
+    comp_cmap_override = {}
+    for c in (args.compartment_cmap or []):
+        if '=' in c:
+            k, v = c.split('=', 1)
+            comp_cmap_override[k.strip().lower()] = v.strip()
     mean_explicit = {}
     for c in (args.mean_matrix or []):
         if "=" not in c:
@@ -880,8 +897,12 @@ def main():
             comp = _align_signal(pd.read_parquet(comp_path), list(M.index),
                                  sel_bins, name, "compartment", grid_align=True)
             if comp is not None:
+                comp_cmap = (comp_cmap_override.get(name.lower())
+                             or _COMPARTMENT_CMAPS.get(
+                                 name.lower(),
+                                 _COMPARTMENT_FALLBACK[mi % len(_COMPARTMENT_FALLBACK)]))
                 comp_made = _companion_group(
-                    comp, "compartment", "RdBu_r", "compartment score",
+                    comp, "compartment", comp_cmap, "compartment score",
                     symmetric=True, **cg)
         if comp_made:
             print(f"  compartment companions -> {', '.join(comp_made)}")
