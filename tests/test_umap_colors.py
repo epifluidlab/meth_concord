@@ -355,6 +355,19 @@ def test_compare_cli_norm_and_plot_flags():
 # --plot-format
 # --------------------------------------------------------------------------
 
+def test_cli_n_svd_none_is_auto_but_explicit_zero_is_honoured():
+    """--n-svd 0 must mean 'no SVD, UMAP on the full bin matrix'.
+
+    Regression: --n-svd defaulted to 0 and the resolver treated 0 as 'unset',
+    so --concordance-method signed silently forced 10 components even when the
+    user asked for 0.  Unset is now None (auto), explicit 0 is honoured.
+    """
+    base = ["--samples", "s.tsv", "--output-dir", "o"]
+    assert parse_args(base).n_svd is None                 # unset -> auto
+    assert parse_args(base + ["--n-svd", "0"]).n_svd == 0  # explicit no-SVD
+    assert parse_args(base + ["--n-svd", "20"]).n_svd == 20
+
+
 def test_cli_plot_format_default_and_choices():
     assert parse_args(["--samples", "s.tsv", "--output-dir", "o"]).plot_format \
         == "png"

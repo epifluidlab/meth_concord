@@ -414,15 +414,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "Default: 50.",
     )
     parser.add_argument(
-        "--n-svd", type=int, default=0,
-        help="If > 0, reduce the normalized matrix to N components via "
-             "TruncatedSVD before running UMAP (bulk-RNA / scATAC-seq "
-             "style).  0 runs UMAP directly on the bin matrix.  Auto-default: "
-             "10 for --concordance-method signed (the cell-type axis is PC0 "
-             "under MLE but only a few %% of variance, so the full bin matrix "
-             "swamps it; 10 components matches what signed used pre-MLE via "
-             "--skip-top-svd), 0 otherwise.  A scree plot is always emitted "
-             "to help tune this; an explicit value overrides the default.",
+        "--n-svd", type=int, default=None,
+        help="Reduce the normalized matrix to N components via TruncatedSVD "
+             "before running UMAP (bulk-RNA / scATAC-seq style).  An explicit "
+             "0 runs UMAP directly on the FULL bin matrix (also pass "
+             "--skip-top-svd 0, since SVD still runs when skip>0).  When UNSET "
+             "it auto-defaults: 10 for --concordance-method signed (the "
+             "cell-type axis is PC0 but only a few %% of variance, so the full "
+             "bin matrix swamps it), 0 otherwise.  A scree plot is always "
+             "emitted to help tune this.  (An explicit value — including 0 — "
+             "overrides the auto-default.)",
     )
     parser.add_argument(
         "--svd-scree-max", type=int, default=50,
@@ -1289,12 +1290,12 @@ def run_context(
         # before (skip=1 fit 11, dropped the top → 10), but now keeping PC0
         # since MLE puts cell type there.  The scree plot is always emitted
         # for tuning; user-explicit --n-svd overrides.
-        if args.n_svd and args.n_svd > 0:
-            n_svd = args.n_svd
-        elif args.concordance_method == "signed":
-            n_svd = 10
+        # None = unset -> auto-default; an explicit value (INCLUDING 0, which
+        # means "no SVD, UMAP on the full bin matrix") is honoured as given.
+        if args.n_svd is None:
+            n_svd = 10 if args.concordance_method == "signed" else 0
         else:
-            n_svd = 0
+            n_svd = args.n_svd
 
         matrices = matrix_ops.process_concordance_matrix(
             concordance_shrunk,
