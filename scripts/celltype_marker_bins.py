@@ -325,7 +325,7 @@ def _batch_color_maps(batch_df, bcols):
 def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
              batch_colors, batch_order, title, out, cmap, legend_order=None,
              legend_max=40, order=None, value_label="concordance (z per bin)",
-             zscore=True):
+             zscore=True, symmetric=False):
     """Marker heatmap: bins x cells.  Cells (columns) are hierarchically
     clustered and the COLUMN dendrogram is drawn on top of the cell-type strip;
     no cell names are shown.  A cell-type strip and one strip per batch variable
@@ -333,9 +333,9 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
     tracks cell type and not any batch.
 
     ``zscore`` (default) z-scores each bin across cells for display (diverging
-    cmap, +/-2.5).  Set False to show the RAW value on a sequential scale (the
-    mean accessibility / methylation companions), with a robust 2-98 percentile
-    range.
+    cmap, +/-2.5).  Set False to show the RAW value with a robust 2-98
+    percentile range: sequential (mean accessibility / methylation), or, with
+    ``symmetric``, a signed range centred at 0 (compartment A/B).
 
     When ``order`` is supplied (a previous heatmap's layout) the columns are NOT
     re-clustered, so the dendrogram is OMITTED -- drawing one would falsely imply
@@ -373,18 +373,24 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
         Z = np.clip(np.where(np.isfinite(Z), Z, 0.0), -2.5, 2.5)
         vmin, vmax = -2.5, 2.5
     else:
-        # Raw value (mean accessibility / methylation): keep the LEVEL, pick a
-        # robust display range for contrast; missing -> the low (white) end.
+        # Raw value: keep the LEVEL, pick a robust display range for contrast.
+        # `symmetric` centres a signed/diverging signal (compartment A/B) at 0;
+        # otherwise a sequential 2-98 percentile range (mean accessibility).
         finite = Z[np.isfinite(Z)]
-        if finite.size:
+        if not finite.size:
+            vmin, vmax = (-1.0, 1.0) if symmetric else (0.0, 1.0)
+        elif symmetric:
+            m = float(np.percentile(np.abs(finite), 98)) or float(
+                np.abs(finite).max()) or 1.0
+            vmin, vmax = -m, m
+        else:
             vmin, vmax = (float(v) for v in np.percentile(finite, [2, 98]))
             if vmax <= vmin:
                 vmin, vmax = float(finite.min()), float(finite.max())
             if vmax <= vmin:
                 vmax = vmin + 1.0
-        else:
-            vmin, vmax = 0.0, 1.0
-        Z = np.where(np.isfinite(Z), Z, vmin)
+        # missing -> 0 (neutral) for a centred diverging map, else the low end.
+        Z = np.where(np.isfinite(Z), Z, 0.0 if symmetric else vmin)
     if order is None:
         # Rows (bins) ordered by clustering on the cell-type-MEAN pattern (no row
         # dendrogram drawn), so bins band by which cell types they mark.
@@ -488,6 +494,90 @@ def _heatmap(M, cells, bins_order, ct_labels, batch_df, ct_colors,
     return cells_o, bins_seq, col_lk
 
 
+def _find_compartment(conc_path):
+    """Best-effort auto-derive: compartment_scores.parquet under a
+    ``compartments/`` directory at the run root (a sibling of the per-context
+    dirs that hold the concordance parquet).  Returns a path or None."""
+    for anc in Path(conc_path).resolve().parents:
+        cand = anc / "compartments" / "compartment_scores.parquet"
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def _align_signal(sig, cells, sel_bins, name, infix, grid_align):
+    """Align a companion signal onto the (cells x sel_bins) grid.
+
+    ``grid_align`` maps a COARSER bin grid onto sel_bins via align_to_grid (each
+    marker bin inherits the covering coarse bin -- e.g. compartments); otherwise
+    an exact reindex (the mean matrix is on the same grid).  Returns the aligned
+    frame, or None if it shares no cells / no bins with the concordance."""
+    sig = sig.copy()
+    sig.index = sig.index.astype(str)
+    n_cell = sum(c in sig.index for c in cells)
+    if n_cell == 0:
+        print(f"  {name}: {infix} matrix shares no cells with the concordance "
+              f"— skipping {infix} heatmaps.", file=sys.stderr)
+        return None
+    sig = sig.reindex(index=list(cells))
+    if grid_align:
+        from nome_hic_concordance.comparison import align_to_grid
+        try:
+            sig = align_to_grid(sig, list(sel_bins))
+        except Exception as e:                       # unparseable bins, etc.
+            print(f"  {name}: could not align {infix} to the marker-bin grid "
+                  f"({e}); skipping {infix} heatmaps.", file=sys.stderr)
+            return None
+    else:
+        sig = sig.reindex(columns=list(sel_bins))
+    n_bin = int((~sig.isna()).any(axis=0).sum())
+    if n_bin == 0:
+        print(f"  {name}: {infix} matrix covers none of the marker bins "
+              f"— skipping {infix} heatmaps.", file=sys.stderr)
+        return None
+    if n_bin < len(sel_bins) or n_cell < len(cells):
+        print(f"  {name}: {infix} covers {n_bin}/{len(sel_bins)} bins, "
+              f"{n_cell}/{len(cells)} cells (rest shown blank).", file=sys.stderr)
+    return sig
+
+
+def _companion_group(sig, infix, cmap, value_label, name, sel_bins, main_order,
+                     ct, batch_df, ct_colors, batch_colors, batch_order,
+                     block_order, out_dir, args, zscore=False, symmetric=False):
+    """Render one companion GROUP for an already-aligned signal ``sig`` (cells x
+    sel_bins): (A) fixed order borrowed from the concordance heatmap (NO
+    dendrogram), (B) reclustered on the signal, and (C) -- when --remove-batch is
+    on -- reclustered on the batch-corrected signal.  Returns the filenames."""
+    made = []
+    kw = dict(legend_order=block_order, legend_max=args.max_legend_levels,
+              zscore=zscore, symmetric=symmetric)
+    fig_a = out_dir / f"marker_heatmap_{name}_{infix}_fixedorder.{args.plot_format}"
+    _heatmap(sig, list(sig.index), list(sel_bins), ct, batch_df, ct_colors,
+             batch_colors, batch_order,
+             f"{name.upper()}: {value_label}, concordance order "
+             f"({len(sel_bins)} marker bins)", fig_a, cmap, order=main_order,
+             value_label=value_label, **kw)
+    made.append(fig_a.name)
+    fig_b = out_dir / f"marker_heatmap_{name}_{infix}_reclustered.{args.plot_format}"
+    _heatmap(sig, list(sig.index), list(sel_bins), ct, batch_df, ct_colors,
+             batch_colors, batch_order,
+             f"{name.upper()}: {value_label}, own clustering "
+             f"({len(sel_bins)} marker bins)", fig_b, cmap,
+             value_label=value_label, **kw)
+    made.append(fig_b.name)
+    if args.remove_batch != "none":
+        sig_bc = _remove_batch(sig, ct, batch_df)
+        fig_c = (out_dir / f"marker_heatmap_{name}_{infix}_reclustered_"
+                 f"batchcorrected.{args.plot_format}")
+        _heatmap(sig_bc, list(sig_bc.index), list(sel_bins), ct, batch_df,
+                 ct_colors, batch_colors, batch_order,
+                 f"{name.upper()}: {value_label}, own clustering, batch-"
+                 f"corrected ({len(sel_bins)} marker bins)", fig_c, cmap,
+                 value_label=f"{value_label} (batch-corrected)", **kw)
+        made.append(fig_c.name)
+    return made
+
+
 def main():
     ctv = _icc_mod()
     ap = argparse.ArgumentParser(
@@ -514,6 +604,22 @@ def main():
                          "clustered on the mean value itself).  'auto' (default) "
                          "makes them when a mean matrix is found, else skips; "
                          "'on' errors if none is found; 'off' disables them.")
+    ap.add_argument("--compartment-matrix", default=None, metavar="PATH",
+                    help="cells x bins compartment-score parquet (the 3D "
+                         "baseline; context-independent, so ONE file is shared "
+                         "by every --matrix), e.g. "
+                         ".../compartments/compartment_scores.parquet.  A "
+                         "coarser bin grid is mapped onto the marker bins.  If "
+                         "omitted, compartments/compartment_scores.parquet at "
+                         "the run root is auto-derived.  Used for the "
+                         "compartment companion heatmaps.")
+    ap.add_argument("--compartment-heatmaps", choices=["auto", "on", "off"],
+                    default="auto",
+                    help="Like --mean-heatmaps, but a third companion group in "
+                         "the COMPARTMENT signal ('<name>_compartment_"
+                         "fixedorder/_reclustered[/_reclustered_batchcorrected]')"
+                         ".  'auto' (default) makes them when a compartment "
+                         "matrix is found, else skips.")
     ap.add_argument("--samples", required=True)
     ap.add_argument("--cell-type-column", default="cell_type")
     ap.add_argument("--batch-column", default="exp_batch,plate_batch,lib_batch",
@@ -625,6 +731,13 @@ def main():
         if not mean_path:
             cand = Path(path).with_name("accessibility_mean.parquet")
             mean_path = str(cand) if cand.exists() else None
+        # Compartment matrix (shared across matrices; explicit flag wins, else
+        # auto-derive compartments/compartment_scores.parquet at the run root).
+        comp_path = args.compartment_matrix
+        if comp_path and not Path(comp_path).exists():
+            sys.exit(f"no such --compartment-matrix: {comp_path}")
+        if not comp_path:
+            comp_path = _find_compartment(path)
         M = pd.read_parquet(path)
         M.index = M.index.astype(str)
         keep = [c for c in M.index if c in ct_of]
@@ -692,72 +805,53 @@ def main():
             f"({clean_note}) bins", fig_hm, cmap, legend_order=block_order,
             legend_max=args.max_legend_levels)
 
-        # Companion mean-signal heatmaps (accessibility for gch, methylation for
-        # hcg): (A) the concordance heatmap's EXACT layout recoloured by the mean
-        # value (NO dendrogram -- the order is borrowed, not clustered here) ->
-        # is the concordance structure present in the mean signal?  (B) the same
-        # cells+bins clustered on the mean value itself -> what layout does the
-        # mean signal make on its own?  (C) when --remove-batch is on, a second
-        # reclustered view on the batch-corrected mean.  All show the RAW mean
-        # LEVEL (no concordance normalisation) on the conventional NOMe-seq
-        # sequential palette (white->teal for accessibility, blue->yellow for
-        # methylation), not the z-scored diverging scale of the main heatmap.
-        macc = None
+        # Companion heatmap GROUPS on the mean signal (accessibility for gch,
+        # methylation for hcg) and the compartment signal (the 3D baseline).
+        # Each group has: (A) the concordance heatmap's EXACT layout (NO
+        # dendrogram -- borrowed, not clustered here) -> is the concordance
+        # structure present in this signal?  (B) the same cells+bins reclustered
+        # on the signal -> what layout does it make on its own?  (C) when
+        # --remove-batch is on, reclustered on the batch-corrected signal.  All
+        # show the RAW value (no concordance normalisation): mean on the
+        # conventional NOMe-seq sequential palette (white->teal / blue->yellow),
+        # compartment on a diverging A/B (red/blue) scale centred at 0.
+        cg = dict(name=name, sel_bins=sel_bins, main_order=main_order, ct=ct,
+                  batch_df=batch_df, ct_colors=ct_colors,
+                  batch_colors=batch_colors, batch_order=batch_order,
+                  block_order=block_order, out_dir=out_dir, args=args)
+
+        mean_made = []
         if args.mean_heatmaps != "off" and mean_path:
-            macc = pd.read_parquet(mean_path)
-            macc.index = macc.index.astype(str)
-            miss_b = sum(b not in macc.columns for b in sel_bins)
-            miss_c = sum(c not in macc.index for c in M.index)
-            if miss_b == len(sel_bins) or miss_c == M.shape[0]:
-                print(f"  {name}: mean matrix {mean_path} shares no "
-                      f"{'bins' if miss_b == len(sel_bins) else 'cells'} with "
-                      f"the concordance matrix — skipping companion heatmaps "
-                      f"(wrong --mean-matrix?).", file=sys.stderr)
-                macc = None
-            elif miss_b or miss_c:
-                print(f"  {name}: mean matrix is missing {miss_b}/{len(sel_bins)}"
-                      f" bins and {miss_c}/{M.shape[0]} cells (shown blank).",
-                      file=sys.stderr)
-        if macc is not None:
-            macc = macc.reindex(index=list(M.index), columns=list(sel_bins))
-            lab = _MEAN_LABEL.get(name.lower(), "mean level")
-            mcmap = _mean_cmap(name)
-            fig_a = out_dir / f"marker_heatmap_{name}_mean_fixedorder.{args.plot_format}"
-            _heatmap(macc, list(macc.index), list(sel_bins), ct, batch_df,
-                     ct_colors, batch_colors, batch_order,
-                     f"{name.upper()}: {lab}, concordance order "
-                     f"({len(sel_bins)} marker bins)", fig_a, mcmap,
-                     legend_order=block_order, legend_max=args.max_legend_levels,
-                     order=main_order, value_label=lab, zscore=False)
-            fig_b = out_dir / f"marker_heatmap_{name}_mean_reclustered.{args.plot_format}"
-            _heatmap(macc, list(macc.index), list(sel_bins), ct, batch_df,
-                     ct_colors, batch_colors, batch_order,
-                     f"{name.upper()}: {lab}, own clustering "
-                     f"({len(sel_bins)} marker bins)", fig_b, mcmap,
-                     legend_order=block_order, legend_max=args.max_legend_levels,
-                     value_label=lab, zscore=False)
-            made = [fig_a.name, fig_b.name]
-            # When the main figure removes batch (--remove-batch), also write a
-            # reclustered companion on the mean signal AFTER the SAME within-
-            # cell-type correction, so you can see how it re-clusters once the
-            # batch structure is gone.
-            if args.remove_batch != "none":
-                macc_bc = _remove_batch(macc, ct, batch_df)
-                fig_c = (out_dir / f"marker_heatmap_{name}_mean_"
-                         f"reclustered_batchcorrected.{args.plot_format}")
-                _heatmap(macc_bc, list(macc_bc.index), list(sel_bins), ct,
-                         batch_df, ct_colors, batch_colors, batch_order,
-                         f"{name.upper()}: {lab}, own clustering, batch-"
-                         f"corrected ({len(sel_bins)} marker bins)", fig_c, mcmap,
-                         legend_order=block_order,
-                         legend_max=args.max_legend_levels,
-                         value_label=f"{lab} (batch-corrected)", zscore=False)
-                made.append(fig_c.name)
-            print(f"  mean-signal companions -> {', '.join(made)}")
+            # Mean is on the concordance bin grid -> exact reindex.
+            macc = _align_signal(pd.read_parquet(mean_path), list(M.index),
+                                 sel_bins, name, "mean", grid_align=False)
+            if macc is not None:
+                mean_made = _companion_group(
+                    macc, "mean", _mean_cmap(name),
+                    _MEAN_LABEL.get(name.lower(), "mean level"), **cg)
+        if mean_made:
+            print(f"  mean-signal companions -> {', '.join(mean_made)}")
         elif args.mean_heatmaps == "on":
-            sys.exit(f"--mean-heatmaps on but no mean matrix for {name!r}: pass "
-                     f"--mean-matrix {name}=PATH or place "
+            sys.exit(f"--mean-heatmaps on but no usable mean matrix for {name!r}:"
+                     f" pass --mean-matrix {name}=PATH or place "
                      f"accessibility_mean.parquet beside {path}.")
+
+        comp_made = []
+        if args.compartment_heatmaps != "off" and comp_path:
+            # Compartment may be on a coarser grid -> map onto the marker bins.
+            comp = _align_signal(pd.read_parquet(comp_path), list(M.index),
+                                 sel_bins, name, "compartment", grid_align=True)
+            if comp is not None:
+                comp_made = _companion_group(
+                    comp, "compartment", "RdBu_r", "compartment score",
+                    symmetric=True, **cg)
+        if comp_made:
+            print(f"  compartment companions -> {', '.join(comp_made)}")
+        elif args.compartment_heatmaps == "on":
+            sys.exit(f"--compartment-heatmaps on but no usable compartment "
+                     f"matrix for {name!r}: pass --compartment-matrix PATH or "
+                     f"place compartments/compartment_scores.parquet at the run "
+                     f"root.")
 
         # Out-of-selection CONTROL (number only; the UMAP figure is produced by
         # nome_hic_concordance / nome_hic_compare): do the bins we did NOT pick

@@ -175,6 +175,8 @@ def test_end_to_end_marker_and_control(tmp_path):
     # no --remove-batch here -> the batch-corrected companion is NOT made
     assert not (out / "marker_heatmap_gch_mean_reclustered_batchcorrected.png"
                 ).exists()
+    # no compartment matrix available -> no compartment companions
+    assert not (out / "marker_heatmap_gch_compartment_fixedorder.png").exists()
     scores = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
     assert scores["selected"].sum() == 30
     # the out-of-selection control must fire: non-selected bins separate types
@@ -212,6 +214,41 @@ def test_remove_batch_adds_batchcorrected_companion(tmp_path):
     assert (out / "marker_heatmap_gch_mean_reclustered.png").exists()
     assert (out / "marker_heatmap_gch_mean_reclustered_batchcorrected.png"
             ).exists()
+
+
+def test_compartment_companions_with_coarser_grid(tmp_path):
+    """--compartment-matrix (a COARSER bin grid, mapped onto the marker bins)
+    yields the third companion group; with --remove-batch the batch-corrected
+    variant appears too."""
+    X, ct, batch, _ = _data(seed=4, n_per=60)
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "gch.parquet"
+    pd.DataFrame(X, index=samples, columns=bins).to_parquet(mat)
+    pd.DataFrame(np.abs(X), index=samples, columns=bins).to_parquet(
+        tmp_path / "accessibility_mean.parquet")
+    # compartment at HALF the resolution (500kb) -> exercises align_to_grid.
+    rng = np.random.default_rng(0)
+    cbins = [f"chr1:{i * 500000}" for i in range(X.shape[1] // 2)]
+    comp = np.tanh(rng.normal(size=(len(ct), len(cbins))))
+    comp_path = tmp_path / "compartment_scores.parquet"
+    pd.DataFrame(comp, index=samples, columns=cbins).to_parquet(comp_path)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["batch2" if b == 0 else "scNH" for b in batch]}
+                 ).to_csv(stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "30", "--n-permutations", "40",
+         "--compartment-matrix", str(comp_path), "--remove-batch",
+         "within-celltype", "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    for suffix in ("fixedorder", "reclustered", "reclustered_batchcorrected"):
+        assert (out / f"marker_heatmap_gch_compartment_{suffix}.png").exists()
 
 
 # ------------------------------------------------------------ batch palettes --
