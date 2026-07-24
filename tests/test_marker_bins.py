@@ -172,6 +172,9 @@ def test_end_to_end_marker_and_control(tmp_path):
     # the two mean-signal companion heatmaps were auto-produced
     assert (out / "marker_heatmap_gch_mean_fixedorder.png").exists()
     assert (out / "marker_heatmap_gch_mean_reclustered.png").exists()
+    # no --remove-batch here -> the batch-corrected companion is NOT made
+    assert not (out / "marker_heatmap_gch_mean_reclustered_batchcorrected.png"
+                ).exists()
     scores = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
     assert scores["selected"].sum() == 30
     # the out-of-selection control must fire: non-selected bins separate types
@@ -180,6 +183,35 @@ def test_end_to_end_marker_and_control(tmp_path):
     assert s["nonselected_perm_p"] is not None
     assert s["nonselected_perm_p"] < 0.05
     assert s["median_celltype_icc_selected"] > 0.5
+
+
+def test_remove_batch_adds_batchcorrected_companion(tmp_path):
+    """With --remove-batch, a reclustered companion on the batch-corrected mean
+    signal is written alongside the raw one."""
+    X, ct, batch, _ = _data(seed=2, n_per=60)
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "gch.parquet"
+    pd.DataFrame(X, index=samples, columns=bins).to_parquet(mat)
+    pd.DataFrame(np.abs(X), index=samples, columns=bins).to_parquet(
+        tmp_path / "accessibility_mean.parquet")
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["batch2" if b == 0 else "scNH" for b in batch]}
+                 ).to_csv(stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "30", "--n-permutations", "40",
+         "--remove-batch", "within-celltype",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    assert (out / "marker_heatmap_gch_mean_reclustered.png").exists()
+    assert (out / "marker_heatmap_gch_mean_reclustered_batchcorrected.png"
+            ).exists()
 
 
 # ------------------------------------------------------------ batch palettes --

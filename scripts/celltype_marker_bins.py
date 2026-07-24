@@ -697,8 +697,9 @@ def main():
         # value (NO dendrogram -- the order is borrowed, not clustered here) ->
         # is the concordance structure present in the mean signal?  (B) the same
         # cells+bins clustered on the mean value itself -> what layout does the
-        # mean signal make on its own?  Both show the RAW mean LEVEL (no
-        # concordance normalisation / batch removal) on the conventional NOMe-seq
+        # mean signal make on its own?  (C) when --remove-batch is on, a second
+        # reclustered view on the batch-corrected mean.  All show the RAW mean
+        # LEVEL (no concordance normalisation) on the conventional NOMe-seq
         # sequential palette (white->teal for accessibility, blue->yellow for
         # methylation), not the z-scored diverging scale of the main heatmap.
         macc = None
@@ -735,7 +736,24 @@ def main():
                      f"({len(sel_bins)} marker bins)", fig_b, mcmap,
                      legend_order=block_order, legend_max=args.max_legend_levels,
                      value_label=lab, zscore=False)
-            print(f"  mean-signal companions -> {fig_a.name}, {fig_b.name}")
+            made = [fig_a.name, fig_b.name]
+            # When the main figure removes batch (--remove-batch), also write a
+            # reclustered companion on the mean signal AFTER the SAME within-
+            # cell-type correction, so you can see how it re-clusters once the
+            # batch structure is gone.
+            if args.remove_batch != "none":
+                macc_bc = _remove_batch(macc, ct, batch_df)
+                fig_c = (out_dir / f"marker_heatmap_{name}_mean_"
+                         f"reclustered_batchcorrected.{args.plot_format}")
+                _heatmap(macc_bc, list(macc_bc.index), list(sel_bins), ct,
+                         batch_df, ct_colors, batch_colors, batch_order,
+                         f"{name.upper()}: {lab}, own clustering, batch-"
+                         f"corrected ({len(sel_bins)} marker bins)", fig_c, mcmap,
+                         legend_order=block_order,
+                         legend_max=args.max_legend_levels,
+                         value_label=f"{lab} (batch-corrected)", zscore=False)
+                made.append(fig_c.name)
+            print(f"  mean-signal companions -> {', '.join(made)}")
         elif args.mean_heatmaps == "on":
             sys.exit(f"--mean-heatmaps on but no mean matrix for {name!r}: pass "
                      f"--mean-matrix {name}=PATH or place "
