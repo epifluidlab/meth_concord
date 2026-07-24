@@ -330,3 +330,72 @@ def test_chromhmm_group_collapse_end_to_end(tmp_path):
     # --chromhmm-per-state also wrote the un-collapsed table (4 states)
     st = pd.read_csv(out / "gch_chromhmm_state_enrichment.tsv", sep="\t")
     assert len(st) == 4
+
+
+# ------------------------------------------------ continuous signal tracks --
+
+def test_binned_mean_overlap_weighted():
+    m = _mod()
+    bins = _bins([("chr1", 0, 1000), ("chr1", 1000, 2000), ("chr2", 0, 1000)])
+    sig = pd.DataFrame({"chrom": ["chr1", "chr1", "chr1"],
+                        "start": [0, 400, 1000], "end": [400, 1000, 2000],
+                        "value": [10.0, 20.0, 5.0]})
+    mn = m._binned_mean(bins, sig)
+    assert mn[0] == pytest.approx(16.0)          # (400*10 + 600*20)/1000
+    assert mn[1] == pytest.approx(5.0)
+    assert np.isnan(mn[2])                        # chr2 uncovered -> NaN
+
+
+def test_signal_bin_means_reads_bedgraph(tmp_path):
+    m = _mod()
+    p = tmp_path / "s.bedgraph"
+    p.write_text("chr1\t0\t250000\t2.0\nchr1\t250000\t500000\t0.5\n")
+    bins = _bins([("chr1", 0, 250000), ("chr1", 250000, 500000)])
+    assert m._signal_bin_means(bins, str(p)).tolist() == [2.0, 0.5]
+
+
+def _rt_bedgraph(tmp_path):
+    BS = 250_000
+    seg = [(c, i * BS, (i + 1) * BS, 2.0 if (c == "chr1" and i < 30) else 0.2)
+           for c in ("chr1", "chr2") for i in range(100)]
+    pd.DataFrame(seg).to_csv(tmp_path / "rt.bedgraph", sep="\t", index=False,
+                             header=False)
+
+
+def test_signal_enrichment_end_to_end_bedgraph(tmp_path):
+    """--signal-track: per-bin mean signal compared fg-vs-bg -> signed diff + p."""
+    pytest.importorskip("scipy")
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    _planted(tmp_path)                            # 30 fg bins on chr1[0:30]
+    _rt_bedgraph(tmp_path)
+    out = tmp_path / "out"
+    m.main(["--bed", f"gch={tmp_path/'bins.all.bed'}",
+            "--signal-track", f"RT={tmp_path/'rt.bedgraph'}",
+            "--output-dir", str(out)])
+    sig = pd.read_csv(out / "gch_signal_enrichment.tsv", sep="\t")
+    row = sig[sig["annotation"] == "RT"].iloc[0]
+    assert row["mean_signal_fg"] > row["mean_signal_bg"]   # fg is 'early'
+    assert row["difference"] > 1.5 and row["fdr"] < 0.05
+
+
+def test_signal_enrichment_bigwig(tmp_path):
+    pyBigWig = pytest.importorskip("pyBigWig")
+    pytest.importorskip("scipy")
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    _planted(tmp_path)
+    BS = 250_000
+    bw = pyBigWig.open(str(tmp_path / "rt.bw"), "w")
+    bw.addHeader([("chr1", 25_000_000), ("chr2", 25_000_000)])
+    for c in ("chr1", "chr2"):
+        bw.addEntries([c] * 100, [i * BS for i in range(100)],
+                      ends=[(i + 1) * BS for i in range(100)],
+                      values=[2.0 if (c == "chr1" and i < 30) else 0.2
+                              for i in range(100)])
+    bw.close()
+    out = tmp_path / "out"
+    m.main(["--bed", f"gch={tmp_path/'bins.all.bed'}",
+            "--signal-track", f"RT={tmp_path/'rt.bw'}", "--output-dir", str(out)])
+    sig = pd.read_csv(out / "gch_signal_enrichment.tsv", sep="\t")
+    assert sig[sig["annotation"] == "RT"].iloc[0]["difference"] > 1.5

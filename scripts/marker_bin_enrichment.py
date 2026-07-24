@@ -387,6 +387,107 @@ def _genes_over_bins(bins: pd.DataFrame, genes: pd.DataFrame) -> set:
     return hits
 
 
+# ---------------------------------------------- continuous (bigWig) signals --
+
+def _binned_mean(bins: pd.DataFrame, sig: pd.DataFrame) -> np.ndarray:
+    """Per-bin overlap-length-weighted mean of a valued interval signal
+    (bedGraph).  Intervals are assumed non-overlapping (a bedGraph partition).
+    NaN where a bin has no covered signal."""
+    out = np.full(len(bins), np.nan)
+    by = {}
+    for c, g in sig.groupby(sig["chrom"].map(_canon)):
+        v = g[["start", "end"]].values.astype(np.int64)
+        order = np.argsort(v[:, 0])
+        by[c] = (v[order, 0], v[order, 1],
+                 g["value"].values.astype(float)[order])
+    bc = bins["chrom"].map(_canon).values
+    bs = bins["start"].values
+    be = bins["end"].values
+    for i in range(len(bins)):
+        t = by.get(bc[i])
+        if t is None:
+            continue
+        starts, ends, vals = t
+        lo = int(np.searchsorted(ends, bs[i], "right"))
+        hi = int(np.searchsorted(starts, be[i], "right"))
+        if hi <= lo:
+            continue
+        ov = np.minimum(be[i], ends[lo:hi]) - np.maximum(bs[i], starts[lo:hi])
+        vv = vals[lo:hi]
+        m = (ov > 0) & np.isfinite(vv)
+        if m.any() and ov[m].sum() > 0:
+            out[i] = float(np.average(vv[m], weights=ov[m]))
+    return out
+
+
+def _bigwig_bin_means(bins: pd.DataFrame, path: str) -> np.ndarray:
+    """Per-bin mean of a bigWig via pyBigWig (mean over covered bases)."""
+    import pyBigWig
+    bw = pyBigWig.open(str(path))
+    have = {c.lower(): c for c in bw.chroms().keys()}
+    out = np.full(len(bins), np.nan)
+    for i, (c, s, e) in enumerate(zip(bins["chrom"], bins["start"],
+                                      bins["end"])):
+        name = have.get(str(c).lower()) or have.get(("chr" + _canon(c)).lower()) \
+            or have.get(_canon(c).lower())
+        if name is None:
+            continue
+        e = min(int(e), bw.chroms()[name])
+        if e <= int(s):
+            continue
+        try:
+            v = bw.stats(name, int(s), e, type="mean", exact=True)[0]
+        except (RuntimeError, ValueError):
+            v = None
+        if v is not None:
+            out[i] = float(v)
+    bw.close()
+    return out
+
+
+def _signal_bin_means(bins: pd.DataFrame, path: str) -> np.ndarray:
+    """Per-bin mean signal from a bigWig (.bw/.bigwig) or a bedGraph/BED (4th
+    numeric column)."""
+    p = str(path).lower()
+    if p.endswith((".bw", ".bigwig")):
+        return _bigwig_bin_means(bins, path)
+    df = pd.read_csv(path, sep="\t", header=None, comment="#",
+                     compression="infer", dtype={0: str})
+    sig = pd.DataFrame({"chrom": df[0].astype(str), "start": df[1].astype(int),
+                        "end": df[2].astype(int),
+                        "value": pd.to_numeric(df[3], errors="coerce")})
+    return _binned_mean(bins, sig)
+
+
+def _signal_enrichment(bins, fg, tracks):
+    """fg-vs-bg Mann-Whitney on the per-bin MEAN of each continuous track
+    (replication timing, ...).  Reports the signed difference of means (not a
+    ratio -- the signal may be negative)."""
+    from scipy.stats import mannwhitneyu
+    rows, series = [], {}
+    for label, path in tracks.items():
+        val = _signal_bin_means(bins, path)
+        series[label] = val
+        a = val[fg & np.isfinite(val)]
+        b = val[(~fg) & np.isfinite(val)]
+        m_fg = float(a.mean()) if a.size else np.nan
+        m_bg = float(b.mean()) if b.size else np.nan
+        p = np.nan
+        if a.size and b.size:
+            try:
+                p = float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
+            except ValueError:
+                p = np.nan
+        rows.append({"annotation": label, "mean_signal_fg": m_fg,
+                     "mean_signal_bg": m_bg, "difference": m_fg - m_bg,
+                     "n_fg": int(a.size), "n_bg": int(b.size), "pvalue": p})
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["fdr"] = _bh(df["pvalue"].values)
+        df = df.sort_values("difference", ascending=False).reset_index(drop=True)
+    return df, series
+
+
 # ------------------------------------------------------------- enrichment ----
 
 def _mwu_row(label, cov, fg):
@@ -482,15 +583,17 @@ def _stars(q):
             else "")
 
 
-def _barh_region(ax, df, title):
-    """Horizontal bars of log2 fold-change, coloured by direction, FDR-starred."""
+def _barh_region(ax, df, title, value_col="log2_fold_change",
+                 xlabel="log2 fold-change of mean coverage (fg / bg)"):
+    """Horizontal bars of a signed effect, coloured by direction, FDR-starred."""
     if df is None or df.empty:
         ax.text(0.5, 0.5, f"{title}\n(no data)", ha="center", va="center")
         ax.axis("off")
         return
     d = df.iloc[::-1]
     y = np.arange(len(d))
-    vals = d["log2_fold_change"].values
+    vals = d[value_col].values
+    span = np.nanmax(np.abs(vals)) or 1.0
     colors = ["#c0392b" if v >= 0 else "#2c6fbb" for v in vals]
     ax.barh(y, vals, color=colors, edgecolor="none")
     ax.set_yticks(y)
@@ -499,9 +602,9 @@ def _barh_region(ax, df, title):
     for i, (v, q) in enumerate(zip(vals, d["fdr"].values)):
         s = _stars(q) if np.isfinite(q) else ""
         if s:
-            ax.text(v + (0.02 if v >= 0 else -0.02), i, s, va="center",
-                    ha="left" if v >= 0 else "right", fontsize=8)
-    ax.set_xlabel("log2 fold-change of mean coverage (fg / bg)")
+            ax.text(v + (0.02 * span if v >= 0 else -0.02 * span), i, s,
+                    va="center", ha="left" if v >= 0 else "right", fontsize=8)
+    ax.set_xlabel(xlabel)
     ax.set_title(title, fontsize=11)
 
 
@@ -538,7 +641,7 @@ def _chrom_page(ax, df):
 # ------------------------------------------------------------------- driver --
 
 def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
-                 annotations, gene_sets, chrom_sizes, out_dir):
+                 annotations, gene_sets, signal_tracks, chrom_sizes, out_dir):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -614,6 +717,12 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
         ann_df.to_csv(tsv("annotation_enrichment"), sep="\t", index=False)
         pages.append(("region", ("Other annotations", ann_df)))
 
+    # (4b) continuous signal tracks (replication timing, ...) --------------
+    if signal_tracks:
+        sig_df, _ = _signal_enrichment(bins, fg, signal_tracks)
+        sig_df.to_csv(tsv("signal_enrichment"), sep="\t", index=False)
+        pages.append(("signal", ("Continuous signals (fg - bg mean)", sig_df)))
+
     # (5) gene-set (GO / KEGG / ...) over-representation --------------------
     if gene_sets and fg_genes is not None:
         for label, sets in gene_sets.items():
@@ -661,6 +770,15 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
                 fig, ax = plt.subplots(
                     figsize=(8.5, max(3, 0.32 * len(df) + 1.5)))
                 _barh_region(ax, df, title)
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+            elif kind == "signal":
+                title, df = payload
+                fig, ax = plt.subplots(
+                    figsize=(8.5, max(3, 0.32 * len(df) + 1.5)))
+                _barh_region(ax, df, title, value_col="difference",
+                             xlabel="mean signal difference (fg - bg)")
                 fig.tight_layout()
                 pdf.savefig(fig)
                 plt.close(fig)
@@ -750,6 +868,14 @@ def main(argv=None):
                     help="Any functional annotation BED (enhancers, CpG islands, "
                          "TF peaks, ...) for coverage enrichment.  Path or URL. "
                          "Repeatable.")
+    ap.add_argument("--signal-track", action="append", default=None,
+                    metavar="LABEL=BW|BEDGRAPH|URL",
+                    help="A CONTINUOUS signal (bigWig .bw or bedGraph; e.g. E/L "
+                         "Repli-seq replication timing) for signal enrichment: "
+                         "the per-bin MEAN signal is compared foreground-vs-"
+                         "background (Mann-Whitney) and reported as a signed "
+                         "difference of means.  bigWig needs pyBigWig.  Path or "
+                         "URL. Repeatable, e.g. RT_early=early.bw RT_late=late.bw.")
     ap.add_argument("--gene-sets", action="append", default=None,
                     metavar="LABEL=GMT|URL",
                     help="Gene-set database in GMT format (e.g. Enrichr/MSigDB "
@@ -853,13 +979,28 @@ def main(argv=None):
             if rv is not None:
                 gene_sets[label] = _read_gmt(rv)
 
+    # Continuous signal tracks (replication timing, ...): the user's plus the
+    # genome preset's.  Resolved to a local path; the per-bin mean is read lazily
+    # per context (bigWig via pyBigWig, or a bedGraph).
+    signal_tracks = {}
+    for k, v in _parse_pairs(args.signal_track, "signal-track").items():
+        rv = _resolve(v, cache, f"signal-track {k}")
+        if rv is not None:
+            signal_tracks[k] = rv
+    for label, url in preset.get("signal_tracks", {}).items():
+        if label not in signal_tracks:
+            rv = _resolve(url, cache, f"signal-track {label}")
+            if rv is not None:
+                signal_tracks[label] = rv
+
     summaries = {}
     for name, path in _parse_pairs(args.bed, "--bed").items():
         rp = _resolve(path, cache, f"--bed {name}")
         if rp is None:
             continue
         s = _run_context(name, rp, args, genes, gene_features, chromhmm,
-                         annotations, gene_sets, chrom_sizes, out_dir)
+                         annotations, gene_sets, signal_tracks, chrom_sizes,
+                         out_dir)
         if s is not None:
             summaries[name] = s
     if not summaries:
