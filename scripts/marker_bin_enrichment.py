@@ -118,29 +118,46 @@ def _read_bed(path: str, want_name=False):
     return out
 
 
+def _read_chrom_sizes(path) -> dict:
+    """{contig (chr-stripped): length} from a chrom.sizes / .fai (first 2 cols)."""
+    sizes = {}
+    with open(path) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    sizes[_canon(parts[0])] = int(parts[1])
+                except ValueError:
+                    continue
+    return sizes
+
+
 def _read_genes(path: str) -> pd.DataFrame:
     """Gene bodies from a GTF/GFF ('gene' features) or a BED6 (name=col4,
     strand=col6).  Returns chrom/start/end/name/strand, 0-based half-open."""
     p = str(path).lower()
     if p.endswith((".gtf", ".gtf.gz", ".gff", ".gff3", ".gff.gz", ".gff3.gz")):
-        g = pd.read_csv(path, sep="\t", comment="#", header=None,
-                        compression="infer", dtype={0: str},
-                        names=["chrom", "src", "feature", "start", "end",
-                               "score", "strand", "frame", "attr"])
-        g = g[g["feature"] == "gene"]
-        if g.empty:
+        # Stream and keep only 'gene' lines -- a full GENCODE GTF is ~1.5 GB of
+        # exon/transcript rows we do not need.
+        import gzip
+        opener = gzip.open if p.endswith(".gz") else open
+        rows = []
+        with opener(path, "rt") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 9 or f[2] != "gene":
+                    continue
+                m = (re.search(r'gene_name "([^"]+)"', f[8])
+                     or re.search(r'gene_id "([^"]+)"', f[8]))
+                if m:
+                    rows.append((f[0], int(f[3]) - 1, int(f[4]),  # GTF 1-based
+                                 m.group(1), f[6]))
+        if not rows:
             sys.exit(f"{path}: no 'gene' features found in the GTF.")
-
-        def _name(a):
-            m = (re.search(r'gene_name "([^"]+)"', a)
-                 or re.search(r'gene_id "([^"]+)"', a))
-            return m.group(1) if m else None
-        out = pd.DataFrame({"chrom": g["chrom"].astype(str),
-                            "start": g["start"].astype(int) - 1,  # GTF 1-based
-                            "end": g["end"].astype(int),
-                            "name": g["attr"].map(_name),
-                            "strand": g["strand"].astype(str)})
-        return out.dropna(subset=["name"]).reset_index(drop=True)
+        return pd.DataFrame(rows, columns=["chrom", "start", "end", "name",
+                                           "strand"])
     df = pd.read_csv(path, sep="\t", header=None, comment="#",
                      compression="infer", dtype={0: str})
     return pd.DataFrame({
@@ -165,6 +182,129 @@ def _read_gmt(path: str) -> dict:
             if genes:
                 sets[term] = genes
     return sets
+
+
+def _read_ucsc_bed(path, cols=(0, 1, 2)):
+    """A UCSC 'database' table dump (chrom/start/end at the given 0-based column
+    indices -- cpgIslandExt has a leading 'bin' column, so use (1, 2, 3))."""
+    c, s, e = cols
+    df = pd.read_csv(path, sep="\t", header=None, comment="#",
+                     compression="infer", dtype={c: str})
+    return pd.DataFrame({"chrom": df[c].astype(str), "start": df[s].astype(int),
+                         "end": df[e].astype(int)})
+
+
+def _read_cytoband(path):
+    """UCSC cytoBand/cytoBandIdeo -> {'band:<gieStain>': intervals}, so the
+    coverage enrichment reports dark (gpos*, heterochromatin) vs light (gneg)
+    Giemsa bands."""
+    df = pd.read_csv(path, sep="\t", header=None, comment="#",
+                     compression="infer", dtype={0: str})
+    stain = df[4].astype(str) if df.shape[1] > 4 else pd.Series(
+        ["band"] * len(df))
+    out = {}
+    for s, g in df.groupby(stain.values):
+        out[f"band:{s}"] = pd.DataFrame({
+            "chrom": g[0].astype(str), "start": g[1].astype(int),
+            "end": g[2].astype(int)})
+    return out
+
+
+# --------------------------------------------------- annotation auto-download -
+
+# Reference URLs per genome for the standard annotations (validated; a coarser
+# ChromHMM has no single canonical source, so it stays user-supplied).  The
+# Enrichr GO/KEGG GMTs are gene-symbol based and matched case-insensitively, so
+# the human-style symbols work for mouse too.
+_ENRICHR = "https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName="
+_UCSC = "https://hgdownload.soe.ucsc.edu/goldenPath"
+_GENCODE = "https://ftp.ebi.ac.uk/pub/databases/gencode"
+_GENOME = {
+    "mm10": {
+        "chrom_sizes": f"{_UCSC}/mm10/bigZips/mm10.chrom.sizes",
+        "gene_annotation": f"{_GENCODE}/Gencode_mouse/release_M25/"
+                           f"gencode.vM25.annotation.gtf.gz",
+        "cytoband": f"{_UCSC}/mm10/database/cytoBand.txt.gz",
+        "cpg_islands": f"{_UCSC}/mm10/database/cpgIslandExt.txt.gz",
+        "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
+                      "KEGG": f"{_ENRICHR}KEGG_2019_Mouse"},
+    },
+    "mm39": {
+        "chrom_sizes": f"{_UCSC}/mm39/bigZips/mm39.chrom.sizes",
+        "gene_annotation": f"{_GENCODE}/Gencode_mouse/release_M33/"
+                           f"gencode.vM33.annotation.gtf.gz",
+        "cytoband": f"{_UCSC}/mm39/database/cytoBandIdeo.txt.gz",
+        "cpg_islands": f"{_UCSC}/mm39/database/cpgIslandExt.txt.gz",
+        "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
+                      "KEGG": f"{_ENRICHR}KEGG_2019_Mouse"},
+    },
+    "hg38": {
+        "chrom_sizes": f"{_UCSC}/hg38/bigZips/hg38.chrom.sizes",
+        "gene_annotation": f"{_GENCODE}/Gencode_human/release_44/"
+                           f"gencode.v44.annotation.gtf.gz",
+        "cytoband": f"{_UCSC}/hg38/database/cytoBand.txt.gz",
+        "cpg_islands": f"{_UCSC}/hg38/database/cpgIslandExt.txt.gz",
+        "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
+                      "KEGG": f"{_ENRICHR}KEGG_2021_Human"},
+    },
+    "hg19": {
+        "chrom_sizes": f"{_UCSC}/hg19/bigZips/hg19.chrom.sizes",
+        "gene_annotation": f"{_GENCODE}/Gencode_human/release_19/"
+                           f"gencode.v19.annotation.gtf.gz",
+        "cytoband": f"{_UCSC}/hg19/database/cytoBand.txt.gz",
+        "cpg_islands": f"{_UCSC}/hg19/database/cpgIslandExt.txt.gz",
+        "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
+                      "KEGG": f"{_ENRICHR}KEGG_2021_Human"},
+    },
+}
+
+
+def _is_url(s) -> bool:
+    return str(s).startswith(("http://", "https://", "ftp://", "file://"))
+
+
+def _fetch(url, cache_dir):
+    """Download ``url`` into ``cache_dir`` (skipped if already cached); return
+    the local path.  Enrichr query URLs are named by their libraryName."""
+    from urllib.parse import urlparse, parse_qs
+    from urllib.request import urlopen, Request
+    import shutil
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    q = parse_qs(urlparse(url).query)
+    if "libraryName" in q:
+        fname = q["libraryName"][0] + ".gmt"
+    else:
+        fname = Path(urlparse(url).path).name or "download"
+    dest = cache_dir / fname
+    if dest.exists() and dest.stat().st_size > 0:
+        print(f"  cached: {fname}", file=sys.stderr)
+        return dest
+    print(f"  downloading {fname} ...", file=sys.stderr)
+    tmp = dest.with_name(dest.name + ".part")
+    req = Request(url, headers={"User-Agent": "marker_bin_enrichment"})
+    with urlopen(req, timeout=180) as r, open(tmp, "wb") as fh:
+        shutil.copyfileobj(r, fh)
+    tmp.replace(dest)
+    return dest
+
+
+def _resolve(value, cache_dir, what):
+    """A local path is returned as-is (validated); an http/ftp/file URL is
+    fetched+cached.  Returns None on download failure so the caller can skip
+    that analysis gracefully."""
+    if value is None:
+        return None
+    if _is_url(value):
+        try:
+            return str(_fetch(value, cache_dir))
+        except Exception as e:                       # network / 404 / timeout
+            print(f"  WARNING: could not download {what} ({value}): {e}; "
+                  f"skipping it.", file=sys.stderr)
+            return None
+    if not Path(value).exists():
+        sys.exit(f"no such {what}: {value}")
+    return value
 
 
 # ------------------------------------------------------ interval operations --
@@ -366,13 +506,17 @@ def _chrom_page(ax, df):
 # ------------------------------------------------------------------- driver --
 
 def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
-                 annotations, gene_sets, out_dir):
+                 annotations, gene_sets, chrom_sizes, out_dir):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
 
     bins = _read_marker_bed(bed_path)
+    if chrom_sizes:                      # defensively clamp over-long bins
+        cap = bins["chrom"].map(_canon).map(chrom_sizes)     # size or NaN
+        clamped = np.minimum(bins["end"], cap.fillna(bins["end"]))
+        bins["end"] = np.maximum(clamped, bins["start"] + 1).astype(int)
     if args.fdr is not None and "celltype_fdr" in bins.columns:
         fg = (bins["celltype_fdr"].values < args.fdr)
         fg_desc = f"celltype_fdr < {args.fdr}"
@@ -494,15 +638,15 @@ def _parse_pairs(items, what):
     filename stem, so multiple bare paths do not collide."""
     out = {}
     for it in (items or []):
-        if "=" in it:
+        head = it.split("=", 1)[0]
+        # 'LABEL=value' only when the head is a plain label (a bare URL may
+        # contain '=' in its query string, e.g. ...?libraryName=GO).
+        if "=" in it and "://" not in head and "/" not in head:
             k, v = it.split("=", 1)
             out[k.strip()] = v.strip()
         else:
-            out[Path(it).stem] = it.strip()
-    for v in out.values():
-        if not Path(v).exists():
-            sys.exit(f"no such {what}: {v}")
-    return out
+            out[Path(it.split("?")[0]).stem or it] = it.strip()
+    return out                                 # resolved/validated by _resolve
 
 
 def main(argv=None):
@@ -515,26 +659,42 @@ def main(argv=None):
     ap.add_argument("--fdr", type=float, default=None,
                     help="Define foreground by celltype_fdr < FDR instead of the "
                          "'selected' column.")
-    ap.add_argument("--gene-annotation", default=None, metavar="GTF|BED",
+    ap.add_argument("--genome", default=None,
+                    choices=sorted(_GENOME),
+                    help="Auto-DOWNLOAD the standard annotations for this genome "
+                         "(GENCODE genes, UCSC chrom.sizes + cytoBand + CpG "
+                         "islands, Enrichr GO_BP + KEGG) into --cache-dir and use "
+                         "them for any input not given explicitly.  e.g. mm10 for "
+                         "GENCODE vM25.  (A tissue ChromHMM has no single "
+                         "canonical source, so pass --chromhmm yourself.)")
+    ap.add_argument("--cache-dir", default=None, metavar="DIR",
+                    help="Where downloaded annotations are cached and reused "
+                         "(default: ~/.cache/marker_bin_enrichment/<genome>).")
+    ap.add_argument("--chrom-sizes", default=None, metavar="FILE|URL",
+                    help="chrom.sizes / .fai; bin ends are clamped to the contig "
+                         "length on read (fixes over-long last bins).  Auto-"
+                         "filled by --genome.")
+    ap.add_argument("--gene-annotation", default=None, metavar="GTF|BED|URL",
                     help="Genes for the feature/gene-overlap/GO analyses: a GTF/"
                          "GFF ('gene' features) or a BED6 (name=col4, "
-                         "strand=col6).")
+                         "strand=col6).  A local path or an http/ftp URL.")
     ap.add_argument("--promoter-window", type=int, default=2000,
                     help="TSS +/- this many bp defines the promoter (default "
                          "2000).")
-    ap.add_argument("--chromhmm", default=None, metavar="BED",
+    ap.add_argument("--chromhmm", default=None, metavar="BED|URL",
                     help="ChromHMM (or any state) BED; column 4 is the state "
-                         "label.  Coverage enrichment per state.")
+                         "label.  Coverage enrichment per state.  Path or URL.")
     ap.add_argument("--annotation", action="append", default=None,
-                    metavar="LABEL=BED",
+                    metavar="LABEL=BED|URL",
                     help="Any functional annotation BED (enhancers, CpG islands, "
-                         "TF peaks, ...) for coverage enrichment. Repeatable.")
+                         "TF peaks, ...) for coverage enrichment.  Path or URL. "
+                         "Repeatable.")
     ap.add_argument("--gene-sets", action="append", default=None,
-                    metavar="LABEL=GMT",
+                    metavar="LABEL=GMT|URL",
                     help="Gene-set database in GMT format (e.g. Enrichr/MSigDB "
                          "GO_Biological_Process, KEGG) for over-representation of "
-                         "the covered genes. Repeatable, e.g. GO=go.gmt "
-                         "KEGG=kegg.gmt.")
+                         "the covered genes.  Path or URL. Repeatable, e.g. "
+                         "GO=go.gmt KEGG=kegg.gmt.")
     ap.add_argument("--min-gene-set", type=int, default=5,
                     help="Ignore gene sets smaller than this (in the universe).")
     ap.add_argument("--max-gene-set", type=int, default=2000,
@@ -547,9 +707,27 @@ def main(argv=None):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    preset = _GENOME.get(args.genome, {}) if args.genome else {}
+    cache = Path(args.cache_dir) if args.cache_dir else (
+        Path.home() / ".cache" / "marker_bin_enrichment" / (args.genome or "custom"))
+    if preset:
+        print(f"genome {args.genome}: filling missing annotations from downloads "
+              f"in {cache}", file=sys.stderr)
+
+    # Chromosome sizes -> clamp over-long bins on read (from --chrom-sizes or the
+    # genome preset).
+    chrom_sizes = None
+    cs = _resolve(args.chrom_sizes or preset.get("chrom_sizes"), cache,
+                  "chrom-sizes")
+    if cs:
+        chrom_sizes = _read_chrom_sizes(cs)
+
+    # Genes -> feature intervals + gene overlap + the GO/KEGG gene universe.
     genes = gene_features = None
-    if args.gene_annotation:
-        genes = _read_genes(args.gene_annotation)
+    ga = _resolve(args.gene_annotation or preset.get("gene_annotation"), cache,
+                  "gene-annotation")
+    if ga:
+        genes = _read_genes(ga)
         tss = np.where(genes["strand"].values == "-", genes["end"].values - 1,
                        genes["start"].values)
         gene_features = {
@@ -560,23 +738,50 @@ def main(argv=None):
             "gene_body": genes[["chrom", "start", "end"]].copy()}
         print(f"gene annotation: {len(genes)} genes", file=sys.stderr)
 
+    # Chromatin states (user-supplied only; no canonical per-tissue preset).
     chromhmm = None
-    if args.chromhmm:
-        chromhmm = _read_bed(args.chromhmm, want_name=True)
+    ch = _resolve(args.chromhmm, cache, "chromhmm")
+    if ch:
+        chromhmm = _read_bed(ch, want_name=True)
         print(f"chromhmm: {chromhmm['name'].nunique()} states, "
               f"{len(chromhmm)} intervals", file=sys.stderr)
 
-    annotations = {k or Path(v).stem: _read_bed(v)
-                   for k, v in _parse_pairs(args.annotation, "annotation").items()}
-    gene_sets = {k or Path(v).stem: _read_gmt(v)
-                 for k, v in _parse_pairs(args.gene_sets, "gene-set GMT").items()}
+    # Generic annotations: the user's, plus the genome's cytoBand (per Giemsa
+    # band -> heterochromatin gpos* vs euchromatin gneg) and CpG islands.
+    annotations = {}
+    for k, v in _parse_pairs(args.annotation, "annotation").items():
+        rv = _resolve(v, cache, f"annotation {k}")
+        if rv is not None:
+            annotations[k] = _read_bed(rv)
+    if preset.get("cytoband"):
+        cb = _resolve(preset["cytoband"], cache, "cytoBand")
+        if cb is not None:
+            for stain, df in _read_cytoband(cb).items():
+                annotations.setdefault(stain, df)
+    if preset.get("cpg_islands") and "CpG_island" not in annotations:
+        cp = _resolve(preset["cpg_islands"], cache, "CpG islands")
+        if cp is not None:
+            annotations["CpG_island"] = _read_ucsc_bed(cp, cols=(1, 2, 3))
 
-    beds = _parse_pairs(args.bed, "--bed")
+    # Gene sets: the user's, plus the genome's GO/KEGG for labels not overridden.
+    gene_sets = {}
+    for k, v in _parse_pairs(args.gene_sets, "gene-set GMT").items():
+        rv = _resolve(v, cache, f"gene-set {k}")
+        if rv is not None:
+            gene_sets[k] = _read_gmt(rv)
+    for label, url in preset.get("gene_sets", {}).items():
+        if label not in gene_sets:
+            rv = _resolve(url, cache, f"gene-set {label}")
+            if rv is not None:
+                gene_sets[label] = _read_gmt(rv)
+
     summaries = {}
-    for name, path in beds.items():
-        name = name or Path(path).stem
-        s = _run_context(name, path, args, genes, gene_features, chromhmm,
-                         annotations, gene_sets, out_dir)
+    for name, path in _parse_pairs(args.bed, "--bed").items():
+        rp = _resolve(path, cache, f"--bed {name}")
+        if rp is None:
+            continue
+        s = _run_context(name, rp, args, genes, gene_features, chromhmm,
+                         annotations, gene_sets, chrom_sizes, out_dir)
         if s is not None:
             summaries[name] = s
     if not summaries:

@@ -112,6 +112,79 @@ def test_ora_hypergeometric_enrichment():
     assert "miss" not in df["term"].values          # k==0 -> dropped
 
 
+# ------------------------------------------------ annotation readers + fetch --
+
+def test_read_ucsc_bed_handles_leading_bin_column(tmp_path):
+    """cpgIslandExt has a leading 'bin' column -> chrom/start/end at 1/2/3."""
+    m = _mod()
+    p = tmp_path / "cpg.txt"
+    p.write_text("611\tchr1\t100\t200\tCpG\n613\tchr1\t500\t700\tCpG\n")
+    df = m._read_ucsc_bed(str(p), cols=(1, 2, 3))
+    assert df["chrom"].tolist() == ["chr1", "chr1"]
+    assert df["start"].tolist() == [100, 500]
+    assert df["end"].tolist() == [200, 700]
+
+
+def test_read_cytoband_groups_by_giestain(tmp_path):
+    m = _mod()
+    p = tmp_path / "cb.txt"
+    p.write_text("chr1\t0\t100\tqA1\tgpos100\nchr1\t100\t200\tqA2\tgneg\n"
+                 "chr2\t0\t50\tqA1\tgpos100\n")
+    bands = m._read_cytoband(str(p))
+    assert set(bands) == {"band:gpos100", "band:gneg"}
+    assert len(bands["band:gpos100"]) == 2                 # chr1 + chr2
+    assert bands["band:gneg"]["chrom"].tolist() == ["chr1"]
+
+
+def test_read_genes_streams_gtf_gene_lines(tmp_path):
+    m = _mod()
+    p = tmp_path / "g.gtf"
+    p.write_text(
+        '#c\n'
+        'chr1\tHAVANA\tgene\t1000\t2000\t.\t+\t.\tgene_name "Sox2"; gene_id "X";\n'
+        'chr1\tHAVANA\texon\t1000\t1100\t.\t+\t.\tgene_name "Sox2";\n'      # skip
+        'chr2\tHAVANA\tgene\t5000\t6000\t.\t-\t.\tgene_id "ENSMUSG1";\n')   # id only
+    g = m._read_genes(str(p))
+    assert g["name"].tolist() == ["Sox2", "ENSMUSG1"]      # exon line skipped
+    assert g.iloc[0][["chrom", "start", "end", "strand"]].tolist() == \
+        ["chr1", 999, 2000, "+"]                            # GTF 1-based -> 0-based
+
+
+def test_fetch_and_resolve_with_file_url(tmp_path):
+    """The downloader works offline via file:// URLs (fetch, cache, reuse)."""
+    m = _mod()
+    src = tmp_path / "data.bed"
+    src.write_text("chr1\t0\t100\n")
+    cache = tmp_path / "cache"
+    url = src.resolve().as_uri()                            # file:///.../data.bed
+    got = Path(m._fetch(url, cache))
+    assert got.read_text() == "chr1\t0\t100\n" and got.parent == cache
+    assert m._fetch(url, cache) == got                      # second call = cached
+    # _resolve: URL -> fetched path; local path -> as-is; bad URL -> None
+    assert m._resolve(url, cache, "x") == str(got)
+    assert m._resolve(str(src), cache, "x") == str(src)
+    assert m._resolve("file:///no/such/file.bed", cache, "x") is None
+
+
+def test_parse_pairs_label_vs_bare_url():
+    m = _mod()
+    d = m._parse_pairs(["GO=https://x.org/lib?libraryName=GO_BP", "local.gmt"], "x")
+    assert d["GO"] == "https://x.org/lib?libraryName=GO_BP"  # '=' in query kept
+    assert d["local"] == "local.gmt"                         # bare -> stem key
+
+
+def test_genome_registry_presets_are_well_formed():
+    m = _mod()
+    assert {"mm10", "mm39", "hg38", "hg19"} <= set(m._GENOME)
+    mm10 = m._GENOME["mm10"]
+    assert "gencode.vM25" in mm10["gene_annotation"]
+    assert mm10["chrom_sizes"].endswith("mm10.chrom.sizes")
+    assert set(mm10["gene_sets"]) == {"GO_BP", "KEGG"}
+    assert "KEGG_2019_Mouse" in mm10["gene_sets"]["KEGG"]
+    for g in m._GENOME.values():                             # all http(s) URLs
+        assert m._is_url(g["gene_annotation"]) and m._is_url(g["chrom_sizes"])
+
+
 # ---------------------------------------------------------------- end to end -
 
 def _planted(d: Path):
