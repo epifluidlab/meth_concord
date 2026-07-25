@@ -641,33 +641,60 @@ def _chrom_page(ax, df):
 def _signal_figure(series, fg, df, name, out_path):
     """Publication figure: per-bin signal DISTRIBUTION, foreground vs
     background, one grouped violin pair per track (ordered as the enrichment
-    table), with the BH-FDR significance annotated."""
+    table), with the BH-FDR significance annotated.
+
+    The y-axis is set to a ROBUST range (1st-99th percentile of the pooled
+    signal) so a few outlier bins do not flatten the distributions; the violin
+    KDE is trimmed to that range (else it is evaluated over the full 0..outlier
+    span and the bulk renders as a flat blob).  The mean line is the true
+    full-data mean (matching the enrichment table)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     order = df["annotation"].tolist()
     n = len(order)
+    pooled = np.concatenate([np.asarray(series[l], float) for l in order])
+    pooled = pooled[np.isfinite(pooled)]
+    if pooled.size:
+        # IQR (Tukey) fence -> robust to ANY outlier fraction; a plain high
+        # percentile is itself contaminated once >1% of bins are outliers (as
+        # happens for low-coverage bins with inflated normalised signal).
+        q1, q3 = (float(x) for x in np.percentile(pooled, [25, 75]))
+        iqr = q3 - q1
+        if iqr > 1e-12:
+            lo = min(0.0, q1 - 1.5 * iqr)
+            hi = q3 + 3.0 * iqr
+        else:
+            lo = min(0.0, float(np.percentile(pooled, 1)))
+            hi = float(np.percentile(pooled, 99))
+        if not (hi > lo):
+            lo, hi = float(pooled.min()), float(pooled.max())
+    else:
+        lo, hi = 0.0, 1.0
+    rng = (hi - lo) or 1.0
     fg_c, bg_c = "#c0392b", "#95a5a6"
     fig, ax = plt.subplots(figsize=(max(4.5, 1.15 * n + 1.5), 4.4))
     for i, lab in enumerate(order):
         v = np.asarray(series[lab], dtype=float)
-        groups = [(v[(~fg) & np.isfinite(v)], 0.22, bg_c),
-                  (v[fg & np.isfinite(v)], -0.22, fg_c)]
-        top = np.nan
-        for data, off, color in groups:
-            if data.size < 2:
+        for mask, off, color in [((~fg), 0.22, bg_c), (fg, -0.22, fg_c)]:
+            full = v[mask & np.isfinite(v)]
+            if full.size < 2:
                 continue
-            pc = ax.violinplot([data], positions=[i + off], widths=0.38,
-                               showmeans=True, showextrema=False)
-            pc["bodies"][0].set_facecolor(color)
-            pc["bodies"][0].set_alpha(0.8)
-            pc["bodies"][0].set_edgecolor("none")
-            pc["cmeans"].set_color("black")
-            pc["cmeans"].set_linewidth(1.0)
-            top = np.nanmax([top, np.nanpercentile(data, 98)])
+            shown = full[(full >= lo) & (full <= hi)]     # trim KDE to the axis
+            if shown.size >= 2:
+                pc = ax.violinplot([shown], positions=[i + off], widths=0.38,
+                                   showmeans=False, showextrema=False)
+                pc["bodies"][0].set_facecolor(color)
+                pc["bodies"][0].set_alpha(0.8)
+                pc["bodies"][0].set_edgecolor("none")
+            med = float(np.median(full))    # median: robust, sits in the bulk
+            ax.plot([i + off - 0.17, i + off + 0.17], [med, med], color="black",
+                    lw=1.1, zorder=3)         # (rank-based, matches the MWU test)
         q = df.loc[df["annotation"] == lab, "fdr"].iloc[0]
         s = _stars(q) if np.isfinite(q) else "ns"
-        ax.text(i, top, s or "ns", ha="center", va="bottom", fontsize=9)
+        ax.text(i, hi + 0.04 * rng, s or "ns", ha="center", va="bottom",
+                fontsize=9)
+    ax.set_ylim(lo - 0.03 * rng, hi + 0.14 * rng)
     ax.set_xticks(range(n))
     ax.set_xticklabels(order, rotation=30, ha="right", fontsize=8)
     ax.set_ylabel("per-bin mean signal")
@@ -678,7 +705,8 @@ def _signal_figure(series, fg, df, name, out_path):
                    label=f"foreground ({int(fg.sum())})"),
         plt.Line2D([], [], color=bg_c, lw=7, alpha=0.8,
                    label=f"background ({int((~fg).sum())})")],
-        frameon=False, fontsize=8, loc="upper right")
+        frameon=False, fontsize=8, loc="upper left",
+        bbox_to_anchor=(1.01, 1.0))         # outside, clear of the star row
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
     fig.tight_layout()
