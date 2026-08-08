@@ -168,6 +168,7 @@ def run_umap_and_plot(
     batch_labels=None,
     batch_correction: str = "none",
     harmony_theta=None,
+    annotate_metrics: bool = True,
 ) -> pd.DataFrame:
     """Embed ``matrix`` via UMAP and save a coordinate table + scatter plot.
 
@@ -206,6 +207,14 @@ def run_umap_and_plot(
     plot_format : str
         Figure extension: ``png`` (default), or a vector format such as
         ``pdf`` / ``svg`` for publication figures.
+    annotate_metrics : bool
+        When ``group_labels`` is given, score how well the representation
+        separates those labels (ASW / kNN-purity / ARI / NMI, see
+        :mod:`nome_hic_concordance.metrics`), caption the figure with them,
+        and write ``<output_prefix>_metrics.tsv``.  Scored on BOTH the
+        feature space UMAP actually consumed (post-SVD, post-batch-
+        correction) and the 2-D embedding; the caption reports the feature
+        space, since the 2-D layout is a lossy view of it.
 
     Returns
     -------
@@ -329,6 +338,27 @@ def run_umap_and_plot(
 
     result.to_csv(out_path / f"{output_prefix}_coordinates.tsv", sep="\t", index=False)
 
+    # ---- Label-agreement metrics -------------------------------------
+    # Scored on the space UMAP consumed (X: post-SVD, post-batch-correction)
+    # as well as the 2-D layout.  The caption reports the feature space: the
+    # 2-D embedding is a lossy projection of it, so judging a representation
+    # by its picture flatters whatever UMAP happened to lay out neatly.
+    metrics_line = ""
+    if annotate_metrics and group_labels is not None:
+        from . import metrics as _metrics
+        y = result["group"].where(result["group"] != "unknown")
+        space = (f"{X.shape[1]} SVD comps" if n_svd_used
+                 else f"{X.shape[1]} bins")
+        feat = _metrics.label_agreement(X, y, random_state=random_state)
+        emb = _metrics.label_agreement(embedding, y, random_state=random_state)
+        metrics_line = _metrics.format_metrics(feat, space)
+        pd.DataFrame([{"space": "feature", "detail": space, **feat},
+                      {"space": "umap2d", "detail": "2 UMAP axes", **emb}]
+                     ).to_csv(out_path / f"{output_prefix}_metrics.tsv",
+                              sep="\t", index=False)
+        if metrics_line:
+            logger.info(f"{output_prefix} [feature space]: {metrics_line}")
+
     fig, ax = plt.subplots(figsize=(8, 7))
     unique_groups = order_groups(result["group"].dropna().unique(), group_order)
     n_g = len(unique_groups)
@@ -350,7 +380,15 @@ def run_umap_and_plot(
 
     ax.set_xlabel("UMAP1")
     ax.set_ylabel("UMAP2")
-    ax.set_title(title)
+    # Extra title pad leaves room for the metrics caption, which is drawn
+    # just above the axes so it reads as a subtitle at a smaller size.
+    ax.set_title(title, pad=20 if metrics_line else None)
+    if metrics_line:
+        ax.annotate(
+            metrics_line, xy=(0.5, 1.0), xytext=(0, 5),
+            xycoords="axes fraction", textcoords="offset points",
+            ha="center", va="bottom", fontsize=8, color="0.35",
+        )
     plt.tight_layout()
     plt.savefig(out_path / f"{output_prefix}.{plot_format}", dpi=150,
                 bbox_inches="tight")

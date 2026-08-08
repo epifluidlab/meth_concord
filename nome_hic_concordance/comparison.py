@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import matrix_ops, visualization
+from . import matrix_ops, metrics as _metrics, visualization
 from .blacklist import infer_bin_size
 from .pair_concordance.component_analysis import _cv_auc
 from .utils import ensure_dir
@@ -120,30 +120,10 @@ def _svd_scores(normalized: pd.DataFrame, n_svd: int,
     return svd.transform(Z)[:, s:], svd.explained_variance_ratio_
 
 
-def _silhouette(scores: np.ndarray, labels: pd.Series) -> float:
-    from sklearn.metrics import silhouette_score
-    y = labels.to_numpy()
-    if len(np.unique(y)) < 2 or scores.shape[0] < 3:
-        return float("nan")
-    try:
-        return float(silhouette_score(scores, y))
-    except Exception:
-        return float("nan")
-
-
-def _knn_purity(scores: np.ndarray, labels: pd.Series, k: int = 15) -> float:
-    """Fraction of each cell's k nearest neighbours sharing its label."""
-    from sklearn.neighbors import NearestNeighbors
-    y = labels.to_numpy()
-    n = scores.shape[0]
-    if n < 3:
-        return float("nan")
-    k_eff = min(k, n - 1)
-    nn = NearestNeighbors(n_neighbors=k_eff + 1).fit(scores)
-    _, idx = nn.kneighbors(scores)
-    idx = idx[:, 1:]
-    same = np.array([(y[idx[i]] == y[i]).mean() for i in range(n)])
-    return float(same.mean())
+# Single implementation lives in `metrics` (visualization needs it too, and
+# this module imports visualization — so it cannot be the other way round).
+_silhouette = _metrics.silhouette
+_knn_purity = _metrics.knn_purity
 
 
 def _knn_purity_stats(
