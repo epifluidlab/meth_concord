@@ -524,6 +524,156 @@ def test_combine_concordant_diff_sees_coordination_signed_diff_misses(tmp_path):
     assert cd.mean() > 0.4, "concordant-diff must detect the concordance"
 
 
+_HI, _LO = 0.95, 0.05
+_MARGINAL = {"open": 0.75, "closed": 0.25, "balanced": 0.50}
+
+
+def _state_block(m: float, coordinated: bool) -> list[tuple[float, float]]:
+    """16 (p1, p2) end-states with per-end marginal ``m``.
+
+    ``coordinated``  -> all mass on the concordant cells (16m co-open,
+                        16(1−m) co-closed): maximal association.
+    ``uncoordinated``-> the INDEPENDENT product (m², (1−m)², 2m(1−m)):
+                        identical marginal, zero association.
+
+    Holding the marginal fixed across the two is what makes the pair a clean
+    coordination contrast — the marginal is the other degree of freedom.
+    """
+    n = 16
+    if coordinated:
+        n_oo, n_cc, n_mix = round(n * m), round(n * (1 - m)), 0
+    else:
+        n_oo, n_cc = round(n * m * m), round(n * (1 - m) * (1 - m))
+        n_mix = (n - n_oo - n_cc) // 2
+    return ([(_HI, _HI)] * n_oo + [(_LO, _LO)] * n_cc
+            + [(_HI, _LO)] * n_mix + [(_LO, _HI)] * n_mix)
+
+
+def _directional_paths(tmp_path, level: str, coordinated: bool, n_cells=8):
+    """Linked pairs at openness ``level``, coordinated or not, against a
+    short-range baseline that is the INDEPENDENT pairing at the SAME marginal.
+
+    Using the independent product as the baseline (rather than, say, an
+    all-mixed pool, which is itself strongly anti-concordant) means E carries
+    the marginal but no association — so C isolates the coordination and an
+    uncoordinated linked pool correctly scores ~0.
+    """
+    m = _MARGINAL[level]
+    linked_states = _state_block(m, coordinated)
+    base_states = _state_block(m, coordinated=False)
+    paths = {}
+    for c in range(n_cells):
+        recs = []
+        for i in range(32):
+            p1, p2 = linked_states[i % len(linked_states)]
+            recs.append({"chrom": "chr1", "pos1": 100 + i * 2,
+                         "pos2": 500 + i * 2, "n1": 5, "n2": 5,
+                         "posterior1": p1, "posterior2": p2, "distance": 400})
+        for i in range(32):
+            p1, p2 = base_states[i % len(base_states)]
+            recs.append({"chrom": "chr1", "pos1": 700 + i * 2,
+                         "pos2": 720 + i * 2, "n1": 5, "n2": 5,
+                         "posterior1": p1, "posterior2": p2, "distance": 20})
+        p = tmp_path / f"{level}_{coordinated}_c{c}.parquet"
+        _make_posteriors(recs).to_parquet(p)
+        paths[f"c{c}"] = str(p)
+    return paths
+
+
+def _run_directional(tmp_path, level, coordinated, tag):
+    return concordance.compute_signed_concordance_matrix(
+        _directional_paths(tmp_path, level, coordinated),
+        bin_size=1000, min_distance=100, min_gch_sites=2, min_pairs_per_bin=1,
+        baseline="short-range", concordance_combine="concordant-signed",
+        use_rwr=False, eb_min_obs=2, n_threads=1, save_outputs=False,
+        output_dir=str(tmp_path / tag),
+    )
+
+
+def test_concordant_signed_orients_co_open_positive_co_closed_negative(tmp_path):
+    """D = C·(2F−1) gives the co-closed → mixed → co-open scale.
+
+    Coordinated-open must be POSITIVE, coordinated-closed NEGATIVE, and an
+    uncoordinated bin at the same marginal ~0 — the property neither
+    'signed-diff' (marginal only) nor 'concordant-diff' (direction-blind) has.
+    """
+    d_open = _run_directional(tmp_path, "open", True, "o")["delta_signed"]["chr1:0"]
+    d_closed = _run_directional(tmp_path, "closed", True, "c")["delta_signed"]["chr1:0"]
+    d_none = _run_directional(tmp_path, "open", False, "n")["delta_signed"]["chr1:0"]
+
+    # Reference values for this fixture: D = +0.151 / -0.151 / 0.000.
+    assert d_open.mean() > 0.08, "coordinated co-open must be clearly positive"
+    assert d_closed.mean() < -0.08, "coordinated co-closed must be clearly negative"
+    assert abs(d_none.mean()) < 0.02, "uncoordinated bin must sit near zero"
+
+
+def test_concordant_signed_magnitude_is_direction_symmetric(tmp_path):
+    """|D| for co-open and co-closed coordination of equal strength matches,
+    and both carry the SAME coordination magnitude C — the direction lives in
+    F, not in the excess (which is identical for open and closed)."""
+    r_open = _run_directional(tmp_path, "open", True, "o")
+    r_closed = _run_directional(tmp_path, "closed", True, "c")
+    d_o = r_open["delta_signed"]["chr1:0"].mean()
+    d_c = r_closed["delta_signed"]["chr1:0"].mean()
+    c_o = r_open["coordination"]["chr1:0"].mean()
+    c_c = r_closed["coordination"]["chr1:0"].mean()
+    assert d_o == pytest.approx(-d_c, abs=0.05)
+    assert c_o == pytest.approx(c_c, abs=0.05), "C must be direction-blind"
+    assert c_o > 0.15, "both must register real coordination (reference 0.304)"
+
+
+def test_components_separate_balanced_coordination_from_mixed(tmp_path):
+    """The documented D≈0 degeneracy is resolvable by reading C alongside D.
+
+    A coordinated-but-BALANCED bin (half co-open, half co-closed) and a truly
+    mixed bin both give D≈0, but only the balanced one has large C.
+    """
+    bal = _run_directional(tmp_path, "balanced", True, "b")
+    mix = _run_directional(tmp_path, "balanced", False, "m")
+    assert abs(bal["delta_signed"]["chr1:0"].mean()) < 0.05
+    assert abs(mix["delta_signed"]["chr1:0"].mean()) < 0.05
+    assert bal["coordination"]["chr1:0"].mean() > 0.25, \
+        "balanced: C is large (reference 0.405)"
+    assert abs(mix["coordination"]["chr1:0"].mean()) < 0.05, "mixed: C ~ 0"
+
+
+def test_components_emitted_for_every_combine_mode(tmp_path):
+    """C / F / D / p̄ are companion outputs, not tied to the headline combine,
+    and the marginal tracks openness while C stays blind to it."""
+    res = concordance.compute_signed_concordance_matrix(
+        _directional_paths(tmp_path, "open", True),
+        bin_size=1000, min_distance=100, min_gch_sites=2, min_pairs_per_bin=1,
+        baseline="short-range", concordance_combine="signed-diff",
+        use_rwr=False, eb_min_obs=2, n_threads=1, save_outputs=False,
+        output_dir=str(tmp_path / "sd"),
+    )
+    for key in ("coordination", "direction", "directional", "marginal"):
+        assert key in res, key
+        assert res[key].shape == res["delta_signed"].shape
+    # D == C·(2F−1) by construction.
+    c = res["coordination"]["chr1:0"]
+    f = res["direction"]["chr1:0"]
+    d = res["directional"]["chr1:0"]
+    assert d.to_numpy() == pytest.approx((c * (2 * f - 1)).to_numpy(), abs=1e-12)
+    # 3:1 both-open:both-closed -> marginal ~0.75, direction F ~0.75.
+    assert res["marginal"]["chr1:0"].mean() == pytest.approx(0.75, abs=0.08)
+    assert f.mean() == pytest.approx(0.75, abs=0.08)
+
+
+def test_components_written_to_disk(tmp_path):
+    out = tmp_path / "out"
+    concordance.compute_signed_concordance_matrix(
+        _directional_paths(tmp_path, "open", True, n_cells=4),
+        bin_size=1000, min_distance=100, min_gch_sites=2, min_pairs_per_bin=1,
+        baseline="short-range", concordance_combine="concordant-signed",
+        use_rwr=False, eb_min_obs=2, n_threads=1, save_outputs=True,
+        output_dir=str(out),
+    )
+    for name in ("coordination", "direction", "directional", "marginal"):
+        assert (out / f"concordance_{name}.parquet").exists(), name
+        assert (out / f"concordance_{name}.tsv").exists(), name
+
+
 def test_baseline_and_combine_invalid_raise(tmp_path):
     paths = _focal_active_paths(tmp_path, n_cells=3)
     with pytest.raises(ValueError, match="baseline"):

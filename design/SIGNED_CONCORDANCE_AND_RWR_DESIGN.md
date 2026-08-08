@@ -33,6 +33,54 @@
 > new **§6b. Empirical findings** below for the evidence, the ladder, and the
 > honest effect sizes; the clean test lives in
 > `scripts/ep_coordination_existence.py` (no cross-cell imputation).
+>
+> **Directional decomposition (v0.7).** The 3-state (open / closed / mixed)
+> co-state distribution has exactly **two** degrees of freedom — the marginal
+> level `p̄` and the association `Cov` — and two identities pin down what any
+> combine mode can possibly measure:
+>
+> 1. `π_open − π_closed == p̄₁ + p̄₂ − 1`, an **exact per-pair identity** (the
+>    `p_i·p_j` terms cancel). So `signed-diff` carries **zero** coordination
+>    signal against a marginal-matched O/E null — it is a pure marginal
+>    contrast.
+> 2. `(O_open − E_open) == (O_closed − E_closed) == Cov`, **identically**:
+>    coordination moves mass out of `mixed` into *both* concordant cells by
+>    the same amount. So the *excess* cannot be attributed to a direction —
+>    a "co-open excess" map and a "co-closed excess" map are the **same map**.
+>
+> Consequently "co-open vs co-closed" is **not** an independent third axis;
+> it *is* the marginal, and no single statistic can be simultaneously
+> marginal-free and directional. `concordant-diff` measures the coordination
+> **magnitude** (`= 2·Cov`) and is therefore direction-blind by construction
+> (`Cov` is invariant under `p → 1−p`).
+>
+> To get a directional read, the sign must come from **where the concordant
+> mass sits**, not from the excess. `--concordance-combine concordant-signed`
+> emits
+>
+> ```
+> C = (O_open + O_closed) − (E_open + E_closed)   coordination magnitude (= 2·Cov)
+> F = O_open / (O_open + O_closed)                realized direction
+> D = C · (2F − 1)                                directional coordination
+> ```
+>
+> `D > 0` = coordinated co-**open**, `D < 0` = coordinated co-**closed**,
+> `D ≈ 0` = uncoordinated (mixed dominates) — the single
+> co-closed → mixed → co-open scale. **Caveat:** `D ≈ 0` *also* arises for a
+> coordinated-but-**balanced** bin (`F ≈ 0.5`, half co-open / half co-closed),
+> which is direction-*ambiguous* rather than mixed. `C` is therefore emitted
+> alongside `D` to separate the two (mixed → `C ≈ 0`; balanced → `C` large
+> with `D ≈ 0`). Reference values from the fixture in
+> `tests/test_signed_concordance.py`: coordinated-open `D = +0.151`,
+> coordinated-closed `D = −0.151` (**same** `C = 0.304`), uncoordinated
+> `D = C = 0`, balanced-coordinated `D = 0` with `C = 0.405`.
+>
+> Step 5 writes `concordance_{coordination,direction,directional,marginal}`
+> for **every** combine mode (they are companion diagnostics, not tied to the
+> headline Δ). Step 7 `--component-umaps` embeds `coordination` and
+> `marginal` — the two *independent* d.o.f. — so it is visible which axis the
+> cell-type structure lives on; a co-open/co-closed UMAP pair would be
+> degenerate per identity (2) above.
 
 ## Design document v0.3 — locked decisions (RWR pre-Layer 2, QN k-NN basis)
 

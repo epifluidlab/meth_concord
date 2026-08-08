@@ -179,7 +179,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--concordance-combine",
         choices=["auto", "signed-diff", "log2-ratio", "linked-only",
-                 "concordant-diff"],
+                 "concordant-diff", "concordant-signed"],
         default="log2-ratio",
         help="How the long-range observed (O) and baseline (E) co-state rates "
              "are combined.  'signed-diff' = "
@@ -192,7 +192,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'concordant-diff' = (O_open+O_closed)−(E_open+E_closed), the "
              "excess concordant mass / mixed deficit = 2·Cov: the marginal-free "
              "coordination magnitude (theoretically the cleanest against an O/E "
-             "null; sign = concordant vs anti-concordant).  'linked-only' = "
+             "null; sign = concordant vs anti-concordant), but DIRECTION-BLIND "
+             "(Cov is unchanged by open<->closed).  'concordant-signed' = "
+             "D = C·(2F−1) where C is the 'concordant-diff' magnitude and "
+             "F = O_open/(O_open+O_closed) is the realized direction: the "
+             "single co-CLOSED (−) -> mixed (0) -> co-OPEN (+) scale.  The "
+             "direction cannot come from the excess itself — "
+             "(O_open−E_open) == (O_closed−E_closed) identically — so it is "
+             "taken from where the concordant mass sits.  NOTE D is also ~0 "
+             "for a coordinated-but-BALANCED bin (F~0.5); read it next to the "
+             "emitted coordination matrix C to tell that apart from mixed "
+             "(mixed -> C~0; balanced -> C large, D~0).  'linked-only' = "
              "(O_open−O_closed) with NO baseline subtracted (--baseline is "
              "ignored) — a diagnostic to check whether the concordance UMAP is "
              "driven by the short-range baseline; note this is the raw "
@@ -200,6 +210,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "accessibility, not less.  'auto' resolves to "
              "'log2-ratio' for the distance-matched / distance-pooled O/E "
              "baselines, 'signed-diff' otherwise (the legacy behaviour).",
+    )
+    parser.add_argument(
+        "--component-umaps", choices=["auto", "on", "off"], default="auto",
+        help="In Step 7, additionally embed the concordance COMPONENT "
+             "matrices written by Step 5 — coordination (C, marginal-free "
+             "magnitude) and marginal (mean per-end openness p̄).  These are "
+             "the two independent degrees of freedom of the co-state "
+             "distribution; the headline Δ is a function of both, so the "
+             "companion UMAPs show which axis the cell-type structure lives "
+             "on.  (A co-open UMAP and a co-closed UMAP would NOT be "
+             "independent — the co-open and co-closed excesses are "
+             "identical — which is why these are the axes emitted.)  Each "
+             "gets the same normalization / SVD / batch-correction treatment "
+             "as the main UMAP.  'auto' = on when --concordance-combine "
+             "resolves to 'concordant-signed', off otherwise.",
     )
     parser.add_argument(
         "--dm-window-mb", type=float, default=0.0,
@@ -790,6 +815,21 @@ def _get_chrom_sizes_from_bam(bam_path: str) -> dict[str, int]:
         }
 
 
+def _resolve_concordance_combine(args) -> str:
+    """Resolve ``--concordance-combine auto``.
+
+    auto → log2-ratio for the non-contact O/E baselines (distance-matched /
+    distance-pooled), signed-diff for the legacy short-range baseline
+    (preserves the validated default).  Module-level so Step 7 can resolve
+    the same value when Step 5 didn't run in this invocation.
+    """
+    if args.concordance_combine != "auto":
+        return args.concordance_combine
+    if args.baseline in ("distance-matched", "distance-pooled"):
+        return "log2-ratio"
+    return "signed-diff"
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -1059,16 +1099,7 @@ def run_context(
                 "dm" if args.concordance_formula == "auto"
                 else args.concordance_formula
             )
-            # Resolve --concordance-combine: auto → log2-ratio for the
-            # non-contact O/E baselines (distance-matched / distance-pooled),
-            # signed-diff for the legacy short-range baseline (preserves the
-            # validated default).
-            concordance_combine = (
-                ("log2-ratio"
-                 if args.baseline in ("distance-matched", "distance-pooled")
-                 else "signed-diff") if args.concordance_combine == "auto"
-                else args.concordance_combine
-            )
+            concordance_combine = _resolve_concordance_combine(args)
             refinement_basis = (
                 "postnorm" if args.refinement_basis == "auto"
                 else args.refinement_basis
@@ -1392,6 +1423,67 @@ def run_context(
                 harmony_theta=args.harmony_theta,
                 plot_format=args.plot_format,
             )
+
+            # ---- Companion UMAPs on the concordance components -----------
+            # coordination (C) and marginal (p̄) are the two INDEPENDENT
+            # degrees of freedom of the co-state distribution; the headline
+            # Δ is a function of both.  Embedding each on its own shows
+            # which axis carries the cell-type structure.  Same
+            # normalization / SVD / batch treatment as the main UMAP so the
+            # three are directly comparable.
+            if args.component_umaps == "on" or (
+                args.component_umaps == "auto"
+                and _resolve_concordance_combine(args) == "concordant-signed"
+            ):
+                for comp, comp_title in (
+                    ("coordination", "coordination C (marginal-free)"),
+                    ("marginal", "marginal p̄ (mean openness)"),
+                ):
+                    comp_path = concordance_dir / f"concordance_{comp}.parquet"
+                    if not comp_path.exists():
+                        logger.warning(
+                            f"Component UMAP: {comp_path.name} not found "
+                            f"(re-run Step 5 to emit it); skipping."
+                        )
+                        continue
+                    # Its own subdirectory: process_concordance_matrix always
+                    # writes concordance_imputed / concordance_<norm>, which
+                    # would otherwise clobber the headline matrices.
+                    comp_mat = matrix_ops.process_concordance_matrix(
+                        pd.read_parquet(comp_path).reindex(
+                            index=concordance_shrunk.index),
+                        min_cell_coverage=args.min_cell_coverage,
+                        output_dir=str(concordance_dir / "components" / comp),
+                        matrix_norm=matrix_norm,
+                        per_cell_center=per_cell_center,
+                        per_cell_norm=per_cell_norm,
+                        post_norm_recenter=post_norm_recenter,
+                    )
+                    if comp_mat["zscore"].shape[1] == 0 or \
+                            comp_mat["zscore"].shape[0] < 2:
+                        logger.warning(
+                            f"Component UMAP ({comp}): too few cells/bins "
+                            f"after the coverage filter; skipping."
+                        )
+                        continue
+                    visualization.run_umap_and_plot(
+                        comp_mat["zscore"], group_labels,
+                        title=(f"UMAP ({comp_title}, {norm_title}"
+                               f"{svd_title}{bc_title}, {context})"),
+                        output_prefix=(f"umap_{comp}_{matrix_norm}"
+                                       f"{svd_suffix}{bc_suffix}"),
+                        output_dir=str(umap_dir),
+                        n_svd=n_svd,
+                        skip_top_svd=skip_top_svd,
+                        n_threads=args.n_threads,
+                        random_state=args.random_seed,
+                        group_colors=group_colors,
+                        group_order=group_order,
+                        batch_labels=batch_labels,
+                        batch_correction=batch_correction,
+                        harmony_theta=args.harmony_theta,
+                        plot_format=args.plot_format,
+                    )
     else:
         logger.info("Step 7: Skipped.")
 

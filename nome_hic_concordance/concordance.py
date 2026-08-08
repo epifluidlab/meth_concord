@@ -1211,10 +1211,11 @@ def compute_signed_concordance_matrix(
     # bin's expected RATE is formed (see _compute_cell_dm_expected mode).
     uses_expected = baseline in ("distance-matched", "distance-pooled")
     if concordance_combine not in ("signed-diff", "log2-ratio", "linked-only",
-                                   "concordant-diff"):
+                                   "concordant-diff", "concordant-signed"):
         raise ValueError(
             f"concordance_combine must be 'signed-diff', 'log2-ratio', "
-            f"'linked-only', or 'concordant-diff'; got {concordance_combine!r}.")
+            f"'linked-only', 'concordant-diff', or 'concordant-signed'; "
+            f"got {concordance_combine!r}.")
 
     out_path = ensure_dir(output_dir) if save_outputs else None
     items = list(cell_posterior_paths.items())
@@ -1407,10 +1408,19 @@ def compute_signed_concordance_matrix(
     # ---- Step 4 + 5: RWR (optional) + Layer 2 ----------------------------
     fitted_priors: dict[str, dict] = {}
 
-    def _layer2(imputed: dict[str, np.ndarray]) -> pd.DataFrame:
-        """Layer-2 callback used by run_rwr_pipeline (or called directly
-        when use_rwr=False).  Fits DM priors and computes the headline
-        Δ_signed matrix.  Side effect: populates ``fitted_priors``.
+    def _fit_and_rates(
+        imputed: dict[str, np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Fit the DM priors on ``imputed`` and return the four co-state rates
+        ``(o_open, o_closed, e_open, e_closed)``.
+
+        Side effect: (re)populates ``fitted_priors`` for the counts passed in.
+        Split out of :func:`_layer2` so the post-pipeline component matrices
+        can be derived from the *returned* imputed counts — under
+        ``rwr_auto_select_passes`` the pipeline may hand back an earlier
+        pass, so capturing them as a side effect of the last ``_layer2``
+        call would silently pair components from one pass with a Δ from
+        another.
         """
         # Build long-format DataFrames for the prior fits.
         n_l_flat = imputed["n_linked"].ravel()
@@ -1509,6 +1519,62 @@ def compute_signed_concordance_matrix(
                 imputed["k_u_open"], imputed["k_u_closed"],
                 imputed["k_u_mixed"], imputed["n_unlinked"], alpha_u)
 
+        return o_open, o_closed, e_open, e_closed
+
+    def _decompose(
+        o_open: np.ndarray, o_closed: np.ndarray,
+        e_open: np.ndarray, e_closed: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Directional decomposition of the co-state distribution.
+
+        The 3-state (open / closed / mixed) distribution has exactly TWO
+        degrees of freedom: the marginal level p̄ and the association Cov.
+        "Co-open vs co-closed" is NOT a third axis — it *is* the marginal:
+
+          π_open − π_closed  ==  p̄_1 + p̄_2 − 1   is an exact per-pair
+            identity (the p_i·p_j terms cancel), so 'signed-diff' carries
+            zero coordination signal against a marginal-matched O/E null.
+
+          (O_open − E_open) == (O_closed − E_closed) == Cov, identically —
+            coordination moves mass out of `mixed` into BOTH concordant
+            cells by the same amount, so the *excess* cannot be attributed
+            to a direction either (a "co-open excess" map and a "co-closed
+            excess" map would be the same map).
+
+        Direction therefore has to come from where the concordant mass
+        actually SITS rather than from the excess:
+
+          C = (O_open + O_closed) − (E_open + E_closed)  coordination (=2·Cov)
+          F = O_open / (O_open + O_closed)               realized direction
+          D = C · (2F − 1)                               directional coordination
+
+        D > 0 → coordinated, realized co-OPEN; D < 0 → coordinated
+        co-CLOSED; D ≈ 0 → uncoordinated (mixed dominates).  D is *also* ≈0
+        for a coordinated-but-balanced bin (F ≈ 0.5), which is
+        direction-ambiguous rather than mixed — so C is emitted alongside D
+        to separate the two cases (mixed → C ≈ 0; balanced-coordinated →
+        C large with D ≈ 0).
+        """
+        coord = (o_open + o_closed) - (e_open + e_closed)
+        mass = o_open + o_closed
+        # No concordant mass → no direction → F = 0.5 → D = 0.
+        safe_mass = np.where(mass > 1e-12, mass, 1.0)
+        frac = np.where(mass > 1e-12, o_open / safe_mass, 0.5)
+        # Mean per-end openness, from the exact identity above.
+        marginal = (o_open - o_closed + 1.0) / 2.0
+        return {
+            "coordination": coord,
+            "direction": frac,
+            "directional": coord * (2.0 * frac - 1.0),
+            "marginal": marginal,
+        }
+
+    def _layer2(imputed: dict[str, np.ndarray]) -> pd.DataFrame:
+        """Layer-2 callback used by run_rwr_pipeline (or called directly when
+        use_rwr=False): fit the DM priors, then combine O and E into the
+        headline Δ matrix."""
+        o_open, o_closed, e_open, e_closed = _fit_and_rates(imputed)
+
         # Combine observed (O) and expected (E).
         if concordance_combine == "linked-only":
             # Long-range (linked) contacts ONLY — the baseline E is NOT
@@ -1534,6 +1600,13 @@ def compute_signed_concordance_matrix(
             # sensitive at ~50% level where log2-ratio vanishes.  This is the
             # theoretically cleanest coordination statistic against an O/E null.
             delta_signed = (o_open + o_closed) - (e_open + e_closed)
+        elif concordance_combine == "concordant-signed":
+            # D = C·(2F−1): the coordination magnitude of 'concordant-diff',
+            # SIGNED by which co-state realizes it.  Gives the single
+            # co-closed (−) → mixed (0) → co-open (+) scale.  See _decompose
+            # for why the sign cannot come from the excess itself.
+            delta_signed = _decompose(o_open, o_closed, e_open, e_closed)[
+                "directional"]
         else:  # 'signed-diff' (legacy): (O_open−O_closed) − (E_open−E_closed)
             delta_signed = (o_open - o_closed) - (e_open - e_closed)
 
@@ -1586,6 +1659,22 @@ def compute_signed_concordance_matrix(
         # Run Layer 2 directly on the raw soft counts.
         imputed_counts = raw_counts
         delta_signed_df = _layer2(imputed_counts)
+
+    # ---- Component matrices (the interpretable 2 d.o.f. + the signed mix) --
+    # Derived from the counts the pipeline actually returned (see
+    # _fit_and_rates), so they always correspond to the returned Δ — and the
+    # re-fit leaves `fitted_priors` describing those same counts.  Emitted for
+    # every combine mode: they are the axes to visualise (coordination C and
+    # marginal p̄ are the two independent d.o.f.; directional D is their
+    # signed combination), independent of which one is the headline Δ.
+    _o_o, _o_c, _e_o, _e_c = _fit_and_rates(imputed_counts)
+    components = {
+        name: pd.DataFrame(arr, index=cell_names, columns=sorted_bins)
+        for name, arr in _decompose(_o_o, _o_c, _e_o, _e_c).items()
+    }
+    for _df in components.values():
+        _df.columns.name = "bin"
+        _df.index.name = "cell"
 
     # ---- Optionally compute the one-sided Δ_open -------------------------
     delta_open_df = None
@@ -1659,6 +1748,11 @@ def compute_signed_concordance_matrix(
         pair_counts_df.to_parquet(out_path / "pair_counts_per_bin.parquet")
         pair_counts_df.to_csv(out_path / "pair_counts_per_bin.tsv", sep="\t")
 
+        # Component matrices — the axes for the companion UMAPs.
+        for _name, _df in components.items():
+            _df.to_parquet(out_path / f"concordance_{_name}.parquet")
+            _df.to_csv(out_path / f"concordance_{_name}.tsv", sep="\t")
+
         # Soft counts + priors for diagnostics / reproducibility.
         soft_long = []
         for row_idx, cell in enumerate(cell_names):
@@ -1692,6 +1786,12 @@ def compute_signed_concordance_matrix(
         "imputed_counts": imputed_counts,
         "priors":         fitted_priors,
         "rwr_diagnostics": rwr_diagnostics,
+        # C (marginal-free coordination), F (realized direction),
+        # D = C·(2F−1) (directional coordination), p̄ (mean per-end openness).
+        "coordination":   components["coordination"],
+        "direction":      components["direction"],
+        "directional":    components["directional"],
+        "marginal":       components["marginal"],
     }
 
 
