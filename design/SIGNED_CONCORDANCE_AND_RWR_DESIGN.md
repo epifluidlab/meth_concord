@@ -77,10 +77,16 @@
 >
 > Step 5 writes `concordance_{coordination,direction,directional,marginal}`
 > for **every** combine mode (they are companion diagnostics, not tied to the
-> headline Δ). Step 7 `--component-umaps` embeds `coordination` and
-> `marginal` — the two *independent* d.o.f. — so it is visible which axis the
-> cell-type structure lives on; a co-open/co-closed UMAP pair would be
-> degenerate per identity (2) above.
+> headline Δ). Step 7 `--component-umaps` embeds all four, so it is visible
+> which one carries the cell-type structure. `C` and `p̄` are the two
+> *independent* d.o.f.; `F` and `D` are derived from them but answer a
+> different question — **`F` is which way a bin's concordance points
+> regardless of its strength, `C` is the strength regardless of direction**,
+> and `D` is their product-form combination. `directional` duplicates the
+> main UMAP when the headline combine is `concordant-signed`, and is emitted
+> anyway so `D` has a stable filename under any combine. A co-open /
+> co-closed UMAP pair is *not* among them: it would be degenerate per
+> identity (2) above.
 
 ## Design document v0.3 — locked decisions (RWR pre-Layer 2, QN k-NN basis)
 

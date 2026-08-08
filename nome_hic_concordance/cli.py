@@ -213,17 +213,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--component-umaps", choices=["auto", "on", "off"], default="auto",
-        help="In Step 7, additionally embed the concordance COMPONENT "
-             "matrices written by Step 5 — coordination (C, marginal-free "
-             "magnitude) and marginal (mean per-end openness p̄).  These are "
-             "the two independent degrees of freedom of the co-state "
-             "distribution; the headline Δ is a function of both, so the "
-             "companion UMAPs show which axis the cell-type structure lives "
-             "on.  (A co-open UMAP and a co-closed UMAP would NOT be "
-             "independent — the co-open and co-closed excesses are "
-             "identical — which is why these are the axes emitted.)  Each "
-             "gets the same normalization / SVD / batch-correction treatment "
-             "as the main UMAP.  'auto' = on when --concordance-combine "
+        help="In Step 7, additionally embed the four concordance COMPONENT "
+             "matrices written by Step 5: directional (D = C·(2F−1)), "
+             "coordination (C, the marginal-free magnitude), direction "
+             "(F = O_open/(O_open+O_closed), the co-open share) and marginal "
+             "(mean per-end openness p̄).  C and p̄ are the two INDEPENDENT "
+             "degrees of freedom of the co-state distribution; F and D are "
+             "derived from them but answer a different question — F is which "
+             "way a bin's concordance points regardless of its strength, C is "
+             "the strength regardless of direction.  Embedding each shows "
+             "which one carries the cell-type structure.  (A co-open UMAP and "
+             "a co-closed UMAP would NOT be independent — the co-open and "
+             "co-closed excesses are identical — which is why these are the "
+             "axes emitted.)  Each gets the same normalization / SVD / "
+             "batch-correction treatment as the main UMAP; 'directional' "
+             "duplicates the main UMAP when --concordance-combine is "
+             "'concordant-signed'.  'auto' = on when --concordance-combine "
              "resolves to 'concordant-signed', off otherwise.",
     )
     parser.add_argument(
@@ -1426,17 +1431,25 @@ def run_context(
 
             # ---- Companion UMAPs on the concordance components -----------
             # coordination (C) and marginal (p̄) are the two INDEPENDENT
-            # degrees of freedom of the co-state distribution; the headline
-            # Δ is a function of both.  Embedding each on its own shows
-            # which axis carries the cell-type structure.  Same
-            # normalization / SVD / batch treatment as the main UMAP so the
-            # three are directly comparable.
+            # degrees of freedom of the co-state distribution; direction (F)
+            # and directional (D = C·(2F−1)) are derived from them but answer
+            # a different question -- F is *which way* a bin's concordance
+            # points (co-open share), independent of how strong it is, while
+            # C is the strength independent of the direction.  All four are
+            # embedded so it is visible which one carries the cell-type
+            # structure.  D gets a stable filename here regardless of which
+            # statistic is the headline Δ (it duplicates the main UMAP only
+            # when --concordance-combine is 'concordant-signed').  Same
+            # normalization / SVD / batch treatment as the main UMAP so they
+            # are all directly comparable.
             if args.component_umaps == "on" or (
                 args.component_umaps == "auto"
                 and _resolve_concordance_combine(args) == "concordant-signed"
             ):
                 for comp, comp_title in (
+                    ("directional", "directional D = C·(2F−1)"),
                     ("coordination", "coordination C (marginal-free)"),
+                    ("direction", "direction F (co-open share)"),
                     ("marginal", "marginal p̄ (mean openness)"),
                 ):
                     comp_path = concordance_dir / f"concordance_{comp}.parquet"
