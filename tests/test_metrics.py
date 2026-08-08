@@ -37,6 +37,32 @@ def test_separated_beats_mixed_on_every_metric():
     assert m_near["knn_purity"] == pytest.approx(0.5, abs=0.12)
 
 
+def test_purity_index_rescales_chance_to_zero_and_perfect_to_one():
+    """Raw purity is not comparable across class balances; the index is."""
+    far, y = _blobs(12.0)
+    near, _ = _blobs(0.0)
+    assert metrics.label_agreement(far, y)["purity_index"] > 0.9
+    # Overlapping blobs sit AT chance -> index ~0, even though raw purity ~0.5.
+    assert abs(metrics.label_agreement(near, y)["purity_index"]) < 0.25
+    # Severe imbalance: raw purity is high by construction, index is not.
+    rng = np.random.default_rng(3)
+    X = rng.normal(0, 1, (100, 2))                      # NO structure
+    y_imb = pd.Series(["A"] * 90 + ["B"] * 10)
+    m = metrics.label_agreement(X, y_imb)
+    assert m["knn_purity"] > 0.7, "raw purity looks high purely from imbalance"
+    assert abs(m["purity_index"]) < 0.2, "index correctly says ~chance"
+
+
+def test_purity_null_separates_real_structure_from_noise():
+    far, y = _blobs(12.0)
+    z, p = metrics.purity_null(far, y, n_perm=100, random_state=0)
+    assert z > 5 and p <= 1 / 101 + 1e-9
+    rng = np.random.default_rng(4)
+    z0, p0 = metrics.purity_null(rng.normal(0, 1, (80, 2)), y,
+                                 n_perm=100, random_state=0)
+    assert abs(z0) < 4 and p0 > 0.01
+
+
 def test_knn_chance_is_the_imbalance_baseline():
     # 90/10 split: random neighbours already give .9^2 + .1^2 = 0.82.
     y = pd.Series(["A"] * 90 + ["B"] * 10)

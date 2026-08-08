@@ -32,8 +32,8 @@ import numpy as np
 import pandas as pd
 
 _NAN = float("nan")
-_KEYS = ("silhouette", "knn_purity", "knn_chance", "ari", "nmi",
-         "n_cells", "n_groups")
+_KEYS = ("silhouette", "knn_purity", "knn_chance", "purity_index",
+         "ari", "nmi", "purity_z", "purity_p", "n_cells", "n_groups")
 
 
 def silhouette(scores: np.ndarray, labels: pd.Series | np.ndarray) -> float:
@@ -72,6 +72,42 @@ def knn_chance(labels: pd.Series | np.ndarray) -> float:
     return float((p ** 2).sum())
 
 
+def purity_null(scores: np.ndarray, labels: pd.Series | np.ndarray,
+                k: int = 15, n_perm: int = 200,
+                random_state: int = 42) -> tuple[float, float]:
+    """(z, p) for kNN-purity against a label-permutation null.
+
+    Labels are shuffled on the *fixed* neighbour graph (relabel only, no
+    refit), so this is cheap.  ``p`` is one-sided and floored at
+    ``1/(n_perm+1)``.
+
+    Caveat worth remembering when reading the number: at thousands of cells
+    almost any real structure clears this null with an enormous z.  It tells
+    you the separation is not zero — not that it is *good*.  Use
+    ``purity_index`` and a positive-control representation for that.
+    """
+    from sklearn.neighbors import NearestNeighbors
+    y = np.asarray(labels)
+    n = scores.shape[0]
+    if n < 3 or n_perm < 1 or len(np.unique(y)) < 2:
+        return _NAN, _NAN
+    k_eff = min(k, n - 1)
+    nn = NearestNeighbors(n_neighbors=k_eff + 1).fit(scores)
+    _, idx = nn.kneighbors(scores)
+    idx = idx[:, 1:]
+    obs = float(np.mean([(y[idx[i]] == y[i]).mean() for i in range(n)]))
+    rng = np.random.default_rng(random_state)
+    null = np.empty(n_perm, dtype=float)
+    for t in range(n_perm):
+        yp = rng.permutation(y)
+        null[t] = np.mean((yp[idx] == yp[:, None]).mean(axis=1))
+    sd = float(null.std(ddof=1))
+    z = (obs - float(null.mean())) / sd if sd > 1e-12 else _NAN
+    p = max((float((null >= obs).sum()) + 1.0) / (n_perm + 1.0),
+            1.0 / (n_perm + 1.0))
+    return z, p
+
+
 def cluster_agreement(scores: np.ndarray, labels: pd.Series | np.ndarray,
                       random_state: int = 42) -> tuple[float, float]:
     """(ARI, NMI) between ``labels`` and k-means at k = #labels.
@@ -101,12 +137,18 @@ def label_agreement(
     labels: pd.Series | np.ndarray | None,
     k: int = 15,
     random_state: int = 42,
+    n_perm: int = 200,
 ) -> dict[str, float]:
     """All metrics at once; NaNs when ``labels`` is missing or degenerate.
 
     Cells whose label is null are dropped (an unlabelled cell has nothing to
     agree with) rather than treated as their own class, which would depress
     every metric.
+
+    ``purity_index`` = (purity − chance)/(1 − chance) rescales kNN-purity so
+    0 is chance and 1 is perfect.  Raw purity is NOT comparable across
+    datasets with different class counts or balance — the index is, which
+    makes it the one number to rank representations by.
     """
     empty = {key: _NAN for key in _KEYS}
     if labels is None:
@@ -120,12 +162,19 @@ def label_agreement(
     if len(np.unique(y)) < 2:
         return empty
     ari, nmi = cluster_agreement(X, y, random_state=random_state)
+    purity, chance = knn_purity(X, y, k=k), knn_chance(y)
+    index = ((purity - chance) / (1.0 - chance)
+             if np.isfinite(purity) and chance < 1.0 - 1e-12 else _NAN)
+    z, p = purity_null(X, y, k=k, n_perm=n_perm, random_state=random_state)
     return {
         "silhouette": silhouette(X, y),
-        "knn_purity": knn_purity(X, y, k=k),
-        "knn_chance": knn_chance(y),
+        "knn_purity": purity,
+        "knn_chance": chance,
+        "purity_index": index,
         "ari": ari,
         "nmi": nmi,
+        "purity_z": z,
+        "purity_p": p,
         "n_cells": float(X.shape[0]),
         "n_groups": float(len(np.unique(y))),
     }
@@ -137,7 +186,8 @@ def format_metrics(m: dict[str, float], space: str = "") -> str:
         return ""
     parts = [
         f"ASW {m['silhouette']:.2f}",
-        f"kNN-purity {m['knn_purity']:.2f} (chance {m['knn_chance']:.2f})",
+        f"kNN-purity {m['knn_purity']:.2f} "
+        f"(chance {m['knn_chance']:.2f} → index {m['purity_index']:.2f})",
         f"ARI {m['ari']:.2f}",
         f"NMI {m['nmi']:.2f}",
     ]
