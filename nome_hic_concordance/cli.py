@@ -180,7 +180,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--concordance-combine",
         choices=["auto", "signed-diff", "log2-ratio", "linked-only",
                  "concordant-diff", "concordant-signed"],
-        default="log2-ratio",
+        default="concordant-signed",
         help="How the long-range observed (O) and baseline (E) co-state rates "
              "are combined.  'signed-diff' = "
              "(O_open−O_closed)−(E_open−E_closed) (legacy; NOTE with an O/E null "
@@ -209,7 +209,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "marginal-laden score and typically correlates MORE with 1D "
              "accessibility, not less.  'auto' resolves to "
              "'log2-ratio' for the distance-matched / distance-pooled O/E "
-             "baselines, 'signed-diff' otherwise (the legacy behaviour).",
+             "baselines, 'signed-diff' otherwise (the legacy behaviour); it "
+             "is now an explicit opt-in rather than the default.  "
+             "DEFAULT: 'concordant-signed' — it is the only mode that is both "
+             "coordination-bearing and directional, and it also turns on "
+             "--component-umaps auto, so C / F / D / p̄ are all embedded.  "
+             "(The library default in compute_signed_concordance_matrix "
+             "remains 'signed-diff' for direct API callers.)",
     )
     parser.add_argument(
         "--component-umaps", choices=["auto", "on", "off"], default="auto",

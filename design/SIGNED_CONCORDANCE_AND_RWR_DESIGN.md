@@ -21,7 +21,9 @@
 > ("more reads for the estimation"). Mechanically it is a drop-in sibling:
 > it fills the same expected (`_DM_KEYS`) pool with `n == #contacts` and
 > rate `= the pooled mean`, so the downstream DM / `log2(O/E)` handling and
-> the `--concordance-combine auto → log2-ratio` default are identical.
+> the `--concordance-combine auto → log2-ratio` resolution are identical.
+> (As of v0.7 `auto` is an explicit opt-in — the CLI default is now
+> `concordant-signed`.)
 > Use `distance-pooled` when the per-bin distance-matched expected is too
 > sparse/noisy and bin-marginal control suffices; use `distance-matched`
 > when you must also hold genomic distance fixed.
@@ -74,6 +76,15 @@
 > `tests/test_signed_concordance.py`: coordinated-open `D = +0.151`,
 > coordinated-closed `D = −0.151` (**same** `C = 0.304`), uncoordinated
 > `D = C = 0`, balanced-coordinated `D = 0` with `C = 0.405`.
+>
+> `concordant-signed` is the **CLI default** as of v0.7 (the library default
+> in `compute_signed_concordance_matrix` stays `signed-diff` so direct API
+> callers and the existing tests are unaffected).  It is the only mode that
+> is both coordination-bearing and directional: `signed-diff` is pure
+> marginal, `concordant-diff` is direction-blind, and `log2-ratio` carries
+> coordination but with a marginal-dependent scaling that vanishes near the
+> 0.5 level.  Because `--component-umaps auto` keys off it, the default run
+> now also embeds C / F / D / p̄.
 >
 > Step 5 writes `concordance_{coordination,direction,directional,marginal}`
 > for **every** combine mode (they are companion diagnostics, not tied to the
