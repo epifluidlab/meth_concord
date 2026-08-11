@@ -133,6 +133,86 @@ def test_end_to_end_emits_a_figure_per_pair(tmp_path):
         assert st.loc[0, "n"] == 30
 
 
+def _with_batch(tmp_path, n_cells=40, n_bins=400, batch_bin_effect=0.0):
+    """Two matrices plus a sample sheet; optionally add a batch x BIN effect
+    shared by both contexts (the class that does NOT cancel under averaging).
+
+    Uses many bins on purpose: with only a few dozen, the realized variance of
+    the planted effect drifts far enough from its population value that the
+    inflation it causes is not reliably measurable.
+    """
+    g, h = _pair(n_cells=n_cells, n_bins=n_bins, rho=0.3, seed=5)
+    rng = np.random.default_rng(7)
+    batch = np.array(["b1", "b2"] * (n_cells // 2))
+    if batch_bin_effect:
+        shared = rng.normal(0, batch_bin_effect, n_bins)   # same for GCH+HCG
+        g.loc[batch == "b2"] += shared
+        h.loc[batch == "b2"] += shared
+    sp = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": g.index, "exp_batch": batch}).to_csv(
+        sp, sep="\t", index=False)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp), h.to_parquet(hp)
+    return str(gp), str(hp), str(sp)
+
+
+def test_per_cell_shift_leaves_the_correlation_untouched():
+    """The 'same cells' intuition, made precise: a per-cell global offset is a
+    constant after averaging, and a constant cannot move a correlation."""
+    m = _mod()
+    g, h = _pair()
+    rng = np.random.default_rng(11)
+    shift = pd.Series(rng.normal(0, 3, len(g.index)), index=g.index)
+    base = m.correlations(*[m.bin_summary(g, h, "mean", 5)[c].to_numpy()
+                            for c in ("gch", "hcg")])
+    shifted = m.bin_summary(g.add(shift, axis=0), h.add(shift, axis=0),
+                            "mean", 5)
+    after = m.correlations(shifted["gch"].to_numpy(), shifted["hcg"].to_numpy())
+    assert after["pearson_r"] == pytest.approx(base["pearson_r"], abs=1e-9)
+
+
+def test_shared_batch_by_bin_effect_inflates_r_and_centering_removes_it(tmp_path):
+    """The class of batch effect that DOES matter, and the fix for it."""
+    m = _mod()
+    gp, hp, sp = _with_batch(tmp_path, batch_bin_effect=1.5)
+    out = tmp_path / "out"
+    common = ["--gch-d", gp, "--hcg-d", hp, "--min-cells", "5",
+              "--plot-format", "png", "--samples", sp,
+              "--batch-column", "exp_batch"]
+    m.main(common + ["--output-dir", str(out)])
+    raw = pd.read_csv(out / "D_gch_vs_hcg_stats.tsv", sep="\t").loc[0, "pearson_r"]
+    out2 = tmp_path / "out2"
+    m.main(common + ["--batch-correction", "center", "--output-dir", str(out2)])
+    corrected = pd.read_csv(out2 / "D_gch_vs_hcg_stats.tsv",
+                            sep="\t").loc[0, "pearson_r"]
+    # Base correlation is 0.3; the planted shared effect lifts it to ~0.55,
+    # and centering should return it to roughly the base.
+    assert raw > 0.45, "a shared batch x bin effect should inflate r"
+    assert corrected < 0.40, "per-bin centering must remove the inflation"
+    assert raw - corrected > 0.10
+
+
+def test_per_batch_check_reports_one_row_per_batch(tmp_path):
+    m = _mod()
+    gp, hp, sp = _with_batch(tmp_path)
+    out = tmp_path / "out"
+    m.main(["--gch-d", gp, "--hcg-d", hp, "--min-cells", "5",
+            "--plot-format", "png", "--samples", sp,
+            "--batch-column", "exp_batch", "--per-batch-check",
+            "--output-dir", str(out)])
+    pb = pd.read_csv(out / "D_gch_vs_hcg_per_batch.tsv", sep="\t")
+    assert set(pb["batch"]) == {"b1", "b2"}
+    assert (pb["n_cells"] == 20).all()
+
+
+def test_batch_options_require_samples_and_column(tmp_path):
+    m = _mod()
+    gp, hp, _ = _with_batch(tmp_path)
+    with pytest.raises(SystemExit, match="--samples and --batch-column"):
+        m.main(["--gch-d", gp, "--hcg-d", hp, "--per-batch-check",
+                "--output-dir", str(tmp_path / "o")])
+
+
 def test_requires_a_complete_pair(tmp_path):
     m = _mod()
     g, _ = _pair()

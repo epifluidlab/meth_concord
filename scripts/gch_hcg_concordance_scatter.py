@@ -22,6 +22,32 @@ Cells are intersected before averaging so the two axes summarize the same
 population; bins are intersected so every dot exists on both.  Bins with fewer
 than ``--min-cells`` observed cells in either context are dropped rather than
 averaged from a handful of values.
+
+BATCH EFFECTS ON A BIN-LEVEL SCATTER
+------------------------------------
+Sharing cells and bins between the axes removes one confound but not all of
+them, and the correction that helps here is NOT the one the cell-level
+pipelines use:
+
+* A per-cell global shift (cell i offset in every bin) survives the average as
+  a single constant added to every bin.  A constant shifts neither Pearson nor
+  Spearman, so this class of batch effect is already harmless -- which is the
+  part the "same cells" intuition gets right.
+* A batch x bin interaction does NOT cancel: it adds a per-bin offset that
+  varies across bins, so it moves the dots.  Worse, it is plausibly SHARED
+  between the two contexts -- both are read off the same libraries, so a bin
+  that is badly covered in one batch is badly covered for GCH and HCG alike --
+  and shared technical structure inflates the very correlation being measured.
+
+Harmony is the wrong instrument for this figure: it aligns cells in a
+low-dimensional embedding, and there is no way back from a harmonized
+embedding to a per-bin value.  ``--batch-correction center`` instead subtracts
+each batch's per-bin mean before aggregating, which is the operation that
+matches a bin-level summary.
+
+``--per-batch-check`` is the stronger evidence: it recomputes the correlation
+inside each batch separately.  If r is similar in every batch, no
+between-batch effect can be producing it, and no correction is needed at all.
 """
 
 from __future__ import annotations
@@ -53,6 +79,46 @@ def _drop_chroms(df: pd.DataFrame, exclude: set[str]) -> pd.DataFrame:
         return df
     return df[[c for c in df.columns
                if str(c).split(":", 1)[0] not in exclude]]
+
+
+def batch_series(samples_path: str, cell_column: str, batch_column: str):
+    """cell -> batch label (composite when several columns are named)."""
+    samples = pd.read_csv(samples_path, sep="\t")
+    if cell_column not in samples.columns:
+        raise SystemExit(f"--cell-column {cell_column!r} not in {samples_path}")
+    idx = samples.set_index(cell_column)
+    cols = [c.strip() for c in batch_column.split(",") if c.strip()]
+    missing = [c for c in cols if c not in idx.columns]
+    if missing:
+        raise SystemExit(f"--batch-column not in {samples_path}: {missing}")
+    return idx[cols[0]] if len(cols) == 1 else idx[cols]
+
+
+def per_batch_correlations(gch, hcg, batch, how, min_cells) -> pd.DataFrame:
+    """Recompute the correlation independently inside each batch.
+
+    A between-batch effect cannot manufacture agreement that is already
+    present within every batch, so consistent within-batch r is stronger
+    evidence than any correction.
+    """
+    from nome_hic_concordance.batch_correction import (_coerce_batch_df,
+                                                       _composite_label)
+    cells = gch.index.intersection(hcg.index)
+    lab = _composite_label(_coerce_batch_df(batch, cells))
+    rows = []
+    for level, idx in lab.groupby(lab).groups.items():
+        sub = [c for c in idx if c in cells]
+        if len(sub) < max(3, min_cells):
+            logger.info(f"  batch {level!r}: {len(sub)} cells — skipped.")
+            continue
+        d = bin_summary(gch.loc[sub], hcg.loc[sub], how,
+                        min_cells=min(min_cells, len(sub)))
+        s = correlations(d["gch"].to_numpy(), d["hcg"].to_numpy())
+        rows.append({"batch": str(level), "n_cells": len(sub), **s})
+        logger.info(f"  batch {level!r} ({len(sub)} cells): "
+                    f"Pearson r = {s['pearson_r']:.3f}, "
+                    f"Spearman ρ = {s['spearman_rho']:.3f}, n = {s['n']} bins")
+    return pd.DataFrame(rows)
 
 
 def bin_summary(gch: pd.DataFrame, hcg: pd.DataFrame, how: str,
@@ -176,6 +242,25 @@ def main(argv=None) -> int:
     ap.add_argument("--min-cells", type=int, default=10,
                     help="Minimum observed cells per bin, per context (10).")
     ap.add_argument("--exclude-chrom", default="")
+    ap.add_argument("--samples", default=None,
+                    help="Sample sheet, required by --batch-correction and "
+                         "--per-batch-check.")
+    ap.add_argument("--cell-column", default="cell_name")
+    ap.add_argument("--batch-column", default=None,
+                    help="Comma-separated batch columns in --samples.")
+    ap.add_argument("--batch-correction",
+                    choices=["none", "center", "zscore", "combat"],
+                    default="none",
+                    help="Subtract each batch's PER-BIN effect from both "
+                         "matrices before aggregating.  'center' is the right "
+                         "default if you want one.  Harmony is deliberately "
+                         "absent: it corrects a cell embedding, which cannot "
+                         "be mapped back to a per-bin value.")
+    ap.add_argument("--per-batch-check", action="store_true",
+                    help="Also recompute the correlation within each batch "
+                         "separately and write it to <stat>_per_batch.tsv.  "
+                         "Consistent within-batch r is stronger evidence than "
+                         "correction that batch is not driving the result.")
     ap.add_argument("--density", action="store_true", default=True,
                     help="Colour points by local density (default on).")
     ap.add_argument("--no-density", dest="density", action="store_false")
@@ -197,10 +282,35 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     excl = {c.strip() for c in args.exclude_chrom.split(",") if c.strip()}
 
+    needs_batch = args.batch_correction != "none" or args.per_batch_check
+    batch = None
+    if needs_batch:
+        if not (args.samples and args.batch_column):
+            raise SystemExit("--batch-correction / --per-batch-check need "
+                             "--samples and --batch-column.")
+        batch = batch_series(args.samples, args.cell_column, args.batch_column)
+
     for stat_key, gch_path, hcg_path in pairs:
         logger.info(f"--- {stat_key} ---")
         gch = _drop_chroms(_load(gch_path), excl)
         hcg = _drop_chroms(_load(hcg_path), excl)
+
+        if args.per_batch_check:
+            logger.info(f"{stat_key}: per-batch correlations")
+            pb = per_batch_correlations(gch, hcg, batch, args.aggregate,
+                                        args.min_cells)
+            pb.to_csv(out_dir / f"{stat_key}_gch_vs_hcg_per_batch.tsv",
+                      sep="\t", index=False)
+
+        if args.batch_correction != "none":
+            from nome_hic_concordance import batch_correction as _bc
+            gch = _bc.apply_batch_correction(
+                gch, batch.reindex(gch.index), method=args.batch_correction)
+            hcg = _bc.apply_batch_correction(
+                hcg, batch.reindex(hcg.index), method=args.batch_correction)
+            logger.info(f"{stat_key}: applied per-bin '{args.batch_correction}' "
+                        f"batch correction to both matrices.")
+
         df = bin_summary(gch, hcg, args.aggregate, args.min_cells)
         stats = correlations(df["gch"].to_numpy(), df["hcg"].to_numpy())
         logger.info(f"{stat_key}: {caption(stats)}")
