@@ -49,6 +49,17 @@ predictable amount of memory rather than holding every pair.  --null-scope cell
 restores the old within-cell behaviour, where only a read-density-biased
 minority of pairs is eligible.
 
+--null-match-column sits between the two.  The within-cell null keeps same-cell
+effects in the null but thins out at long range, where one cell rarely has a
+second end within ±window; the pooled null has donors to spare but draws them
+across batches.  Naming e.g. 'exp_batch,plate_batch,lib_batch' runs the pooled
+null INDEPENDENTLY inside each batch combination and merges the per-cell
+accumulators, so donor density stays of order the stratum size while no donor
+crosses a batch boundary.  This matters asymmetrically by context: GCH comes
+from an ADDED methyltransferase whose per-nucleus efficiency varies with prep,
+whereas HCG is endogenous and merely read out — so a cross-batch donor
+degrades the GCH null specifically.
+
 Each panel is paired with Δ = linked − null, its 95% CI, and a p-value from a
 CELL-level bootstrap: site pairs are not independent (tens per read, ~1e6 reads
 per cell), so a test that treats them as independent would report significance
@@ -427,6 +438,59 @@ def _pooled_null(res, idxs, edges, args, nb):
             "n_anchors": int(out["n_anchors"]), "n_donors": int(len(d_mid)),
             "n_anchor_long": sum(s["anchor_long"] for s in st),
             "n_pairs_long_seen": sum(s["pairs_long_seen"] for s in st)}
+
+
+def _pooled_null_stratified(res, idxs, edges, args, nb, null_key):
+    """Pooled null with donors restricted to cells sharing ``null_key``.
+
+    The two existing scopes trade off against each other: ``cell`` keeps the
+    donor in the same cell (so the null retains same-cell effects, which for
+    GCH includes the per-nucleus enzymatic labeling rate) but at long range a
+    single cell rarely has a second end within ±window, so the null thins out
+    exactly where it is needed.  ``pooled`` has donors to spare but draws them
+    across batches, so between-batch differences in labeling dilute it.
+
+    Stratifying splits the difference: run the pooled null INDEPENDENTLY inside
+    each stratum (e.g. every exp_batch × plate_batch × lib_batch combination)
+    and merge the per-cell accumulators afterwards.  Donor density stays of
+    order the stratum size rather than 1, and no donor ever crosses a batch
+    boundary.
+
+    Merging is a concatenation of the per-cell lists and a sum of the counts,
+    which is exact: each stratum's anchors are disjoint, and the accumulators
+    are additive over anchors.
+    """
+    if null_key is None:
+        return _pooled_null(res, idxs, edges, args, nb)
+
+    strata: dict[str, list[int]] = {}
+    for i in idxs:
+        strata.setdefault(str(null_key[i]), []).append(i)
+
+    parts = []
+    for key in sorted(strata):
+        sub = strata[key]
+        p = _pooled_null(res, sub, edges, args, nb)
+        if p is None:
+            logger.warning(f"  null stratum {key!r}: no usable donor ends from "
+                           f"{len(sub)} cell(s) — contributes nothing.")
+            continue
+        parts.append((key, len(sub), p))
+    if not parts:
+        return None
+
+    merged: dict = {"null_per_cell": {}, "matched_per_cell": {}}
+    for mkey, _ in _MEASURES:
+        merged["null_per_cell"][mkey] = [
+            a for _, _, p in parts for a in p["null_per_cell"][mkey]]
+        merged["matched_per_cell"][mkey] = [
+            a for _, _, p in parts for a in p["matched_per_cell"][mkey]]
+    for cnt in ("n_eligible", "n_anchors", "n_donors",
+                "n_anchor_long", "n_pairs_long_seen"):
+        merged[cnt] = sum(p[cnt] for _, _, p in parts)
+    merged["n_strata"] = len(parts)
+    merged["strata"] = [(k, n, p["n_donors"]) for k, n, p in parts]
+    return merged
 
 
 def _build_edges(min_d, max_d, per_decade):
@@ -1273,6 +1337,17 @@ def main():
                     help="Mask a distance bin with fewer site pairs than this, "
                          "on EITHER side of a comparison. Thin bins are what "
                          "produce lone spikes in an otherwise smooth curve.")
+    ap.add_argument("--null-match-column", default=None,
+                    help="Comma-separated columns in --samples (e.g. "
+                         "'exp_batch,plate_batch,lib_batch').  With "
+                         "--null-scope pooled, donor ends are drawn ONLY from "
+                         "cells sharing the same combination of these values, "
+                         "so the null keeps pooled donor density but never "
+                         "crosses a batch boundary.  Use it when a per-cell "
+                         "technical rate differs between batches — GCH "
+                         "especially, whose signal comes from an added "
+                         "methyltransferase whose efficiency varies with "
+                         "prep, unlike endogenous HCG.")
     ap.add_argument("--null-scope", choices=["pooled", "cell"], default="pooled",
                     help="Where substitute partner ends come from. 'pooled' "
                          "(default) draws them from every cell in the group "
@@ -1517,6 +1592,24 @@ def main():
               "point (the CpG dyad),\n    so treat the shortest bins as a "
               "selected subset, not a population estimate.")
 
+    # Optional donor stratification for the pooled null (--null-match-column).
+    null_key = None
+    if args.null_match_column:
+        cols = [c.strip() for c in args.null_match_column.split(",") if c.strip()]
+        missing = [c for c in cols if c not in samples.columns]
+        if missing:
+            sys.exit(f"--null-match-column not in --samples: {missing} "
+                     f"(columns: {samples.columns.tolist()}).")
+        null_key = (samples[cols].astype(str)
+                    .agg("|".join, axis=1).to_numpy())
+        if not pooled_null:
+            print("  NOTE: --null-match-column only applies to --null-scope "
+                  "pooled; ignoring it.", file=sys.stderr)
+            null_key = None
+        else:
+            print(f"  null donors stratified by {'+'.join(cols)}: "
+                  f"{len(set(null_key))} strata")
+
     keys = [(m, c) for m, _ in _MEASURES for c, _ in _CONDS]
     groups: dict[str, list[int]] = {"all": list(range(len(res)))}
     if args.group_column:
@@ -1543,7 +1636,8 @@ def main():
               for m, _ in _MEASURES for c, _ in _CONDS}
         scope_note = ""
         if pooled_null:
-            pooled = _pooled_null(res, idxs, edges, args, len(edges) - 1)
+            pooled = _pooled_null_stratified(res, idxs, edges, args,
+                                             len(edges) - 1, null_key)
             if pooled is not None:
                 for m, _ in _MEASURES:
                     pc[(m, "null")] = pooled["null_per_cell"][m]
@@ -1555,9 +1649,12 @@ def main():
                 seen_l = pooled["n_pairs_long_seen"]
                 kept_l = pooled["n_anchor_long"]
                 frac = f"{100.0 * kept_l / seen_l:.0f}%" if seen_l else "n/a"
+                strat = (f", stratified into {pooled['n_strata']} donor "
+                         f"strata by {args.null_match_column}"
+                         if pooled.get("n_strata") else "")
                 scope_note = (
                     f"pooled null: {pooled['n_donors']:,} donor ends from "
-                    f"{len(idxs)} cells; {pooled['n_anchors']:,} anchors "
+                    f"{len(idxs)} cells{strat}; {pooled['n_anchors']:,} anchors "
                     f"({kept_l:,} long-range = {frac} of the "
                     f"{seen_l:,} seen)")
                 # eligibility is now relative to the sampled anchors
