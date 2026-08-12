@@ -23,10 +23,23 @@ Site pairs come from BOTH arms, giving one continuous curve:
 
 Two conditions are plotted:
   * LINKED  — the read pair's true partner end (the real ligation), ALL pairs
-  * NULL    — the partner end is replaced by a DIFFERENT end within
-              ±--null-window bp of it (same distance, different molecule), so a
-              linked-minus-null gap is same-molecule coordination rather than
-              genomic proximity.
+  * NULL    — a non-linked pair standing in for it.  --null-type picks how:
+
+      locus-matched (default)  the partner end is replaced by a DIFFERENT end
+        within ±--null-window bp of it, so BOTH loci are held fixed and the
+        gap is "same two places, different molecule".
+
+      distance-matched         the SEPARATION is held fixed and the locus is
+        redrawn: a fresh anchor from the same cell within
+        ±--null-anchor-window (10 Mb), then a partner at the observed distance
+        ±--null-window.  The gap is then "this ligation vs any two loci that
+        far apart in this cell".  Because any end at the right offset
+        qualifies, the null does not thin out at long range the way the
+        locus-matched one does inside a single cell — which is what makes
+        --null-scope cell usable past a few kb.
+
+    The two answer different questions and are not interchangeable; name
+    whichever was used when reporting a gap.
 
 The question the null answers is whether local methylation at ONE END
 correlates with local methylation at the OTHER end, so Δ = LINKED − NULL is
@@ -417,14 +430,30 @@ def _pooled_null(res, idxs, edges, args, nb):
     anchors = {"chrom": _col(aparts, "chrom", np.int32),
                "mid2": _col(aparts, "mid2", np.int32),
                "cell": _cellcol(aparts)}
+    if "mid1" in aparts[0]:
+        anchors["mid1"] = _col(aparts, "mid1", np.int32)
     for tag in ("g1", "h1", "g2", "h2"):
         p_, s_, q_ = _concat_csr(aparts, tag)
         anchors[f"{tag}_pos"], anchors[f"{tag}_st"], anchors[f"{tag}_ptr"] = p_, s_, q_
 
-    out = _CPP.cross_cell_null(anchors, donors, [float(e) for e in edges],
-                               int(args.null_window),
-                               int(args.max_site_pairs_per_read),
-                               int(args.seed), len(kept))
+    # getattr rather than attribute access: _pooled_null is also driven by
+    # duck-typed args objects (tests, and any caller predating these options),
+    # and an absent option must mean the previous behaviour, not a crash.
+    if getattr(args, "null_type", "locus-matched") == "distance-matched":
+        if "mid1" not in anchors:
+            sys.exit("--null-type distance-matched needs anchor mid1, which "
+                     "this build of the extension does not emit; rebuild it "
+                     "(pip install -e .).")
+        out = _CPP.same_cell_distance_null(
+            anchors, donors, [float(e) for e in edges],
+            int(getattr(args, "null_anchor_window", 10_000_000)),
+            int(args.null_window),
+            int(args.max_site_pairs_per_read), int(args.seed), len(kept))
+    else:
+        out = _CPP.cross_cell_null(anchors, donors, [float(e) for e in edges],
+                                   int(args.null_window),
+                                   int(args.max_site_pairs_per_read),
+                                   int(args.seed), len(kept))
     k = len(kept)
     null_pc, match_pc = {}, {}
     for mi, (mkey, _) in enumerate(_MEASURES):
@@ -1337,6 +1366,27 @@ def main():
                     help="Mask a distance bin with fewer site pairs than this, "
                          "on EITHER side of a comparison. Thin bins are what "
                          "produce lone spikes in an otherwise smooth curve.")
+    ap.add_argument("--null-type", choices=["locus-matched", "distance-matched"],
+                    default="locus-matched",
+                    help="'locus-matched' (default) keeps the anchor's own end "
+                         "1 and swaps end 2 for another end within "
+                         "±--null-window of the TRUE partner, so both loci are "
+                         "held fixed: 'same two places, different molecule'.  "
+                         "'distance-matched' instead keeps the SEPARATION and "
+                         "redraws the locus — a fresh anchor from the same "
+                         "cell within ±--null-anchor-window, then a partner at "
+                         "the observed distance ±--null-window.  Any end at "
+                         "the right offset qualifies, so the null no longer "
+                         "thins out at long range where a single cell rarely "
+                         "has a second end beside one specific position.")
+    ap.add_argument("--null-anchor-window", type=int, default=10_000_000,
+                    help="For --null-type distance-matched: draw the synthetic "
+                         "anchor within ±this many bp of the real one "
+                         "(default 10 Mb).  Keeps the synthetic pair in the "
+                         "same compartment / replication domain, so the "
+                         "contrast isolates the ligation instead of also "
+                         "swapping the genomic neighbourhood.  0 removes the "
+                         "restriction entirely.")
     ap.add_argument("--null-match-column", default=None,
                     help="Comma-separated columns in --samples (e.g. "
                          "'exp_batch,plate_batch,lib_batch').  With "
@@ -1652,8 +1702,14 @@ def main():
                 strat = (f", stratified into {pooled['n_strata']} donor "
                          f"strata by {args.null_match_column}"
                          if pooled.get("n_strata") else "")
+                # The null TYPE changes what a linked-minus-null gap means, so
+                # it is named in the figure rather than left to the command line.
+                ntype = getattr(args, "null_type", "locus-matched")
+                tnote = (f"{ntype} null"
+                         + (f" (anchor ±{args.null_anchor_window/1e6:g} Mb)"
+                            if ntype == "distance-matched" else ""))
                 scope_note = (
-                    f"pooled null: {pooled['n_donors']:,} donor ends from "
+                    f"{tnote}, pooled: {pooled['n_donors']:,} donor ends from "
                     f"{len(idxs)} cells{strat}; {pooled['n_anchors']:,} anchors "
                     f"({kept_l:,} long-range = {frac} of the "
                     f"{seen_l:,} seen)")
