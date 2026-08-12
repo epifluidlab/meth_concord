@@ -204,17 +204,23 @@ static void site_calls(const int64_t* ctx_pos, const uint8_t* ctx_ref,
 }
 
 /* Pearson sufficient statistics per distance bin: n, Sx, Sy, Sxx, Syy, Sxy. */
+/* Sufficient statistics per bin.
+ *
+ * Site states are strictly 0/1 (see emit() in the base decoder), so x*x == x,
+ * y*y == y and x*y == (x & y).  Rows 3 and 4 of the classic six are therefore
+ * copies of rows 1 and 2 and need not be accumulated: only n, Sx, Sy and Sxy
+ * are kept in the inner loop, and to_numpy() re-expands to the six rows the
+ * Python side expects.  That removes a third of the read-modify-writes from
+ * the hottest loop in the program without changing a single output value. */
 struct Acc {
-    std::vector<double> v;
+    std::vector<double> v;                    // 4 x nb: n, Sx, Sy, Sxy
     int nb;
-    explicit Acc(int n) : v(6 * (size_t)n, 0.0), nb(n) {}
-    inline void add(int b, double x, double y) {
+    explicit Acc(int n) : v(4 * (size_t)n, 0.0), nb(n) {}
+    inline void add(int b, unsigned x, unsigned y) {
         v[(size_t)0 * nb + b] += 1.0;
-        v[(size_t)1 * nb + b] += x;
-        v[(size_t)2 * nb + b] += y;
-        v[(size_t)3 * nb + b] += x * x;
-        v[(size_t)4 * nb + b] += y * y;
-        v[(size_t)5 * nb + b] += x * y;
+        v[(size_t)1 * nb + b] += (double)x;
+        v[(size_t)2 * nb + b] += (double)y;
+        v[(size_t)3 * nb + b] += (double)(x & y);      // x*y for 0/1
     }
 };
 
@@ -228,6 +234,36 @@ static inline int bin_of(const std::vector<double>& edges, int64_t d) {
     return idx;
 }
 
+/* Uniform-ish index in [0, n) without a 64-bit division.
+ *
+ * `rng() % n` costs a hardware divide (tens of cycles) and the capped sampler
+ * below issues two of them per site pair, which at ~1e11 site pairs per run is
+ * the single largest term in the inner loop.  Lemire's multiply-high trick
+ * replaces it with one widening multiply.  The residual modulo bias is O(n /
+ * 2^64) — utterly negligible for the index ranges here, and this is a random
+ * subsample of site pairs to begin with. */
+static inline uint64_t bounded(uint64_t r, uint64_t n) {
+    return (uint64_t)(((__uint128_t)r * (__uint128_t)n) >> 64);
+}
+
+/* splitmix64 — a few ALU ops per draw, versus mt19937_64's table update.
+ *
+ * Measured: the capped SAMPLING path ran at half the throughput of the
+ * exhaustive path purely on generator cost, since it needs two draws per site
+ * pair while the exhaustive path needs none.  Quality is irrelevant here: the
+ * draws only choose which site pairs of a read enter a subsample.  Seeded from
+ * the caller's mt19937_64 so a run stays reproducible from --seed. */
+struct FastRng {
+    uint64_t s;
+    explicit FastRng(uint64_t seed) : s(seed) {}
+    inline uint64_t next() {
+        uint64_t z = (s += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+};
+
 /* Enumerate (or randomly sample, when capped) site pairs and accumulate. */
 static void pair_accumulate(Acc& acc, const SiteVec& A, const SiteVec& B,
                             bool same, const std::vector<double>& edges,
@@ -237,16 +273,49 @@ static void pair_accumulate(Acc& acc, const SiteVec& A, const SiteVec& B,
     size_t total = same ? (na * (na - 1)) / 2 : na * nbs;
     if (total == 0) return;
 
+    // Raw pointers hoisted out of the loop.  Through the vector references the
+    // compiler must reload A.pos/A.st/edges/acc.v's data pointers on every
+    // iteration, because the store inside acc.add() may alias them; that
+    // pointer chase, not the arithmetic, is what the inner loop spends its
+    // time on.
+    const int64_t* ap = A.pos.data(); const uint8_t* as = A.st.data();
+    const int64_t* bp = B.pos.data(); const uint8_t* bs = B.st.data();
+    const double* E = edges.data();
+    double* V = acc.v.data();
+    const size_t vnb = (size_t)acc.nb;
+
+    // Every site pair from ONE read pair spans nearly the same distance: the
+    // two ends are fixed and only the within-read site offsets (<= a read
+    // length) vary.  At long range all of them therefore land in the SAME log
+    // bin, so testing the previous bin before falling back to the binary
+    // search turns ~6 dependent, badly-predicted branches into 2 predictable
+    // comparisons for the overwhelming majority of lookups.
+    const int nbins = (int)edges.size() - 1;
+    int last = -1;
     auto one = [&](size_t i, size_t j) {
-        int64_t d = B.pos[j] > A.pos[i] ? B.pos[j] - A.pos[i]
-                                        : A.pos[i] - B.pos[j];
-        int b = bin_of(edges, d);
-        if (b >= 0) acc.add(b, (double)A.st[i], (double)B.st[j]);
+        const int64_t pa = ap[i], pb = bp[j];
+        const double dd = (double)(pb > pa ? pb - pa : pa - pb);
+        int b;
+        if (last >= 0 && dd >= E[last] && dd < E[last + 1]) {
+            b = last;                                  // cache hit
+        } else {
+            b = bin_of(edges, (int64_t)dd);
+            if (b >= 0 && b < nbins) last = b;
+        }
+        if (b >= 0) {
+            const unsigned x = as[i], y = bs[j];
+            V[0 * vnb + b] += 1.0;
+            V[1 * vnb + b] += (double)x;
+            V[2 * vnb + b] += (double)y;
+            V[3 * vnb + b] += (double)(x & y);
+        }
     };
 
     if (cap > 0 && total > (size_t)cap) {
+        FastRng fr(rng());
         for (int t = 0; t < cap; ++t) {
-            size_t i = rng() % na, j = rng() % nbs;
+            size_t i = (size_t)bounded(fr.next(), na),
+                   j = (size_t)bounded(fr.next(), nbs);
             if (same) {
                 if (i == j) continue;
                 if (i > j) std::swap(i, j);
@@ -274,12 +343,13 @@ static void pair_accumulate_into(Acc& acc, const SiteVec& A, const SiteVec& B,
     size_t total = na * nbs;
     if (cap > 0 && total > (size_t)cap) {
         for (int t = 0; t < cap; ++t)
-            acc.add(bin, (double)A.st[rng() % na], (double)B.st[rng() % nbs]);
+            acc.add(bin, (unsigned)A.st[(size_t)bounded(rng(), na)],
+                    (unsigned)B.st[(size_t)bounded(rng(), nbs)]);
         return;
     }
     for (size_t i = 0; i < na; ++i)
         for (size_t j = 0; j < nbs; ++j)
-            acc.add(bin, (double)A.st[i], (double)B.st[j]);
+            acc.add(bin, (unsigned)A.st[i], (unsigned)B.st[j]);
 }
 
 struct PairRec {
@@ -308,9 +378,19 @@ static void add_pair(Acc& gg, Acc& hh, Acc& gh,
     pair_accumulate(gh, h2, g1, false, edges, cap, rng);
 }
 
+/* Re-expand the 4 kept rows into the 6 the Python side reads:
+ * n, Sx, Sy, Sxx, Syy, Sxy — with Sxx = Sx and Syy = Sy for 0/1 data. */
 static py::array_t<double> to_numpy(const Acc& a) {
     py::array_t<double> out({(py::ssize_t)6, (py::ssize_t)a.nb});
-    std::copy(a.v.begin(), a.v.end(), out.mutable_data());
+    double* o = out.mutable_data();
+    const double* s = a.v.data();
+    const size_t nb = (size_t)a.nb;
+    std::copy(s + 0 * nb, s + 1 * nb, o + 0 * nb);      // n
+    std::copy(s + 1 * nb, s + 2 * nb, o + 1 * nb);      // Sx
+    std::copy(s + 2 * nb, s + 3 * nb, o + 2 * nb);      // Sy
+    std::copy(s + 1 * nb, s + 2 * nb, o + 3 * nb);      // Sxx == Sx
+    std::copy(s + 2 * nb, s + 3 * nb, o + 4 * nb);      // Syy == Sy
+    std::copy(s + 3 * nb, s + 4 * nb, o + 5 * nb);      // Sxy
     return out;
 }
 
