@@ -199,6 +199,73 @@ def test_driver_routes_null_type_and_forwards_mid1(tmp_path):
         m._pooled_null(res2, [0], _EDGES, Args(), len(_EDGES) - 1)
 
 
+def _driver():
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "sdc_route", Path(__file__).resolve().parent.parent / "scripts"
+        / "site_distance_correlation.py")
+    m = importlib.util.module_from_spec(spec)
+    _sys.modules["sdc_route"] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_distance_null_engages_the_reservoir_even_under_null_scope_cell():
+    """Regression: --null-scope cell used to skip the reservoir entirely, so
+    --null-type distance-matched was silently ignored."""
+    m = _driver()
+    res, dist, notes = m._resolve_null_path("distance-matched", "cell", True)
+    assert res is True and dist is True
+    assert any("redundant" in n for n in notes), "the redundancy is announced"
+
+
+def test_locus_matched_under_scope_cell_keeps_the_within_cell_path():
+    m = _driver()
+    res, dist, notes = m._resolve_null_path("locus-matched", "cell", True)
+    assert res is False and dist is False and notes == []
+
+
+def test_pooled_scope_still_engages_the_reservoir():
+    m = _driver()
+    assert m._resolve_null_path("locus-matched", "pooled", True)[0] is True
+
+
+def test_distance_null_without_the_backend_exits_rather_than_degrading():
+    m = _driver()
+    with pytest.raises(SystemExit, match="htslib"):
+        m._resolve_null_path("distance-matched", "cell", False)
+    # ...whereas a pooled request without the backend only warns.
+    res, _, notes = m._resolve_null_path("locus-matched", "pooled", False)
+    assert res is False and any("falling back" in n for n in notes)
+
+
+def test_distance_counts_table_flags_a_null_below_min_pairs(capsys):
+    m = _driver()
+    centers = np.array([100.0, 10_000.0])
+    accs = {}
+    for key, _ in m._MEASURES:
+        for cond, _l in m._CONDS:
+            a = m._new_acc(2)
+            a[0] = [5000, 4000] if cond == "linked" else [900, 5]
+            accs[(key, cond)] = a
+
+    class A:
+        min_pairs = 100
+        log_distance_counts = True
+    m._print_distance_counts(accs, centers, A())
+    out = capsys.readouterr().out
+    assert "100 bp" in out and "10 kb" in out
+    assert "5,000" in out and "900" in out
+    assert "*" in out, "the 5-pair null is below min_pairs and must be flagged"
+
+    class B(A):
+        log_distance_counts = False
+    m._print_distance_counts(accs, centers, B())
+    assert capsys.readouterr().out == "", "--no-log-distance-counts suppresses it"
+
+
 def test_per_cell_accumulators_are_keyed_by_the_anchor_cell():
     mids = [0, 5000, 10000, 15000]
     d = _donors(list(mids) + list(mids), [0] * 4 + [1] * 4)

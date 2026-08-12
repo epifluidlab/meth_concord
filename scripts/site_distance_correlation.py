@@ -522,6 +522,80 @@ def _pooled_null_stratified(res, idxs, edges, args, nb, null_key):
     return merged
 
 
+def _resolve_null_path(null_type, null_scope, use_cpp):
+    """Decide whether the donor-reservoir path runs: (reservoir, distance, notes).
+
+    The distance-matched null is built by the SAME reservoir machinery as the
+    pooled null (donor ends plus anchors carrying mid1), and its matcher already
+    requires both ends to come from the anchor's own cell.  It is therefore a
+    within-cell null whatever --null-scope says, and the reservoir has to be
+    collected either way — otherwise ``--null-scope cell --null-type
+    distance-matched`` would silently fall through to the locus-matched null,
+    with only the ±window wording in the log to give it away.
+    """
+    notes: list[str] = []
+    distance = null_type == "distance-matched"
+    if distance and not use_cpp:
+        raise SystemExit(
+            "--null-type distance-matched needs the htslib backend; build the "
+            "extension first (pip install -e .).")
+    reservoir = null_scope == "pooled" or distance
+    if reservoir and not use_cpp:
+        notes.append("--null-scope pooled needs the htslib backend; falling "
+                     "back to the within-cell null.")
+        reservoir = False
+    if distance and null_scope == "cell":
+        notes.append("--null-type distance-matched is same-cell by "
+                     "construction (both ends come from the anchor's own "
+                     "cell), so it uses the donor reservoir and --null-scope "
+                     "cell is redundant here.")
+    return reservoir, distance, notes
+
+
+def _fmt_bp(x: float) -> str:
+    """Compact genomic distance: 250 bp / 12.5 kb / 3.4 Mb."""
+    x = float(x)
+    if x >= 1e6:
+        return f"{x / 1e6:.3g} Mb"
+    if x >= 1e3:
+        return f"{x / 1e3:.3g} kb"
+    return f"{x:.0f} bp"
+
+
+def _print_distance_counts(accs, centers, args):
+    """Per-distance site-pair counts, linked vs null, for every measure.
+
+    A single overall eligibility percentage hides where the null actually
+    exists: the locus-matched null can be plentiful at short range and empty
+    past a few kb, which is exactly the regime the curves are read in.  Printing
+    the counts per bin makes an empty or thin null visible at the distance it
+    matters rather than only as a masked point on the figure.
+    """
+    if not getattr(args, "log_distance_counts", True):
+        return
+    nb = len(centers)
+    cols = [(m, lab.split()[0]) for m, lab in _MEASURES]
+    header = "".join(f"{name:>22}" for _, name in cols)
+    print(f"  per-distance site pairs (linked → null), "
+          f"min-pairs = {args.min_pairs:,}:")
+    print(f"    {'distance':>10}{header}")
+    for b in range(nb):
+        cells = []
+        any_data = False
+        for m, _ in cols:
+            nl = float(accs[(m, "linked")][0][b])
+            nn = float(accs[(m, "null")][0][b])
+            any_data |= (nl > 0 or nn > 0)
+            # A null that exists but is below --min-pairs is masked on the
+            # figure, so flag it rather than let it read as usable.
+            thin = "*" if 0 < nn < args.min_pairs else " "
+            cells.append(f"{int(nl):>10,} →{int(nn):>9,}{thin}")
+        if any_data:
+            print(f"    {_fmt_bp(centers[b]):>10}" + "".join(cells))
+    print("      (* null present but below --min-pairs, so masked on the "
+          "figure)")
+
+
 def _build_edges(min_d, max_d, per_decade):
     lo, hi = np.log10(max(min_d, 1)), np.log10(max_d)
     n_edges = max(2, int(round((hi - lo) * per_decade)) + 1)
@@ -1250,15 +1324,37 @@ def _report(accs, n_cells, n_pairs, centers, edges, label, out_dir, args,
         print(f"  {scope_note}")
     denom = n_pairs_for_pct if n_pairs_for_pct else n_pairs
     pct = 100.0 * n_eligible / denom if denom else 0.0
-    print(f"  null-eligible: {n_eligible:,} anchors ({pct:.1f}%) had a "
-          f"non-linked end within ±{args.null_window}bp")
-    if pct < 25.0:
-        print("  NOTE: most anchors have no nearby non-linked end, and the ones "
-              "that do sit in read-dense loci.\n"
-              "        Compare 'null' against 'matched' (same pairs), NOT "
-              "against 'linked' (all pairs).\n"
-              "        --null-scope pooled raises this by drawing donor ends "
-              "from every cell in the group.")
+    # The eligibility criterion differs by null type, so the wording has to as
+    # well — reporting a ±window for the distance-matched null would describe
+    # a constraint it does not apply.
+    if getattr(args, "null_type", "locus-matched") == "distance-matched":
+        aw = getattr(args, "null_anchor_window", 10_000_000)
+        where = (f"within ±{aw / 1e6:g}Mb of the real anchor"
+                 if aw > 0 else "anywhere on the chromosome")
+        print(f"  null-eligible: {n_eligible:,} anchors ({pct:.1f}%) found a "
+              f"same-cell non-linked pair at the observed distance "
+              f"(±{args.null_window}bp), anchored {where}")
+        if pct < 25.0:
+            print("  NOTE: most anchors could not be matched at their own "
+                  "separation, so the ones that could sit in read-dense "
+                  "loci.\n"
+                  "        Compare 'null' against 'matched' (same pairs), NOT "
+                  "against 'linked' (all pairs).\n"
+                  "        Widening --null-anchor-window or --null-window "
+                  "raises this.")
+    else:
+        print(f"  null-eligible: {n_eligible:,} anchors ({pct:.1f}%) had a "
+              f"non-linked end within ±{args.null_window}bp")
+        if pct < 25.0:
+            print("  NOTE: most anchors have no nearby non-linked end, and the "
+                  "ones that do sit in read-dense loci.\n"
+                  "        Compare 'null' against 'matched' (same pairs), NOT "
+                  "against 'linked' (all pairs).\n"
+                  "        --null-scope pooled raises this by drawing donor "
+                  "ends from every cell in the group.\n"
+                  "        --null-type distance-matched relaxes the locus "
+                  "instead, which is what helps at long range.")
+    _print_distance_counts(accs, centers, args)
     deltas = {k: _delta(curves, k, args.min_pairs)[0] for k, _ in _MEASURES}
     print(f"  {'distance':>10}{'n(GG)':>12} | "
           + "".join(f"{m.split('  ')[0]:>30}" for _, m in _MEASURES))
@@ -1366,6 +1462,10 @@ def main():
                     help="Mask a distance bin with fewer site pairs than this, "
                          "on EITHER side of a comparison. Thin bins are what "
                          "produce lone spikes in an otherwise smooth curve.")
+    ap.add_argument("--no-log-distance-counts", dest="log_distance_counts",
+                    action="store_false",
+                    help="Suppress the per-distance linked/null site-pair "
+                         "table printed under each group's summary.")
     ap.add_argument("--null-type", choices=["locus-matched", "distance-matched"],
                     default="locus-matched",
                     help="'locus-matched' (default) keeps the anchor's own end "
@@ -1538,11 +1638,10 @@ def main():
               file=sys.stderr)
     pairs_note = ("ALL pairs" if not args.max_pairs_per_cell
                   else f"~{args.max_pairs_per_cell:,} pairs/cell")
-    pooled_null = args.null_scope == "pooled"
-    if pooled_null and not use_cpp:
-        print("  NOTE: --null-scope pooled needs the htslib backend; falling "
-              "back to the within-cell null.", file=sys.stderr)
-        pooled_null = False
+    pooled_null, distance_null, _notes = _resolve_null_path(
+        getattr(args, "null_type", "locus-matched"), args.null_scope, use_cpp)
+    for _n in _notes:
+        print(f"  NOTE: {_n}", file=sys.stderr)
     donor_cap = args.null_donors_per_cell if pooled_null else 0
     anchor_cap = args.null_anchors_per_cell if pooled_null else 0
     anchor_long_cap = args.null_anchors_long_per_cell if pooled_null else 0
