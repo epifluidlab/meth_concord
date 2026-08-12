@@ -430,30 +430,17 @@ def _pooled_null(res, idxs, edges, args, nb):
     anchors = {"chrom": _col(aparts, "chrom", np.int32),
                "mid2": _col(aparts, "mid2", np.int32),
                "cell": _cellcol(aparts)}
-    if "mid1" in aparts[0]:
-        anchors["mid1"] = _col(aparts, "mid1", np.int32)
     for tag in ("g1", "h1", "g2", "h2"):
         p_, s_, q_ = _concat_csr(aparts, tag)
         anchors[f"{tag}_pos"], anchors[f"{tag}_st"], anchors[f"{tag}_ptr"] = p_, s_, q_
 
-    # getattr rather than attribute access: _pooled_null is also driven by
-    # duck-typed args objects (tests, and any caller predating these options),
-    # and an absent option must mean the previous behaviour, not a crash.
-    if getattr(args, "null_type", "locus-matched") == "distance-matched":
-        if "mid1" not in anchors:
-            sys.exit("--null-type distance-matched needs anchor mid1, which "
-                     "this build of the extension does not emit; rebuild it "
-                     "(pip install -e .).")
-        out = _CPP.same_cell_distance_null(
-            anchors, donors, [float(e) for e in edges],
-            int(getattr(args, "null_anchor_window", 10_000_000)),
-            int(args.null_window),
-            int(args.max_site_pairs_per_read), int(args.seed), len(kept))
-    else:
-        out = _CPP.cross_cell_null(anchors, donors, [float(e) for e in edges],
-                                   int(args.null_window),
-                                   int(args.max_site_pairs_per_read),
-                                   int(args.seed), len(kept))
+    # Only the locus-matched null is served from the reservoir.  The
+    # distance-matched one is built during the parse, where a cell's full end
+    # set is in hand -- see _resolve_null_path.
+    out = _CPP.cross_cell_null(anchors, donors, [float(e) for e in edges],
+                               int(args.null_window),
+                               int(args.max_site_pairs_per_read),
+                               int(args.seed), len(kept))
     k = len(kept)
     null_pc, match_pc = {}, {}
     for mi, (mkey, _) in enumerate(_MEASURES):
@@ -539,16 +526,20 @@ def _resolve_null_path(null_type, null_scope, use_cpp):
         raise SystemExit(
             "--null-type distance-matched needs the htslib backend; build the "
             "extension first (pip install -e .).")
-    reservoir = null_scope == "pooled" or distance
+    # The distance-matched null is built during the PARSE, from the cell's
+    # complete end set, so it must NOT take the reservoir path: the reservoir
+    # keeps only --null-donors-per-cell ends per cell, a density at which no
+    # end ever lands at a prescribed separation (that is what made the first
+    # version return an empty null at every distance).
+    reservoir = null_scope == "pooled" and not distance
     if reservoir and not use_cpp:
         notes.append("--null-scope pooled needs the htslib backend; falling "
                      "back to the within-cell null.")
         reservoir = False
-    if distance and null_scope == "cell":
-        notes.append("--null-type distance-matched is same-cell by "
-                     "construction (both ends come from the anchor's own "
-                     "cell), so it uses the donor reservoir and --null-scope "
-                     "cell is redundant here.")
+    if distance and null_scope == "pooled":
+        notes.append("--null-type distance-matched is within-cell by "
+                     "construction (both ends come from one cell's own read "
+                     "ends), so --null-scope pooled does not apply to it.")
     return reservoir, distance, notes
 
 
@@ -683,7 +674,8 @@ def prepare_ctx(ctx_positions, blacklist=None):
 def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
                      cap, null_window, seed, baseq_min=0,
                      donor_cap=0, anchor_cap=0, anchor_long_cap=0,
-                     long_range_bp=1000, strand_min_evidence=1):
+                     long_range_bp=1000, strand_min_evidence=1,
+                     null_type=0, anchor_window=10_000_000):
     """htslib fast path — same result as :func:`process_cell`, ~100x faster.
 
     ``prepared`` comes from :func:`prepare_ctx`; the extension releases the GIL,
@@ -698,7 +690,7 @@ def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
         int(trim_ends), int(mapq_min), int(null_window), int(cap), int(seed),
         False, int(baseq_min), bl, int(donor_cap), int(anchor_cap),
         int(anchor_long_cap), int(long_range_bp),
-        int(strand_min_evidence))
+        int(strand_min_evidence), int(null_type), int(anchor_window))
     accs = {}
     for m, _ in _MEASURES:
         for c, _lab in _CONDS:
@@ -1676,7 +1668,9 @@ def main():
                  args.mapq_min, args.max_site_pairs_per_read,
                  args.null_window, args.seed + i, args.baseq_min,
                  donor_cap, anchor_cap, anchor_long_cap,
-                 args.null_long_range_bp, args.strand_min_evidence)
+                 args.null_long_range_bp, args.strand_min_evidence,
+                 1 if distance_null else 0,
+                 int(getattr(args, "null_anchor_window", 10_000_000)))
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = process_cell_cpp
     else:

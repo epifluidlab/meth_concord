@@ -500,7 +500,7 @@ static py::dict parse_cell_site_distance(
     int max_site_pairs_per_read, uint64_t seed,
     bool keep_supplementary, int baseq_min, py::dict blacklist,
     int donor_cap, int anchor_cap, int anchor_long_cap, int long_range_bp,
-    int strand_min_evidence)
+    int strand_min_evidence, int null_type, int64_t anchor_window)
 {
     const int nb = (int)edges.size() - 1;
     Acc gg_l(nb), hh_l(nb), gh_l(nb), gg_n(nb), hh_n(nb), gh_n(nb);
@@ -678,8 +678,91 @@ static py::dict parse_cell_site_distance(
             add_pair(gg_l, hh_l, gh_l, p.g1, p.g2, p.h1, p.h2, edges,
                      max_site_pairs_per_read, rng, false);
 
+        // ---- NULL (distance-matched): same cell, same separation ---------
+        //
+        // Built HERE, from the cell's complete end set for this chromosome,
+        // rather than from the downsampled donor reservoir: one cell
+        // contributes ~1e6 ends to `pairs` but only --null-donors-per-cell
+        // (1e4) to the reservoir, and at that density no end ever lands at a
+        // prescribed separation.
+        //
+        // The target separation is the observed pair's own distance BIN,
+        // widened to at least +-null_window.  Matching to the bin is what
+        // makes this findable at long range, and it costs nothing: the
+        // analysis cannot resolve finer than a bin anyway, so a null pair in
+        // the same bin is matched as exactly as the figure can show.
+        if (null_type == 1 && pairs.size() > 1) {
+            struct EndRef { int64_t mid; uint32_t pi; uint8_t which; };
+            std::vector<EndRef> ends;
+            ends.reserve(pairs.size() * 2);
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                ends.push_back(EndRef{pairs[i].mid1, (uint32_t)i, 0});
+                ends.push_back(EndRef{pairs[i].mid2, (uint32_t)i, 1});
+            }
+            std::sort(ends.begin(), ends.end(),
+                      [](const EndRef& a, const EndRef& c) { return a.mid < c.mid; });
+            std::vector<int64_t> emid(ends.size());
+            for (size_t i = 0; i < ends.size(); ++i) emid[i] = ends[i].mid;
+
+            const int kTries = 32;
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                const int64_t m1 = pairs[i].mid1, m2 = pairs[i].mid2;
+                const int64_t d = m2 > m1 ? m2 - m1 : m1 - m2;
+                const int bb = bin_of(edges, d);
+                if (bb < 0) continue;
+                int64_t tlo = (int64_t)edges[bb], thi = (int64_t)edges[bb + 1];
+                if (d - null_window < tlo) tlo = d - null_window;
+                if (d + null_window > thi) thi = d + null_window;
+                if (tlo < 1) tlo = 1;
+
+                size_t alo = 0, ahi = ends.size();
+                if (anchor_window > 0) {
+                    alo = (size_t)(std::lower_bound(emid.begin(), emid.end(),
+                            m1 - anchor_window) - emid.begin());
+                    ahi = (size_t)(std::upper_bound(emid.begin(), emid.end(),
+                            m1 + anchor_window) - emid.begin());
+                }
+                if (ahi <= alo) continue;
+
+                for (int t = 0; t < kTries; ++t) {
+                    const size_t ka = alo +
+                        (size_t)bounded(rng(), (uint64_t)(ahi - alo));
+                    const int64_t pa = emid[ka];
+                    const bool up = (rng() & 1u) != 0;
+                    const int64_t clo = up ? pa + tlo : pa - thi;
+                    const int64_t chi = up ? pa + thi : pa - tlo;
+                    const size_t blo = (size_t)(std::lower_bound(
+                            emid.begin(), emid.end(), clo) - emid.begin());
+                    const size_t bhi = (size_t)(std::upper_bound(
+                            emid.begin(), emid.end(), chi) - emid.begin());
+                    if (bhi <= blo) continue;
+                    const size_t kb = blo +
+                        (size_t)bounded(rng(), (uint64_t)(bhi - blo));
+                    if (kb == ka) continue;
+                    // Both ends from ONE read pair would be a real ligation,
+                    // not a null — and that also excludes the observed pair.
+                    if (ends[ka].pi == ends[kb].pi) continue;
+
+                    const PairRec& A = pairs[ends[ka].pi];
+                    const PairRec& B = pairs[ends[kb].pi];
+                    const SiteVec& ga = ends[ka].which ? A.g2 : A.g1;
+                    const SiteVec& ha = ends[ka].which ? A.h2 : A.h1;
+                    const SiteVec& gb = ends[kb].which ? B.g2 : B.g1;
+                    const SiteVec& hb = ends[kb].which ? B.h2 : B.h1;
+                    ++n_null_eligible;
+                    add_pair(gg_n, hh_n, gh_n, ga, gb, ha, hb, edges,
+                             max_site_pairs_per_read, rng, true);
+                    // MATCHED: the true pair, over exactly the anchors the
+                    // null could place — the like-for-like baseline.
+                    add_pair(gg_m, hh_m, gh_m, pairs[i].g1, pairs[i].g2,
+                             pairs[i].h1, pairs[i].h2, edges,
+                             max_site_pairs_per_read, rng_m, true);
+                    break;
+                }
+            }
+        }
         // ---- NULL: partner replaced by a different end within ±window ----
-        if (null_window > 0 && pairs.size() > 1) {
+        else if (null_window > 0 && pairs.size() > 1) {
             std::vector<size_t> order(pairs.size());
             for (size_t i = 0; i < order.size(); ++i) order[i] = i;
             std::sort(order.begin(), order.end(),
@@ -911,159 +994,6 @@ static py::dict cross_cell_null(py::dict anchors, py::dict donors,
     out["n_anchors"] = py::int_(na);
     return out;
 }
-
-/* ------------------------------------------------------------------------
- * DISTANCE-MATCHED null: same cell, same separation, different pair.
- *
- * cross_cell_null() above keeps the anchor's own end 1 and swaps end 2 for a
- * nearby end, so it holds BOTH loci fixed and asks "same two places, different
- * molecule".  That needs a donor within +/-window (100bp) of one specific
- * position, which inside a single cell almost never exists at long range --
- * the null thins out exactly where the interesting signal is.
- *
- * This one relaxes the locus and keeps the SEPARATION.  For an observed pair
- * spanning d = |mid2 - mid1| it draws a fresh anchor A from the same cell
- * within +/-anchor_window of mid1, then a partner B from the same cell at
- * |mid_B - mid_A| within d +/- dist_tol.  Any end at the right offset now
- * qualifies rather than only those near one position, so donor density stops
- * being the binding constraint.
- *
- * anchor_window is what keeps this from becoming a genome-wide shuffle: at a
- * few Mb the synthetic pair still sits in the same compartment / replication
- * domain as the real one, so the contrast isolates the ligation rather than
- * also swapping the genomic neighbourhood.  anchor_window <= 0 disables the
- * restriction entirely (fully relaxed).
- *
- * Both ends must come from the anchor's own cell, and the observed pair itself
- * is rejected, so the result is a genuine non-linked pair.
- * --------------------------------------------------------------------- */
-
-static py::dict same_cell_distance_null(
-    py::dict anchors, py::dict donors, std::vector<double> edges,
-    int anchor_window, int dist_tol, int max_site_pairs_per_read,
-    uint64_t seed, int n_cells)
-{
-    const int nb = (int)edges.size() - 1;
-    auto a_chrom = anchors["chrom"].cast<py::array_t<int32_t>>();
-    auto a_mid1 = anchors["mid1"].cast<py::array_t<int32_t>>();
-    auto a_mid2 = anchors["mid2"].cast<py::array_t<int32_t>>();
-    auto a_cell = anchors["cell"].cast<py::array_t<int32_t>>();
-    auto d_chrom = donors["chrom"].cast<py::array_t<int32_t>>();
-    auto d_mid = donors["mid"].cast<py::array_t<int32_t>>();
-    auto d_cell = donors["cell"].cast<py::array_t<int32_t>>();
-    CsrView ag1, ah1, ag2, ah2, dg, dh;
-    ag1.bind(anchors, "g1"); ah1.bind(anchors, "h1");
-    ag2.bind(anchors, "g2"); ah2.bind(anchors, "h2");
-    dg.bind(donors, "g"); dh.bind(donors, "h");
-
-    const int32_t* ac = a_chrom.data(); const int32_t* am1 = a_mid1.data();
-    const int32_t* am2 = a_mid2.data(); const int32_t* acell = a_cell.data();
-    const int32_t* dc = d_chrom.data(); const int32_t* dm = d_mid.data();
-    const int32_t* dcell = d_cell.data();
-    const int64_t na = a_chrom.size(), nd = d_chrom.size();
-
-    std::vector<Acc> null_c, match_c;
-    null_c.reserve(3 * (size_t)n_cells); match_c.reserve(3 * (size_t)n_cells);
-    for (int i = 0; i < 3 * n_cells; ++i) {
-        null_c.emplace_back(nb); match_c.emplace_back(nb);
-    }
-    uint64_t eligible = 0;
-
-    {
-    py::gil_scoped_release release;
-    std::mt19937_64 rng(seed);
-    SiteVec av_g, av_h, bv_g, bv_h, g1, h1, g2, h2;
-
-    // Per-chromosome donor spans; donors arrive sorted by (chrom, mid).
-    std::vector<int64_t> cstart, cend;
-    {
-        int32_t cur = nd ? dc[0] : 0; int64_t s = 0;
-        for (int64_t i = 1; i <= nd; ++i) {
-            if (i == nd || dc[i] != cur) {
-                if ((size_t)cur >= cstart.size()) {
-                    cstart.resize((size_t)cur + 1, -1);
-                    cend.resize((size_t)cur + 1, -1);
-                }
-                cstart[(size_t)cur] = s; cend[(size_t)cur] = i;
-                if (i < nd) { cur = dc[i]; s = i; }
-            }
-        }
-    }
-
-    // At most this many random draws per anchor before giving up; bounded so a
-    // cell whose ends simply do not admit the separation cannot spin.
-    const int kMaxTries = 24;
-
-    for (int64_t i = 0; i < na; ++i) {
-        const int32_t c = ac[i];
-        if ((size_t)c >= cstart.size() || cstart[(size_t)c] < 0) continue;
-        const int64_t lo0 = cstart[(size_t)c], hi0 = cend[(size_t)c];
-        const int64_t d = std::llabs((int64_t)am2[i] - (int64_t)am1[i]);
-
-        // Candidate fresh anchors: same chromosome, within +/-anchor_window of
-        // the real anchor (or the whole chromosome when window <= 0).
-        int64_t alo = lo0, ahi = hi0;
-        if (anchor_window > 0) {
-            alo = std::lower_bound(dm + lo0, dm + hi0,
-                                   am1[i] - anchor_window) - dm;
-            ahi = std::upper_bound(dm + lo0, dm + hi0,
-                                   am1[i] + anchor_window) - dm;
-        }
-        if (ahi <= alo) continue;
-
-        bool placed = false;
-        for (int t = 0; t < kMaxTries && !placed; ++t) {
-            const int64_t ka = alo + (int64_t)(rng() % (uint64_t)(ahi - alo));
-            if (dcell[ka] != acell[i]) continue;          // same cell only
-            const int64_t pa = dm[ka];
-            // Partner at |pa - pb| in [d - tol, d + tol], either side.
-            const bool up = (rng() & 1u) != 0;
-            const int64_t centre = up ? pa + d : pa - d;
-            const int64_t blo = std::lower_bound(dm + lo0, dm + hi0,
-                                                 centre - dist_tol) - dm;
-            const int64_t bhi = std::upper_bound(dm + lo0, dm + hi0,
-                                                 centre + dist_tol) - dm;
-            if (bhi <= blo) continue;
-            const int64_t kb = blo + (int64_t)(rng() % (uint64_t)(bhi - blo));
-            if (kb == ka || dcell[kb] != acell[i]) continue;
-            // Reject the OBSERVED pair: same two midpoints in the same cell.
-            const int64_t pb = dm[kb];
-            const bool is_observed =
-                (pa == am1[i] && pb == am2[i]) || (pa == am2[i] && pb == am1[i]);
-            if (is_observed) continue;
-
-            ++eligible;
-            const int ci = acell[i];
-            dg.get(ka, av_g); dh.get(ka, av_h);
-            dg.get(kb, bv_g); dh.get(kb, bv_h);
-            add_pair(null_c[3 * ci + 0], null_c[3 * ci + 1], null_c[3 * ci + 2],
-                     av_g, bv_g, av_h, bv_h, edges, max_site_pairs_per_read,
-                     rng, true);
-            // MATCHED: the true pair, restricted to anchors the null could
-            // actually place — the like-for-like baseline.
-            ag1.get(i, g1); ah1.get(i, h1);
-            ag2.get(i, g2); ah2.get(i, h2);
-            add_pair(match_c[3 * ci + 0], match_c[3 * ci + 1],
-                     match_c[3 * ci + 2], g1, g2, h1, h2, edges,
-                     max_site_pairs_per_read, rng, true);
-            placed = true;
-        }
-    }
-    }   // GIL reacquired
-
-    py::dict out;
-    py::list nl, ml;
-    for (int i = 0; i < 3 * n_cells; ++i) {
-        nl.append(to_numpy(null_c[i]));
-        ml.append(to_numpy(match_c[i]));
-    }
-    out["null_per_cell"] = nl;
-    out["matched_per_cell"] = ml;
-    out["n_eligible"] = py::int_(eligible);
-    out["n_anchors"] = py::int_(na);
-    return out;
-}
-
 
 /* ------------------------------------------------------------------------
  * Contact-frequency (SPATIAL distance) analysis
@@ -1319,6 +1249,7 @@ PYBIND11_MODULE(_site_dist_core, m) {
           py::arg("donor_cap") = 0, py::arg("anchor_cap") = 0,
           py::arg("anchor_long_cap") = 0, py::arg("long_range_bp") = 1000,
           py::arg("strand_min_evidence") = 1,
+          py::arg("null_type") = 0, py::arg("anchor_window") = 10000000,
           "Parse one cell's BAM and return per-distance-bin Pearson "
           "sufficient statistics for GCH-GCH / HCG-HCG / HCG-GCH, linked and "
           "non-linked.");
@@ -1329,16 +1260,6 @@ PYBIND11_MODULE(_site_dist_core, m) {
           "Pooled cross-cell null: substitute partners are drawn from the "
           "donor ends of every cell in the group, not just the anchor's own "
           "cell.  Returns per-cell accumulators for the cell bootstrap.");
-    m.def("same_cell_distance_null", &same_cell_distance_null,
-          py::arg("anchors"), py::arg("donors"), py::arg("edges"),
-          py::arg("anchor_window") = 10000000, py::arg("dist_tol") = 100,
-          py::arg("max_site_pairs_per_read") = 64,
-          py::arg("seed") = 42, py::arg("n_cells") = 1,
-          "Distance-matched null: for each observed pair spanning d, draw a "
-          "fresh anchor from the SAME cell within +/-anchor_window of the real "
-          "one, then a partner at d +/- dist_tol.  Relaxes the locus that "
-          "cross_cell_null holds fixed, so donor density stops binding at long "
-          "range.  anchor_window <= 0 removes the locality restriction.");
     m.def("parse_cell_contacts", &parse_cell_contacts,
           py::arg("bam_path"), py::arg("ctx_gch"), py::arg("ctx_hcg"),
           py::arg("trim_ends") = 5, py::arg("mapq_min") = 30,
