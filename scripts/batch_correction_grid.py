@@ -68,6 +68,41 @@ logger = logging.getLogger("batch_grid")
 _METRIC_COLS = ("knn_purity", "purity_index", "ari", "nmi", "silhouette",
                 "knn_chance")
 
+# Metrics that carry INDEPENDENT information, for the composite rankings.
+# purity_index is deliberately excluded: chance is fixed across the grid (same
+# cells, same labels), so it is a monotone transform of knn_purity and ranks
+# identically — including both would simply weight purity twice.
+_RANK_METRICS = ("knn_purity", "ari", "nmi", "silhouette")
+
+
+def add_composite_ranks(res: pd.DataFrame) -> pd.DataFrame:
+    """Two scale-free ways to combine the metrics, plus their per-metric ranks.
+
+    A mean (or sum, or median) of the RAW values is not a defensible composite:
+    the metrics live on different scales with different spreads, so whichever
+    happens to vary most across the grid dominates the total.  Both composites
+    here remove that.
+
+    ``mean_rank``   — average of the per-metric ranks; scale-free and robust to
+                      outliers, but ignores how MUCH better a setting is.
+    ``scaled_mean`` — min-max each metric across the grid, then average; keeps
+                      the margins, at the cost of being defined relative to
+                      this particular grid.
+    """
+    r = res.copy()
+    have = [m for m in _RANK_METRICS if m in r.columns and r[m].notna().any()]
+    for m in have:
+        r[f"rank_{m}"] = r[m].rank(ascending=False, method="average")
+    r["mean_rank"] = r[[f"rank_{m}" for m in have]].mean(axis=1)
+    scaled = []
+    for m in have:
+        v = r[m].astype(float)
+        span = float(np.nanmax(v) - np.nanmin(v))
+        scaled.append((v - np.nanmin(v)) / span if span > 1e-12
+                      else pd.Series(1.0, index=v.index))
+    r["scaled_mean"] = pd.concat(scaled, axis=1).mean(axis=1)
+    return r
+
 
 def _load(path: str) -> pd.DataFrame:
     p = Path(path)
@@ -279,6 +314,18 @@ def main(argv=None) -> int:
     ap.add_argument("--harmony-theta", type=float, default=None)
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--random-seed", type=int, default=42)
+    ap.add_argument("--rank-by",
+                    choices=["knn_purity", "purity_index", "ari", "nmi",
+                             "silhouette", "mean_rank", "scaled_mean"],
+                    default="knn_purity",
+                    help="Criterion the table is sorted by and the winner "
+                         "chosen on.  Single metrics answer different "
+                         "questions: knn_purity is local and blind to a type "
+                         "split across islands, silhouette is the one that "
+                         "punishes that split, ARI/NMI ask whether k-means "
+                         "recovers the labels.  'mean_rank' and 'scaled_mean' "
+                         "combine them scale-free — do NOT average the raw "
+                         "values, whose spreads differ severalfold.")
     ap.add_argument("--top", type=int, default=15,
                     help="Rows to print (default 15).")
     ap.add_argument("--dry-run", action="store_true",
@@ -303,20 +350,35 @@ def main(argv=None) -> int:
     if res.empty:
         return 0
 
-    res = res.sort_values("knn_purity", ascending=False).reset_index(drop=True)
+    res = add_composite_ranks(res)
+    ascending = args.rank_by == "mean_rank"      # a rank: lower is better
+    res = res.sort_values(args.rank_by, ascending=ascending
+                          ).reset_index(drop=True)
     tsv = out_dir / "batch_correction_grid.tsv"
     res.to_csv(tsv, sep="\t", index=False)
 
+    # Whether the metrics agree is itself the finding: if they do, the choice
+    # of criterion is immaterial; if they do not, no single composite can be
+    # right for every purpose and the disagreement has to be read directly.
+    ok = res[[m for m in _RANK_METRICS if m in res]].dropna()
+    if len(ok) > 2:
+        print("\n=== rank agreement between metrics (Spearman) ===")
+        print(ok.corr(method="spearman").round(2).to_string())
+        print("  (purity_index is omitted: at fixed chance it ranks "
+              "identically to knn_purity)")
+
     show = ["concordance_batch_correction", "concordance_batch_column",
             "batch_correction", "batch_column", "skip_top_svd",
-            "knn_purity", "purity_index", "ari", "nmi", "silhouette"]
-    pd.set_option("display.width", 200)
-    print(f"\n=== top {args.top} by kNN purity "
-          f"(chance = {res['knn_chance'].iloc[0]:.3f}) ===")
+            "knn_purity", "ari", "nmi", "silhouette",
+            "mean_rank", "scaled_mean"]
+    show = [c for c in show if c in res.columns]
+    pd.set_option("display.width", 220)
+    print(f"\n=== top {args.top} by {args.rank_by} "
+          f"(purity chance = {res['knn_chance'].iloc[0]:.3f}) ===")
     print(res[show].head(args.top).to_string(index=False))
 
     best = res.iloc[0]
-    print("\n=== best by kNN purity ===")
+    print(f"\n=== best by {args.rank_by} ===")
     print(f"  --concordance-batch-correction {best['concordance_batch_correction']}"
           + ("" if best["concordance_batch_correction"] == "none"
              else f" (columns {best['concordance_batch_column'].replace('+', ',')})"))
@@ -328,10 +390,18 @@ def main(argv=None) -> int:
           f"purity index {best['purity_index']:.4f}  "
           f"ARI {best['ari']:.4f}  NMI {best['nmi']:.4f}  "
           f"ASW {best['silhouette']:.4f}")
-    near = int((res["knn_purity"] >= best["knn_purity"] - 0.01).sum())
-    print(f"\n  {near} combination(s) within 0.01 purity of the best — the max "
-          f"over {len(res)} settings is optimistically biased, so prefer a "
-          f"setting inside a band of similar scores over a lone spike.")
+    # A tie band on the chosen criterion, in its own units.
+    col = args.rank_by
+    if col == "mean_rank":
+        near = int((res[col] <= best[col] + 0.05 * len(res)).sum())
+        unit = f"within 5% of the grid in mean rank"
+    else:
+        near = int((res[col] >= best[col] - 0.01).sum())
+        unit = f"within 0.01 {col}"
+    print(f"\n  {near} combination(s) {unit} of the best — the max over "
+          f"{len(res)} settings is optimistically biased by selection alone, "
+          f"so prefer a setting inside a band of similar scores over a lone "
+          f"spike.")
     print(f"\nwrote {tsv}")
     return 0
 

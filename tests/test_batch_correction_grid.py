@@ -188,3 +188,61 @@ def test_correct_scores_is_a_no_op_without_labels_or_method():
     assert np.array_equal(visualization.correct_scores(X, idx, bl, "none"), X)
     out = visualization.correct_scores(X, idx, bl, "center")
     assert out.shape == X.shape and not np.array_equal(out, X)
+
+
+# ------------------------------------------------------- composite rankings --
+
+def _grid_frame():
+    return pd.DataFrame({
+        "knn_purity": [0.90, 0.80, 0.70, 0.60],
+        "purity_index": [0.889, 0.778, 0.667, 0.556],   # monotone in purity
+        "ari": [0.10, 0.90, 0.20, 0.80],                # deliberately opposed
+        "nmi": [0.20, 0.85, 0.30, 0.75],
+        "silhouette": [0.40, 0.30, 0.20, 0.10],
+    })
+
+
+def test_purity_index_is_excluded_from_the_composites():
+    """At fixed chance it ranks identically to knn_purity, so including both
+    would weight purity twice in any average."""
+    m = _mod()
+    assert "purity_index" not in m._RANK_METRICS
+    df = _grid_frame()
+    assert df["knn_purity"].corr(df["purity_index"], method="spearman") == 1.0
+
+
+def test_composites_are_scale_free_not_a_raw_mean():
+    """ARI spans 0.8 here and silhouette 0.3; a raw mean would let ARI decide.
+    Both composites must be invariant to rescaling one metric."""
+    m = _mod()
+    a = m.add_composite_ranks(_grid_frame())
+    scaled = _grid_frame()
+    scaled["ari"] = scaled["ari"] * 100.0            # same order, huge scale
+    b = m.add_composite_ranks(scaled)
+    assert np.allclose(a["mean_rank"], b["mean_rank"])
+    assert np.allclose(a["scaled_mean"], b["scaled_mean"])
+    raw_mean_a = _grid_frame()[list(m._RANK_METRICS)].mean(axis=1)
+    raw_mean_b = scaled[list(m._RANK_METRICS)].mean(axis=1)
+    assert not np.allclose(raw_mean_a.rank(), raw_mean_b.rank()), (
+        "a raw mean IS sensitive to rescaling — which is why it is not used")
+
+
+def test_composite_ranks_are_added_for_every_independent_metric():
+    m = _mod()
+    out = m.add_composite_ranks(_grid_frame())
+    for k in m._RANK_METRICS:
+        assert f"rank_{k}" in out.columns
+    assert out["mean_rank"].notna().all()
+    assert out["scaled_mean"].between(0, 1).all()
+
+
+def test_rank_by_changes_the_winner_when_metrics_disagree(tmp_path):
+    """The whole point of exposing --rank-by: purity and ARI pick different
+    rows here, so a single 'best' does not exist independent of the criterion."""
+    m = _mod()
+    df = m.add_composite_ranks(_grid_frame())
+    assert df["knn_purity"].idxmax() != df["ari"].idxmax()
+    by_purity = df.sort_values("knn_purity", ascending=False).index[0]
+    by_rank = df.sort_values("mean_rank", ascending=True).index[0]
+    assert by_purity == df["knn_purity"].idxmax()
+    assert by_rank in df.index
