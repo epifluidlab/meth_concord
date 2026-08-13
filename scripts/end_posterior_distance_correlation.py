@@ -35,6 +35,15 @@ Nulls mirror the site-level script:
         restricted to cells sharing --null-match-column (e.g.
         exp_batch,plate_batch,lib_batch), so a donor never crosses a batch.
 
+Linked is tested against null twice, on the same contrast and with the cell as
+the unit of inference both times, because end pairs within a cell are nowhere
+near independent.  end_posterior_dist_<label> carries a cell-level bootstrap of
+Δ = r_linked − r_null; end_posterior_dist_<label>_fisherz carries the Fisher
+z version (--fisher-z), which z-transforms each cell's two correlations, pairs
+them within the cell and tests the mean difference with a one-sample t.  Both
+are BH-adjusted across every bin and measure in their figure.  Agreement
+between the two files is the point: one is resampled, the other parametric.
+
 With --group-column, a figure and table are written per cell-type group as well
 as for the pooled "all".
 
@@ -63,7 +72,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from nome_hic_concordance.distance_stats import (      # noqa: E402
     accumulate, bootstrap_delta, build_edges, corr_from_acc, fdr,
-    new_acc, stars)
+    fisher_z_cell, fisher_z_pooled, new_acc, stars)
 
 logger = logging.getLogger("end_posterior_dist")
 
@@ -379,7 +388,14 @@ def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
 
 # ----------------------------------------------------------------- plotting --
 
-def _figure(curves, centers, label, out_path, args, note="", boot=None):
+def _figure(curves, centers, label, out_path, args, note="", boot=None,
+            fisher=None):
+    """Row 1 the linked and null curves, row 2 the contrast between them.
+
+    With ``fisher`` the second row switches to Δz and its parametric interval;
+    the first row is untouched, so the two files can be read side by side and
+    differ only in which test drew the marks.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -403,23 +419,33 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None):
         ax.legend(fontsize=8, frameon=False)
 
         axd = axes[1, j]
-        delta = curves[(key, "linked")][0] - curves[(key, "null")][0]
-        if key in boot:
-            lo, hi, pv, q = boot[key]
+        if fisher is not None:
+            delta, lo, hi, pv, q, _ = fisher.get(
+                key, (np.full(len(centers), np.nan),) * 5 + (None,))
+            by_cell = args.fisher_z == "cell"
+            band = ("95% CI (t across cells)" if by_cell
+                    else "95% CI (Fisher z)")
+            line = ("Δz = mean$_{cells}$(z$_{linked}$ − z$_{null}$)" if by_cell
+                    else "Δz = z(r$_{linked}$) − z(r$_{null}$)")
+            ylab = "Δz (Fisher)"
+        else:
+            delta = curves[(key, "linked")][0] - curves[(key, "null")][0]
+            lo, hi, pv, q = boot.get(key, (None, None, None, None))
+            band, line = "95% CI (cell bootstrap)", "Δ = linked − null"
+            ylab = "Δ = linked − null"
+        if lo is not None:
             axd.fill_between(centers, lo, hi, color=_COLOR[key], alpha=0.18,
-                             lw=0, label="95% CI (cell bootstrap)")
+                             lw=0, label=band)
         axd.plot(centers, delta, color=_COLOR[key], lw=1.6, marker="o", ms=3,
-                 label="Δ = linked − null")
-        if key in boot:
+                 label=line)
+        if q is not None:
             # Ring the bins that survive FDR, and only those: one test per bin
             # per measure means several would clear raw p<0.05 by chance.
-            lo, hi, pv, q = boot[key]
             sig = np.isfinite(q) & (q < 0.05) & np.isfinite(delta)
             if sig.any():
                 axd.plot(centers[sig], delta[sig], "o", ms=8,
                          mfc="none", mec=_COLOR[key], mew=1.5,
                          label=f"q < 0.05  ({int(sig.sum())} bins)")
-            span = np.nanmax(np.abs(delta)) or 1.0
             for xi, di, qi in zip(centers, delta, q):
                 mark = stars(qi)
                 if mark and np.isfinite(di):
@@ -429,10 +455,14 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None):
         axd.axhline(0, color="#9AA0A6", lw=0.8)
         axd.set_xscale("log")
         axd.set_xlabel("genomic distance between the two ends (bp)")
-        axd.set_ylabel("Δ = linked − null" if j == 0 else "")
+        axd.set_ylabel(ylab if j == 0 else "")
         axd.legend(fontsize=8, frameon=False)
+    test = ("" if fisher is None else
+            ("   [Fisher z, paired within cell, t across cells]"
+             if args.fisher_z == "cell" else
+             "   [Fisher z, two-sample, pooled pairs — anti-conservative]"))
     fig.suptitle(f"{label}: end-posterior correlation vs distance"
-                 + (f"   ({note})" if note else ""), fontsize=12)
+                 + (f"   ({note})" if note else "") + test, fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -699,6 +729,30 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                 boot[m] = (lo, hi, pv, q_all[off:off + pv.size])
                 off += pv.size
 
+    # Companion parametric test on the same contrast, written to its own
+    # figure.  It shares the bootstrap's unit of inference (the cell) under
+    # --fisher-z cell and deliberately abandons it under 'pooled', so the two
+    # files together show how much of the significance is real replication.
+    fz = {}
+    if args.fisher_z != "none" and (args.fisher_z == "pooled"
+                                    or len(per_cell) >= 3):
+        raw = {}
+        for m, _ in _MEASURES:
+            if args.fisher_z == "cell":
+                raw[m] = fisher_z_cell([a[(m, "linked")] for a in per_cell],
+                                       [a[(m, "null")] for a in per_cell],
+                                       args.fisher_min_cell_pairs)
+            else:
+                raw[m] = fisher_z_pooled(accs[(m, "linked")],
+                                         accs[(m, "null")], args.min_pairs)
+        flat = np.concatenate([raw[m][3] for m in raw])
+        q_all = fdr(flat, args.fdr)
+        off = 0
+        for m in raw:
+            dz, lo, hi, pv, k = raw[m]
+            fz[m] = (dz, lo, hi, pv, q_all[off:off + pv.size], k)
+            off += pv.size
+
     centers = np.sqrt(edges[:-1] * edges[1:])
     rows = {"bin_lo": edges[:-1], "bin_hi": edges[1:], "center_bp": centers}
     for (m, c), (r, n) in curves.items():
@@ -709,6 +763,15 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
         rows[f"{m}_delta_hi"] = hi
         rows[f"{m}_delta_p"] = pv
         rows[f"{m}_delta_q"] = q
+    for m, (dz, lo, hi, pv, q, k) in fz.items():
+        rows[f"{m}_fz_dz"] = dz
+        rows[f"{m}_fz_lo"] = lo
+        rows[f"{m}_fz_hi"] = hi
+        rows[f"{m}_fz_p"] = pv
+        rows[f"{m}_fz_q"] = q
+        # Cells contributing under 'cell'; the smaller arm's pair count under
+        # 'pooled' — the n that test wrongly treats as independent.
+        rows[f"{m}_fz_n"] = k
     tsv = Path(out_dir) / f"end_posterior_dist_{label}.tsv"
     pd.DataFrame(rows).to_csv(tsv, sep="\t", index=False)
     note = (f"{args.null_type}, --null-scope {args.null_scope}"
@@ -718,6 +781,11 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
     _figure(curves, centers, label,
             Path(out_dir) / f"end_posterior_dist_{label}.{args.plot_format}",
             args, note, boot)
+    if fz:
+        _figure(curves, centers, label,
+                Path(out_dir) / f"end_posterior_dist_{label}_fisherz."
+                                f"{args.plot_format}",
+                args, note, fisher=fz)
     logger.info(f"  {label}: {n_pairs:,} linked and {n_null:,} null "
                 f"end-pairs; wrote {tsv}")
     return curves, centers
@@ -783,6 +851,26 @@ def main(argv=None) -> int:
                     help="Cell-level bootstrap resamples for the Δ CI and "
                          "p-value (500; 0 disables).  Cells are the unit "
                          "because end pairs within one are not independent.")
+    ap.add_argument("--fisher-z", choices=["cell", "pooled", "none"],
+                    default="cell",
+                    help="Companion parametric test, written to a separate "
+                         "'_fisherz' figure with the same layout.  'cell' "
+                         "(default) z-transforms each CELL's linked and null "
+                         "r, pairs them within the cell and tests the mean "
+                         "difference with a one-sample t: the cell is the "
+                         "unit, as in the bootstrap, so this is a genuine "
+                         "second opinion on the same contrast and can resolve "
+                         "p below the bootstrap's 2/(B+1) floor.  'pooled' is "
+                         "the textbook two-sample Fisher z on the pooled "
+                         "curves; its n is the number of end pairs, which are "
+                         "not independent, so it is anti-conservative by "
+                         "orders of magnitude and is offered only to show "
+                         "that.  'none' skips it.")
+    ap.add_argument("--fisher-min-cell-pairs", type=int, default=30,
+                    help="--fisher-z cell: minimum end-pairs for ONE cell to "
+                         "contribute an r to a bin (30).  --min-pairs is a "
+                         "threshold on the pooled count across every cell and "
+                         "is far too high to apply per cell.")
     ap.add_argument("--fdr", choices=["bh", "by", "none"], default="bh",
                     help="Multiple-testing adjustment across every bin and "
                          "measure in a figure.  'bh' assumes positive "
@@ -822,6 +910,14 @@ def main(argv=None) -> int:
     merged, excl_chrom = load_exclusions(
         args.exclude_bed,
         [c.strip() for c in args.exclude_chrom.split(",") if c.strip()])
+
+    if args.fisher_z == "pooled":
+        logger.warning(
+            "--fisher-z pooled treats every end pair as an independent "
+            "observation.  They are not: one cell contributes most of the "
+            "pairs in a bin and one end sits in many of them, so the reported "
+            "p is anti-conservative by orders of magnitude.  Read it only "
+            "against --fisher-z cell, never on its own.")
 
     edges = build_edges(args.min_distance, args.max_distance,
                         args.bins_per_decade)

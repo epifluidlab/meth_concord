@@ -114,6 +114,91 @@ def bootstrap_delta(per_cell_a, per_cell_b, min_pairs, n_boot, seed,
     return lo, hi, p
 
 
+def _fisher_z(r, n):
+    """Fisher's variance-stabilising z with the O(1/n) bias correction.
+
+    E[z] ~ zeta + rho / (2(n-1)), and a bin's linked and null arms need not
+    carry the same n, so without the correction unequal counts alone would
+    leave a systematic difference behind when the two true correlations are
+    equal.
+    """
+    r = np.clip(np.asarray(r, dtype=np.float64), -0.999999, 0.999999)
+    n = np.asarray(n, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.arctanh(r) - r / (2.0 * np.maximum(n - 1.0, 1.0))
+
+
+def fisher_z_cell(per_cell_a, per_cell_b, min_pairs, min_cells=3):
+    """Paired Fisher z within cells, one-sample t across them → (dz,lo,hi,p,k).
+
+    Fisher's two-sample z compares two correlations through n = the number of
+    OBSERVATIONS.  Applied to the pooled curves that n is the number of end
+    pairs — hundreds of thousands per bin, nearly all of them non-independent,
+    since one cell contributes most of them and one end sits in many — so it
+    would return p ~ 1e-12 for a difference of 0.01.  Here the transform is
+    taken WITHIN each cell and the per-cell differences are tested with a
+    one-sample t, which puts the unit of inference back on the cell, exactly
+    where :func:`bootstrap_delta` puts it.  The two tests then differ only in
+    how the tail is obtained — parametric rather than resampled, so this one
+    resolves p below the bootstrap's 2/(B+1) floor, at the cost of assuming
+    the cell-level differences are roughly normal.
+
+    Pairing inside the cell also repairs the other flaw in the textbook form:
+    the linked and null arms are not independent samples (same cells, and
+    under a locus-matched null the same anchor ends), which the two-sample
+    standard error assumes.
+
+    Cells are weighted equally rather than by their pair count — the standard
+    cluster-summary analysis.  Inverse-variance weights would be more
+    efficient only if the within-cell 1/(n-3) model were exact, which is the
+    assumption this whole function exists to avoid relying on.
+    """
+    from scipy.stats import t as _t
+
+    a = np.stack(per_cell_a).astype(np.float64)          # (k, 6, nb)
+    b = np.stack(per_cell_b).astype(np.float64)
+    with warnings.catch_warnings():
+        # Bins a cell never covers are all-NaN slices — expected, not an error.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ra, na = corr_from_acc(a, min_pairs)
+        rb, nbp = corr_from_acc(b, min_pairs)
+        d = _fisher_z(ra, na) - _fisher_z(rb, nbp)       # (k, nbins)
+        k = np.sum(np.isfinite(d), axis=0)
+        mean = np.nanmean(d, axis=0)
+        sd = np.nanstd(d, axis=0, ddof=1)
+    ok = (k >= max(min_cells, 3)) & np.isfinite(mean) & np.isfinite(sd)
+    ok &= sd > 0
+    df = np.maximum(k - 1, 1)
+    se = np.where(ok, sd / np.sqrt(np.maximum(k, 1)), np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        p = 2.0 * _t.sf(np.abs(np.where(ok, mean / se, np.nan)), df)
+        crit = np.where(ok, _t.ppf(0.975, df), np.nan)
+    mean = np.where(ok, mean, np.nan)
+    return mean, mean - crit * se, mean + crit * se, p, k
+
+
+def fisher_z_pooled(acc_a, acc_b, min_pairs):
+    """Textbook two-sample Fisher z on the pooled curves → (dz, lo, hi, p, n).
+
+    Offered for comparison only.  Its n is the number of end pairs, which are
+    emphatically not independent observations, so it is anti-conservative by
+    orders of magnitude: at n ~ 1e6 per arm the standard error is ~0.0014 and
+    a Δz of 0.01 lands at p ~ 1e-12.  It also assumes the two samples are
+    independent, which linked and null are not.  Use :func:`fisher_z_cell`.
+    """
+    from scipy.stats import norm
+
+    ra, na = corr_from_acc(acc_a, min_pairs)
+    rb, nb = corr_from_acc(acc_b, min_pairs)
+    dz = _fisher_z(ra, na) - _fisher_z(rb, nb)
+    na = np.where(na > 3, na, np.nan)
+    nb = np.where(nb > 3, nb, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        se = np.sqrt(1.0 / (na - 3.0) + 1.0 / (nb - 3.0))
+        p = 2.0 * norm.sf(np.abs(dz / se))
+    return dz, dz - 1.959964 * se, dz + 1.959964 * se, p, np.minimum(na, nb)
+
+
 def fdr(p, method="bh"):
     """Adjusted p (q) over the finite entries of ``p``; NaN stays NaN.
 

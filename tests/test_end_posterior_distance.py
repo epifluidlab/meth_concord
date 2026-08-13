@@ -417,6 +417,147 @@ def test_group_overlay_needs_at_least_two_groups(tmp_path):
         "'all' plus ONE group is not a comparison")
 
 
+# --------------------------------------------------------------- Fisher z --
+
+def _null_arms(k=30, nb=60, rho_a=0.0, rho_b=0.0, n=80, seed=0):
+    """Per-cell accumulators for two arms with known true correlations."""
+    from nome_hic_concordance import distance_stats as ds
+    rng = np.random.default_rng(seed)
+    A, B = [], []
+    for _ in range(k):
+        accs = []
+        for rho in (rho_a, rho_b):
+            acc = ds.new_acc(nb)
+            bins = np.repeat(np.arange(nb), n)
+            x = rng.normal(size=nb * n)
+            y = rho * x + np.sqrt(1 - rho ** 2) * rng.normal(size=nb * n)
+            ds.accumulate(acc, bins, x, y)
+            accs.append(acc)
+        A.append(accs[0])
+        B.append(accs[1])
+    return A, B
+
+
+def test_cell_level_fisher_z_is_calibrated_when_the_arms_agree():
+    """Both arms rho=0: the test must not manufacture significance."""
+    from nome_hic_concordance import distance_stats as ds
+    A, B = _null_arms(seed=1)
+    dz, lo, hi, p, k = ds.fisher_z_cell(A, B, min_pairs=30)
+    ok = np.isfinite(p)
+    assert ok.sum() > 50
+    assert np.mean(p[ok] < 0.05) < 0.15, "false positives near the 5% nominal"
+    assert (k[ok] == 30).all(), "every cell should clear 30 pairs per bin"
+
+
+def test_cell_level_fisher_z_finds_a_real_difference():
+    from nome_hic_concordance import distance_stats as ds
+    A, B = _null_arms(rho_a=0.5, rho_b=0.0, seed=2)
+    dz, lo, hi, p, _ = ds.fisher_z_cell(A, B, min_pairs=30)
+    ok = np.isfinite(p)
+    assert (dz[ok] > 0).all(), "arm A is the more correlated one"
+    assert np.mean(p[ok] < 0.05) > 0.9
+    assert ((lo[ok] <= dz[ok]) & (dz[ok] <= hi[ok])).all()
+
+
+def test_the_bias_correction_shrinks_z_and_fades_with_n():
+    """Unequal n between the arms would otherwise leave a difference behind
+    when the two true correlations are identical."""
+    from nome_hic_concordance import distance_stats as ds
+    small = ds._fisher_z(0.6, 10)
+    large = ds._fisher_z(0.6, 100_000)
+    assert small < large < np.arctanh(0.6)
+    assert abs(large - np.arctanh(0.6)) < 1e-5
+
+
+def test_pooled_fisher_z_is_wildly_anticonservative_next_to_the_cell_test():
+    """The whole reason 'cell' is the default: pooling pretends every end pair
+    is an independent observation, so its p collapses."""
+    from nome_hic_concordance import distance_stats as ds
+    A, B = _null_arms(rho_a=0.15, rho_b=0.0, seed=3)
+    _, _, _, p_cell, _ = ds.fisher_z_cell(A, B, min_pairs=30)
+    _, _, _, p_pool, _ = ds.fisher_z_pooled(sum(A), sum(B), min_pairs=30)
+    ok = np.isfinite(p_cell) & np.isfinite(p_pool)
+    assert ok.any()
+    assert np.median(p_pool[ok]) < np.median(p_cell[ok]) / 100
+
+
+def test_pooled_fisher_z_invents_significance_when_cells_disagree():
+    """The failure mode that decides the default.
+
+    Each cell has its own nonzero difference between the arms — which is what
+    a cell-to-cell difference in how well the null matches looks like — but
+    the MEAN difference across cells is zero, so the honest answer is "not
+    significant".  Pooling the pairs asks a different and uninteresting
+    question, "is the pooled difference exactly zero", and answers it with a
+    standard error that knows nothing about the spread across cells.
+    """
+    from nome_hic_concordance import distance_stats as ds
+    rng = np.random.default_rng(11)
+    nb, n = 25, 100
+    A, B = [], []
+    for _ in range(40):
+        # One draw per (cell, bin), so the bins are independent replicates of
+        # the situation rather than 25 copies of a single draw.
+        e = rng.normal(0, 0.15, size=nb)        # cancels across cells
+        arms = [ds.new_acc(nb), ds.new_acc(nb)]
+        for b in range(nb):
+            for acc, rho in zip(arms, (0.3 + e[b], 0.3 - e[b])):
+                x = rng.normal(size=n)
+                y = rho * x + np.sqrt(1 - rho ** 2) * rng.normal(size=n)
+                ds.accumulate(acc, np.full(n, b), x, y)
+        A.append(arms[0])
+        B.append(arms[1])
+    _, _, _, p_cell, _ = ds.fisher_z_cell(A, B, 30)
+    _, _, _, p_pool, _ = ds.fisher_z_pooled(sum(A), sum(B), 30)
+    rej_cell = np.mean(p_cell[np.isfinite(p_cell)] < 0.05)
+    rej_pool = np.mean(p_pool[np.isfinite(p_pool)] < 0.05)
+    # Over ten seeds this averages 0.05 for the cell test and 0.45 for the
+    # pooled one; the bounds are loose enough to survive a reseed.
+    assert rej_cell < 0.2, "the cell-level test should sit near its nominal 5%"
+    assert rej_pool > 0.25, "the pooled test should fire on many bins"
+
+
+def test_fisher_z_figure_and_columns_are_written(tmp_path):
+    res, out = _run(tmp_path, ["--fisher-min-cell-pairs", "15"])
+    assert (out / "end_posterior_dist_all_fisherz.png").exists()
+    assert (out / "end_posterior_dist_all.png").exists(), (
+        "the bootstrap figure must still be written alongside")
+    for m in ("gg", "hh", "gh"):
+        for col in ("_fz_dz", "_fz_lo", "_fz_hi", "_fz_p", "_fz_q", "_fz_n"):
+            assert f"{m}{col}" in res.columns, m + col
+    ok = res[res["gg_fz_p"].notna()]
+    assert len(ok) > 0
+    assert (ok["gg_fz_q"] >= ok["gg_fz_p"] - 1e-12).all()
+    assert ok["gg_fz_p"].between(0, 1).all()
+
+
+def test_fisher_z_and_the_bootstrap_agree_on_the_planted_signal(tmp_path):
+    res, _ = _run(tmp_path, ["--fisher-min-cell-pairs", "15",
+                             "--n-bootstrap", "200"])
+    ok = res[res["gg_fz_dz"].notna() & res["gg_delta_lo"].notna()]
+    assert len(ok) > 0
+    d = ok["gg_linked_r"] - ok["gg_null_r"]
+    assert (np.sign(ok["gg_fz_dz"]) == np.sign(d)).all(), (
+        "z is monotone in r, so the two contrasts cannot disagree in sign")
+    assert (ok["gg_fz_q"] < 0.05).any(), "the planted coupling is strong"
+
+
+def test_fisher_z_can_be_switched_off(tmp_path):
+    res, out = _run(tmp_path, ["--fisher-z", "none"])
+    assert not (out / "end_posterior_dist_all_fisherz.png").exists()
+    assert "gg_fz_p" not in res.columns
+
+
+def test_pooled_mode_runs_end_to_end(tmp_path):
+    res, out = _run(tmp_path, ["--fisher-z", "pooled"])
+    assert (out / "end_posterior_dist_all_fisherz.png").exists()
+    ok = res[res["gg_fz_p"].notna()]
+    assert len(ok) > 0
+    # n is the pair count here, not the 8 cells — that is exactly the flaw.
+    assert (ok["gg_fz_n"] >= 50).all(), "--min-pairs is the floor"
+    assert ok["gg_fz_n"].max() > 500
+
+
 def test_fdr_is_applied_across_the_whole_figure(tmp_path):
     """One test per bin per measure, so the adjustment must span all three
     measures rather than being redone per panel."""
