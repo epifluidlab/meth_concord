@@ -218,6 +218,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "remains 'signed-diff' for direct API callers.)",
     )
     parser.add_argument(
+        "--concordance-batch-correction",
+        choices=["none", "center", "zscore", "combat", "harmony"],
+        default="none",
+        help="Batch-correct the CONCORDANCE matrix itself (and the C / F / D / "
+             "p̄ components) per bin, in Step 7 before normalization.  This is "
+             "a different stage from --batch-correction, which corrects the "
+             "mean-accessibility matrix seeding the RWR graph in Step 5 and "
+             "the SVD scores just before UMAP in Step 7 — neither of which "
+             "touches the concordance values.  Batch enters those values in "
+             "between (per-cell coverage drives the DM shrinkage and what RWR "
+             "imputes), and correcting ten SVD components afterwards cannot "
+             "separate what is already mixed into the bins.  Must precede the "
+             "per-bin quantile normalization, since QN turns a batch offset "
+             "into a batch-ordered ranking and preserves it.  'center' "
+             "(subtract each batch's per-bin mean) is the right default if "
+             "you want one; it cannot fail the way harmony can when batch and "
+             "cell type are partly confounded.  Needs --batch-column.  The "
+             "before/after per-bin ANOVA F is logged.",
+    )
+    parser.add_argument(
         "--component-umaps", choices=["auto", "on", "off"], default="auto",
         help="In Step 7, additionally embed the four concordance COMPONENT "
              "matrices written by Step 5: directional (D = C·(2F−1)), "
@@ -826,6 +846,43 @@ def _get_chrom_sizes_from_bam(bam_path: str) -> dict[str, int]:
         }
 
 
+def _correct_concordance_batch(df, batch_labels, method: str,
+                               random_state: int, label: str):
+    """Per-bin batch correction of a cells × bins concordance matrix.
+
+    The pipeline's other two corrections do NOT touch these values: Step 5
+    corrects the mean-accessibility matrix that seeds the RWR graph, and Step 7
+    corrects the SVD scores just before UMAP.  Batch enters the concordance
+    itself in between — through per-cell coverage driving the DM shrinkage and
+    what RWR imputes — and a correction on ten SVD components cannot separate
+    what is already mixed into the bins.  This removes each batch's per-bin
+    mean while leaving the cell-type centroids in place.
+
+    It must run BEFORE the per-bin quantile normalization: QN ranks cells
+    within a bin, and a batch offset simply becomes a batch-ordered ranking, so
+    QN preserves rather than removes it.
+
+    The before/after ANOVA F is logged so "the correction ran" and "the
+    correction worked" stay distinguishable.
+    """
+    from . import batch_correction as _bc
+    bl = (batch_labels.reindex(df.index)
+          if isinstance(batch_labels, (pd.Series, pd.DataFrame))
+          else batch_labels)
+    f_pre = _bc.batch_anova_f_per_bin(df, bl)
+    out = _bc.apply_batch_correction(df, bl, method=method,
+                                     random_state=random_state)
+    f_post = _bc.batch_anova_f_per_bin(out, bl)
+    logger.info(
+        f"[concordance batch correction: {method}] {label}: "
+        f"per-bin ANOVA F over batches median "
+        f"{float(np.nanmedian(f_pre)):.2f} → {float(np.nanmedian(f_post)):.2f} "
+        f"(90th pct {float(np.nanpercentile(f_pre, 90)):.2f} → "
+        f"{float(np.nanpercentile(f_post, 90)):.2f})"
+    )
+    return out
+
+
 def _resolve_concordance_combine(args) -> str:
     """Resolve ``--concordance-combine auto``.
 
@@ -1343,6 +1400,21 @@ def run_context(
         else:
             n_svd = args.n_svd
 
+        # Correct the concordance values themselves, before any normalization.
+        cbc = args.concordance_batch_correction
+        if cbc != "none":
+            if batch_labels is None:
+                logger.warning(
+                    "--concordance-batch-correction needs --batch-column; "
+                    "skipping.")
+                cbc = "none"
+            else:
+                concordance_shrunk = _correct_concordance_batch(
+                    concordance_shrunk, batch_labels, cbc, args.random_seed,
+                    "concordance")
+                concordance_shrunk.to_parquet(
+                    concordance_dir / "concordance_batchcorrected.parquet")
+
         matrices = matrix_ops.process_concordance_matrix(
             concordance_shrunk,
             min_cell_coverage=args.min_cell_coverage,
@@ -1404,6 +1476,12 @@ def run_context(
                          else "")
             bc_title = (f" + {batch_correction}" if batch_correction != "none"
                         else "")
+            # The concordance-level correction goes in the name and the title
+            # too: otherwise a corrected run silently overwrites an
+            # uncorrected one and the two figures are indistinguishable.
+            if cbc != "none":
+                bc_suffix += f"_cbc-{cbc}"
+                bc_title += f" + concordance-{cbc}"
 
             visualization.run_umap_and_plot(
                 matrices["imputed"], group_labels,
@@ -1465,12 +1543,19 @@ def run_context(
                             f"(re-run Step 5 to emit it); skipping."
                         )
                         continue
+                    # Components get the same per-bin correction as the
+                    # headline matrix, or their UMAPs would answer a different
+                    # question from it.
+                    comp_raw = pd.read_parquet(comp_path).reindex(
+                        index=concordance_shrunk.index)
+                    if cbc != "none":
+                        comp_raw = _correct_concordance_batch(
+                            comp_raw, batch_labels, cbc, args.random_seed, comp)
                     # Its own subdirectory: process_concordance_matrix always
                     # writes concordance_imputed / concordance_<norm>, which
                     # would otherwise clobber the headline matrices.
                     comp_mat = matrix_ops.process_concordance_matrix(
-                        pd.read_parquet(comp_path).reindex(
-                            index=concordance_shrunk.index),
+                        comp_raw,
                         min_cell_coverage=args.min_cell_coverage,
                         output_dir=str(concordance_dir / "components" / comp),
                         matrix_norm=matrix_norm,
