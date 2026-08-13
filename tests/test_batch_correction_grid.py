@@ -82,6 +82,16 @@ def test_all_methods_unavailable_is_an_explicit_exit():
         m._usable_methods(["nope"], "--score-methods")
 
 
+def test_probe_is_large_enough_for_every_installed_method():
+    """Regression: an 8x4 probe made harmony raise, so it was reported as
+    unavailable and silently left out of the grid — indistinguishable from a
+    missing package, and it is the method the production command uses."""
+    pytest.importorskip("harmonypy")
+    m = _mod()
+    assert "harmony" in m._usable_methods(["none", "harmony"],
+                                          "--score-methods")
+
+
 # --------------------------------------------------------------- end to end --
 
 def _run(tmp_path, extra=None):

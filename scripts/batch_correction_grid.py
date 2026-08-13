@@ -105,23 +105,49 @@ def _usable_methods(methods, where):
     swallows the error silently would report a method as merely losing when it
     never ran.  Probe each once and say plainly which were dropped.
     """
+    import contextlib
+    import io
+    import logging as _logging
+
+    # The probe must be big enough for every method to run on it.  Harmony
+    # clusters internally and raises on a handful of cells, so an 8x4 probe
+    # reported it as unavailable and silently removed it from the grid -- a
+    # false negative that looked exactly like a missing package.
+    n_probe, p_probe = 80, 12
     rng = np.random.default_rng(0)
-    probe = pd.DataFrame(rng.normal(0, 1, (8, 4)),
-                         index=[f"c{i}" for i in range(8)])
-    bl = pd.Series(["a", "b"] * 4, index=probe.index)
-    ok = []
+    probe = pd.DataFrame(rng.normal(0, 1, (n_probe, p_probe)),
+                         index=[f"c{i}" for i in range(n_probe)])
+    bl = pd.Series(["a", "b"] * (n_probe // 2), index=probe.index)
+    ok, dropped = [], []
     for m in methods:
         if m == "none":
             ok.append(m)
             continue
         try:
-            _bc.apply_batch_correction(probe, bl, method=m, random_state=0)
+            # ComBat narrates to stdout and the correction logs its own banner,
+            # so an 8x4 probe would otherwise print a full run report that
+            # reads as if it were the real data.
+            _logging.disable(_logging.INFO)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                _bc.apply_batch_correction(probe, bl, method=m, random_state=0)
             ok.append(m)
         except Exception as exc:                      # missing optional dep
-            logger.warning(f"  {where}: dropping {m!r} — {type(exc).__name__}: "
-                           f"{str(exc).splitlines()[0]}")
+            dropped.append((m, f"{type(exc).__name__}: "
+                               f"{str(exc).splitlines()[0]}"))
+        finally:
+            _logging.disable(_logging.NOTSET)
+    for m, why in dropped:
+        logger.warning(f"  {where}: DROPPING {m!r} — {why}")
+    if dropped:
+        logger.warning(
+            f"  {where}: {len(dropped)} method(s) will NOT appear in the "
+            f"ranking. Install the missing package and re-run if you need "
+            f"them compared (combat/inmoose for ComBat, harmonypy for "
+            f"harmony) — a method that never ran is absent, not beaten.")
     if not ok:
         raise SystemExit(f"No usable methods for {where}.")
+    logger.info(f"  {where}: using {ok}")
     return ok
 
 
@@ -179,15 +205,29 @@ def run_grid(delta, labels, samples, args):
                     bl2 = (None if sbc == "none"
                            else _batch_frame(samples, args.cell_column,
                                              sbc_cols).reindex(common))
-                    X = visualization.correct_scores(
-                        X0, common, bl2, sbc,
-                        random_state=args.random_seed,
-                        n_threads=args.n_threads,
-                        harmony_theta=args.harmony_theta)
-                    m = metrics.label_agreement(
-                        X, y, k=args.knn_k, random_state=args.random_seed,
-                        n_perm=0)
+                    # A method can clear the probe and still fail on the real
+                    # data (a stratum with one cell, a degenerate component).
+                    # Record it as failed rather than losing the whole sweep,
+                    # and never let it be read as a low score.
+                    try:
+                        X = visualization.correct_scores(
+                            X0, common, bl2, sbc,
+                            random_state=args.random_seed,
+                            n_threads=args.n_threads,
+                            harmony_theta=args.harmony_theta)
+                        m = metrics.label_agreement(
+                            X, y, k=args.knn_k, random_state=args.random_seed,
+                            n_perm=0)
+                        err = ""
+                    except Exception as exc:
+                        m = {k: float("nan") for k in _METRIC_COLS}
+                        err = f"{type(exc).__name__}: {exc}"
+                        logger.warning(
+                            f"  failed: cbc={cbc}/{'+'.join(cbc_cols)} "
+                            f"sbc={sbc}/{'+'.join(sbc_cols)} skip={skip} — "
+                            f"{err}")
                     rows.append({
+                        "error": err,
                         "concordance_batch_correction": cbc,
                         "concordance_batch_column": ("-" if cbc == "none"
                                                      else "+".join(cbc_cols)),
