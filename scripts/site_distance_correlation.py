@@ -123,6 +123,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Imported AFTER the sys.path insertion above: at module-import time the
+# repo is not yet on the path, so this would otherwise bind to an
+# installed copy of the package rather than the checkout being run.
+from nome_hic_concordance import distance_stats as _ds  # noqa: E402
+
 from nome_hic_concordance.site_calls import iter_cell_read_pairs  # noqa: E402
 
 # htslib backend: does the whole hot path (parse → sites → pair → bin →
@@ -318,35 +323,10 @@ def _bootstrap_delta(per_cell_a, per_cell_b, min_pairs, n_boot, seed,
     return lo, hi, np.where(n_ok >= 20, p, np.nan)
 
 
-def _fdr(p, method="bh"):
-    """Adjusted p (q) over the finite entries of ``p``; NaN stays NaN.
-
-    The figure makes one test per distance bin per measure -- ~144 for a single
-    group -- so at raw p<0.05 roughly 7 bins would be starred by chance alone.
-
-    'bh' (Benjamini-Hochberg) is the default and is valid under positive
-    regression dependency, which is the right assumption here: adjacent distance
-    bins share reads and cells and trace a smooth curve, so the tests are
-    positively correlated rather than independent.  'by' (Benjamini-Yekutieli)
-    holds under ARBITRARY dependence at the cost of a log(m) penalty.
-    """
-    p = np.asarray(p, float)
-    if method == "none":
-        return p.copy()
-    out = np.full(p.shape, np.nan)
-    ok = np.isfinite(p)
-    m = int(ok.sum())
-    if m == 0:
-        return out
-    ps = p[ok]
-    order = np.argsort(ps)
-    c = np.sum(1.0 / np.arange(1, m + 1)) if method == "by" else 1.0
-    q = ps[order] * c * m / np.arange(1, m + 1)
-    q = np.minimum.accumulate(q[::-1])[::-1]      # enforce monotonicity in rank
-    adj = np.empty(m)
-    adj[order] = np.clip(q, 0.0, 1.0)
-    out[ok] = adj
-    return out
+# Shared with end_posterior_distance_correlation.py: one multiple-testing
+# implementation, so a change to it cannot reach one analysis and miss the
+# other.  The docstrings live in nome_hic_concordance.distance_stats.
+_fdr = _ds.fdr
 
 
 def _boot_parts(entry):
@@ -359,10 +339,8 @@ def _boot_parts(entry):
     return lo, hi, p, p
 
 
-def _stars(p):
-    if not np.isfinite(p):
-        return ""
-    return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+_stars = _ds.stars
+
 
 
 # --------------------------------------------------------------------------

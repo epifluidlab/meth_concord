@@ -62,7 +62,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from nome_hic_concordance.distance_stats import (      # noqa: E402
-    build_edges, corr_from_acc, new_acc, accumulate)
+    accumulate, bootstrap_delta, build_edges, corr_from_acc, fdr,
+    new_acc, stars)
 
 logger = logging.getLogger("end_posterior_dist")
 
@@ -378,23 +379,23 @@ def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
 
 # ----------------------------------------------------------------- plotting --
 
-def _figure(curves, centers, label, out_path, args, note=""):
+def _figure(curves, centers, label, out_path, args, note="", boot=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
+    boot = boot or {}
 
-    fig, axes = plt.subplots(2, len(_MEASURES), figsize=(5.2 * len(_MEASURES), 8),
-                             sharex=True)
+    fig, axes = plt.subplots(2, len(_MEASURES),
+                             figsize=(5.2 * len(_MEASURES), 8), sharex=True)
     for j, (key, title) in enumerate(_MEASURES):
         ax = axes[0, j]
         for cond, clab in _CONDS:
             r, n = curves[(key, cond)]
-            style = dict(color=_COLOR[key], lw=1.6,
-                         marker="o" if cond == "linked" else "",
-                         ms=3.0, ls="-" if cond == "linked" else "--",
-                         alpha=1.0 if cond == "linked" else 0.6)
-            ax.plot(centers, r, label=clab, **style)
+            ax.plot(centers, r, label=clab, color=_COLOR[key], lw=1.6,
+                    marker="o" if cond == "linked" else "", ms=3.0,
+                    ls="-" if cond == "linked" else "--",
+                    alpha=1.0 if cond == "linked" else 0.6)
         ax.axhline(0, color="#9AA0A6", lw=0.8)
         ax.set_title(title, fontsize=11)
         ax.set_ylabel("Pearson r of end posteriors" if j == 0 else "")
@@ -402,18 +403,96 @@ def _figure(curves, centers, label, out_path, args, note=""):
         ax.legend(fontsize=8, frameon=False)
 
         axd = axes[1, j]
-        rl = curves[(key, "linked")][0]
-        rn = curves[(key, "null")][0]
-        axd.plot(centers, rl - rn, color=_COLOR[key], lw=1.6, marker="o", ms=3)
+        delta = curves[(key, "linked")][0] - curves[(key, "null")][0]
+        if key in boot:
+            lo, hi, pv, q = boot[key]
+            axd.fill_between(centers, lo, hi, color=_COLOR[key], alpha=0.18,
+                             lw=0, label="95% CI (cell bootstrap)")
+        axd.plot(centers, delta, color=_COLOR[key], lw=1.6, marker="o", ms=3,
+                 label="Δ = linked − null")
+        if key in boot:
+            # Ring the bins that survive FDR, and only those: one test per bin
+            # per measure means several would clear raw p<0.05 by chance.
+            lo, hi, pv, q = boot[key]
+            sig = np.isfinite(q) & (q < 0.05) & np.isfinite(delta)
+            if sig.any():
+                axd.plot(centers[sig], delta[sig], "o", ms=8,
+                         mfc="none", mec=_COLOR[key], mew=1.5,
+                         label=f"q < 0.05  ({int(sig.sum())} bins)")
+            span = np.nanmax(np.abs(delta)) or 1.0
+            for xi, di, qi in zip(centers, delta, q):
+                mark = stars(qi)
+                if mark and np.isfinite(di):
+                    axd.annotate(mark, (xi, di), textcoords="offset points",
+                                 xytext=(0, 7), ha="center", fontsize=8,
+                                 color=_COLOR[key])
         axd.axhline(0, color="#9AA0A6", lw=0.8)
         axd.set_xscale("log")
         axd.set_xlabel("genomic distance between the two ends (bp)")
         axd.set_ylabel("Δ = linked − null" if j == 0 else "")
+        axd.legend(fontsize=8, frameon=False)
     fig.suptitle(f"{label}: end-posterior correlation vs distance"
                  + (f"   ({note})" if note else ""), fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
+
+
+def _figure_by_group(per_group, out_path, args, colors=None):
+    """One panel per measure, every cell-type group overlaid on a shared scale.
+
+    The per-group figures cannot be compared by eye because each is drawn to
+    its own y-range; this is the one that shows whether the groups actually
+    differ.  Δ is plotted rather than the raw curves, since that is the
+    quantity the per-group panels are read for.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
+
+    labels = [g for g in per_group if g != "all"]
+    if len(labels) < 2:
+        return False
+    cmap = plt.cm.tab20(np.linspace(0, 1, max(len(labels), 1)))
+    colors = colors or {g: cmap[i] for i, g in enumerate(labels)}
+
+    fig, axes = plt.subplots(2, len(_MEASURES),
+                             figsize=(5.2 * len(_MEASURES), 8), sharex=True)
+    for j, (key, title) in enumerate(_MEASURES):
+        for row, what in enumerate(("linked", "delta")):
+            ax = axes[row, j]
+            for g in labels:
+                curves, centers = per_group[g]
+                if what == "linked":
+                    y = curves[(key, "linked")][0]
+                else:
+                    y = (curves[(key, "linked")][0]
+                         - curves[(key, "null")][0])
+                ax.plot(centers, y, lw=1.4, color=colors[g], label=g,
+                        marker="o", ms=2.5, alpha=0.9)
+            ax.axhline(0, color="#9AA0A6", lw=0.8)
+            ax.set_xscale("log")
+            if row == 0:
+                ax.set_title(title, fontsize=11)
+                ax.set_ylabel("linked r" if j == 0 else "")
+            else:
+                ax.set_xlabel("genomic distance between the two ends (bp)")
+                ax.set_ylabel("Δ = linked − null" if j == 0 else "")
+        # Shared y-scale per row so the groups are visually comparable.
+    for row in range(2):
+        ylo = min(ax.get_ylim()[0] for ax in axes[row])
+        yhi = max(ax.get_ylim()[1] for ax in axes[row])
+        for ax in axes[row]:
+            ax.set_ylim(ylo, yhi)
+    axes[0, -1].legend(fontsize=7, frameon=False, ncol=2,
+                       loc="upper right")
+    fig.suptitle(f"end-posterior correlation by cell-type group "
+                 f"({len(labels)} groups, shared y-scale)", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return True
 
 
 # --------------------------------------------------------------------- main --
@@ -553,6 +632,7 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                                excl_chrom))
 
     n_pairs = n_null = 0
+    per_cell: list = []   # kept for the cell-level bootstrap
     jobs = [(c, i) for i, c in enumerate(cells)]
     if executor is not None and len(cells) > 1:
         # The pool is created once for the whole run and reused across groups.
@@ -578,6 +658,7 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
         for a, np_, nn_ in out:
             for k in accs:
                 accs[k] += a[k]
+            per_cell.append(a)
             n_pairs += np_
             n_null += nn_
     else:
@@ -586,17 +667,48 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                                            batch_of, merged, excl_chrom)
             for k in accs:
                 accs[k] += a[k]
+            per_cell.append(a)
             n_pairs += np_
             n_null += nn_
             if (i + 1) % 200 == 0:
                 logger.info(f"  {label}: {i + 1}/{len(cells)} cells")
 
     curves = {k: corr_from_acc(a, args.min_pairs) for k, a in accs.items()}
+
+    # Cell-level bootstrap of Δ = linked − null, then FDR across the whole
+    # figure.  Resampling CELLS rather than end pairs is the honest unit: a
+    # cell contributes hundreds of thousands of massively non-independent
+    # pairs, so a test treating those as independent would star everything.
+    boot = {}
+    if args.n_bootstrap > 0 and len(per_cell) >= 3:
+        raw = {}
+        for m, _ in _MEASURES:
+            got = bootstrap_delta([a[(m, "linked")] for a in per_cell],
+                                  [a[(m, "null")] for a in per_cell],
+                                  args.min_pairs, args.n_bootstrap, args.seed)
+            if got is not None:
+                raw[m] = got
+        if raw:
+            # One test per bin per measure, so adjust over the figure as a
+            # whole rather than per panel.
+            flat = np.concatenate([raw[m][2] for m in raw])
+            q_all = fdr(flat, args.fdr)
+            off = 0
+            for m in raw:
+                lo, hi, pv = raw[m]
+                boot[m] = (lo, hi, pv, q_all[off:off + pv.size])
+                off += pv.size
+
     centers = np.sqrt(edges[:-1] * edges[1:])
     rows = {"bin_lo": edges[:-1], "bin_hi": edges[1:], "center_bp": centers}
     for (m, c), (r, n) in curves.items():
         rows[f"{m}_{c}_r"] = r
         rows[f"{m}_{c}_n"] = n.astype(np.int64)
+    for m, (lo, hi, pv, q) in boot.items():
+        rows[f"{m}_delta_lo"] = lo
+        rows[f"{m}_delta_hi"] = hi
+        rows[f"{m}_delta_p"] = pv
+        rows[f"{m}_delta_q"] = q
     tsv = Path(out_dir) / f"end_posterior_dist_{label}.tsv"
     pd.DataFrame(rows).to_csv(tsv, sep="\t", index=False)
     note = (f"{args.null_type}, --null-scope {args.null_scope}"
@@ -605,10 +717,10 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                else ""))
     _figure(curves, centers, label,
             Path(out_dir) / f"end_posterior_dist_{label}.{args.plot_format}",
-            args, note)
+            args, note, boot)
     logger.info(f"  {label}: {n_pairs:,} linked and {n_null:,} null "
                 f"end-pairs; wrote {tsv}")
-    return curves
+    return curves, centers
 
 
 def main(argv=None) -> int:
@@ -667,6 +779,14 @@ def main(argv=None) -> int:
                     help="Cells are scored in parallel and their accumulators "
                          "summed; each cell gets its own seeded RNG, so the "
                          "result does not depend on thread count or order.")
+    ap.add_argument("--n-bootstrap", type=int, default=500,
+                    help="Cell-level bootstrap resamples for the Δ CI and "
+                         "p-value (500; 0 disables).  Cells are the unit "
+                         "because end pairs within one are not independent.")
+    ap.add_argument("--fdr", choices=["bh", "by", "none"], default="bh",
+                    help="Multiple-testing adjustment across every bin and "
+                         "measure in a figure.  'bh' assumes positive "
+                         "dependence, which adjacent distance bins have.")
     ap.add_argument("--max-cells", type=int, default=0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--plot-format", choices=["pdf", "png", "svg"],
@@ -728,11 +848,18 @@ def main(argv=None) -> int:
         logger.info(f"Parallel over cells: {args.n_threads} "
                     f"{args.backend}(s), pool reused across groups.")
     try:
+        per_group = {}
         for label, gcells in groups.items():
             safe = label.replace("/", "_").replace(" ", "_")
             logger.info(f"--- {label} ({len(gcells)} cells) ---")
-            run_group(gcells, paths, edges, args, safe, out_dir, batch_of,
-                      merged, excl_chrom, executor)
+            per_group[label] = run_group(
+                gcells, paths, edges, args, safe, out_dir, batch_of, merged,
+                excl_chrom, executor)
+        overlay = out_dir / f"end_posterior_dist_by_group.{args.plot_format}"
+        if _figure_by_group(per_group, overlay, args):
+            logger.info(f"wrote {overlay}  "
+                        f"({len(per_group) - 1} groups overlaid, shared "
+                        f"y-scale)")
     finally:
         if executor is not None:
             executor.shutdown()

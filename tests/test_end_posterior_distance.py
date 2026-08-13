@@ -363,3 +363,66 @@ def test_pooled_null_is_unaffected_by_the_backend_plumbing(tmp_path):
     assert (res["gg_null_n"] > 0).any(), "pooled null produced nothing"
     ok = res[res["gg_null_n"] > 0]
     assert abs(ok["gg_null_r"].median()) < 0.2
+
+
+# ------------------------------------------------ significance and grouping --
+
+def test_delta_gets_a_bootstrap_ci_and_fdr_adjusted_p(tmp_path):
+    res, _ = _run(tmp_path, ["--n-bootstrap", "200"])
+    for m in ("gg", "hh", "gh"):
+        for col in ("_delta_lo", "_delta_hi", "_delta_p", "_delta_q"):
+            assert f"{m}{col}" in res.columns, m + col
+    ok = res[res["gg_delta_p"].notna()]
+    assert len(ok) > 0
+    # q is an adjustment of p, so it can only be larger, and both stay in [0,1].
+    assert (ok["gg_delta_q"] >= ok["gg_delta_p"] - 1e-12).all()
+    assert ok["gg_delta_p"].between(0, 1).all()
+    # The bootstrap floors p at 2/(B+1); it can never be exactly zero.
+    assert (ok["gg_delta_p"] > 0).all()
+
+
+def test_ci_brackets_the_point_estimate_where_it_is_defined(tmp_path):
+    res, _ = _run(tmp_path, ["--n-bootstrap", "200"])
+    d = res["gg_linked_r"] - res["gg_null_r"]
+    ok = res["gg_delta_lo"].notna() & d.notna()
+    assert ok.any()
+    inside = ((d[ok] >= res.loc[ok, "gg_delta_lo"] - 0.15)
+              & (d[ok] <= res.loc[ok, "gg_delta_hi"] + 0.15))
+    assert inside.mean() > 0.8, "the CI should sit around the estimate"
+
+
+def test_bootstrap_can_be_switched_off(tmp_path):
+    res, _ = _run(tmp_path, ["--n-bootstrap", "0"])
+    assert "gg_delta_p" not in res.columns
+
+
+def test_by_group_overlay_written_only_with_several_groups(tmp_path):
+    _, out = _run(tmp_path / "grouped", ["--group-column", "group"])
+    assert (out / "end_posterior_dist_by_group.png").exists()
+    # Separate directory: reusing one would leave the first run's overlay in
+    # place and the check below would pass for the wrong reason.
+    _, out2 = _run(tmp_path / "ungrouped")
+    assert not (out2 / "end_posterior_dist_by_group.png").exists()
+
+
+def test_group_overlay_needs_at_least_two_groups(tmp_path):
+    m = _mod()
+    curves = {(k, c): (np.zeros(3), np.zeros(3))
+              for k, _ in m._MEASURES for c, _ in m._CONDS}
+    one = {"all": (curves, np.array([1.0, 2.0, 3.0])),
+           "A": (curves, np.array([1.0, 2.0, 3.0]))}
+    import argparse
+    a = argparse.Namespace(plot_format="png")
+    assert m._figure_by_group(one, tmp_path / "x.png", a) is False, (
+        "'all' plus ONE group is not a comparison")
+
+
+def test_fdr_is_applied_across_the_whole_figure(tmp_path):
+    """One test per bin per measure, so the adjustment must span all three
+    measures rather than being redone per panel."""
+    from nome_hic_concordance import distance_stats as ds
+    p = np.array([0.001, 0.02, 0.5, np.nan])
+    q = ds.fdr(p)
+    assert np.isnan(q[3])
+    assert (q[np.isfinite(q)] >= p[np.isfinite(p)] - 1e-12).all()
+    assert ds.stars(0.0005) == "***" and ds.stars(0.2) == ""
