@@ -35,6 +35,11 @@ Nulls mirror the site-level script:
         restricted to cells sharing --null-match-column (e.g.
         exp_batch,plate_batch,lib_batch), so a donor never crosses a batch.
 
+Under either scope a draw that would re-create a real ligation is refused: read
+pairs carry run-wide identifiers, so two donor ends belonging to one read pair
+are recognised as such even when the pool spans hundreds of cells and the pair
+is not the anchor's own.
+
 Linked is tested against null twice, on the same contrast and with the cell as
 the unit of inference both times, because end pairs within a cell are nowhere
 near independent.  end_posterior_dist_<label> carries a cell-level bootstrap of
@@ -82,6 +87,17 @@ _MEASURES = (("gg", "GCH–GCH  r(end$_i$, end$_j$)"),
 _CONDS = (("linked", "linked (true partner)"),
           ("null", "non-linked"))
 _COLOR = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c"}
+
+# Pair identifiers must be unique across the WHOLE run, not just within a cell,
+# or a pooled donor pool cannot tell a real ligation from a coincidence: the
+# per-cell indices collide, and rejecting on them would throw away every draw.
+# Striding by the cell's position in the group needs no bookkeeping between the
+# pool build and the per-cell pass, since both enumerate the same list.
+_PAIR_STRIDE = 1 << 32
+
+
+def _pair_base(cell_index: int) -> int:
+    return int(cell_index) * _PAIR_STRIDE
 
 
 # ---------------------------------------------------------------- exclusion --
@@ -254,18 +270,24 @@ def joined_pairs(per_ctx: dict[str, pd.DataFrame]):
          "p1_h", "p2_h", "p1_g", "p2_g"]]
 
 
-def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]]):
+def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]],
+              base: int = 0):
     """Both ends of every pair, sorted by position.
 
     ``cols`` maps an output name to the (end-1, end-2) column pair, so one call
     builds an end table carrying however many per-end values the caller needs
     (here: the GCH and HCG posteriors together).  Returns
     ``(pos, {name: values}, pair_index)``; the pair index lets a null refuse to
-    re-create a real ligation.
+    re-create a real ligation.  Both ends of a pair carry the SAME id, so the
+    check also stops an end from being paired with itself.
+
+    ``base`` offsets the ids into a run-wide namespace (see :func:`_pair_base`)
+    so that a pooled donor pool spanning many cells stays unambiguous.
     """
     n = len(df)
     pos = np.concatenate([df["pos1"].to_numpy(), df["pos2"].to_numpy()])
-    pi = np.concatenate([np.arange(n), np.arange(n)])
+    ids = base + np.arange(n, dtype=np.int64)
+    pi = np.concatenate([ids, ids])
     order = np.argsort(pos, kind="stable")
     vals = {name: np.concatenate([df[c1].to_numpy(), df[c2].to_numpy()])[order]
             for name, (c1, c2) in cols.items()}
@@ -276,7 +298,7 @@ def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]]):
 
 def _null_indices_distance_matched(anchor_pos, anchor_dist, d_pos, d_pi,
                                    edges, rng, window, anchor_window,
-                                   same_pool, max_rounds=16):
+                                   max_rounds=16):
     """Indices (ka, kb) into the donor end table for a distance-matched null.
 
     Returning INDICES rather than values is what lets one re-pairing serve
@@ -328,10 +350,10 @@ def _null_indices_distance_matched(anchor_pos, anchor_dist, d_pos, d_pi,
         width = np.maximum(bhi - blo, 1).astype(np.int64)
         kb = blo + (rng.random(idx.size) * width).astype(np.int64)
         kb = np.clip(kb, 0, d_pos.size - 1)
-        good = has & (kb != ka)
-        if same_pool:
-            # Two ends of ONE read pair are a real ligation, not a null.
-            good &= d_pi[ka] != d_pi[kb]
+        # Two ends of ONE read pair are a real ligation, not a null.  With a
+        # pooled pool this can happen for any cell's pair, not just the
+        # anchor's, which is why the ids are run-wide.
+        good = has & (kb != ka) & (d_pi[ka] != d_pi[kb])
         sel = idx[good]
         ka_out[sel] = ka[good]
         kb_out[sel] = kb[good]
@@ -346,13 +368,18 @@ def _null_indices_distance_matched(anchor_pos, anchor_dist, d_pos, d_pi,
 
 
 def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
-                                d_pi, rng, window, same_pool, max_rounds=8):
+                                d_pi, rng, window, max_rounds=8):
     """Indices for the locus-matched null: keep end 1, swap end 2 for another
     end within +/-window of the true partner.
 
     The first return value indexes the ANCHOR's own end 1 (not the donor
     table), so the caller pairs anchor-side values with donor-side ones.
     Vectorised the same way as above.
+
+    ``anchor_idx`` carries the anchor pair's run-wide id, so rejecting donors
+    that share it removes both the true partner and the anchor's own end 1 —
+    the latter sits inside the window whenever the pair is closer than
+    ``window``, and would otherwise be correlated with itself.
     """
     n = int(anchor_pos2.size)
     if d_pos.size < 2 or n == 0:
@@ -369,9 +396,7 @@ def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
         span = (hi[idx] - lo[idx]).astype(np.int64)
         k = lo[idx] + (rng.random(idx.size) * span).astype(np.int64)
         k = np.clip(k, 0, d_pos.size - 1)
-        good = np.ones(idx.size, dtype=bool)
-        if same_pool:
-            good = d_pi[k] != anchor_idx[idx]
+        good = d_pi[k] != anchor_idx[idx]
         sel = idx[good]
         kb_out[sel] = k[good]
         alive[sel] = False
@@ -583,21 +608,21 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
         n_pairs = int(keep.sum())
 
     cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
-    a_pos, a_vals, a_pi = end_table(j, cols)
+    base = _pair_base(seed_i)
+    a_pos, a_vals, a_pi = end_table(j, cols, base)
     bkey = batch_of.get(cell, "") if batch_of else ""
     if args.null_scope == "pooled":
         pool = pools.get(bkey)
         if pool is None:
             return accs, n_pairs, 0
         d_pos, d_vals, d_pi = pool
-        same_pool = False
     else:
-        d_pos, d_vals, d_pi, same_pool = a_pos, a_vals, a_pi, True
+        d_pos, d_vals, d_pi = a_pos, a_vals, a_pi
 
     if args.null_type == "distance-matched":
         got = _null_indices_distance_matched(
             j["pos1"].to_numpy(), d, d_pos, d_pi, edges, rng,
-            args.null_window, args.null_anchor_window, same_pool)
+            args.null_window, args.null_anchor_window)
         if got is None:
             return accs, n_pairs, 0
         ka, kb, dn = got
@@ -605,8 +630,9 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
         xb = {k: v[kb] for k, v in d_vals.items()}
     else:
         got = _null_indices_locus_matched(
-            j["pos2"].to_numpy(), j["pos1"].to_numpy(), np.arange(len(j)),
-            d_pos, d_pi, rng, args.null_window, same_pool)
+            j["pos2"].to_numpy(), j["pos1"].to_numpy(),
+            base + np.arange(len(j), dtype=np.int64),
+            d_pos, d_pi, rng, args.null_window)
         if got is None:
             return accs, n_pairs, 0
         ai, kb, dn = got
@@ -630,22 +656,25 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
 def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
     """Donor end pools for --null-scope pooled, one per batch stratum."""
     parts: dict[str, list] = {}
-    for cell in cells:
+    for ci, cell in enumerate(cells):
         j = joined_pairs(_load_cell(paths, cell, args.min_sites, merged,
                                     excl_chrom))
         if j is None or j.empty:
             continue
         key = batch_of.get(cell, "") if batch_of else ""
+        # Same enumeration as run_group's job list, so a cell's ids here and
+        # in its own pass agree without either side recording an offset.
         parts.setdefault(key, []).append(
-            end_table(j, {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}))
+            end_table(j, {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")},
+                      _pair_base(ci)))
     pools = {}
     for k, ps in parts.items():
         pos = np.concatenate([p[0] for p in ps])
         vals = {name: np.concatenate([p[1][name] for p in ps])
                 for name in ("g", "h")}
-        # Cross-cell donors: no pair index can collide with the anchor's, so
-        # -1 marks "never a self-pair".
-        pi = np.full(pos.size, -1)
+        # Run-wide ids, so a donor pair drawn out of ANY cell in the stratum is
+        # recognisable as a real ligation and refused.
+        pi = np.concatenate([p[2] for p in ps])
         o = np.argsort(pos, kind="stable")
         pools[k] = (pos[o], {n_: v[o] for n_, v in vals.items()}, pi[o])
     logger.info(f"  pooled donor ends: "

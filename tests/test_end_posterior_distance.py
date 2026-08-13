@@ -132,6 +132,45 @@ def test_end_table_carries_both_contexts_sorted_by_position(tmp_path):
     # The two ends of one pair keep the same pair index, so a null can reject
     # re-creating a real ligation.
     assert pi[list(pos).index(100)] == pi[list(pos).index(200)]
+    assert pi[list(pos).index(100)] != pi[list(pos).index(300)]
+
+
+def test_pair_ids_are_unique_across_cells(tmp_path):
+    """A pooled donor pool spans cells, so per-cell indices would collide and
+    the ligation check would fire on unrelated pairs — or, if disabled, let
+    real ligations into the null."""
+    m = _mod()
+    df = pd.DataFrame({"pos1": [100], "pos2": [200], "p1_g": [0.1],
+                       "p2_g": [0.2], "p1_h": [0.3], "p2_h": [0.4]})
+    cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
+    a = m.end_table(df, cols, m._pair_base(0))[2]
+    b = m.end_table(df, cols, m._pair_base(1))[2]
+    assert not set(a) & set(b)
+    # Offsetting must not disturb a within-cell comparison.
+    assert (a == a[0]).all() and (b == b[0]).all()
+
+
+def test_pooled_null_refuses_a_real_ligation_from_any_cell(tmp_path):
+    """Two donor ends that are the two ends of ONE read pair are a ligation,
+    whichever cell contributed them, and must never enter the null."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n = 4000
+    # Ends laid out as adjacent pairs, so the partner is always the nearest
+    # end and a matched separation lands on it constantly unless refused.
+    starts = np.sort(rng.integers(0, 2_000_000, n)).astype(np.int64)
+    pos = np.sort(np.concatenate([starts, starts + 5000]))
+    pi = np.concatenate([m._pair_base(c) + np.arange(n // 2, dtype=np.int64)
+                         for c in range(2)])
+    pi = np.concatenate([pi, pi])[np.argsort(np.concatenate(
+        [starts, starts + 5000]), kind="stable")]
+    edges = m.build_edges(100, 1_000_000, 8)
+    got = m._null_indices_distance_matched(
+        pos[::2][:n], np.full(n, 5000.0), pos, pi, edges, rng,
+        window=1000, anchor_window=10_000_000)
+    assert got is not None
+    ka, kb, _ = got
+    assert (pi[ka] != pi[kb]).all(), "a real ligation reached the null"
 
 
 # ------------------------------------------------------------------ options --
@@ -141,6 +180,27 @@ def test_group_split_emits_a_table_per_group(tmp_path):
     for label in ("all", "A", "B"):
         assert (out / f"end_posterior_dist_{label}.tsv").exists(), label
         assert (out / f"end_posterior_dist_{label}.png").exists(), label
+
+
+def test_pooled_donor_pool_keeps_identifiable_pair_ids(tmp_path):
+    """The pool used to stamp -1 on every end, which made the ligation check
+    unusable and let real ligations from any cell into the null."""
+    import argparse
+    m = _mod()
+    sp = _fixture(tmp_path)
+    cells = pd.read_csv(sp, sep="\t")["cell_name"].astype(str).tolist()
+    args = argparse.Namespace(min_sites=2)
+    pools = m._build_pools(
+        cells, {"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"}, args,
+        None, None, ())
+    (pos, vals, pi), = pools.values()
+    assert (pi >= 0).all(), "no sentinel ids left"
+    # Every end appears twice, once per member of its pair, and no two cells
+    # share an id.
+    counts = np.unique(pi, return_counts=True)[1]
+    assert (counts == 2).all()
+    assert np.unique(pi).size == pos.size // 2
+    assert np.unique(pi // m._PAIR_STRIDE).size == len(cells)
 
 
 def test_pooled_null_with_batch_matching_runs(tmp_path):
@@ -311,7 +371,7 @@ def test_vectorised_null_places_most_anchors(tmp_path):
     anchor_dist = rng.integers(1000, 100_000, n).astype(float)
     got = m._null_indices_distance_matched(
         anchor_pos, anchor_dist, pos, pi, edges, rng,
-        window=1000, anchor_window=10_000_000, same_pool=True)
+        window=1000, anchor_window=10_000_000)
     assert got is not None
     ka, kb, d = got
     assert ka.size > 0.9 * n, f"only placed {ka.size}/{n}"
