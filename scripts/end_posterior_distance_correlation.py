@@ -129,24 +129,43 @@ def _keep_mask(df: pd.DataFrame, merged, excl_chrom) -> np.ndarray:
     available here (the read spans are not carried in the posteriors), so a
     read overlapping an interval edge can survive -- acceptable for regions
     that are large relative to a read, which is what these exclusions are.
+
+    Chromosomes are handled through categorical CODES.  The obvious
+    ``chrom.map(_canon)`` runs a Python call per row -- 1.6 M of them for two
+    contexts of a 400 k-pair cell, which profiling showed was the single
+    largest cost in the whole script -- and ``np.unique`` on the string column
+    then sorts every row again.  Canonicalising the ~20 category labels
+    instead makes both costs independent of the number of pairs.
     """
-    keep = np.ones(len(df), dtype=bool)
-    chrom = df["chrom"].astype(str).map(_canon).to_numpy()
+    n = len(df)
+    keep = np.ones(n, dtype=bool)
+    cat = df["chrom"].astype("category")
+    codes = cat.cat.codes.to_numpy()
+    canon = np.array([_canon(c) for c in cat.cat.categories])   # ~20 calls
+
     if excl_chrom:
-        keep &= ~np.isin(chrom, list(excl_chrom))
+        bad = np.flatnonzero(np.isin(canon, list(excl_chrom)))
+        if bad.size:
+            keep &= ~np.isin(codes, bad)
     if not merged:
         return keep
+
     p1 = df["pos1"].to_numpy(np.int64)
     p2 = df["pos2"].to_numpy(np.int64)
-    for c in np.unique(chrom):
+    for ci, c in enumerate(canon):                 # ~20 iterations, not n
         iv = merged.get(c)
         if iv is None:
             continue
+        rows = np.flatnonzero(codes == ci)
+        if rows.size == 0:
+            continue
         starts, ends = iv
-        rows = np.flatnonzero(chrom == c)
+        last = len(ends) - 1
         for pos in (p1[rows], p2[rows]):
+            # Intervals are merged and sorted, so only the predecessor of the
+            # insertion point can contain the position.
             i = np.searchsorted(starts, pos, side="right") - 1
-            hit = (i >= 0) & (ends[np.clip(i, 0, len(ends) - 1)] > pos)
+            hit = (i >= 0) & (ends[np.clip(i, 0, last)] > pos)
             keep[rows[hit]] = False
     return keep
 
@@ -399,6 +418,25 @@ def _figure(curves, centers, label, out_path, args, note=""):
 
 # --------------------------------------------------------------------- main --
 
+# Read-only context handed to a worker process ONCE, at start-up.  Passing it
+# per task instead would pickle the exclusion intervals and the donor pools
+# 1577 times over, which is what made the process backend lose to threads.
+_W: dict = {}
+
+
+def _init_worker(paths, edges, args, pools, batch_of, merged, excl_chrom):
+    _W.update(paths=paths, edges=edges, args=args, pools=pools,
+              batch_of=batch_of, merged=merged, excl_chrom=excl_chrom)
+
+
+def _worker(job):
+    """Only (cell, index) crosses the process boundary per task."""
+    cell, i = job
+    return _accumulate_cell(cell, i, _W["paths"], _W["edges"], _W["args"],
+                            _W["pools"], _W["batch_of"], _W["merged"],
+                            _W["excl_chrom"])
+
+
 def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
                      merged, excl_chrom):
     """One cell's contribution, as its own accumulators.
@@ -507,7 +545,7 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
 
 
 def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
-              merged=None, excl_chrom=()):
+              merged=None, excl_chrom=(), executor=None):
     nb = len(edges) - 1
     accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
     pools = ({} if args.null_scope != "pooled"
@@ -516,24 +554,27 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
 
     n_pairs = n_null = 0
     jobs = [(c, i) for i, c in enumerate(cells)]
-    if args.n_threads > 1 and len(cells) > 1:
-        if args.backend == "process":
-            # Real parallelism.  After vectorising the null the remaining work
-            # is parquet reads and pandas, which hold the GIL, so threads gain
-            # almost nothing; separate interpreters do.  joblib memmaps the
-            # large donor pools rather than pickling a copy per worker.
-            from joblib import Parallel, delayed
-            out = Parallel(n_jobs=args.n_threads, prefer="processes")(
-                delayed(_accumulate_cell)(c, i, paths, edges, args, pools,
-                                          batch_of, merged, excl_chrom)
-                for c, i in jobs)
+    if executor is not None and len(cells) > 1:
+        # The pool is created once for the whole run and reused across groups.
+        chunk = max(1, len(jobs) // (args.n_threads * 8))
+        if args.backend == "process" and pools:
+            # Pooled donors are per GROUP, so they cannot ride on a pool built
+            # once for the whole run: a shared initializer would hand every
+            # group the same (or an empty) donor set and silently produce the
+            # wrong null.  Threads close over `pools` directly and are fine.
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(
+                    max_workers=args.n_threads, initializer=_init_worker,
+                    initargs=(paths, edges, args, pools, batch_of, merged,
+                              excl_chrom)) as gex:
+                out = list(gex.map(_worker, jobs, chunksize=chunk))
+        elif args.backend == "process":
+            out = list(executor.map(_worker, jobs, chunksize=chunk))
         else:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=args.n_threads) as ex:
-                out = list(ex.map(
-                    lambda ci: _accumulate_cell(ci[0], ci[1], paths, edges,
-                                                args, pools, batch_of, merged,
-                                                excl_chrom), jobs))
+            out = list(executor.map(
+                lambda ci: _accumulate_cell(ci[0], ci[1], paths, edges, args,
+                                            pools, batch_of, merged,
+                                            excl_chrom), jobs))
         for a, np_, nn_ in out:
             for k in accs:
                 accs[k] += a[k]
@@ -673,11 +714,28 @@ def main(argv=None) -> int:
         for c in cells:
             g = str(gmap.get(c, "NA"))
             groups.setdefault(g, []).append(c)
-    for label, gcells in groups.items():
-        safe = label.replace("/", "_").replace(" ", "_")
-        logger.info(f"--- {label} ({len(gcells)} cells) ---")
-        run_group(gcells, paths, edges, args, safe, out_dir, batch_of,
-                  merged, excl_chrom)
+    executor = None
+    if args.n_threads > 1 and len(cells) > 1:
+        if args.backend == "process":
+            from concurrent.futures import ProcessPoolExecutor
+            executor = ProcessPoolExecutor(
+                max_workers=args.n_threads, initializer=_init_worker,
+                initargs=(paths, edges, args, {}, batch_of, merged,
+                          excl_chrom))
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor(max_workers=args.n_threads)
+        logger.info(f"Parallel over cells: {args.n_threads} "
+                    f"{args.backend}(s), pool reused across groups.")
+    try:
+        for label, gcells in groups.items():
+            safe = label.replace("/", "_").replace(" ", "_")
+            logger.info(f"--- {label} ({len(gcells)} cells) ---")
+            run_group(gcells, paths, edges, args, safe, out_dir, batch_of,
+                      merged, excl_chrom, executor)
+    finally:
+        if executor is not None:
+            executor.shutdown()
     return 0
 
 

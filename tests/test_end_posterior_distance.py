@@ -318,3 +318,48 @@ def test_vectorised_null_places_most_anchors(tmp_path):
     assert (ka != kb).all()
     assert (pi[ka] != pi[kb]).all(), "never re-creates a real ligation"
     assert (d > 0).all()
+
+
+def test_keep_mask_cost_is_independent_of_row_count(tmp_path):
+    """Regression: the mask used to call _canon once per ROW (1.6 M calls for
+    one cell) and np.unique over the string column, which profiling showed was
+    the largest single cost in the script.  Canonicalisation must now touch
+    only the handful of category labels."""
+    m = _mod()
+    bed = tmp_path / "z.bed"
+    bed.write_text("chr1\t0\t1000\nchr2\t0\t1000\n")
+    merged, ec = m.load_exclusions([str(bed)], ["chrM"])
+
+    calls = {"n": 0}
+    real = m._canon
+
+    def counting(c):
+        calls["n"] += 1
+        return real(c)
+
+    m._canon = counting
+    try:
+        n = 20000
+        df = pd.DataFrame({
+            "chrom": np.resize(np.array(["chr1", "chr2", "chr3", "chrM"]), n),
+            "pos1": np.resize(np.array([500, 5000]), n),
+            "pos2": np.resize(np.array([9000, 8000]), n)})
+        keep = m._keep_mask(df, merged, ec)
+    finally:
+        m._canon = real
+    assert calls["n"] <= 20, (
+        f"_canon ran {calls['n']} times for {n} rows — it must scale with the "
+        f"number of distinct chromosomes, not rows")
+    # And it must still be correct: chrM dropped, chr1/chr2 hits dropped.
+    assert not keep[df["chrom"].to_numpy() == "chrM"].any()
+    assert keep[(df["chrom"] == "chr3").to_numpy()].all()
+
+
+def test_pooled_null_is_unaffected_by_the_backend_plumbing(tmp_path):
+    """The shared worker pool is built before any group's donor pool exists,
+    so a pooled-scope run must not end up with an empty donor set."""
+    res, _ = _run(tmp_path, ["--null-scope", "pooled", "--n-threads", "4",
+                             "--null-match-column", "exp_batch"])
+    assert (res["gg_null_n"] > 0).any(), "pooled null produced nothing"
+    ok = res[res["gg_null_n"] > 0]
+    assert abs(ok["gg_null_r"].median()) < 0.2
