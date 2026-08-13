@@ -61,6 +61,7 @@ def process_concordance_matrix(
     per_cell_center: bool = False,
     per_cell_norm: str = "off",
     post_norm_recenter: bool = False,
+    save_outputs: bool = True,
 ) -> dict[str, object]:
     """Filter bins, impute NaNs, and normalize per bin.
 
@@ -95,7 +96,10 @@ def process_concordance_matrix(
     no longer a bin-level blacklist filter here; if you need it, re-run
     Step 2 with ``--blacklist-bed``.
     """
-    out_path = ensure_dir(output_dir)
+    # save_outputs=False keeps this in memory: the normalized matrix is ~126 MB
+    # for 1577 cells x 10k bins, and a parameter sweep that re-normalizes tens
+    # of times would otherwise write gigabytes it never reads back.
+    out_path = ensure_dir(output_dir) if save_outputs else None
     n_cells, n_bins_orig = concordance_shrunk.shape
 
     # Filter bins by fraction of non-NA cells.
@@ -111,9 +115,10 @@ def process_concordance_matrix(
         f"(coverage >= {min_cell_coverage:.0%})"
     )
 
-    with open(out_path / "retained_bins.txt", "w") as f:
-        for b in retained_bins:
-            f.write(f"{b}\n")
+    if save_outputs:
+        with open(out_path / "retained_bins.txt", "w") as f:
+            for b in retained_bins:
+                f.write(f"{b}\n")
 
     # Step 2: impute remaining NaNs with 0.
     na_count = int(filtered.isna().sum().sum())
@@ -250,11 +255,13 @@ def process_concordance_matrix(
         imp_row_shifts = imputed.mean(axis=1)
         imputed = imputed.sub(imp_row_shifts, axis=0)
 
-    imputed.to_parquet(out_path / "concordance_imputed.parquet")
-    imputed.to_csv(out_path / "concordance_imputed.tsv", sep="\t")
+    if save_outputs:
+        imputed.to_parquet(out_path / "concordance_imputed.parquet")
+        imputed.to_csv(out_path / "concordance_imputed.tsv", sep="\t")
     # Filename reflects the actual normalization used.
-    normalized.to_parquet(out_path / f"concordance_{matrix_norm}.parquet")
-    normalized.to_csv(out_path / f"concordance_{matrix_norm}.tsv", sep="\t")
+    if save_outputs:
+        normalized.to_parquet(out_path / f"concordance_{matrix_norm}.parquet")
+        normalized.to_csv(out_path / f"concordance_{matrix_norm}.tsv", sep="\t")
 
     return {
         "retained_bins": retained_bins,

@@ -149,6 +149,94 @@ def resolve_group_colors(groups, group_colors) -> list:
     return [group_colors.get(g, fallback[i]) for i, g in enumerate(groups)]
 
 
+def umap_input_scores(
+    matrix: pd.DataFrame,
+    n_svd: int = 0,
+    skip_top_svd: int = 0,
+    n_threads: int = 4,
+    random_state: int = 42,
+    batch_labels=None,
+    batch_correction: str = "none",
+    harmony_theta=None,
+) -> tuple[np.ndarray, int]:
+    """Everything :func:`run_umap_and_plot` does BEFORE calling UMAP.
+
+    Returns ``(X, n_svd_used)`` — the exact array UMAP would be handed, after
+    the optional TruncatedSVD pre-reduction, the top-component drop, and the
+    batch correction.  Factored out so a parameter sweep can score the real
+    pipeline input instead of a re-implementation of it that could drift.
+    """
+    X = matrix.values
+    n_svd_used = 0
+    skip = max(0, int(skip_top_svd or 0))
+    n_svd_requested = int(n_svd or 0)
+    if n_svd_requested > 0 or skip > 0:
+        from sklearn.decomposition import TruncatedSVD
+        effective_n_svd = n_svd_requested if n_svd_requested > 0 else 10
+        k_total = max(
+            1,
+            min(effective_n_svd + skip, matrix.shape[0] - 1, matrix.shape[1]),
+        )
+        svd = TruncatedSVD(n_components=k_total, random_state=random_state)
+        emb = svd.fit_transform(X)
+        X = emb[:, skip:]
+        n_svd_used = X.shape[1]
+        var_explained = float(svd.explained_variance_ratio_[skip:].sum())
+        if skip > 0:
+            logger.info(
+                f"SVD: fitted {k_total} components, dropped top {skip} "
+                f"(--skip-top-svd), retained components {skip}..{k_total - 1} "
+                f"({n_svd_used} components in total; "
+                f"cumulative variance explained by retained: "
+                f"{var_explained:.1%})")
+        else:
+            logger.info(
+                f"TruncatedSVD reduced {matrix.shape[1]} bins → "
+                f"{k_total} components "
+                f"(cumulative variance explained: {var_explained:.1%})")
+
+    if batch_labels is not None and batch_correction not in (None, "none"):
+        space = (f"{X.shape[1]} SVD scores" if n_svd_used
+                 else f"{X.shape[1]} bins (full matrix, no SVD)")
+        logger.info(
+            f"Batch correction ({batch_correction}) on {space}, "
+            f"{matrix.shape[0]} cells before UMAP.")
+        X = correct_scores(X, matrix.index, batch_labels, batch_correction,
+                           random_state=random_state, n_threads=n_threads,
+                           harmony_theta=harmony_theta)
+    return X, n_svd_used
+
+
+def correct_scores(X, index, batch_labels, method: str,
+                   random_state: int = 42, n_threads: int = 4,
+                   harmony_theta=None):
+    """Batch-correct an already-reduced score matrix.
+
+    Split out of :func:`umap_input_scores` so a parameter sweep can reuse ONE
+    SVD across many score-level corrections — the SVD is the expensive half and
+    does not depend on the correction — without duplicating this branch, where
+    harmony's index handling is easy to get subtly wrong.
+    """
+    if batch_labels is None or method in (None, "none"):
+        return X
+    from . import batch_correction as _bc
+    if method == "harmony":
+        # harmonize_embedding coerces against a RangeIndex, so a cell-indexed
+        # frame would reindex to all-NaN (one batch, silently a no-op).
+        bl = batch_labels
+        if isinstance(bl, (pd.Series, pd.DataFrame)):
+            bl = bl.reindex(index).reset_index(drop=True)
+        return _bc.harmonize_embedding(X, bl, random_state=random_state,
+                                       theta=harmony_theta,
+                                       n_threads=n_threads)
+    bl = (batch_labels.reindex(index)
+          if isinstance(batch_labels, (pd.Series, pd.DataFrame))
+          else batch_labels)
+    return _bc.apply_batch_correction(
+        pd.DataFrame(X, index=index), bl, method=method,
+        random_state=random_state).to_numpy()
+
+
 def run_umap_and_plot(
     matrix: pd.DataFrame,
     group_labels: pd.Series | None = None,
@@ -233,79 +321,12 @@ def run_umap_and_plot(
             f"UMAP requires >= 2 cells; received {matrix.shape[0]}."
         )
 
-    # Optional TruncatedSVD pre-reduction.
-    # SVD runs whenever EITHER --n-svd > 0 OR --skip-top-svd > 0.
-    # When the user specifies --skip-top-svd without --n-svd, default
-    # the number of retained components to 10 — otherwise the option
-    # would silently no-op.
-    X = matrix.values
-    n_svd_used = 0
-    skip = max(0, int(skip_top_svd or 0))
-    n_svd_requested = int(n_svd or 0)
-    if n_svd_requested > 0 or skip > 0:
-        from sklearn.decomposition import TruncatedSVD
-        # If user only specified --skip-top-svd, retain 10 components by default.
-        effective_n_svd = n_svd_requested if n_svd_requested > 0 else 10
-        # Fit enough components to satisfy retained + skipped.
-        k_total = max(
-            1,
-            min(effective_n_svd + skip, matrix.shape[0] - 1, matrix.shape[1]),
-        )
-        svd = TruncatedSVD(n_components=k_total, random_state=random_state)
-        emb = svd.fit_transform(X)
-        # Drop the top-`skip` components.
-        X = emb[:, skip:]
-        n_svd_used = X.shape[1]
-        var_explained = float(svd.explained_variance_ratio_[skip:].sum())
-
-        if skip > 0:
-            logger.info(
-                f"SVD: fitted {k_total} components, dropped top {skip} "
-                f"(--skip-top-svd), retained components {skip}..{k_total - 1} "
-                f"({n_svd_used} components in total; "
-                f"cumulative variance explained by retained: {var_explained:.1%})"
-            )
-        else:
-            logger.info(
-                f"TruncatedSVD reduced {matrix.shape[1]} bins → "
-                f"{k_total} components "
-                f"(cumulative variance explained: {var_explained:.1%})"
-            )
-
-    # Batch-correct WHAT FEEDS UMAP -- the SVD scores if an SVD ran, else the
-    # full normalised bin matrix (--n-svd 0 --skip-top-svd 0).  Standard harmony
-    # corrects a low-dim embedding; on the full matrix it runs on every bin, so
-    # it is heavier and uses n_threads.  (Correcting the raw matrix BEFORE the
-    # per-cell / per-bin normalisation is undone by those transforms, which is
-    # why the correction lives here, after normalisation.)
-    if batch_labels is not None and batch_correction not in (None, "none"):
-        from . import batch_correction as _bc
-        space = (f"{X.shape[1]} SVD scores" if n_svd_used
-                 else f"{X.shape[1]} bins (full matrix, no SVD)")
-        logger.info(
-            f"Batch correction ({batch_correction}) on {space}, "
-            f"{matrix.shape[0]} cells before UMAP.")
-        if batch_correction == "harmony":
-            # Align to the matrix's cell order and make it POSITIONAL:
-            # harmonize_embedding coerces against a RangeIndex, so a
-            # cell-indexed frame would reindex to all-NaN (one batch, no-op).
-            bl = batch_labels
-            if isinstance(bl, (pd.Series, pd.DataFrame)):
-                bl = bl.reindex(matrix.index).reset_index(drop=True)
-            X = _bc.harmonize_embedding(X, bl, random_state=random_state,
-                                        theta=harmony_theta, n_threads=n_threads)
-        else:
-            # center / zscore / combat: per-batch mean (or z) removal per
-            # feature.  For BALANCED composition this removes the batch shift
-            # without moving cell-type centroids, and unlike harmony it cannot
-            # fail when batch dominates a feature.
-            bl = (batch_labels.reindex(matrix.index)
-                  if isinstance(batch_labels, (pd.Series, pd.DataFrame))
-                  else batch_labels)
-            score_df = pd.DataFrame(X, index=matrix.index)
-            X = _bc.apply_batch_correction(
-                score_df, bl, method=batch_correction,
-                random_state=random_state).to_numpy()
+    # SVD pre-reduction + batch correction of WHAT FEEDS UMAP, shared with
+    # the parameter sweep via umap_input_scores so the two cannot drift.
+    X, n_svd_used = umap_input_scores(
+        matrix, n_svd=n_svd, skip_top_svd=skip_top_svd, n_threads=n_threads,
+        random_state=random_state, batch_labels=batch_labels,
+        batch_correction=batch_correction, harmony_theta=harmony_theta)
 
     logger.info(
         f"Running UMAP on {matrix.shape[0]} cells x {X.shape[1]} "
