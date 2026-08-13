@@ -1118,6 +1118,7 @@ def compute_signed_concordance_matrix(
     output_dir: str = "output/05_concordance",
     save_outputs: bool = True,
     random_state: int = 42,
+    precomputed: dict | None = None,
 ) -> dict[str, object]:
     """Compute the signed (and optionally one-sided) concordance matrix.
 
@@ -1220,157 +1221,175 @@ def compute_signed_concordance_matrix(
     out_path = ensure_dir(output_dir) if save_outputs else None
     items = list(cell_posterior_paths.items())
 
-    # ---- Step 1: aggregate soft counts per cell -------------------------
-    logger.info(
-        f"Aggregating per-(cell, bin) U-3 soft counts for {len(items)} cells "
-        f"(bin_size={bin_size:,}, min_distance={min_distance:,}, "
-        f"min_gch_sites={min_gch_sites})"
-    )
-    if n_threads > 1 and len(items) > 1:
-        per_cell = Parallel(n_jobs=n_threads)(
-            delayed(_compute_cell_soft_counts)(
-                path, cell_name, bin_size, min_distance, min_gch_sites,
-                max_distance,
-            )
-            for cell_name, path in items
-        )
+    # Steps 1-3 -- reading every cell's posteriors, aggregating the soft
+    # counts and building the accessibility matrix -- do NOT depend on the
+    # batch correction, which first acts at step 3.5.  `precomputed` lets a
+    # caller sweeping batch settings pay for them once instead of once per
+    # setting; the returned dict carries exactly what to pass back.
+    if precomputed is not None:
+        raw_counts = precomputed["raw_counts"]
+        accessibility_df = precomputed["accessibility_raw"].copy()
+        cell_names = list(precomputed["cell_names"])
+        sorted_bins = list(precomputed["sorted_bins"])
+        uses_expected = bool(precomputed.get("uses_expected", uses_expected))
+        n_cells, n_bins = len(cell_names), len(sorted_bins)
+        logger.info(
+            f"Reusing precomputed soft counts + accessibility "
+            f"({n_cells} cells x {n_bins} bins); skipping steps 1-3.")
     else:
-        per_cell = [
-            _compute_cell_soft_counts(
-                path, cell_name, bin_size, min_distance, min_gch_sites,
-                max_distance,
-            )
-            for cell_name, path in items
-        ]
-
-    # ---- Step 1b: non-contact end-pair expected (O/E baseline), optional --
-    if uses_expected:
-        dm_mode = "pooled" if baseline == "distance-pooled" else "matched"
-        dm_window_bins = int(round((dm_window_mb * 1_000_000) / bin_size))
-        if dm_mode == "pooled":
-            logger.info(
-                f"Distance-pooled expected baseline: window=±{dm_window_bins} "
-                f"bins ({dm_window_mb} Mb), all null pairs with sep "
-                f">= {min_distance:,} bp pooled per bin"
-            )
-        else:
-            logger.info(
-                f"Distance-matched expected baseline: window=±{dm_window_bins} "
-                f"bins ({dm_window_mb} Mb), dist-bin={dm_dist_bin:,} bp"
-            )
+        # ---- Step 1: aggregate soft counts per cell -------------------------
+        logger.info(
+            f"Aggregating per-(cell, bin) U-3 soft counts for {len(items)} cells "
+            f"(bin_size={bin_size:,}, min_distance={min_distance:,}, "
+            f"min_gch_sites={min_gch_sites})"
+        )
         if n_threads > 1 and len(items) > 1:
-            per_cell_dm = Parallel(n_jobs=n_threads)(
-                delayed(_compute_cell_dm_expected)(
+            per_cell = Parallel(n_jobs=n_threads)(
+                delayed(_compute_cell_soft_counts)(
                     path, cell_name, bin_size, min_distance, min_gch_sites,
-                    dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
-                    random_state,
+                    max_distance,
                 )
                 for cell_name, path in items
             )
         else:
-            per_cell_dm = [
-                _compute_cell_dm_expected(
+            per_cell = [
+                _compute_cell_soft_counts(
                     path, cell_name, bin_size, min_distance, min_gch_sites,
-                    dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
-                    random_state,
+                    max_distance,
                 )
                 for cell_name, path in items
             ]
-        # Merge dm entries into the soft-count entries (same bin ids).
-        dm_by_cell = {cn: d for cn, d in per_cell_dm}
-        for cn, c in per_cell:
-            for bid, dm_entry in dm_by_cell.get(cn, {}).items():
-                c.setdefault(bid, {k: 0.0 for k in _SOFT_COUNT_KEYS}).update(dm_entry)
 
-    # ---- Step 2: assemble cells × bins soft-count matrices --------------
-    all_bins: set[str] = set()
-    for _, c in per_cell:
-        all_bins.update(c.keys())
-    sorted_bins = _sort_bins(all_bins, chrom_sizes)
+        # ---- Step 1b: non-contact end-pair expected (O/E baseline), optional --
+        if uses_expected:
+            dm_mode = "pooled" if baseline == "distance-pooled" else "matched"
+            dm_window_bins = int(round((dm_window_mb * 1_000_000) / bin_size))
+            if dm_mode == "pooled":
+                logger.info(
+                    f"Distance-pooled expected baseline: window=±{dm_window_bins} "
+                    f"bins ({dm_window_mb} Mb), all null pairs with sep "
+                    f">= {min_distance:,} bp pooled per bin"
+                )
+            else:
+                logger.info(
+                    f"Distance-matched expected baseline: window=±{dm_window_bins} "
+                    f"bins ({dm_window_mb} Mb), dist-bin={dm_dist_bin:,} bp"
+                )
+            if n_threads > 1 and len(items) > 1:
+                per_cell_dm = Parallel(n_jobs=n_threads)(
+                    delayed(_compute_cell_dm_expected)(
+                        path, cell_name, bin_size, min_distance, min_gch_sites,
+                        dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
+                        random_state,
+                    )
+                    for cell_name, path in items
+                )
+            else:
+                per_cell_dm = [
+                    _compute_cell_dm_expected(
+                        path, cell_name, bin_size, min_distance, min_gch_sites,
+                        dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
+                        random_state,
+                    )
+                    for cell_name, path in items
+                ]
+            # Merge dm entries into the soft-count entries (same bin ids).
+            dm_by_cell = {cn: d for cn, d in per_cell_dm}
+            for cn, c in per_cell:
+                for bid, dm_entry in dm_by_cell.get(cn, {}).items():
+                    c.setdefault(bid, {k: 0.0 for k in _SOFT_COUNT_KEYS}).update(dm_entry)
 
-    cell_names = [c for c, _ in per_cell]
-    n_cells = len(cell_names)
-    n_bins = len(sorted_bins)
-    bin_to_col = {b: i for i, b in enumerate(sorted_bins)}
+        # ---- Step 2: assemble cells × bins soft-count matrices --------------
+        all_bins: set[str] = set()
+        for _, c in per_cell:
+            all_bins.update(c.keys())
+        sorted_bins = _sort_bins(all_bins, chrom_sizes)
 
-    matrix_keys = list(_SOFT_COUNT_KEYS) + (
-        list(_DM_KEYS) if uses_expected else [])
-    raw_counts: dict[str, np.ndarray] = {
-        k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in matrix_keys
-    }
-    for row_idx, (_, c) in enumerate(per_cell):
-        for bid, entry in c.items():
-            j = bin_to_col[bid]
-            for k in matrix_keys:
-                raw_counts[k][row_idx, j] = entry.get(k, 0.0)
+        cell_names = [c for c, _ in per_cell]
+        n_cells = len(cell_names)
+        n_bins = len(sorted_bins)
+        bin_to_col = {b: i for i, b in enumerate(sorted_bins)}
 
-    logger.info(
-        f"Soft-count matrices: {n_cells} cells × {n_bins} bins. "
-        f"Total linked pairs across all cells: {raw_counts['n_linked'].sum():.0f}. "
-        f"Total unlinked (short-range) pairs: {raw_counts['n_unlinked'].sum():.0f}."
-    )
+        matrix_keys = list(_SOFT_COUNT_KEYS) + (
+            list(_DM_KEYS) if uses_expected else [])
+        raw_counts: dict[str, np.ndarray] = {
+            k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in matrix_keys
+        }
+        for row_idx, (_, c) in enumerate(per_cell):
+            for bid, entry in c.items():
+                j = bin_to_col[bid]
+                for k in matrix_keys:
+                    raw_counts[k][row_idx, j] = entry.get(k, 0.0)
 
-    # ---- Step 2.5: pre-imputation sparsity QC ---------------------------
-    # Drop very sparse cells and bins BEFORE building the RWR graph.  A
-    # near-empty cell has almost no raw pairs, so its Δ is dominated by
-    # imputation; if its (noisy) accessibility profile links it to the
-    # wrong neighbours it lands as a spurious island and injects noise
-    # into the lower SVD components that fragment the UMAP.  Sparse bins
-    # likewise add noise dimensions.  Both filters default OFF (0); set
-    # via --min-cell-pairs / --min-bin-coverage.  Filtered here so the
-    # accessibility matrix, batch labels, and Δ outputs all inherit the
-    # same cell/bin set (accessibility is reindexed to cell_names below).
-    if min_cell_pairs and min_cell_pairs > 0:
-        total_pairs = (raw_counts["n_linked"] + raw_counts["n_unlinked"]).sum(axis=1)
-        keep_cell = total_pairs >= float(min_cell_pairs)
-        n_drop = int((~keep_cell).sum())
-        if n_drop:
-            logger.info(
-                f"Pre-imputation cell QC: dropping {n_drop}/{n_cells} cells with "
-                f"< {min_cell_pairs} informative pairs "
-                f"(kept median = {float(np.median(total_pairs[keep_cell])):.0f}, "
-                f"dropped max = {float(total_pairs[~keep_cell].max()) if n_drop else 0:.0f})."
-            )
-            cell_names = [c for c, keep in zip(cell_names, keep_cell) if keep]
-            raw_counts = {k: v[keep_cell] for k, v in raw_counts.items()}
-            n_cells = len(cell_names)
-
-    if min_bin_coverage and min_bin_coverage > 0.0:
-        has_pair = (raw_counts["n_linked"] + raw_counts["n_unlinked"]) > 0
-        bin_cov = has_pair.mean(axis=0)
-        keep_bin = bin_cov >= float(min_bin_coverage)
-        n_drop = int((~keep_bin).sum())
-        if n_drop:
-            logger.info(
-                f"Pre-imputation bin QC: dropping {n_drop}/{n_bins} bins with "
-                f"raw coverage < {min_bin_coverage:.0%} of cells."
-            )
-            sorted_bins = [b for b, keep in zip(sorted_bins, keep_bin) if keep]
-            raw_counts = {k: v[:, keep_bin] for k, v in raw_counts.items()}
-            n_bins = len(sorted_bins)
-
-    if n_cells < 2:
-        raise ValueError(
-            f"After sparsity QC only {n_cells} cell(s) remain; "
-            f"lower --min-cell-pairs (was {min_cell_pairs})."
-        )
-    if n_bins == 0:
-        raise ValueError(
-            f"After sparsity QC no bins remain; lower --min-bin-coverage "
-            f"(was {min_bin_coverage})."
+        logger.info(
+            f"Soft-count matrices: {n_cells} cells × {n_bins} bins. "
+            f"Total linked pairs across all cells: {raw_counts['n_linked'].sum():.0f}. "
+            f"Total unlinked (short-range) pairs: {raw_counts['n_unlinked'].sum():.0f}."
         )
 
-    # ---- Step 3: mean accessibility for the RWR k-NN basis --------------
-    accessibility_df, _ = _accessibility_mod.compute_accessibility_matrix(
-        cell_posterior_paths, chrom_sizes=chrom_sizes, bin_size=bin_size,
-        min_gch_sites=min_gch_sites, n_threads=n_threads,
-        output_dir=output_dir, save_outputs=save_outputs,
-    )
-    # Align accessibility row + column order to the soft-count matrices so
-    # the RWR k-NN graph is built in the same cell order.
-    accessibility_df = accessibility_df.reindex(
-        index=cell_names, columns=sorted_bins,
-    )
+        # ---- Step 2.5: pre-imputation sparsity QC ---------------------------
+        # Drop very sparse cells and bins BEFORE building the RWR graph.  A
+        # near-empty cell has almost no raw pairs, so its Δ is dominated by
+        # imputation; if its (noisy) accessibility profile links it to the
+        # wrong neighbours it lands as a spurious island and injects noise
+        # into the lower SVD components that fragment the UMAP.  Sparse bins
+        # likewise add noise dimensions.  Both filters default OFF (0); set
+        # via --min-cell-pairs / --min-bin-coverage.  Filtered here so the
+        # accessibility matrix, batch labels, and Δ outputs all inherit the
+        # same cell/bin set (accessibility is reindexed to cell_names below).
+        if min_cell_pairs and min_cell_pairs > 0:
+            total_pairs = (raw_counts["n_linked"] + raw_counts["n_unlinked"]).sum(axis=1)
+            keep_cell = total_pairs >= float(min_cell_pairs)
+            n_drop = int((~keep_cell).sum())
+            if n_drop:
+                logger.info(
+                    f"Pre-imputation cell QC: dropping {n_drop}/{n_cells} cells with "
+                    f"< {min_cell_pairs} informative pairs "
+                    f"(kept median = {float(np.median(total_pairs[keep_cell])):.0f}, "
+                    f"dropped max = {float(total_pairs[~keep_cell].max()) if n_drop else 0:.0f})."
+                )
+                cell_names = [c for c, keep in zip(cell_names, keep_cell) if keep]
+                raw_counts = {k: v[keep_cell] for k, v in raw_counts.items()}
+                n_cells = len(cell_names)
+
+        if min_bin_coverage and min_bin_coverage > 0.0:
+            has_pair = (raw_counts["n_linked"] + raw_counts["n_unlinked"]) > 0
+            bin_cov = has_pair.mean(axis=0)
+            keep_bin = bin_cov >= float(min_bin_coverage)
+            n_drop = int((~keep_bin).sum())
+            if n_drop:
+                logger.info(
+                    f"Pre-imputation bin QC: dropping {n_drop}/{n_bins} bins with "
+                    f"raw coverage < {min_bin_coverage:.0%} of cells."
+                )
+                sorted_bins = [b for b, keep in zip(sorted_bins, keep_bin) if keep]
+                raw_counts = {k: v[:, keep_bin] for k, v in raw_counts.items()}
+                n_bins = len(sorted_bins)
+
+        if n_cells < 2:
+            raise ValueError(
+                f"After sparsity QC only {n_cells} cell(s) remain; "
+                f"lower --min-cell-pairs (was {min_cell_pairs})."
+            )
+        if n_bins == 0:
+            raise ValueError(
+                f"After sparsity QC no bins remain; lower --min-bin-coverage "
+                f"(was {min_bin_coverage})."
+            )
+
+        # ---- Step 3: mean accessibility for the RWR k-NN basis --------------
+        accessibility_df, _ = _accessibility_mod.compute_accessibility_matrix(
+            cell_posterior_paths, chrom_sizes=chrom_sizes, bin_size=bin_size,
+            min_gch_sites=min_gch_sites, n_threads=n_threads,
+            output_dir=output_dir, save_outputs=save_outputs,
+        )
+        # Align accessibility row + column order to the soft-count matrices so
+        # the RWR k-NN graph is built in the same cell order.
+        accessibility_df = accessibility_df.reindex(
+            index=cell_names, columns=sorted_bins,
+        )
+
+    accessibility_raw = accessibility_df.copy()
 
     # ---- Step 3.5: optional batch correction on accessibility ----------
     # Applied before QN + k-NN so batch structure doesn't leak into the
@@ -1786,6 +1805,12 @@ def compute_signed_concordance_matrix(
         "imputed_counts": imputed_counts,
         "priors":         fitted_priors,
         "rwr_diagnostics": rwr_diagnostics,
+        # Everything a batch-setting sweep needs to skip steps 1-3 next time.
+        "raw_counts": raw_counts,
+        "accessibility_raw": accessibility_raw,
+        "cell_names": list(cell_names),
+        "sorted_bins": list(sorted_bins),
+        "uses_expected": uses_expected,
         # C (marginal-free coordination), F (realized direction),
         # D = C·(2F−1) (directional coordination), p̄ (mean per-end openness).
         "coordination":   components["coordination"],

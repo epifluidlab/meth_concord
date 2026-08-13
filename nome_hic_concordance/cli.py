@@ -218,6 +218,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "remains 'signed-diff' for direct API callers.)",
     )
     parser.add_argument(
+        "--step5-batch-sweep", default=None, metavar="METHODS",
+        help="Comma-separated batch-correction methods to sweep at STEP 5 "
+             "(the mean-accessibility matrix that seeds the RWR graph), "
+             "crossed with every non-empty subset of --batch-column.  Unlike "
+             "the Step-7 axes this one cannot be swept from a finished Δ "
+             "matrix: correcting the RWR basis changes the k-NN graph, hence "
+             "what RWR imputes, hence the concordance values themselves.  "
+             "Steps 1-3 are computed once and replayed, so each setting costs "
+             "only RWR + Layer 2.  Writes step5_batch_sweep.tsv ranked by kNN "
+             "purity.  Requires --batch-column and a run that includes step 5; "
+             "applying a winner means re-running steps 5-7, not step 7 alone.",
+    )
+    parser.add_argument(
         "--concordance-batch-column", default=None,
         help="Batch variables for --concordance-batch-correction, when they "
              "should differ from --batch-column.  The two corrections act on "
@@ -912,6 +925,189 @@ def _resolve_concordance_combine(args) -> str:
 # ---------------------------------------------------------------------------
 
 
+
+def _step5_batch_sweep(sig_result, posterior_paths, chrom_sizes, step5_kwargs,
+                       samples, args, group_labels, out_dir):
+    """Sweep the Step-5 (RWR-basis) batch correction and rank the results.
+
+    This axis cannot be swept from a finished Δ matrix the way the Step-7 ones
+    can: correcting the accessibility matrix changes the k-NN graph, so it
+    changes what RWR imputes and therefore the concordance values themselves.
+    Each setting needs its own Step 5.
+
+    What makes that affordable is that steps 1-3 -- reading every cell's
+    posteriors, aggregating soft counts, building the accessibility matrix --
+    do not depend on the correction, which first acts at step 3.5.  They are
+    computed once and replayed through ``precomputed``.
+
+    Each resulting Δ is scored through the same Step-7 path the real run uses
+    (process_concordance_matrix -> umap_input_scores -> label_agreement), with
+    the downstream settings resolved by _resolve_step7_params.
+    """
+    import itertools
+
+    from . import matrix_ops as _mo
+    from . import metrics as _metrics
+    from . import visualization as _vis
+
+    methods = [m.strip() for m in args.step5_batch_sweep.split(",") if m.strip()]
+    cols_all = [c.strip() for c in (args.batch_column or "").split(",")
+                if c.strip()]
+    if not cols_all:
+        logger.warning("--step5-batch-sweep needs --batch-column; skipping.")
+        return
+    subsets = [tuple(cols_all[i] for i in idx)
+               for r in range(1, len(cols_all) + 1)
+               for idx in itertools.combinations(range(len(cols_all)), r)]
+    cache = {k: sig_result[k] for k in
+             ("raw_counts", "accessibility_raw", "cell_names", "sorted_bins",
+              "uses_expected")}
+    s7 = _resolve_step7_params(args)
+    idx_s = samples.set_index("cell_name")
+
+    rows = []
+    combos = [(m, s) for m in methods for s in subsets
+              if not (m == "none" and s != subsets[0])]
+    logger.info(f"Step-5 batch sweep: {len(combos)} setting(s); steps 1-3 are "
+                f"reused, so each costs only RWR + Layer 2.")
+    for i, (method, cols) in enumerate(combos, 1):
+        bl = idx_s[cols[0]] if len(cols) == 1 else idx_s[list(cols)]
+        try:
+            res = concordance_mod.compute_signed_concordance_matrix(
+                posterior_paths, chrom_sizes, precomputed=cache,
+                batch_labels=(None if method == "none" else bl),
+                batch_correction=method, save_outputs=False, **step5_kwargs)
+            delta = res["delta_signed"]
+            norm = _mo.process_concordance_matrix(
+                delta, min_cell_coverage=args.min_cell_coverage,
+                output_dir="", matrix_norm=s7["matrix_norm"],
+                per_cell_norm=s7["per_cell_norm"],
+                post_norm_recenter=s7["post_norm_recenter"],
+                save_outputs=False)["zscore"]
+            common = norm.index.intersection(group_labels.index)
+            X, _ = _vis.umap_input_scores(
+                norm.loc[common], n_svd=s7["n_svd"],
+                skip_top_svd=s7["skip_top_svd"], n_threads=args.n_threads,
+                random_state=args.random_seed, batch_correction="none")
+            m = _metrics.label_agreement(X, group_labels.loc[common],
+                                         random_state=args.random_seed,
+                                         n_perm=0)
+            err = ""
+        except Exception as exc:
+            m = {k: float("nan") for k in
+                 ("silhouette", "knn_purity", "knn_chance", "purity_index",
+                  "ari", "nmi")}
+            err = f"{type(exc).__name__}: {exc}"
+            logger.warning(f"  [{i}/{len(combos)}] {method}/{'+'.join(cols)} "
+                           f"FAILED — {err}")
+        rows.append({"step5_batch_correction": method,
+                     "step5_batch_column": ("-" if method == "none"
+                                            else "+".join(cols)),
+                     "knn_purity": m["knn_purity"],
+                     "purity_index": m["purity_index"], "ari": m["ari"],
+                     "nmi": m["nmi"], "silhouette": m["silhouette"],
+                     "knn_chance": m["knn_chance"], "error": err})
+        logger.info(f"  [{i}/{len(combos)}] {method}/{'+'.join(cols)}: "
+                    f"purity={m['knn_purity']:.4f} ari={m['ari']:.4f} "
+                    f"nmi={m['nmi']:.4f} asw={m['silhouette']:.4f}")
+
+    tab = pd.DataFrame(rows).sort_values("knn_purity", ascending=False)
+    path = Path(out_dir) / "step5_batch_sweep.tsv"
+    tab.to_csv(path, sep="\t", index=False)
+    logger.info(f"Step-5 batch sweep written to {path}")
+    if tab["knn_purity"].notna().any():
+        best = tab.iloc[0]
+        logger.info(
+            f"Best Step-5 setting by kNN purity: --batch-correction "
+            f"{best['step5_batch_correction']} --batch-column "
+            f"{best['step5_batch_column'].replace('+', ',')} "
+            f"(purity {best['knn_purity']:.4f}). NOTE this changes the Δ "
+            f"matrix, so steps 5-7 must be re-run with it — a Step-7-only "
+            f"rerun cannot apply it.")
+
+
+def _resolve_step7_params(args) -> dict:
+    """Resolve the Step-7 'auto' settings once.
+
+    Shared with --step5-batch-sweep so a swept setting is scored through the
+    same normalization / SVD / skip choices the real Step 7 would apply; a
+    second copy of these rules would let the sweep rank settings under a
+    pipeline that never runs.
+    """
+    # Resolve --per-cell-norm.  --per-cell-center is the legacy
+    # boolean form; --per-cell-norm wins if both are set explicitly
+    # (i.e., neither at 'auto').
+    if args.per_cell_norm != "auto":
+        per_cell_norm = args.per_cell_norm
+    elif args.per_cell_center == "on":
+        per_cell_norm = "center"
+    elif args.per_cell_center == "off":
+        per_cell_norm = "off"
+    else:  # both auto
+        # 'rank' default for signed (empirically the most effective on
+        # NOMe-HiC data — see methodology debug log in design doc).
+        per_cell_norm = (
+            "rank" if args.concordance_method == "signed" else "off"
+        )
+    per_cell_center = per_cell_norm == "center"  # for legacy boolean param
+
+    # Resolve --post-norm-recenter auto → on for signed.
+    if args.post_norm_recenter == "auto":
+        post_norm_recenter = args.concordance_method == "signed"
+    else:
+        post_norm_recenter = args.post_norm_recenter == "on"
+
+    # Resolve --matrix-norm auto → quantile for signed (rank-based QN
+    # is the validated Step-7 normalization for Δ_signed), zscore
+    # otherwise (the classical pipeline).
+    if args.matrix_norm == "auto":
+        matrix_norm = (
+            "quantile" if args.concordance_method == "signed" else "zscore"
+        )
+    else:
+        matrix_norm = args.matrix_norm
+
+    # Resolve --skip-top-svd auto-default.  On the FULL cell set the
+    # dominant PC0 of Δ_signed is a non-cell-type confound (the
+    # low-coverage cells), with cell type on PC1 — for BOTH estimators.
+    # So signed defaults to skip 1 (drop the confound; full-set kNN
+    # 0.884 → 0.937 for DM).  The exception is explicit MLE, where skip
+    # didn't help (kNN ~flat), so leave it at 0 there.  Non-signed
+    # methods never skip.  User-explicit values (including 0) override.
+    _signed_formula = (
+        "mle" if args.concordance_formula == "mle" else "dm"
+    )
+    if args.skip_top_svd is None:
+        if args.concordance_method == "signed" and _signed_formula == "dm":
+            skip_top_svd = 1
+        else:
+            skip_top_svd = 0
+    else:
+        skip_top_svd = args.skip_top_svd
+
+    # Resolve --n-svd auto-default for the UMAP pre-reduction.  SVD only
+    # runs when n_svd>0 OR skip>0 (see visualization.run_umap_and_plot).
+    # Under signed MLE, skip resolves to 0, so without an n_svd default
+    # UMAP would run on the full ~10k-bin matrix and the cell-type PC0
+    # signal (a few % variance) would be swamped by noise dimensions.
+    # Default signed to 10 components — exactly the count signed used
+    # before (skip=1 fit 11, dropped the top → 10), but now keeping PC0
+    # since MLE puts cell type there.  The scree plot is always emitted
+    # for tuning; user-explicit --n-svd overrides.
+    # None = unset -> auto-default; an explicit value (INCLUDING 0, which
+    # means "no SVD, UMAP on the full bin matrix") is honoured as given.
+    if args.n_svd is None:
+        n_svd = 10 if args.concordance_method == "signed" else 0
+    else:
+        n_svd = args.n_svd
+    return {"per_cell_norm": per_cell_norm,
+            "per_cell_center": per_cell_center,
+            "post_norm_recenter": post_norm_recenter,
+            "matrix_norm": matrix_norm,
+            "skip_top_svd": skip_top_svd,
+            "n_svd": n_svd}
+
+
 def run_context(
     context: str,
     context_positions: dict[str, np.ndarray],
@@ -1262,6 +1458,36 @@ def run_context(
                 save_outputs=True,
                 random_state=args.random_seed,
             )
+            if args.step5_batch_sweep:
+                # Reuses this run's steps 1-3 via `precomputed`, so each swept
+                # setting costs only RWR + Layer 2 rather than a full Step 5.
+                _s5_kwargs = dict(
+                    bin_size=args.bin_size, min_distance=args.min_distance,
+                    max_distance=args.max_distance, min_gch_sites=min_sites,
+                    min_pairs_per_bin=args.min_pairs_per_bin,
+                    min_cell_pairs=args.min_cell_pairs,
+                    min_bin_coverage=args.min_bin_coverage,
+                    statistic=args.concordance_statistic or "signed",
+                    concordance_formula=concordance_formula,
+                    baseline=args.baseline,
+                    concordance_combine=concordance_combine,
+                    dm_window_mb=args.dm_window_mb,
+                    dm_dist_bin=args.dm_dist_bin_bp,
+                    use_rwr=(args.impute == "rwr"), rwr_k=args.rwr_k,
+                    rwr_restart_prob=args.rwr_restart_prob,
+                    rwr_n_refine_passes=rwr_refine_passes,
+                    rwr_refinement_basis=refinement_basis,
+                    rwr_auto_select_passes=auto_select_passes,
+                    rwr_max_auto_passes=args.rwr_max_auto_passes,
+                    rwr_solver=args.rwr_solver, rwr_max_iter=args.rwr_max_iter,
+                    rwr_tol=args.rwr_tol, eb_min_obs=args.eb_min_obs,
+                    n_threads=args.n_threads, output_dir=str(concordance_dir),
+                    random_state=args.random_seed)
+                _step5_batch_sweep(
+                    sig_result, posterior_paths, chrom_sizes, _s5_kwargs,
+                    samples, args,
+                    samples.set_index("cell_name")["group"].dropna(),
+                    str(concordance_dir))
             # Headline matrix for Step 6/7 is whichever statistic was selected.
             stat = args.concordance_statistic or "signed"
             if stat == "open" and sig_result["delta_open"] is not None:
@@ -1365,72 +1591,13 @@ def run_context(
             )
             return
 
-        # Resolve --per-cell-norm.  --per-cell-center is the legacy
-        # boolean form; --per-cell-norm wins if both are set explicitly
-        # (i.e., neither at 'auto').
-        if args.per_cell_norm != "auto":
-            per_cell_norm = args.per_cell_norm
-        elif args.per_cell_center == "on":
-            per_cell_norm = "center"
-        elif args.per_cell_center == "off":
-            per_cell_norm = "off"
-        else:  # both auto
-            # 'rank' default for signed (empirically the most effective on
-            # NOMe-HiC data — see methodology debug log in design doc).
-            per_cell_norm = (
-                "rank" if args.concordance_method == "signed" else "off"
-            )
-        per_cell_center = per_cell_norm == "center"  # for legacy boolean param
-
-        # Resolve --post-norm-recenter auto → on for signed.
-        if args.post_norm_recenter == "auto":
-            post_norm_recenter = args.concordance_method == "signed"
-        else:
-            post_norm_recenter = args.post_norm_recenter == "on"
-
-        # Resolve --matrix-norm auto → quantile for signed (rank-based QN
-        # is the validated Step-7 normalization for Δ_signed), zscore
-        # otherwise (the classical pipeline).
-        if args.matrix_norm == "auto":
-            matrix_norm = (
-                "quantile" if args.concordance_method == "signed" else "zscore"
-            )
-        else:
-            matrix_norm = args.matrix_norm
-
-        # Resolve --skip-top-svd auto-default.  On the FULL cell set the
-        # dominant PC0 of Δ_signed is a non-cell-type confound (the
-        # low-coverage cells), with cell type on PC1 — for BOTH estimators.
-        # So signed defaults to skip 1 (drop the confound; full-set kNN
-        # 0.884 → 0.937 for DM).  The exception is explicit MLE, where skip
-        # didn't help (kNN ~flat), so leave it at 0 there.  Non-signed
-        # methods never skip.  User-explicit values (including 0) override.
-        _signed_formula = (
-            "mle" if args.concordance_formula == "mle" else "dm"
-        )
-        if args.skip_top_svd is None:
-            if args.concordance_method == "signed" and _signed_formula == "dm":
-                skip_top_svd = 1
-            else:
-                skip_top_svd = 0
-        else:
-            skip_top_svd = args.skip_top_svd
-
-        # Resolve --n-svd auto-default for the UMAP pre-reduction.  SVD only
-        # runs when n_svd>0 OR skip>0 (see visualization.run_umap_and_plot).
-        # Under signed MLE, skip resolves to 0, so without an n_svd default
-        # UMAP would run on the full ~10k-bin matrix and the cell-type PC0
-        # signal (a few % variance) would be swamped by noise dimensions.
-        # Default signed to 10 components — exactly the count signed used
-        # before (skip=1 fit 11, dropped the top → 10), but now keeping PC0
-        # since MLE puts cell type there.  The scree plot is always emitted
-        # for tuning; user-explicit --n-svd overrides.
-        # None = unset -> auto-default; an explicit value (INCLUDING 0, which
-        # means "no SVD, UMAP on the full bin matrix") is honoured as given.
-        if args.n_svd is None:
-            n_svd = 10 if args.concordance_method == "signed" else 0
-        else:
-            n_svd = args.n_svd
+        _s7 = _resolve_step7_params(args)
+        per_cell_norm = _s7["per_cell_norm"]
+        per_cell_center = _s7["per_cell_center"]
+        post_norm_recenter = _s7["post_norm_recenter"]
+        matrix_norm = _s7["matrix_norm"]
+        skip_top_svd = _s7["skip_top_svd"]
+        n_svd = _s7["n_svd"]
 
         # Correct the concordance values themselves, before any normalization.
         cbc = args.concordance_batch_correction
