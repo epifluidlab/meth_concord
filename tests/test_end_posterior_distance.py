@@ -266,3 +266,55 @@ def test_exclude_chrom_removes_whole_chromosomes():
     df = pd.DataFrame({"chrom": ["chr1", "chrX", "M"],
                        "pos1": [1, 1, 1], "pos2": [2, 2, 2]})
     assert list(m._keep_mask(df, merged, ec)) == [True, False, False]
+
+
+def test_per_cell_work_is_deterministic_given_its_index(tmp_path):
+    """The property that makes ANY backend equivalent: a cell's contribution
+    depends only on (cell, its index), never on execution order.
+
+    Tested here rather than by running the process backend, which cannot work
+    under a module loaded by importlib: loky re-imports the module in the
+    child and this one has no importable name.  The cross-backend equivalence
+    itself was checked by running the script directly.
+    """
+    m = _mod()
+    sp = _fixture(tmp_path)
+    args = m.main.__wrapped__ if hasattr(m.main, "__wrapped__") else None
+    import argparse
+    a = argparse.Namespace(
+        min_sites=2, seed=42, null_type="distance-matched",
+        null_scope="cell", null_window=1000,
+        null_anchor_window=10_000_000)
+    paths = {"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"}
+    edges = m.build_edges(100, 10_000_000, 8)
+    first = m._accumulate_cell("c0", 3, paths, edges, a, {}, None, None, ())
+    second = m._accumulate_cell("c0", 3, paths, edges, a, {}, None, None, ())
+    assert first[1] == second[1] and first[2] == second[2]
+    for k in first[0]:
+        assert np.allclose(first[0][k], second[0][k]), k
+    # A different index must give a different draw, or the per-cell seeding
+    # would be a no-op and every cell would share one null stream.
+    other = m._accumulate_cell("c0", 4, paths, edges, a, {}, None, None, ())
+    assert not np.allclose(first[0][("gg", "null")], other[0][("gg", "null")])
+
+
+def test_vectorised_null_places_most_anchors(tmp_path):
+    """The retry is a bounded outer loop over vectorised passes; it must still
+    place essentially every anchor, not quietly give up on them."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n = 5000
+    pos = np.sort(rng.integers(0, 5_000_000, 2 * n)).astype(np.int64)
+    pi = np.arange(2 * n) // 2
+    edges = m.build_edges(100, 1_000_000, 8)
+    anchor_pos = pos[::2][:n]
+    anchor_dist = rng.integers(1000, 100_000, n).astype(float)
+    got = m._null_indices_distance_matched(
+        anchor_pos, anchor_dist, pos, pi, edges, rng,
+        window=1000, anchor_window=10_000_000, same_pool=True)
+    assert got is not None
+    ka, kb, d = got
+    assert ka.size > 0.9 * n, f"only placed {ka.size}/{n}"
+    assert (ka != kb).all()
+    assert (pi[ka] != pi[kb]).all(), "never re-creates a real ligation"
+    assert (d > 0).all()

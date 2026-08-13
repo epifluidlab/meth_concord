@@ -247,85 +247,114 @@ def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]]):
 
 def _null_indices_distance_matched(anchor_pos, anchor_dist, d_pos, d_pi,
                                    edges, rng, window, anchor_window,
-                                   same_pool):
+                                   same_pool, max_rounds=16):
     """Indices (ka, kb) into the donor end table for a distance-matched null.
 
     Returning INDICES rather than values is what lets one re-pairing serve
     every measure: gg takes (g[ka], g[kb]), hh takes (h[ka], h[kb]) and the
     cross-context measure takes (h[ka], g[kb]).  Building a separate null per
     measure would compare them against different synthetic pairs.
+
+    Vectorised over anchors, with the retry as an OUTER loop of at most
+    ``max_rounds`` fully-vectorised passes over whatever is still unplaced.
+    The obvious per-anchor loop is pure Python and holds the GIL for the whole
+    run, which made --n-threads do nothing at all.
     """
-    if d_pos.size < 2 or anchor_pos.size == 0:
+    n = int(anchor_pos.size)
+    if d_pos.size < 2 or n == 0:
         return None
     nb = len(edges) - 1
+    in_range = (anchor_dist >= edges[0]) & (anchor_dist <= edges[-1])
     bins = np.clip(np.digitize(anchor_dist, edges) - 1, 0, nb - 1)
-    ka_l, kb_l, d_l = [], [], []
-    for i in range(anchor_pos.size):
-        if anchor_dist[i] < edges[0] or anchor_dist[i] > edges[-1]:
-            continue
-        b = int(bins[i])
-        # Target separation = the observed pair's own distance BIN, widened to
-        # at least +/-window: the analysis cannot resolve finer than a bin, and
-        # an absolute window is unfindable at long range.
-        tlo = min(float(edges[b]), anchor_dist[i] - window)
-        thi = max(float(edges[b + 1]), anchor_dist[i] + window)
-        alo, ahi = 0, d_pos.size
-        if anchor_window > 0:
-            alo = int(np.searchsorted(d_pos, anchor_pos[i] - anchor_window, "left"))
-            ahi = int(np.searchsorted(d_pos, anchor_pos[i] + anchor_window, "right"))
-        if ahi - alo < 2:
-            continue
-        for _ in range(16):
-            ka = int(rng.integers(alo, ahi))
-            up = bool(rng.integers(0, 2))
-            lo = d_pos[ka] + tlo if up else d_pos[ka] - thi
-            hi = d_pos[ka] + thi if up else d_pos[ka] - tlo
-            blo = int(np.searchsorted(d_pos, lo, "left"))
-            bhi = int(np.searchsorted(d_pos, hi, "right"))
-            if bhi <= blo:
-                continue
-            kb = int(rng.integers(blo, bhi))
-            if kb == ka:
-                continue
-            # Two ends of ONE read pair are a real ligation, not a null.
-            if same_pool and d_pi[ka] == d_pi[kb]:
-                continue
-            ka_l.append(ka), kb_l.append(kb)
-            d_l.append(abs(int(d_pos[kb]) - int(d_pos[ka])))
+    # Target separation = the observed pair's own distance BIN, widened to at
+    # least +/-window: the analysis cannot resolve finer than a bin, and an
+    # absolute window is unfindable at long range.
+    tlo = np.minimum(edges[bins], anchor_dist - window)
+    thi = np.maximum(edges[bins + 1], anchor_dist + window)
+
+    if anchor_window > 0:
+        alo = np.searchsorted(d_pos, anchor_pos - anchor_window, side="left")
+        ahi = np.searchsorted(d_pos, anchor_pos + anchor_window, side="right")
+    else:
+        alo = np.zeros(n, dtype=np.int64)
+        ahi = np.full(n, d_pos.size, dtype=np.int64)
+
+    alive = in_range & ((ahi - alo) >= 2)
+    ka_out = np.full(n, -1, dtype=np.int64)
+    kb_out = np.full(n, -1, dtype=np.int64)
+
+    for _ in range(max_rounds):
+        idx = np.flatnonzero(alive)
+        if idx.size == 0:
             break
-    if not ka_l:
+        span = (ahi[idx] - alo[idx]).astype(np.int64)
+        ka = alo[idx] + (rng.random(idx.size) * span).astype(np.int64)
+        up = rng.random(idx.size) < 0.5
+        pa = d_pos[ka]
+        lo = np.where(up, pa + tlo[idx], pa - thi[idx])
+        hi = np.where(up, pa + thi[idx], pa - tlo[idx])
+        blo = np.searchsorted(d_pos, lo, side="left")
+        bhi = np.searchsorted(d_pos, hi, side="right")
+        has = bhi > blo
+        width = np.maximum(bhi - blo, 1).astype(np.int64)
+        kb = blo + (rng.random(idx.size) * width).astype(np.int64)
+        kb = np.clip(kb, 0, d_pos.size - 1)
+        good = has & (kb != ka)
+        if same_pool:
+            # Two ends of ONE read pair are a real ligation, not a null.
+            good &= d_pi[ka] != d_pi[kb]
+        sel = idx[good]
+        ka_out[sel] = ka[good]
+        kb_out[sel] = kb[good]
+        alive[sel] = False
+
+    placed = ka_out >= 0
+    if not placed.any():
         return None
-    return (np.asarray(ka_l), np.asarray(kb_l),
-            np.asarray(d_l, dtype=float))
+    ka_f, kb_f = ka_out[placed], kb_out[placed]
+    dist = np.abs(d_pos[kb_f].astype(np.int64) - d_pos[ka_f].astype(np.int64))
+    return ka_f, kb_f, dist.astype(float)
 
 
 def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
-                                d_pi, rng, window, same_pool):
+                                d_pi, rng, window, same_pool, max_rounds=8):
     """Indices for the locus-matched null: keep end 1, swap end 2 for another
     end within +/-window of the true partner.
 
-    ``ka`` here indexes the ANCHOR's own end 1 (not the donor table), so the
-    caller pairs anchor-side values with donor-side ones.
+    The first return value indexes the ANCHOR's own end 1 (not the donor
+    table), so the caller pairs anchor-side values with donor-side ones.
+    Vectorised the same way as above.
     """
-    if d_pos.size < 2 or anchor_pos2.size == 0:
+    n = int(anchor_pos2.size)
+    if d_pos.size < 2 or n == 0:
         return None
-    ai_l, kb_l, d_l = [], [], []
-    for i in range(anchor_pos2.size):
-        lo = int(np.searchsorted(d_pos, anchor_pos2[i] - window, "left"))
-        hi = int(np.searchsorted(d_pos, anchor_pos2[i] + window, "right"))
-        if hi - lo < 2:
-            continue
-        for _ in range(8):
-            k = int(rng.integers(lo, hi))
-            if same_pool and d_pi[k] == anchor_idx[i]:
-                continue
-            ai_l.append(i), kb_l.append(k)
-            d_l.append(abs(int(d_pos[k]) - int(anchor_pos1[i])))
+    lo = np.searchsorted(d_pos, anchor_pos2 - window, side="left")
+    hi = np.searchsorted(d_pos, anchor_pos2 + window, side="right")
+    alive = (hi - lo) >= 2
+    kb_out = np.full(n, -1, dtype=np.int64)
+
+    for _ in range(max_rounds):
+        idx = np.flatnonzero(alive)
+        if idx.size == 0:
             break
-    if not ai_l:
+        span = (hi[idx] - lo[idx]).astype(np.int64)
+        k = lo[idx] + (rng.random(idx.size) * span).astype(np.int64)
+        k = np.clip(k, 0, d_pos.size - 1)
+        good = np.ones(idx.size, dtype=bool)
+        if same_pool:
+            good = d_pi[k] != anchor_idx[idx]
+        sel = idx[good]
+        kb_out[sel] = k[good]
+        alive[sel] = False
+
+    placed = kb_out >= 0
+    if not placed.any():
         return None
-    return (np.asarray(ai_l), np.asarray(kb_l),
-            np.asarray(d_l, dtype=float))
+    ai = np.flatnonzero(placed)
+    kb_f = kb_out[placed]
+    dist = np.abs(d_pos[kb_f].astype(np.int64)
+                  - anchor_pos1[ai].astype(np.int64))
+    return ai, kb_f, dist.astype(float)
 
 
 # ----------------------------------------------------------------- plotting --
@@ -486,25 +515,32 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                                excl_chrom))
 
     n_pairs = n_null = 0
+    jobs = [(c, i) for i, c in enumerate(cells)]
     if args.n_threads > 1 and len(cells) > 1:
-        # Threads, not processes: the parquet read (pyarrow) and every numpy
-        # op release the GIL, while the donor pools are large and read-only —
-        # processes would pay to pickle a copy of them per worker.
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=args.n_threads) as ex:
-            futs = {ex.submit(_accumulate_cell, c, i, paths, edges, args,
-                              pools, batch_of, merged, excl_chrom): c
-                    for i, c in enumerate(cells)}
-            for done, fut in enumerate(as_completed(futs), 1):
-                a, np_, nn_ = fut.result()
-                for k in accs:
-                    accs[k] += a[k]
-                n_pairs += np_
-                n_null += nn_
-                if done % 200 == 0:
-                    logger.info(f"  {label}: {done}/{len(cells)} cells")
+        if args.backend == "process":
+            # Real parallelism.  After vectorising the null the remaining work
+            # is parquet reads and pandas, which hold the GIL, so threads gain
+            # almost nothing; separate interpreters do.  joblib memmaps the
+            # large donor pools rather than pickling a copy per worker.
+            from joblib import Parallel, delayed
+            out = Parallel(n_jobs=args.n_threads, prefer="processes")(
+                delayed(_accumulate_cell)(c, i, paths, edges, args, pools,
+                                          batch_of, merged, excl_chrom)
+                for c, i in jobs)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=args.n_threads) as ex:
+                out = list(ex.map(
+                    lambda ci: _accumulate_cell(ci[0], ci[1], paths, edges,
+                                                args, pools, batch_of, merged,
+                                                excl_chrom), jobs))
+        for a, np_, nn_ in out:
+            for k in accs:
+                accs[k] += a[k]
+            n_pairs += np_
+            n_null += nn_
     else:
-        for i, c in enumerate(cells):
+        for c, i in jobs:
             a, np_, nn_ = _accumulate_cell(c, i, paths, edges, args, pools,
                                            batch_of, merged, excl_chrom)
             for k in accs:
@@ -578,6 +614,14 @@ def main(argv=None) -> int:
     ap.add_argument("--exclude-chrom", default="",
                     help="Comma-separated chromosomes to drop entirely "
                          "(e.g. chrM,chrX,chrY).")
+    ap.add_argument("--backend", choices=["thread", "process"],
+                    default="thread",
+                    help="'thread' (default) measured fastest: on 16 cells x "
+                         "250k pairs, 8 threads took 5.8 s against 8.6 s "
+                         "serial and 8.0 s with processes, whose worker "
+                         "start-up and argument pickling outweigh the GIL they "
+                         "escape.  Try 'process' on a machine with many more "
+                         "cores, where that trade may reverse.")
     ap.add_argument("--n-threads", type=int, default=4,
                     help="Cells are scored in parallel and their accumulators "
                          "summed; each cell gets its own seeded RNG, so the "
