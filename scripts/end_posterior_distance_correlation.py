@@ -49,6 +49,7 @@ as for the pooled "all".
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
 import sys
 from pathlib import Path
@@ -73,9 +74,87 @@ _CONDS = (("linked", "linked (true partner)"),
 _COLOR = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c"}
 
 
+# ---------------------------------------------------------------- exclusion --
+
+def _canon(c: str) -> str:
+    """Chromosome name without the 'chr' prefix, so a BED and a BAM that
+    disagree about it still line up."""
+    c = str(c)
+    return c[3:] if c.startswith("chr") else c
+
+
+def load_exclusions(bed_paths, exclude_chrom=()):
+    """Merged intervals per chromosome from one or more BED files.
+
+    Merging matters for the lookup below: with non-overlapping, sorted
+    intervals a position hits at most the predecessor of its insertion point,
+    so the test is one searchsorted rather than a scan.
+    """
+    excl_chrom = {_canon(c) for c in exclude_chrom if c}
+    by_chrom: dict[str, list[tuple[int, int]]] = {}
+    for path in bed_paths or []:
+        with (gzip.open(path, "rt") if str(path).endswith(".gz")
+              else open(path)) as fh:
+            for line in fh:
+                if not line.strip() or line.startswith(("#", "track", "browser")):
+                    continue
+                f = line.split()
+                if len(f) < 3:
+                    continue
+                by_chrom.setdefault(_canon(f[0]), []).append(
+                    (int(f[1]), int(f[2])))
+    merged: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for c, ivs in by_chrom.items():
+        ivs.sort()
+        out: list[list[int]] = []
+        for s0, e0 in ivs:
+            if out and s0 <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], e0)
+            else:
+                out.append([s0, e0])
+        merged[c] = (np.array([a for a, _ in out], np.int64),
+                     np.array([b for _, b in out], np.int64))
+    if merged:
+        n = sum(len(v[0]) for v in merged.values())
+        logger.info(f"Exclusion set: {n:,} merged intervals over "
+                    f"{len(merged)} chromosome(s).")
+    return merged, excl_chrom
+
+
+def _keep_mask(df: pd.DataFrame, merged, excl_chrom) -> np.ndarray:
+    """Keep a pair only if NEITHER end falls in an excluded interval.
+
+    Pair-level, matching the site-level script's blacklist rule: a contact with
+    one end in a dark region is not half-usable.  Only the end midpoints are
+    available here (the read spans are not carried in the posteriors), so a
+    read overlapping an interval edge can survive -- acceptable for regions
+    that are large relative to a read, which is what these exclusions are.
+    """
+    keep = np.ones(len(df), dtype=bool)
+    chrom = df["chrom"].astype(str).map(_canon).to_numpy()
+    if excl_chrom:
+        keep &= ~np.isin(chrom, list(excl_chrom))
+    if not merged:
+        return keep
+    p1 = df["pos1"].to_numpy(np.int64)
+    p2 = df["pos2"].to_numpy(np.int64)
+    for c in np.unique(chrom):
+        iv = merged.get(c)
+        if iv is None:
+            continue
+        starts, ends = iv
+        rows = np.flatnonzero(chrom == c)
+        for pos in (p1[rows], p2[rows]):
+            i = np.searchsorted(starts, pos, side="right") - 1
+            hit = (i >= 0) & (ends[np.clip(i, 0, len(ends) - 1)] > pos)
+            keep[rows[hit]] = False
+    return keep
+
+
 # ------------------------------------------------------------------ loading --
 
-def _load_cell(paths: dict[str, Path], cell: str, min_sites: int):
+def _load_cell(paths: dict[str, Path], cell: str, min_sites: int,
+               merged=None, excl_chrom=()):
     """One cell's per-end posteriors, per context, keyed by read pair.
 
     Returns ``{ctx: DataFrame[chrom,pos1,pos2,distance,p1,p2]}``; contexts with
@@ -93,6 +172,10 @@ def _load_cell(paths: dict[str, Path], cell: str, min_sites: int):
                 & df["posterior1"].notna() & df["posterior2"].notna()]
         if df.empty:
             continue
+        if merged or excl_chrom:
+            df = df[_keep_mask(df, merged, excl_chrom)]
+            if df.empty:
+                continue
         out[ctx] = df.rename(columns={"posterior1": "p1", "posterior2": "p2"})[
             ["chrom", "pos1", "pos2", "distance", "p1", "p2"]]
     return out
@@ -287,103 +370,149 @@ def _figure(curves, centers, label, out_path, args, note=""):
 
 # --------------------------------------------------------------------- main --
 
-def run_group(cells, paths, edges, args, label, out_dir, batch_of=None):
-    rng = np.random.default_rng(args.seed)
+def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
+                     merged, excl_chrom):
+    """One cell's contribution, as its own accumulators.
+
+    Returned rather than added in place so the cells can run on a thread pool
+    and be merged afterwards; the accumulators are additive, so summing them is
+    exact.  The RNG is seeded per cell rather than shared: a shared generator
+    would both race between threads and make the run depend on the order they
+    happen to finish in.
+    """
+    rng = np.random.default_rng(args.seed + seed_i)
     nb = len(edges) - 1
     accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
-
-    # Pooled donors are assembled per batch stratum so a substitute end never
-    # crosses a batch boundary -- the same reasoning as --null-match-column in
-    # the site-level script.
-    pools: dict[str, tuple] = {}
-    if args.null_scope == "pooled":
-        parts: dict[str, list] = {}
-        for cell in cells:
-            j = joined_pairs(_load_cell(paths, cell, args.min_sites))
-            if j is None or j.empty:
-                continue
-            key = batch_of.get(cell, "") if batch_of else ""
-            parts.setdefault(key, []).append(
-                end_table(j, {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}))
-        for k, ps in parts.items():
-            pos = np.concatenate([p[0] for p in ps])
-            vals = {name: np.concatenate([p[1][name] for p in ps])
-                    for name in ("g", "h")}
-            # Cross-cell donors: no pair index can collide with the anchor's,
-            # so -1 marks "never a self-pair".
-            pi = np.full(pos.size, -1)
-            o = np.argsort(pos, kind="stable")
-            pools[k] = (pos[o], {n_: v[o] for n_, v in vals.items()}, pi[o])
-        logger.info(f"  pooled donor ends: "
-                    f"{ {k: int(v[0].size) for k, v in pools.items()} }")
-
     n_pairs = n_null = 0
-    for ci, cell in enumerate(cells, 1):
-        per_ctx = _load_cell(paths, cell, args.min_sites)
-        j = joined_pairs(per_ctx)
+
+    per_ctx = _load_cell(paths, cell, args.min_sites, merged, excl_chrom)
+    j = joined_pairs(per_ctx)
+    if j is None or j.empty:
+        return accs, 0, 0
+
+    d = j["distance"].to_numpy()
+    keep = (d >= edges[0]) & (d <= edges[-1])
+    if keep.any():
+        b = np.clip(np.digitize(d[keep], edges) - 1, 0, nb - 1)
+        # LINKED: the true partner, all three measures off the same pairs.
+        accumulate(accs[("gg", "linked")], b,
+                   j["p1_g"].to_numpy()[keep], j["p2_g"].to_numpy()[keep])
+        accumulate(accs[("hh", "linked")], b,
+                   j["p1_h"].to_numpy()[keep], j["p2_h"].to_numpy()[keep])
+        # Both orderings of the cross measure, as the site-level script does.
+        accumulate(accs[("gh", "linked")], b,
+                   j["p1_h"].to_numpy()[keep], j["p2_g"].to_numpy()[keep])
+        accumulate(accs[("gh", "linked")], b,
+                   j["p2_h"].to_numpy()[keep], j["p1_g"].to_numpy()[keep])
+        n_pairs = int(keep.sum())
+
+    cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
+    a_pos, a_vals, a_pi = end_table(j, cols)
+    bkey = batch_of.get(cell, "") if batch_of else ""
+    if args.null_scope == "pooled":
+        pool = pools.get(bkey)
+        if pool is None:
+            return accs, n_pairs, 0
+        d_pos, d_vals, d_pi = pool
+        same_pool = False
+    else:
+        d_pos, d_vals, d_pi, same_pool = a_pos, a_vals, a_pi, True
+
+    if args.null_type == "distance-matched":
+        got = _null_indices_distance_matched(
+            j["pos1"].to_numpy(), d, d_pos, d_pi, edges, rng,
+            args.null_window, args.null_anchor_window, same_pool)
+        if got is None:
+            return accs, n_pairs, 0
+        ka, kb, dn = got
+        xa = {k: v[ka] for k, v in d_vals.items()}
+        xb = {k: v[kb] for k, v in d_vals.items()}
+    else:
+        got = _null_indices_locus_matched(
+            j["pos2"].to_numpy(), j["pos1"].to_numpy(), np.arange(len(j)),
+            d_pos, d_pi, rng, args.null_window, same_pool)
+        if got is None:
+            return accs, n_pairs, 0
+        ai, kb, dn = got
+        # end 1 stays with the anchor; end 2 comes from the donor pool
+        xa = {"g": j["p1_g"].to_numpy()[ai], "h": j["p1_h"].to_numpy()[ai]}
+        xb = {k: v[kb] for k, v in d_vals.items()}
+
+    keep = (dn >= edges[0]) & (dn <= edges[-1])
+    if keep.any():
+        bn = np.clip(np.digitize(dn[keep], edges) - 1, 0, nb - 1)
+        # ONE re-pairing feeds every measure, so the three panels are compared
+        # against the same synthetic pairs.
+        accumulate(accs[("gg", "null")], bn, xa["g"][keep], xb["g"][keep])
+        accumulate(accs[("hh", "null")], bn, xa["h"][keep], xb["h"][keep])
+        accumulate(accs[("gh", "null")], bn, xa["h"][keep], xb["g"][keep])
+        accumulate(accs[("gh", "null")], bn, xa["g"][keep], xb["h"][keep])
+        n_null = int(keep.sum())
+    return accs, n_pairs, n_null
+
+
+def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
+    """Donor end pools for --null-scope pooled, one per batch stratum."""
+    parts: dict[str, list] = {}
+    for cell in cells:
+        j = joined_pairs(_load_cell(paths, cell, args.min_sites, merged,
+                                    excl_chrom))
         if j is None or j.empty:
             continue
-        d = j["distance"].to_numpy()
-        keep = (d >= edges[0]) & (d <= edges[-1])
-        if keep.any():
-            b = np.clip(np.digitize(d[keep], edges) - 1, 0, nb - 1)
-            # LINKED: the true partner, all three measures off the same pairs.
-            accumulate(accs[("gg", "linked")], b,
-                       j["p1_g"].to_numpy()[keep], j["p2_g"].to_numpy()[keep])
-            accumulate(accs[("hh", "linked")], b,
-                       j["p1_h"].to_numpy()[keep], j["p2_h"].to_numpy()[keep])
-            # Both orderings of the cross measure, as the site-level script does.
-            accumulate(accs[("gh", "linked")], b,
-                       j["p1_h"].to_numpy()[keep], j["p2_g"].to_numpy()[keep])
-            accumulate(accs[("gh", "linked")], b,
-                       j["p2_h"].to_numpy()[keep], j["p1_g"].to_numpy()[keep])
-            n_pairs += int(keep.sum())
+        key = batch_of.get(cell, "") if batch_of else ""
+        parts.setdefault(key, []).append(
+            end_table(j, {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}))
+    pools = {}
+    for k, ps in parts.items():
+        pos = np.concatenate([p[0] for p in ps])
+        vals = {name: np.concatenate([p[1][name] for p in ps])
+                for name in ("g", "h")}
+        # Cross-cell donors: no pair index can collide with the anchor's, so
+        # -1 marks "never a self-pair".
+        pi = np.full(pos.size, -1)
+        o = np.argsort(pos, kind="stable")
+        pools[k] = (pos[o], {n_: v[o] for n_, v in vals.items()}, pi[o])
+    logger.info(f"  pooled donor ends: "
+                f"{ {k: int(v[0].size) for k, v in pools.items()} }")
+    return pools
 
-        cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
-        a_pos, a_vals, a_pi = end_table(j, cols)
-        bkey = batch_of.get(cell, "") if batch_of else ""
-        if args.null_scope == "pooled":
-            pool = pools.get(bkey)
-            if pool is None:
-                continue
-            d_pos, d_vals, d_pi = pool
-            same_pool = False
-        else:
-            d_pos, d_vals, d_pi, same_pool = a_pos, a_vals, a_pi, True
 
-        if args.null_type == "distance-matched":
-            got = _null_indices_distance_matched(
-                j["pos1"].to_numpy(), d, d_pos, d_pi, edges, rng,
-                args.null_window, args.null_anchor_window, same_pool)
-            if got is None:
-                continue
-            ka, kb, dn = got
-            xa = {k: v[ka] for k, v in d_vals.items()}
-            xb = {k: v[kb] for k, v in d_vals.items()}
-        else:
-            got = _null_indices_locus_matched(
-                j["pos2"].to_numpy(), j["pos1"].to_numpy(),
-                np.arange(len(j)), d_pos, d_pi, rng, args.null_window,
-                same_pool)
-            if got is None:
-                continue
-            ai, kb, dn = got
-            # end 1 stays with the anchor; end 2 comes from the donor pool
-            xa = {"g": j["p1_g"].to_numpy()[ai], "h": j["p1_h"].to_numpy()[ai]}
-            xb = {k: v[kb] for k, v in d_vals.items()}
+def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
+              merged=None, excl_chrom=()):
+    nb = len(edges) - 1
+    accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
+    pools = ({} if args.null_scope != "pooled"
+             else _build_pools(cells, paths, args, batch_of, merged,
+                               excl_chrom))
 
-        keep = (dn >= edges[0]) & (dn <= edges[-1])
-        if keep.any():
-            bn = np.clip(np.digitize(dn[keep], edges) - 1, 0, nb - 1)
-            # ONE re-pairing feeds every measure, so the three panels are
-            # compared against the same synthetic pairs.
-            accumulate(accs[("gg", "null")], bn, xa["g"][keep], xb["g"][keep])
-            accumulate(accs[("hh", "null")], bn, xa["h"][keep], xb["h"][keep])
-            accumulate(accs[("gh", "null")], bn, xa["h"][keep], xb["g"][keep])
-            accumulate(accs[("gh", "null")], bn, xa["g"][keep], xb["h"][keep])
-            n_null += int(keep.sum())
-        if ci % 100 == 0:
-            logger.info(f"  {label}: {ci}/{len(cells)} cells")
+    n_pairs = n_null = 0
+    if args.n_threads > 1 and len(cells) > 1:
+        # Threads, not processes: the parquet read (pyarrow) and every numpy
+        # op release the GIL, while the donor pools are large and read-only —
+        # processes would pay to pickle a copy of them per worker.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=args.n_threads) as ex:
+            futs = {ex.submit(_accumulate_cell, c, i, paths, edges, args,
+                              pools, batch_of, merged, excl_chrom): c
+                    for i, c in enumerate(cells)}
+            for done, fut in enumerate(as_completed(futs), 1):
+                a, np_, nn_ = fut.result()
+                for k in accs:
+                    accs[k] += a[k]
+                n_pairs += np_
+                n_null += nn_
+                if done % 200 == 0:
+                    logger.info(f"  {label}: {done}/{len(cells)} cells")
+    else:
+        for i, c in enumerate(cells):
+            a, np_, nn_ = _accumulate_cell(c, i, paths, edges, args, pools,
+                                           batch_of, merged, excl_chrom)
+            for k in accs:
+                accs[k] += a[k]
+            n_pairs += np_
+            n_null += nn_
+            if (i + 1) % 200 == 0:
+                logger.info(f"  {label}: {i + 1}/{len(cells)} cells")
 
     curves = {k: corr_from_acc(a, args.min_pairs) for k, a in accs.items()}
     centers = np.sqrt(edges[:-1] * edges[1:])
@@ -438,6 +567,21 @@ def main(argv=None) -> int:
     ap.add_argument("--bins-per-decade", type=int, default=8)
     ap.add_argument("--min-pairs", type=int, default=200,
                     help="Mask a bin with fewer end-pairs than this.")
+    ap.add_argument("--exclude-bed", action="append", default=None,
+                    metavar="BED",
+                    help="Repeatable.  Drop a read pair when EITHER end falls "
+                         "in one of these intervals — a blacklist, a "
+                         "CpG-island+shore set, or any custom region file.  "
+                         "Pair-level, matching the site-level script: a "
+                         "contact with one end in a dark region is not half "
+                         "usable.  .gz is fine.")
+    ap.add_argument("--exclude-chrom", default="",
+                    help="Comma-separated chromosomes to drop entirely "
+                         "(e.g. chrM,chrX,chrY).")
+    ap.add_argument("--n-threads", type=int, default=4,
+                    help="Cells are scored in parallel and their accumulators "
+                         "summed; each cell gets its own seeded RNG, so the "
+                         "result does not depend on thread count or order.")
     ap.add_argument("--max-cells", type=int, default=0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--plot-format", choices=["pdf", "png", "svg"],
@@ -470,6 +614,10 @@ def main(argv=None) -> int:
         idx = samples.set_index(args.cell_column)
         batch_of = (idx[cols].astype(str).agg("|".join, axis=1)).to_dict()
 
+    merged, excl_chrom = load_exclusions(
+        args.exclude_bed,
+        [c.strip() for c in args.exclude_chrom.split(",") if c.strip()])
+
     edges = build_edges(args.min_distance, args.max_distance,
                         args.bins_per_decade)
     logger.info(f"{len(cells)} cells, {len(edges) - 1} distance bins, "
@@ -484,7 +632,8 @@ def main(argv=None) -> int:
     for label, gcells in groups.items():
         safe = label.replace("/", "_").replace(" ", "_")
         logger.info(f"--- {label} ({len(gcells)} cells) ---")
-        run_group(gcells, paths, edges, args, safe, out_dir, batch_of)
+        run_group(gcells, paths, edges, args, safe, out_dir, batch_of,
+                  merged, excl_chrom)
     return 0
 
 

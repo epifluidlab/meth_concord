@@ -195,3 +195,74 @@ def test_constant_bin_is_masked_not_reported_as_zero():
     ds.accumulate(acc, np.zeros(50, int), np.ones(50), np.arange(50.0))
     r, _ = ds.corr_from_acc(acc, min_pairs=10)
     assert np.isnan(r[0]), "no variance means undefined, not uncorrelated"
+
+
+# ------------------------------------------------- threading and exclusion --
+
+def test_result_does_not_depend_on_thread_count(tmp_path):
+    """Each cell gets its own seeded RNG, so the answer must not depend on how
+    many threads ran or the order they finished in."""
+    one, _ = _run(tmp_path, ["--n-threads", "1"])
+    many, _ = _run(tmp_path, ["--n-threads", "4"])
+    assert np.allclose(one.fillna(-9).to_numpy(), many.fillna(-9).to_numpy())
+
+
+def test_exclude_bed_drops_pairs_with_either_end_inside(tmp_path):
+    m = _mod()
+    sp = _fixture(tmp_path)
+    bed = tmp_path / "x.bed"
+    bed.write_text("chr1\t0\t100000\nchr1\t200000\t300000\n")
+    base, _ = _run(tmp_path)
+    excl, _ = _run(tmp_path, ["--exclude-bed", str(bed)])
+    assert excl["gg_linked_n"].sum() < base["gg_linked_n"].sum()
+    # Independent count of what should survive.
+    g = pd.read_parquet(tmp_path / "GCH" / "c0.posteriors.parquet")
+    bad = ((g.pos1 < 100000) | ((g.pos1 >= 200000) & (g.pos1 < 300000))
+           | (g.pos2 < 100000) | ((g.pos2 >= 200000) & (g.pos2 < 300000)))
+    merged, ec = m.load_exclusions([str(bed)])
+    keep = m._keep_mask(g, merged, ec)
+    assert keep.sum() == int((~bad).sum())
+
+
+def test_exclusion_is_pair_level_not_end_level(tmp_path):
+    """One end inside an excluded region removes the whole pair."""
+    m = _mod()
+    bed = tmp_path / "y.bed"
+    bed.write_text("chr1\t1000\t2000\n")
+    merged, ec = m.load_exclusions([str(bed)])
+    df = pd.DataFrame({"chrom": ["chr1"] * 3,
+                       "pos1": [1500, 5000, 500],     # in, out, out
+                       "pos2": [9000, 1200, 800]})    # out, in,  out
+    assert list(m._keep_mask(df, merged, ec)) == [False, False, True]
+
+
+def test_overlapping_intervals_are_merged():
+    m = _mod()
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".bed", delete=False) as fh:
+        fh.write("chr1\t100\t200\nchr1\t150\t300\nchr1\t500\t600\n")
+        path = fh.name
+    merged, _ = m.load_exclusions([path])
+    starts, ends = merged["1"]
+    assert list(starts) == [100, 500] and list(ends) == [300, 600]
+
+
+def test_chrom_naming_mismatch_still_matches():
+    """A BED using 'chr1' must still mask a table recording '1'."""
+    m = _mod()
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".bed", delete=False) as fh:
+        fh.write("chr1\t0\t1000\n")
+        path = fh.name
+    merged, ec = m.load_exclusions([path])
+    df = pd.DataFrame({"chrom": ["1", "1"], "pos1": [500, 5000],
+                       "pos2": [5000, 6000]})
+    assert list(m._keep_mask(df, merged, ec)) == [False, True]
+
+
+def test_exclude_chrom_removes_whole_chromosomes():
+    m = _mod()
+    merged, ec = m.load_exclusions(None, ["chrM", "chrX"])
+    df = pd.DataFrame({"chrom": ["chr1", "chrX", "M"],
+                       "pos1": [1, 1, 1], "pos2": [2, 2, 2]})
+    assert list(m._keep_mask(df, merged, ec)) == [True, False, False]
