@@ -246,3 +246,86 @@ def test_rank_by_changes_the_winner_when_metrics_disagree(tmp_path):
     by_rank = df.sort_values("mean_rank", ascending=True).index[0]
     assert by_purity == df["knn_purity"].idxmax()
     assert by_rank in df.index
+
+
+# ------------------------------------------------------------ --rerank mode --
+
+def test_rerank_reproduces_the_compute_path_ordering(tmp_path):
+    """Re-ranking an existing table by the criterion it was computed under must
+    give the same order — the metrics are already in the file."""
+    m = _mod()
+    res = _run(tmp_path)                                   # sorted by purity
+    src = tmp_path / "out" / "batch_correction_grid.tsv"
+    out2 = tmp_path / "re"
+    assert m.main(["--rerank", str(src), "--rank-by", "knn_purity",
+                   "--output-dir", str(out2)]) == 0
+    got = pd.read_csv(out2 / "batch_correction_grid.ranked_by_knn_purity.tsv",
+                      sep="\t")
+    assert len(got) == len(res)
+    assert np.allclose(got["knn_purity"], res["knn_purity"])
+
+
+def test_rerank_by_a_different_criterion_reorders_without_recomputing(tmp_path):
+    m = _mod()
+    _run(tmp_path)
+    src = tmp_path / "out" / "batch_correction_grid.tsv"
+    out2 = tmp_path / "re2"
+    assert m.main(["--rerank", str(src), "--rank-by", "silhouette",
+                   "--output-dir", str(out2)]) == 0
+    got = pd.read_csv(out2 / "batch_correction_grid.ranked_by_silhouette.tsv",
+                      sep="\t")
+    assert got["silhouette"].is_monotonic_decreasing
+    assert set(got.columns) >= {"mean_rank", "scaled_mean", "rank_knn_purity"}
+
+
+def test_rerank_never_overwrites_its_source(tmp_path):
+    m = _mod()
+    _run(tmp_path)
+    src = tmp_path / "out" / "batch_correction_grid.tsv"
+    before = src.read_bytes()
+    assert m.main(["--rerank", str(src), "--rank-by", "ari",
+                   "--output-dir", str(src.parent)]) == 0
+    assert src.read_bytes() == before, "the expensive table must survive intact"
+    assert (src.parent / "batch_correction_grid.ranked_by_ari.tsv").exists()
+
+
+def test_rerank_needs_no_matrix_or_samples(tmp_path):
+    """The whole point: no inputs beyond the previous table."""
+    m = _mod()
+    _run(tmp_path)
+    src = tmp_path / "out" / "batch_correction_grid.tsv"
+    assert m.main(["--rerank", str(src), "--rank-by", "nmi",
+                   "--output-dir", str(tmp_path / "re3")]) == 0
+
+
+def test_compute_path_still_requires_its_inputs(tmp_path):
+    m = _mod()
+    with pytest.raises(SystemExit, match="--concordance-matrix is required"):
+        m.main(["--output-dir", str(tmp_path / "x")])
+
+
+def test_rerank_rejects_a_file_that_is_not_a_grid_table(tmp_path):
+    m = _mod()
+    bad = tmp_path / "bad.tsv"
+    pd.DataFrame({"a": [1], "b": [2]}).to_csv(bad, sep="\t", index=False)
+    with pytest.raises(SystemExit, match="does not look like"):
+        m.main(["--rerank", str(bad), "--output-dir", str(tmp_path / "y")])
+
+
+def test_rerank_discards_stale_composites_from_the_source(tmp_path):
+    """A previous run's mean_rank must not leak into the new ordering."""
+    m = _mod()
+    _run(tmp_path)
+    src = tmp_path / "out" / "batch_correction_grid.tsv"
+    df = pd.read_csv(src, sep="\t")
+    df["mean_rank"] = 999.0                       # obviously stale
+    df["rank_knn_purity"] = 999.0
+    poisoned = tmp_path / "poisoned.tsv"
+    df.to_csv(poisoned, sep="\t", index=False)
+    out2 = tmp_path / "re4"
+    assert m.main(["--rerank", str(poisoned), "--rank-by", "mean_rank",
+                   "--output-dir", str(out2)]) == 0
+    got = pd.read_csv(out2 / "batch_correction_grid.ranked_by_mean_rank.tsv",
+                      sep="\t")
+    assert (got["mean_rank"] != 999.0).all(), "composites must be re-derived"
+    assert got["mean_rank"].is_monotonic_increasing

@@ -281,80 +281,20 @@ def run_grid(delta, labels, samples, args):
     return pd.DataFrame(rows)
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--concordance-matrix", required=True,
-                    help="concordance_shrunk.parquet from Step 6.")
-    ap.add_argument("--samples", required=True)
-    ap.add_argument("--cell-column", default="cell_name")
-    ap.add_argument("--group-column", default="group")
-    ap.add_argument("--batch-column", required=True,
-                    help="Comma-separated; every non-empty SUBSET is tried.")
-    ap.add_argument("--concordance-methods",
-                    default="none,center,zscore,combat",
-                    help="Values to try for --concordance-batch-correction. "
-                         "harmony is omitted by default: it is built for "
-                         "low-dimensional embeddings, and on a full bin matrix "
-                         "it is slow and most likely to remove cell type.")
-    ap.add_argument("--score-methods",
-                    default="none,center,zscore,combat,harmony",
-                    help="Values to try for --batch-correction (SVD scores).")
-    ap.add_argument("--skip-top-svd", default="0,1")
-    ap.add_argument("--matrix-norm", choices=["quantile", "zscore"],
-                    default="quantile")
-    ap.add_argument("--per-cell-norm",
-                    choices=["off", "center", "zscore", "rank"], default="rank")
-    ap.add_argument("--post-norm-recenter", action="store_true")
-    ap.add_argument("--n-svd", type=int, default=10)
-    ap.add_argument("--min-cell-coverage", type=float, default=0.0)
-    ap.add_argument("--exclude-chrom", default="")
-    ap.add_argument("--knn-k", type=int, default=15)
-    ap.add_argument("--harmony-theta", type=float, default=None)
-    ap.add_argument("--n-threads", type=int, default=4)
-    ap.add_argument("--random-seed", type=int, default=42)
-    ap.add_argument("--rank-by",
-                    choices=["knn_purity", "purity_index", "ari", "nmi",
-                             "silhouette", "mean_rank", "scaled_mean"],
-                    default="knn_purity",
-                    help="Criterion the table is sorted by and the winner "
-                         "chosen on.  Single metrics answer different "
-                         "questions: knn_purity is local and blind to a type "
-                         "split across islands, silhouette is the one that "
-                         "punishes that split, ARI/NMI ask whether k-means "
-                         "recovers the labels.  'mean_rank' and 'scaled_mean' "
-                         "combine them scale-free — do NOT average the raw "
-                         "values, whose spreads differ severalfold.")
-    ap.add_argument("--top", type=int, default=15,
-                    help="Rows to print (default 15).")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Report the grid size and exit.")
-    ap.add_argument("--output-dir", required=True)
-    args = ap.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _report(res: pd.DataFrame, args, out_dir: Path,
+            filename: str = "batch_correction_grid.tsv") -> pd.DataFrame:
+    """Rank, print and write — shared by the compute and --rerank paths so a
+    re-ranked table is presented exactly like a freshly computed one.
 
-    excl = {c.strip() for c in args.exclude_chrom.split(",") if c.strip()}
-    delta = _drop_chroms(_load(args.concordance_matrix), excl)
-    samples = pd.read_csv(args.samples, sep="\t")
-    labels = samples.set_index(args.cell_column)[args.group_column].dropna()
-    labels = labels.loc[labels.index.intersection(delta.index)]
-    logger.info(f"{delta.shape[0]} cells x {delta.shape[1]} bins; "
-                f"{len(labels)} labelled, {labels.nunique()} cell types.")
-
-    res = run_grid(delta, labels, samples, args)
-    if res.empty:
-        return 0
-
+    ``filename`` is explicit so a re-rank writes beside its source rather than
+    over it: the metrics are expensive and the ordering is not.
+    """
     res = add_composite_ranks(res)
     ascending = args.rank_by == "mean_rank"      # a rank: lower is better
     res = res.sort_values(args.rank_by, ascending=ascending
                           ).reset_index(drop=True)
-    tsv = out_dir / "batch_correction_grid.tsv"
+    tsv = out_dir / filename
     res.to_csv(tsv, sep="\t", index=False)
 
     # Whether the metrics agree is itself the finding: if they do, the choice
@@ -403,6 +343,114 @@ def main(argv=None) -> int:
           f"so prefer a setting inside a band of similar scores over a lone "
           f"spike.")
     print(f"\nwrote {tsv}")
+    return res
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--concordance-matrix",
+                    help="concordance_shrunk.parquet from Step 6. Required "
+                         "unless --rerank is given.")
+    ap.add_argument("--samples",
+                    help="Required unless --rerank is given.")
+    ap.add_argument("--cell-column", default="cell_name")
+    ap.add_argument("--group-column", default="group")
+    ap.add_argument("--batch-column",
+                    help="Comma-separated; every non-empty SUBSET is tried. "
+                         "Required unless --rerank is given.")
+    ap.add_argument("--rerank", metavar="TSV",
+                    help="Re-rank an existing batch_correction_grid.tsv by a "
+                         "different --rank-by, without recomputing anything. "
+                         "The per-combination metrics are already in the file; "
+                         "only the ordering and the composites depend on the "
+                         "criterion.")
+    ap.add_argument("--concordance-methods",
+                    default="none,center,zscore,combat",
+                    help="Values to try for --concordance-batch-correction. "
+                         "harmony is omitted by default: it is built for "
+                         "low-dimensional embeddings, and on a full bin matrix "
+                         "it is slow and most likely to remove cell type.")
+    ap.add_argument("--score-methods",
+                    default="none,center,zscore,combat,harmony",
+                    help="Values to try for --batch-correction (SVD scores).")
+    ap.add_argument("--skip-top-svd", default="0,1")
+    ap.add_argument("--matrix-norm", choices=["quantile", "zscore"],
+                    default="quantile")
+    ap.add_argument("--per-cell-norm",
+                    choices=["off", "center", "zscore", "rank"], default="rank")
+    ap.add_argument("--post-norm-recenter", action="store_true")
+    ap.add_argument("--n-svd", type=int, default=10)
+    ap.add_argument("--min-cell-coverage", type=float, default=0.0)
+    ap.add_argument("--exclude-chrom", default="")
+    ap.add_argument("--knn-k", type=int, default=15)
+    ap.add_argument("--harmony-theta", type=float, default=None)
+    ap.add_argument("--n-threads", type=int, default=4)
+    ap.add_argument("--random-seed", type=int, default=42)
+    ap.add_argument("--rank-by",
+                    choices=["knn_purity", "purity_index", "ari", "nmi",
+                             "silhouette", "mean_rank", "scaled_mean"],
+                    default="knn_purity",
+                    help="Criterion the table is sorted by and the winner "
+                         "chosen on.  Single metrics answer different "
+                         "questions: knn_purity is local and blind to a type "
+                         "split across islands, silhouette is the one that "
+                         "punishes that split, ARI/NMI ask whether k-means "
+                         "recovers the labels.  'mean_rank' and 'scaled_mean' "
+                         "combine them scale-free — do NOT average the raw "
+                         "values, whose spreads differ severalfold.")
+    ap.add_argument("--top", type=int, default=15,
+                    help="Rows to print (default 15).")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Report the grid size and exit.")
+    ap.add_argument("--output-dir", required=True)
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- re-rank an existing table: no matrices, no scoring ---------------
+    if args.rerank:
+        prev = pd.read_csv(args.rerank, sep="\t")
+        missing = [c for c in _RANK_METRICS if c not in prev.columns]
+        if missing:
+            raise SystemExit(
+                f"{args.rerank} lacks {missing} — it does not look like a "
+                f"batch_correction_grid.tsv.")
+        # Composite columns from a previous run would be re-derived anyway;
+        # drop them so a stale ordering cannot leak into the new one.
+        prev = prev.drop(columns=[c for c in prev.columns
+                                  if c.startswith("rank_")
+                                  or c in ("mean_rank", "scaled_mean")],
+                         errors="ignore")
+        logger.info(f"Re-ranking {len(prev)} existing combinations from "
+                    f"{args.rerank} by {args.rank_by} (nothing recomputed).")
+        _report(prev, args, out_dir,
+                f"batch_correction_grid.ranked_by_{args.rank_by}.tsv")
+        return 0
+
+    for req, flag in ((args.concordance_matrix, "--concordance-matrix"),
+                      (args.samples, "--samples"),
+                      (args.batch_column, "--batch-column")):
+        if not req:
+            raise SystemExit(f"{flag} is required unless --rerank is given.")
+
+    excl = {c.strip() for c in args.exclude_chrom.split(",") if c.strip()}
+    delta = _drop_chroms(_load(args.concordance_matrix), excl)
+    samples = pd.read_csv(args.samples, sep="\t")
+    labels = samples.set_index(args.cell_column)[args.group_column].dropna()
+    labels = labels.loc[labels.index.intersection(delta.index)]
+    logger.info(f"{delta.shape[0]} cells x {delta.shape[1]} bins; "
+                f"{len(labels)} labelled, {labels.nunique()} cell types.")
+
+    res = run_grid(delta, labels, samples, args)
+    if res.empty:
+        return 0
+
+    _report(res, args, out_dir)
     return 0
 
 
