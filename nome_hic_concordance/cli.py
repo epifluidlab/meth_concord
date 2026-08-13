@@ -218,6 +218,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "remains 'signed-diff' for direct API callers.)",
     )
     parser.add_argument(
+        "--concordance-batch-column", default=None,
+        help="Batch variables for --concordance-batch-correction, when they "
+             "should differ from --batch-column.  The two corrections act on "
+             "different matrices at different stages, so a sweep can find "
+             "that (say) the plate effect shows up per bin while the "
+             "experiment effect shows up in the embedding.  Defaults to "
+             "--batch-column, so the common case stays one flag.",
+    )
+    parser.add_argument(
         "--concordance-batch-correction",
         choices=["none", "center", "zscore", "combat", "harmony"],
         default="none",
@@ -947,6 +956,29 @@ def run_context(
         idx = samples.set_index("cell_name")
         batch_labels = (idx[batch_cols[0]] if len(batch_cols) == 1
                         else idx[batch_cols])
+
+    # The concordance-level correction may use a DIFFERENT set of batch
+    # variables from the score-level one: they act on different matrices at
+    # different stages, and a sweep can well find that e.g. the plate effect
+    # shows up per bin while the experiment effect shows up in the embedding.
+    # Falls back to --batch-column when unset, so the common case stays a
+    # single flag.
+    concordance_batch_labels = batch_labels
+    if getattr(args, "concordance_batch_column", None):
+        cbc_cols = [c.strip() for c in args.concordance_batch_column.split(",")
+                    if c.strip()]
+        missing = [c for c in cbc_cols if c not in samples.columns]
+        if missing:
+            raise ValueError(
+                f"--concordance-batch-column {missing} not in {args.samples}. "
+                f"Available columns: {samples.columns.tolist()}")
+        idx2 = samples.set_index("cell_name")
+        concordance_batch_labels = (idx2[cbc_cols[0]] if len(cbc_cols) == 1
+                                    else idx2[cbc_cols])
+        logger.info(f"Concordance-level batch correction will use "
+                    f"{cbc_cols} (score-level uses "
+                    f"{args.batch_column or 'nothing'}).")
+
     if args.batch_correction == "auto":
         batch_correction = "harmony" if batch_labels is not None else "none"
     else:
@@ -1403,15 +1435,15 @@ def run_context(
         # Correct the concordance values themselves, before any normalization.
         cbc = args.concordance_batch_correction
         if cbc != "none":
-            if batch_labels is None:
+            if concordance_batch_labels is None:
                 logger.warning(
-                    "--concordance-batch-correction needs --batch-column; "
-                    "skipping.")
+                    "--concordance-batch-correction needs --batch-column (or "
+                    "--concordance-batch-column); skipping.")
                 cbc = "none"
             else:
                 concordance_shrunk = _correct_concordance_batch(
-                    concordance_shrunk, batch_labels, cbc, args.random_seed,
-                    "concordance")
+                    concordance_shrunk, concordance_batch_labels, cbc,
+                    args.random_seed, "concordance")
                 concordance_shrunk.to_parquet(
                     concordance_dir / "concordance_batchcorrected.parquet")
 
@@ -1550,7 +1582,8 @@ def run_context(
                         index=concordance_shrunk.index)
                     if cbc != "none":
                         comp_raw = _correct_concordance_batch(
-                            comp_raw, batch_labels, cbc, args.random_seed, comp)
+                            comp_raw, concordance_batch_labels, cbc,
+                            args.random_seed, comp)
                     # Its own subdirectory: process_concordance_matrix always
                     # writes concordance_imputed / concordance_<norm>, which
                     # would otherwise clobber the headline matrices.

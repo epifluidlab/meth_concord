@@ -118,3 +118,37 @@ def test_flag_defaults_off_and_accepts_the_documented_methods():
         got = cli.parse_args(
             base + ["--concordance-batch-correction", m])
         assert got.concordance_batch_correction == m
+
+
+# ------------------------------------------ independent columns per stage --
+
+def test_concordance_batch_column_is_optional_and_falls_back():
+    base = ["--samples", "x", "--reference", "y", "--output-dir", "z"]
+    a = cli.parse_args(base + ["--batch-column", "exp_batch"])
+    assert a.concordance_batch_column is None, (
+        "unset means 'use --batch-column', so the common case is one flag")
+
+
+def test_the_two_stages_can_use_different_batch_variables():
+    """The grid sweeps the two corrections independently, so it can pick
+    different column sets for them; the pipeline must be able to express that."""
+    base = ["--samples", "x", "--reference", "y", "--output-dir", "z"]
+    a = cli.parse_args(base + [
+        "--batch-column", "exp_batch",
+        "--concordance-batch-column", "plate_batch,lib_batch",
+        "--concordance-batch-correction", "center"])
+    assert a.batch_column == "exp_batch"
+    assert a.concordance_batch_column == "plate_batch,lib_batch"
+
+
+def test_correcting_by_the_wrong_variable_does_not_remove_the_effect():
+    """Why the columns matter: centering on a variable that carries no effect
+    leaves the real one untouched."""
+    df, batch, _ = _matrix(batch_shift=2.0)
+    # A second, effect-free variable interleaved across the same cells.
+    other = pd.Series(["x", "x", "y", "y"] * (len(batch) // 4), index=df.index)
+    right = cli._correct_concordance_batch(df, batch, "center", 42, "right")
+    wrong = cli._correct_concordance_batch(df, other, "center", 42, "wrong")
+    assert _f_median(right, batch) < 1.5
+    assert _f_median(wrong, batch) > 3.0, (
+        "correcting the wrong variable must leave the batch effect standing")
