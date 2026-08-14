@@ -489,3 +489,32 @@ def test_compare_cli_leaves_matrices_alone_when_off(tmp_path):
                     "--output-dir", str(tmp_path / "out")]) == 0
     with open(tmp_path / "out" / "summary.json") as fh:
         assert "concordance_batch_correction" not in json.load(fh)
+
+
+def test_named_spec_on_a_bare_path_flag_says_which_flag_to_use(tmp_path):
+    """The failure it replaces was a FileNotFoundError quoting
+    'hcg_mean=output/.../accessibility_mean.parquet', which reads like a
+    corrupt path rather than the wrong flag."""
+    import pandas as pd, pytest
+    from nome_hic_concordance import comparison_cli as cc
+    base, conc, labels, batch = _batched()
+    p = tmp_path / "acc.parquet"
+    base.to_parquet(p)
+    sheet = pd.DataFrame({"cell_name": labels.index, "group": labels.to_numpy()})
+    sp = tmp_path / "s.tsv"
+    sheet.to_csv(sp, sep="\t", index=False)
+    conc.to_parquet(tmp_path / "conc.parquet")
+    with pytest.raises(ValueError, match="--baseline-matrix hcg_mean="):
+        cc.main(["--accessibility-matrix", f"hcg_mean={p}",
+                 "--concordance-matrix", f"gch={tmp_path / 'conc.parquet'}",
+                 "--samples", str(sp), "--output-dir", str(tmp_path / "o")])
+
+
+def test_a_real_path_containing_an_equals_sign_still_loads(tmp_path):
+    """The guard keys on the file not existing, so it cannot hijack a path
+    that genuinely has '=' in it."""
+    from nome_hic_concordance import comparison_cli as cc
+    base, _, _, _ = _batched()
+    odd = tmp_path / "run=1.parquet"
+    base.to_parquet(odd)
+    assert cc._plain_path(str(odd), "--accessibility-matrix") == str(odd)

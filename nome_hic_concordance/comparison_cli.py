@@ -88,6 +88,24 @@ def _parse_named(spec: str) -> tuple[str, str]:
     return "concordance", spec.strip()
 
 
+def _plain_path(value: str, flag: str) -> str:
+    """Reject a NAME=PATH argument to a flag that takes a bare path.
+
+    Only --baseline-matrix and --concordance-matrix are named; the two fixed
+    baselines are not.  Passing 'name=path' to them otherwise surfaces as a
+    FileNotFoundError quoting a path with the name glued to its front, which
+    reads like a corrupt path rather than the wrong flag.
+    """
+    if "=" in value and not Path(value).exists():
+        name = value.split("=", 1)[0].strip()
+        raise ValueError(
+            f"{flag} takes a bare PATH, not NAME=PATH — only "
+            f"--baseline-matrix and --concordance-matrix are named.  To load "
+            f"this matrix as a baseline called {name!r}, use:\n"
+            f"    --baseline-matrix {value}")
+    return value
+
+
 class _DefaultsRawFormatter(argparse.ArgumentDefaultsHelpFormatter,
                             argparse.RawDescriptionHelpFormatter):
     """Keep the raw multi-line description AND mark every option's default."""
@@ -241,10 +259,12 @@ def main(argv: list[str] | None = None) -> int:
     concordance_names: list[str] = []
 
     if args.accessibility_matrix:
-        matrices["accessibility"] = pd.read_parquet(args.accessibility_matrix)
+        matrices["accessibility"] = pd.read_parquet(
+            _plain_path(args.accessibility_matrix, "--accessibility-matrix"))
         baseline_names.append("accessibility")
     if args.compartment_matrix:
-        matrices["compartment"] = pd.read_parquet(args.compartment_matrix)
+        matrices["compartment"] = pd.read_parquet(
+            _plain_path(args.compartment_matrix, "--compartment-matrix"))
         baseline_names.append("compartment")
     for spec in args.baseline_matrix:
         name, path = _parse_named(spec)
