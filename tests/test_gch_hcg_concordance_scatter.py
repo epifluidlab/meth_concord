@@ -449,3 +449,18 @@ def test_flow_can_be_requested_for_c_too(tmp_path):
                    "--min-cells", "5", "--plot-format", "png",
                    "--state-flow-c", "on", "--output-dir", str(out)]) == 0
     assert (out / "C_state_flow.png").exists()
+
+
+def test_empty_result_names_the_likely_cause_instead_of_crashing(tmp_path):
+    """The failure it replaces was a numpy 'zero-size array to reduction
+    operation minimum' from inside the plotting code, which says nothing about
+    the batch correction that produced the empty frame."""
+    m = _mod()
+    g, h = _pair(n_cells=20, n_bins=10)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp)
+    h.to_parquet(hp)
+    with pytest.raises(SystemExit, match="no bin survived"):
+        m.main(["--gch-d", str(gp), "--hcg-d", str(hp),
+                "--min-cells", "999", "--plot-format", "png",
+                "--output-dir", str(tmp_path / "o")])

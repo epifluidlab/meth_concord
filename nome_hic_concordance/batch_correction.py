@@ -228,13 +228,41 @@ def _combat_correction(
 
     ComBat expects features × samples, so the matrix is transposed
     before being passed in and the result is transposed back.
+
+    Bins with no WITHIN-BATCH variance are held out and returned untouched.
+    ComBat standardises each feature by its pooled within-batch variance, so
+    such a bin divides by zero; and because the empirical-Bayes priors are
+    estimated by pooling ACROSS features, the resulting NaN does not stay in
+    that one bin -- it travels through the shared prior and comes back out in
+    EVERY bin.  One dead bin therefore turns the whole corrected matrix into
+    NaN, which downstream looks like "no bin passed the coverage filter"
+    rather than like a numerical failure.  A bin with no within-batch variance
+    has no batch effect to remove in the first place, so holding it out costs
+    nothing.
     """
+    original = matrix
     # NaN-impute (ComBat doesn't tolerate NaNs).
     matrix = _impute_for_dense_solver(matrix, "ComBat")
 
+    # Pooled within-batch SD, which is what ComBat divides by.
+    centred = matrix - matrix.groupby(batch_labels.to_numpy()).transform("mean")
+    n = max(len(matrix) - int(batch_labels.nunique()), 1)
+    usable = np.sqrt((centred ** 2).sum(axis=0) / n) > 1e-8
+    held = matrix.columns[~usable]
+    if len(held):
+        logger.info(
+            f"  ComBat: {len(held)} bin(s) have no within-batch variance and "
+            f"cannot be standardised; held out and returned unchanged (they "
+            f"carry no batch effect to remove, and one of them would turn the "
+            f"whole matrix into NaN through the shared prior).")
+    if not usable.any():
+        logger.warning("  ComBat: no bin has within-batch variance; "
+                       "returning the input unchanged.")
+        return original
+
     pycombat = _try_import_pycombat()
     # Most pycombat APIs accept (data: features × samples DataFrame, batch: list[str]).
-    data_t = matrix.T  # bins × cells
+    data_t = matrix.loc[:, usable].T  # bins × cells
     batch_list = batch_labels.tolist()
     try:
         corrected_t = pycombat(data_t, batch_list)
@@ -243,7 +271,11 @@ def _combat_correction(
         corrected_t = pycombat(data_t.to_numpy(), batch_list)
         corrected_t = pd.DataFrame(corrected_t, index=data_t.index, columns=data_t.columns)
 
-    return corrected_t.T
+    if not len(held):
+        return corrected_t.T
+    out = original.copy()                     # held-out bins keep their values
+    out.loc[:, usable] = corrected_t.T
+    return out
 
 
 def _try_import_pycombat():

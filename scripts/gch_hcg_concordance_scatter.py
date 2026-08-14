@@ -693,14 +693,25 @@ def main(argv=None) -> int:
 
         if args.batch_correction != "none":
             from nome_hic_concordance import batch_correction as _bc
-            gch = _bc.apply_batch_correction(
-                gch, batch.reindex(gch.index), method=args.batch_correction)
-            hcg = _bc.apply_batch_correction(
-                hcg, batch.reindex(hcg.index), method=args.batch_correction)
-            logger.info(f"{stat_key}: applied per-bin '{args.batch_correction}' "
-                        f"batch correction to both matrices.")
+            # correct_and_report rather than apply_batch_correction: it logs
+            # the before/after batch F so "it ran" and "it worked" stay
+            # distinguishable, and it restores the original NaN pattern, which
+            # ComBat and Harmony both destroy in order to run at all.
+            gch = _bc.correct_and_report(gch, batch, args.batch_correction, 42,
+                                         f"{stat_key} GCH", stage="per-bin")
+            hcg = _bc.correct_and_report(hcg, batch, args.batch_correction, 42,
+                                         f"{stat_key} HCG", stage="per-bin")
 
         df = bin_summary(gch, hcg, args.aggregate, args.min_cells)
+        if df.empty:
+            raise SystemExit(
+                f"{stat_key}: no bin survived --min-cells {args.min_cells}.  "
+                f"With --batch-correction {args.batch_correction!r} this "
+                f"usually means the correction returned NaN rather than that "
+                f"the data are thin: check the per-bin ANOVA F logged just "
+                f"above, and try --batch-correction center, or fewer batch "
+                f"variables ({args.batch_column} was combined into a single "
+                f"composite batch).")
         stats = correlations(df["gch"].to_numpy(), df["hcg"].to_numpy())
         logger.info(f"{stat_key}: {caption(stats)}")
 

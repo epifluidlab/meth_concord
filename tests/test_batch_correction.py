@@ -555,3 +555,74 @@ def test_correct_and_report_reduces_the_batch_effect_it_reports():
     out = bc.correct_and_report(raw, batch, "center", 0, "t")
     post = float(np.nanmedian(bc.batch_anova_f_per_bin(out, batch)))
     assert pre > 50 and post < pre / 100, (pre, post)
+
+
+# ------------------------------------------------- ComBat degenerate columns --
+
+def _fake_combat(monkeypatch, seen):
+    """Stand in for pycombat, recording what it is handed.
+
+    Real ComBat divides each feature by its pooled within-batch variance and
+    then estimates its priors by pooling ACROSS features, so a zero-variance
+    feature does not fail alone -- it returns NaN for every feature.  This
+    stub reproduces that consequence, which is the behaviour the hold-out
+    exists to prevent.
+    """
+    def fake(data_t, batch_list):
+        seen.append(data_t)
+        arr = np.asarray(data_t, float)
+        within_const = np.isclose(arr.std(axis=1), 0.0)
+        if within_const.any():                 # one bad feature poisons them all
+            return pd.DataFrame(np.nan, index=data_t.index,
+                                columns=data_t.columns)
+        return data_t * 0.5
+    monkeypatch.setattr(bc, "_try_import_pycombat", lambda: fake)
+    return fake
+
+
+def test_combat_holds_out_bins_with_no_within_batch_variance(monkeypatch):
+    """The failure this prevents looked like 'no bin passed the coverage
+    filter' — every value NaN — from a handful of empty bins."""
+    seen = []
+    _fake_combat(monkeypatch, seen)
+    raw, batch = _sparse_matrix(missing=0.0)
+    raw.iloc[:, 0] = np.nan                    # empty bin -> zero-filled
+    raw.iloc[:, 1] = 7.0                       # constant bin
+    out = bc.apply_batch_correction(raw, batch, method="combat")
+    assert len(seen) == 1
+    assert list(seen[0].index) == list(raw.columns[2:]), "degenerates held out"
+    assert out.shape == raw.shape
+    assert out.iloc[:, 2:].notna().all().all(), "the usable bins came through"
+    # Held-out bins come back exactly as they went in, NaNs included.
+    assert out.iloc[:, 0].isna().all()
+    assert (out.iloc[:, 1] == 7.0).all()
+
+
+def test_combat_without_degenerate_bins_passes_everything_through(monkeypatch):
+    seen = []
+    _fake_combat(monkeypatch, seen)
+    raw, batch = _sparse_matrix(missing=0.0)
+    out = bc.apply_batch_correction(raw, batch, method="combat")
+    assert list(seen[0].index) == list(raw.columns)
+    np.testing.assert_allclose(out.to_numpy(), raw.to_numpy() * 0.5)
+
+
+def test_combat_returns_the_input_when_no_bin_is_usable(monkeypatch):
+    seen = []
+    _fake_combat(monkeypatch, seen)
+    raw, batch = _sparse_matrix(missing=0.0)
+    raw.iloc[:, :] = 1.0
+    out = bc.apply_batch_correction(raw, batch, method="combat")
+    assert not seen, "ComBat must not be called with nothing to correct"
+    pd.testing.assert_frame_equal(out, raw)
+
+
+def test_a_bin_constant_within_batch_but_not_across_is_still_held_out(monkeypatch):
+    """Pure batch offset and nothing else: ComBat's divisor is the WITHIN-batch
+    variance, which is zero here even though the column clearly varies."""
+    seen = []
+    _fake_combat(monkeypatch, seen)
+    raw, batch = _sparse_matrix(missing=0.0)
+    raw.iloc[:, 0] = np.where(batch.to_numpy() == "b1", 5.0, -5.0)
+    bc.apply_batch_correction(raw, batch, method="combat")
+    assert raw.columns[0] not in set(seen[0].index)
