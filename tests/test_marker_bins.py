@@ -480,6 +480,7 @@ def test_mean_cmap_endpoints_match_nomeseq_convention():
 
 class _Args2(_Args):
     sign_min_consistency = 0.6
+    sign_reference = "zero"
 
 
 def _flat_data(seed=0, n_per=40, n_ct=4):
@@ -803,3 +804,71 @@ def test_contrast_on_an_absent_group_is_reported_not_silent(tmp_path):
     # 'every group' leaves nothing to contrast against, so it is skipped.
     assert "skipped" in r.stderr
     assert not (out / "bin_scores_g.contrast_y.bed").exists()
+
+
+class _SArgsZero(_Args2):
+    sign_reference = "zero"
+
+
+class _SArgsMedian(_Args2):
+    sign_reference = "median"
+
+
+def test_a_mark_that_is_mostly_closed_lands_on_one_side_against_zero():
+    """The identity behind the degenerate result: sign(2F-1) = sign(mean level
+    - 0.5), so D over a mark whose genome-wide mean is far from 0.5 is
+    one-sided everywhere and 'co-closed' merely restates the base rate."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    ct = np.repeat(np.arange(3), 30)
+    nb = 60
+    # Every bin negative (a mostly-closed mark) but with real spread BETWEEN
+    # bins: some far more negative than others.
+    level = rng.normal(-1.0, 0.4, nb)
+    X = level + rng.normal(0, 0.15, (90, nb))
+
+    zero = m.sign_summary(X, ct, 3, _SArgsZero())
+    assert zero["always_co_closed"].mean() > 0.95
+    assert zero["always_co_open"].sum() == 0
+
+    med = m.sign_summary(X, ct, 3, _SArgsMedian())
+    # Against the genome-wide median the same data splits, because the question
+    # becomes "more co-open than typical" rather than "below 50%".
+    assert 0.2 < med["always_co_open"].mean() < 0.8, med["always_co_open"].mean()
+    assert 0.2 < med["always_co_closed"].mean() < 0.8
+
+
+def test_sign_reference_median_is_the_genome_wide_median_of_the_bin_means():
+    m = _mod()
+    X = np.tile(np.array([[-3.0, -1.0, 1.0]]), (10, 1))
+    means = np.nanmean(X, axis=0)
+    assert m.sign_reference(means, "median") == -1.0
+    assert m.sign_reference(means, "zero") == 0.0
+
+
+def test_end_to_end_warns_when_one_state_takes_everything(tmp_path):
+    """A one-sided split is the expected outcome against zero, so the run has
+    to say so rather than let it read as a finding."""
+    rng = np.random.default_rng(4)
+    n_ct, n_per, nb = 3, 30, 40
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    X = rng.normal(-1.0, 0.4, nb) + rng.normal(0, 0.15, (n, nb))
+    cells = [f"cell{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    mat = tmp_path / "concordance_directional.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        stab, sep="\t", index=False)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"g={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "10", "--n-permutations", "40",
+         "--output-dir", str(tmp_path / "out"), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "fall on ONE side" in r.stderr
+    assert "--sign-reference median" in r.stderr

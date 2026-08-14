@@ -335,6 +335,7 @@ def test_the_null_absorbs_a_shared_batch_by_bin_effect():
 class _SArgs:
     min_cells = 5
     state_rule = "fdr"
+    state_reference = "zero"
     state_fdr = 0.05
     state_threshold = 0.0
 
@@ -514,3 +515,66 @@ def test_blacklist_applies_before_the_batch_correction(tmp_path):
     finally:
         bc.correct_and_report = orig
     assert calls == [16, 16], calls
+
+
+class _SArgsRef(_SArgs):
+    state_reference = "zero"
+
+
+class _SArgsMed(_SArgs):
+    state_reference = "median"
+
+
+def test_state_reference_zero_is_one_sided_for_a_mark_off_0_5():
+    """sign(2F−1) = sign(mean level − 0.5): a mark whose genome-wide mean is
+    not near 0.5 puts every bin on one side, and 'co-closed everywhere' is the
+    base rate restated rather than a regional finding."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    nb = 60
+    level = rng.normal(-1.0, 0.4, nb)
+    X = pd.DataFrame(level + rng.normal(0, 0.15, (60, nb)),
+                     index=[f"c{i}" for i in range(60)],
+                     columns=[f"chr1:{i * 250000}" for i in range(nb)])
+    zero, _, _ = m.bin_states(X, ("co-open", "co-closed"), _SArgsRef())
+    assert (zero == "co-closed").mean() > 0.95
+    med, _, _ = m.bin_states(X, ("co-open", "co-closed"), _SArgsMed())
+    assert 0.2 < (med == "co-open").mean() < 0.8, med
+
+
+def test_flow_has_something_to_flow_once_the_reference_is_relative(tmp_path):
+    m = _mod()
+    rng = np.random.default_rng(1)
+    n, nb = 80, 120
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    # Both marks sit far off 0.5 -- GCH mostly closed, HCG mostly methylated --
+    # exactly the real situation, with a genuine anti-correlation between them.
+    lvl = rng.normal(0, 1.0, nb)
+    g = pd.DataFrame(-1.5 + lvl + rng.normal(0, .2, (n, nb)),
+                     index=cells, columns=bins)
+    h = pd.DataFrame(1.5 - lvl + rng.normal(0, .2, (n, nb)),
+                     index=cells, columns=bins)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp)
+    h.to_parquet(hp)
+
+    def counts(extra, sub):
+        assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp),
+                       "--min-cells", "5", "--plot-format", "png",
+                       "--per-bin-correlation", "off",
+                       "--output-dir", str(tmp_path / sub)] + extra) == 0
+        return pd.read_csv(tmp_path / sub / "D_state_flow_counts.tsv",
+                           sep="\t", index_col=0)
+
+    def concentration(t):
+        a = t.to_numpy()
+        return a.max() / a.sum()
+
+    zero = counts([], "zero")
+    assert concentration(zero) > 0.9, "essentially one ribbon, no information"
+    med = counts(["--state-reference", "median"], "med")
+    assert concentration(med) < 0.75, "a real table to read"
+    # Anti-correlated by construction: co-open goes to co-unmethylated.
+    assert med.loc["co-open", "co-unmethylated"] > med.loc["co-open",
+                                                           "co-methylated"]

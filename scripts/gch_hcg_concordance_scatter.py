@@ -452,16 +452,27 @@ def bin_states(M: pd.DataFrame, names, args):
     """Label each bin by the sign its cells agree on: (labels, mean, q).
 
     Under the default 'fdr' rule a bin is called only when its cells actually
-    agree — a one-sample t of the per-cell values against zero, BH-adjusted
-    over bins — so 'mixed' means "no consistent direction", not "close to an
-    arbitrary line".  --state-rule threshold restores the arbitrary line for
-    anyone who wants a fixed effect size instead.
+    agree — a one-sample t of the per-cell values against the reference,
+    BH-adjusted over bins — so 'mixed' means "no consistent direction", not
+    "close to an arbitrary line".  --state-rule threshold restores the
+    arbitrary line for anyone who wants a fixed effect size instead.
+
+    The reference is zero only under --state-reference zero.  For a pair with
+    marginals p1, p2, P(both open) − P(both closed) = p1 + p2 − 1, so
+    sign(2F−1) is the sign of (mean level − 0.5) and D inherits it: against
+    zero, a mark whose genome-wide mean is not near 0.5 puts every bin on one
+    side, which is the base rate restated rather than anything regional.
     """
     from scipy.stats import t as _t
     X = M.to_numpy(float)
     n = np.isfinite(X).sum(axis=0).astype(float)
     with np.errstate(invalid="ignore", divide="ignore"):
         mean = np.nanmean(X, axis=0)
+        ref = 0.0
+        if args.state_reference == "median":
+            finite = mean[np.isfinite(mean)]
+            ref = float(np.median(finite)) if finite.size else 0.0
+        mean = mean - ref
         sd = np.nanstd(X, axis=0, ddof=1)
         tt = mean / (sd / np.sqrt(np.maximum(n, 1)))
         p = 2.0 * _t.sf(np.abs(tt), np.maximum(n - 1, 1))
@@ -658,6 +669,17 @@ def main(argv=None) -> int:
                          "'mixed' means the cells do not agree rather than "
                          "'near an arbitrary line'.  'threshold': |mean| > "
                          "--state-threshold.")
+    ap.add_argument("--state-reference", choices=["zero", "median"],
+                    default="zero",
+                    help="What a bin's state is judged against.  'zero' is the "
+                         "literal reading and is almost always degenerate on "
+                         "real data: sign(2F−1) = sign(mean level − 0.5), so "
+                         "GCH (mean well below 0.5) comes back co-closed "
+                         "everywhere and HCG (mean well above) co-methylated "
+                         "everywhere, and the flow collapses to one ribbon.  "
+                         "'median' judges each bin against the genome-wide "
+                         "median of the per-bin means, which is the version "
+                         "with something to flow.")
     ap.add_argument("--state-fdr", type=float, default=0.05)
     ap.add_argument("--state-threshold", type=float, default=0.0,
                     help="Only with --state-rule threshold.")
@@ -762,6 +784,18 @@ def main(argv=None) -> int:
             h_lab, h_mean, h_q = bin_states(
                 H, ("co-methylated", "co-unmethylated"), args)
             tab = flow_table(g_lab, h_lab)
+            for side, lab in (("GCH", g_lab), ("HCG", h_lab)):
+                called = lab[(lab != "mixed") & (lab != "unusable")]
+                if called.size:
+                    top = pd.Series(called).value_counts().iloc[0] / called.size
+                    if top > 0.9 and args.state_reference == "zero":
+                        logger.warning(
+                            f"{stat_key} {side}: {100 * top:.1f}% of called "
+                            f"bins are ONE state.  Against --state-reference "
+                            f"zero that is the genome's base rate, not a "
+                            f"regional signal: sign(2F−1) = sign(mean level − "
+                            f"0.5).  Re-run with --state-reference median for "
+                            f"a flow with something in it.")
             tab.to_csv(out_dir / f"{stat_key}_state_flow_counts.tsv", sep="\t")
             pd.DataFrame({"bin": G.columns, "gch_state": g_lab,
                           "gch_mean": g_mean, "gch_q": g_q,

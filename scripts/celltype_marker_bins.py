@@ -257,6 +257,33 @@ def select_stable_bins(X, cell_type_ids, n_ct, b_icc, args, n_want):
     return sel, spread, int(clean.size)
 
 
+def sign_reference(grand, mode: str) -> float:
+    """The value a bin's D is called co-open / co-closed against.
+
+    Zero is the neutral point for COORDINATION but NOT for DIRECTION, and that
+    distinction decides what this analysis can see.  For a pair with marginals
+    p1, p2,
+
+        P(both open) - P(both closed) = p1*p2 - (1-p1)(1-p2) = p1 + p2 - 1
+
+    so sign(2F-1) is the sign of (mean level - 0.5), and D = C*(2F-1) inherits
+    it.  Mean GCH accessibility over 250 kb bins sits well below 0.5 and mean
+    HCG methylation well above it, so against zero essentially every bin comes
+    back co-closed for GCH and co-methylated for HCG.  That is the genome's
+    base rate restated, not a property of any region.
+
+    'median' therefore calls a bin against the genome-wide median of the
+    per-bin means instead: "more co-open than the typical bin", which is the
+    question that has an answer that varies along the genome.  'zero' keeps
+    the literal reading for anyone who wants it.
+    """
+    if mode == "zero":
+        return 0.0
+    v = np.asarray(grand, float)
+    v = v[np.isfinite(v)]
+    return float(np.median(v)) if v.size else 0.0
+
+
 def sign_summary(raw, cell_type_ids, n_ct, args):
     """Per-bin co-open / co-closed evidence for a DIRECTIONAL matrix.
 
@@ -269,26 +296,29 @@ def sign_summary(raw, cell_type_ids, n_ct, args):
 
     Returns the per-cell-type mean range and the fraction of cells on the
     positive side, so a bin is called only when EVERY cell type agrees and the
-    cells within them mostly do too.
+    cells within them mostly do too.  Both are measured against
+    :func:`sign_reference`, not necessarily against zero.
     """
     X = np.asarray(raw, float)
     means, usable = _group_stats(X, cell_type_ids, n_ct,
                                  args.min_cells_per_group)
     covered = usable.sum(axis=0)
     with np.errstate(invalid="ignore"):
-        lo = np.nanmin(means, axis=0)
-        hi = np.nanmax(means, axis=0)
-        fin = np.isfinite(X).sum(axis=0)
-        pos = np.nansum(X > 0, axis=0)
-        frac_pos = np.where(fin > 0, pos / np.maximum(fin, 1), np.nan)
         grand = np.nanmean(X, axis=0)
+        ref = sign_reference(grand, args.sign_reference)
+        lo = np.nanmin(means, axis=0) - ref
+        hi = np.nanmax(means, axis=0) - ref
+        fin = np.isfinite(X).sum(axis=0)
+        pos = np.nansum(X > ref, axis=0)
+        frac_pos = np.where(fin > 0, pos / np.maximum(fin, 1), np.nan)
     enough = covered >= max(args.min_groups, 2)
     lo = np.where(enough, lo, np.nan)
     hi = np.where(enough, hi, np.nan)
     c = args.sign_min_consistency
     co_open = np.isfinite(lo) & (lo > 0) & (frac_pos >= c)
     co_closed = np.isfinite(hi) & (hi < 0) & ((1.0 - frac_pos) >= c)
-    return {"d_mean": grand, "d_group_min": lo, "d_group_max": hi,
+    return {"d_mean": grand, "d_reference": np.full(X.shape[1], ref),
+            "d_group_min": lo, "d_group_max": hi,
             "frac_cells_positive": frac_pos, "n_groups_used": covered,
             "always_co_open": co_open, "always_co_closed": co_closed}
 
@@ -925,6 +955,20 @@ def main():
                          "Computed on the RAW values, since the normalisation "
                          "used for selection destroys the sign.  Writes "
                          "bin_scores_<name>.always_co_{open,closed}.bed.")
+    ap.add_argument("--sign-reference", choices=["zero", "median"],
+                    default="zero",
+                    help="What co-open / co-closed is judged against.  'zero' "
+                         "is the literal reading, and on real data it is "
+                         "almost always degenerate: sign(2F−1) equals "
+                         "sign(mean level − 0.5), so with mean GCH "
+                         "accessibility below 0.5 and mean HCG methylation "
+                         "above it, essentially every bin comes back "
+                         "co-closed for GCH and co-methylated for HCG — the "
+                         "genome's base rate restated, not a property of any "
+                         "region.  'median' judges each bin against the "
+                         "genome-wide median instead ('more co-open than the "
+                         "typical bin'), which is the version that varies "
+                         "along the genome.")
     ap.add_argument("--sign-min-consistency", type=float, default=0.6,
                     help="Fraction of cells that must fall on the dominant "
                          "side for a bin to be called always co-open / "
@@ -1262,12 +1306,25 @@ def main():
                 subsets[key] = mask
                 summary_sign[f"n_{key}"] = int(mask.sum())
                 summary_sign[f"n_{key}_total"] = int(sg[key].sum())
-            for c in ("d_mean", "d_group_min", "d_group_max",
+            for c in ("d_mean", "d_reference", "d_group_min", "d_group_max",
                       "frac_cells_positive"):
                 scores_df[c] = sg[c]
-            extra_cols += ["d_mean", "d_group_min", "d_group_max",
-                           "frac_cells_positive", "always_co_open",
-                           "always_co_closed"]
+            extra_cols += ["d_mean", "d_reference", "d_group_min",
+                           "d_group_max", "frac_cells_positive",
+                           "always_co_open", "always_co_closed"]
+            called = int(sg["always_co_open"].sum()
+                         + sg["always_co_closed"].sum())
+            big = max(int(sg["always_co_open"].sum()),
+                      int(sg["always_co_closed"].sum()))
+            if called and big / called > 0.9 and args.sign_reference == "zero":
+                print(f"  NOTE {name}: {100 * big / called:.1f}% of the called "
+                      f"bins fall on ONE side.  Against --sign-reference zero "
+                      f"that is expected rather than informative: "
+                      f"sign(2F−1) = sign(mean level − 0.5), so a mark whose "
+                      f"genome-wide mean is not near 0.5 lands on one side "
+                      f"everywhere.  Re-run with --sign-reference median for "
+                      f"the version that varies along the genome.",
+                      file=sys.stderr)
 
         # (4) Group-set contrasts: these groups against every other.
         summary_contrast = {}
