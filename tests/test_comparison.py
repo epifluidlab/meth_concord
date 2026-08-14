@@ -314,3 +314,178 @@ def test_batch_design_shapes_and_centering():
     # a single-level batch contributes no columns -> None
     one = pd.Series(["a"] * 6, index=cells)
     assert C._batch_design(one, cells) is None
+
+
+# ------------------------------ concordance-stage batch correction (compare) --
+
+def _batched(seed=0, offset=3.0):
+    """Concordance and baseline matrices sharing a hard per-bin batch offset.
+
+    The offset sits on the raw values, which is where it lands in the real
+    pipeline: per-cell coverage drives the DM shrinkage and what RWR imputes,
+    so batch is mixed into the bins before any embedding exists.
+    """
+    import numpy as np, pandas as pd
+    rng = np.random.default_rng(seed)
+    n = 40
+    cells = _cells(n)
+    bins8 = _bins(8, 250_000)
+    sig = np.r_[np.ones(n // 2), -np.ones(n // 2)]
+    batch = pd.Series(["b1" if i % 2 == 0 else "b2" for i in range(n)],
+                      index=cells)
+    shift = np.where(batch.to_numpy() == "b1", offset, -offset)[:, None]
+    base = pd.DataFrame(rng.normal(0, 1, (n, 8)) + 0.4 * sig[:, None],
+                        index=cells, columns=bins8)
+    conc = pd.DataFrame(rng.normal(0, 1, (n, 8)) + 0.4 * sig[:, None] + shift,
+                        index=cells, columns=bins8)
+    labels = pd.Series(["A"] * (n // 2) + ["B"] * (n // 2), index=cells)
+    return base, conc, labels, batch
+
+
+def test_concordance_stage_correction_hits_concordance_not_baselines(tmp_path):
+    """The point of a separate flag: baselines come off a different stage and
+    must be left as they are.  Checked downstream, on the analysis the
+    correction is supposed to change, rather than on the bookkeeping."""
+    import numpy as np
+    from nome_hic_concordance import batch_correction as bc, comparison as C
+    base, conc, labels, batch = _batched()
+    assert float(np.nanmedian(bc.batch_anova_f_per_bin(conc, batch))) > 10.0, (
+        "fixture must be batchy or the test proves nothing")
+
+    def run(where, method):
+        return C.run_comparison(
+            {"accessibility": base, "gch": conc}, labels,
+            baseline_names=["accessibility"], concordance_names=["gch"],
+            output_dir=str(tmp_path / where), matrix_norm="quantile", n_svd=5,
+            min_cell_coverage=0.5, n_folds=3, random_state=0,
+            concordance_batch_labels=batch,
+            concordance_batch_correction=method)
+
+    off, on = run("off", "none"), run("on", "center")
+    rec = on["concordance_batch_correction"]
+    assert rec["method"] == "center" and rec["matrices"] == ["gch"]
+    assert rec["applied_on"] == "raw_matrix_per_bin"
+    assert "concordance_batch_correction" not in off
+    assert on["marginal"]["gch"] != off["marginal"]["gch"], (
+        "the corrected matrix must reach the analysis")
+    assert on["marginal"]["accessibility"] == off["marginal"]["accessibility"], (
+        "the baseline must be bit-identical either way")
+
+
+def test_concordance_stage_correction_removes_the_offset(tmp_path):
+    import numpy as np
+    from nome_hic_concordance import batch_correction as bc
+    base, conc, labels, batch = _batched()
+    pre = float(np.nanmedian(bc.batch_anova_f_per_bin(conc, batch)))
+    post = float(np.nanmedian(bc.batch_anova_f_per_bin(
+        bc.correct_and_report(conc, batch, "center", 0, "gch"), batch)))
+    assert post < pre / 10, (pre, post)
+
+
+def test_compare_and_concordance_apply_the_same_transform():
+    """Both CLIs must route through one implementation, or a setting chosen in
+    one tool would not reproduce in the other."""
+    import numpy as np
+    from nome_hic_concordance import batch_correction as bc, cli
+    _, conc, _, batch = _batched()
+    a = cli._correct_concordance_batch(conc, batch, "center", 42, "x")
+    b = bc.correct_and_report(conc, batch, "center", 42, "x")
+    np.testing.assert_allclose(a.to_numpy(), b.to_numpy())
+
+
+def test_compare_cli_defaults_the_column_to_batch_column(tmp_path):
+    import pandas as pd
+    from nome_hic_concordance import comparison_cli as cc
+    base, conc, labels, batch = _batched()
+    sheet = pd.DataFrame({"cell_name": labels.index, "group": labels.to_numpy(),
+                          "exp_batch": batch.to_numpy(),
+                          "lib_batch": ["L1", "L2"] * (len(labels) // 2)})
+    sp = tmp_path / "s.tsv"
+    sheet.to_csv(sp, sep="\t", index=False)
+    base.to_parquet(tmp_path / "base.parquet")
+    conc.to_parquet(tmp_path / "conc.parquet")
+    argv = ["--accessibility-matrix", str(tmp_path / "base.parquet"),
+            "--concordance-matrix", f"gch={tmp_path / 'conc.parquet'}",
+            "--samples", str(sp), "--batch-column", "exp_batch",
+            "--concordance-batch-correction", "center",
+            "--n-svd", "5", "--n-folds", "3",
+            "--output-dir", str(tmp_path / "out")]
+    assert cc.main(argv) == 0
+    import json
+    with open(tmp_path / "out" / "summary.json") as fh:
+        rec = json.load(fh)["concordance_batch_correction"]
+    assert rec["method"] == "center" and rec["matrices"] == ["gch"]
+
+
+def test_compare_cli_can_use_a_different_column_than_batch_column(tmp_path):
+    """The two corrections act on different matrices at different stages, so a
+    sweep can land on different variables for each."""
+    import pandas as pd
+    from nome_hic_concordance import comparison_cli as cc
+    base, conc, labels, batch = _batched()
+    sheet = pd.DataFrame({"cell_name": labels.index, "group": labels.to_numpy(),
+                          "exp_batch": ["E1", "E2"] * (len(labels) // 2),
+                          "lib_batch": batch.to_numpy()})
+    sp = tmp_path / "s.tsv"
+    sheet.to_csv(sp, sep="\t", index=False)
+    base.to_parquet(tmp_path / "base.parquet")
+    conc.to_parquet(tmp_path / "conc.parquet")
+    args = cc.parse_args(
+        ["--concordance-matrix", f"gch={tmp_path / 'conc.parquet'}",
+         "--samples", str(sp), "--batch-column", "exp_batch",
+         "--concordance-batch-column", "lib_batch",
+         "--concordance-batch-correction", "center",
+         "--output-dir", str(tmp_path / "out")])
+    assert args.concordance_batch_column == "lib_batch"
+    assert args.batch_column == "exp_batch"
+
+
+def test_compare_cli_rejects_correction_without_a_column(tmp_path):
+    import pandas as pd, pytest
+    from nome_hic_concordance import comparison_cli as cc
+    base, conc, labels, batch = _batched()
+    sheet = pd.DataFrame({"cell_name": labels.index, "group": labels.to_numpy()})
+    sp = tmp_path / "s.tsv"
+    sheet.to_csv(sp, sep="\t", index=False)
+    conc.to_parquet(tmp_path / "conc.parquet")
+    with pytest.raises(ValueError, match="concordance-batch-correction"):
+        cc.main(["--concordance-matrix", f"gch={tmp_path / 'conc.parquet'}",
+                 "--samples", str(sp),
+                 "--concordance-batch-correction", "center",
+                 "--output-dir", str(tmp_path / "out")])
+
+
+def test_compare_cli_rejects_an_unknown_concordance_batch_column(tmp_path):
+    import pandas as pd, pytest
+    from nome_hic_concordance import comparison_cli as cc
+    base, conc, labels, batch = _batched()
+    sheet = pd.DataFrame({"cell_name": labels.index, "group": labels.to_numpy(),
+                          "exp_batch": batch.to_numpy()})
+    sp = tmp_path / "s.tsv"
+    sheet.to_csv(sp, sep="\t", index=False)
+    conc.to_parquet(tmp_path / "conc.parquet")
+    with pytest.raises(ValueError, match="concordance-batch-column"):
+        cc.main(["--concordance-matrix", f"gch={tmp_path / 'conc.parquet'}",
+                 "--samples", str(sp), "--concordance-batch-column", "nope",
+                 "--concordance-batch-correction", "center",
+                 "--output-dir", str(tmp_path / "out")])
+
+
+def test_compare_cli_leaves_matrices_alone_when_off(tmp_path):
+    import json
+    import pandas as pd
+    from nome_hic_concordance import comparison_cli as cc
+    base, conc, labels, batch = _batched()
+    sheet = pd.DataFrame({"cell_name": labels.index, "group": labels.to_numpy(),
+                          "exp_batch": batch.to_numpy()})
+    sp = tmp_path / "s.tsv"
+    sheet.to_csv(sp, sep="\t", index=False)
+    base.to_parquet(tmp_path / "base.parquet")
+    conc.to_parquet(tmp_path / "conc.parquet")
+    assert cc.main(["--accessibility-matrix", str(tmp_path / "base.parquet"),
+                    "--concordance-matrix", f"gch={tmp_path / 'conc.parquet'}",
+                    "--samples", str(sp), "--batch-column", "exp_batch",
+                    "--n-svd", "5", "--n-folds", "3",
+                    "--output-dir", str(tmp_path / "out")]) == 0
+    with open(tmp_path / "out" / "summary.json") as fh:
+        assert "concordance_batch_correction" not in json.load(fh)

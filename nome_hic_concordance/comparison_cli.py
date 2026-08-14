@@ -143,6 +143,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "harmonised inputs — mirroring nome_hic_concordance, "
                         "which corrects the mean-accessibility matrix before it "
                         "is normalised.")
+    p.add_argument("--concordance-batch-column", type=str, default=None,
+                   help="Batch variable(s) for --concordance-batch-correction "
+                        "when they should differ from --batch-column; accepts "
+                        "a COMMA-SEPARATED list.  Defaults to --batch-column, "
+                        "so the common case stays one flag.")
+    p.add_argument("--concordance-batch-correction",
+                   choices=["none", "center", "zscore", "combat", "harmony"],
+                   default="none",
+                   help="Batch-correct ONLY the --concordance-matrix inputs, "
+                        "per bin on their raw values, before any "
+                        "normalization.  This is a different stage from "
+                        "--batch-correction, which acts on the UMAP SVD scores "
+                        "of every matrix: batch is already mixed into the "
+                        "concordance bins (per-cell coverage drives the DM "
+                        "shrinkage and what RWR imputes), and ten SVD "
+                        "components cannot separate it out afterwards.  It has "
+                        "to precede the per-bin normalization, since QN turns a "
+                        "batch offset into a batch-ordered ranking and keeps "
+                        "it.  Same flag and semantics as in "
+                        "nome_hic_concordance, so a setting chosen there can be "
+                        "reproduced here.  Baselines are deliberately left "
+                        "alone — they come off a different stage, and "
+                        "correcting them with a setting tuned for concordance "
+                        "would weaken the control the comparison rests on.  "
+                        "Needs --batch-column or --concordance-batch-column.")
     p.add_argument("--harmony-theta", type=float, default=None,
                    help="Harmony batch-correction STRENGTH (diversity-clustering "
                         "penalty) for --batch-correction harmony.  Higher mixes "
@@ -259,28 +284,53 @@ def main(argv: list[str] | None = None) -> int:
             "cross-method comparison needs >= 2.")
 
     group_labels = group_colors = batch_labels = None
+    concordance_batch_labels = None
     if args.samples:
         from .cli import group_colors_from_samples
 
         sheet = _load_samples_sheet(args.samples)
         group_labels = sheet.set_index("cell_name")["group"]
         group_colors = group_colors_from_samples(sheet, args.color_column)
-        if args.batch_column:
-            bcols = [c.strip() for c in args.batch_column.split(",") if c.strip()]
-            miss = [c for c in bcols if c not in sheet.columns]
+        idx = sheet.set_index("cell_name")
+
+        def _batch_series(spec: str, flag: str):
+            cols = [c.strip() for c in spec.split(",") if c.strip()]
+            miss = [c for c in cols if c not in sheet.columns]
             if miss:
                 raise ValueError(
-                    f"--batch-column {miss} not in {args.samples}. "
+                    f"{flag} {miss} not in {args.samples}. "
                     f"Available columns: {sheet.columns.tolist()}"
                 )
-            idx = sheet.set_index("cell_name")
-            batch_labels = idx[bcols[0]] if len(bcols) == 1 else idx[bcols]
-    elif args.color_column or args.batch_column:
-        raise ValueError("--color-column / --batch-column require --samples.")
+            return idx[cols[0]] if len(cols) == 1 else idx[cols]
+
+        if args.batch_column:
+            batch_labels = _batch_series(args.batch_column, "--batch-column")
+        # Falls back to --batch-column, so one flag covers the common case.
+        concordance_batch_labels = (
+            _batch_series(args.concordance_batch_column,
+                          "--concordance-batch-column")
+            if args.concordance_batch_column else batch_labels)
+    elif (args.color_column or args.batch_column
+          or args.concordance_batch_column):
+        raise ValueError("--color-column / --batch-column / "
+                         "--concordance-batch-column require --samples.")
     if args.batch_correction != "none" and batch_labels is None:
         raise ValueError(
             f"--batch-correction {args.batch_correction!r} requires --batch-column."
         )
+    if (args.concordance_batch_correction != "none"
+            and concordance_batch_labels is None):
+        raise ValueError(
+            f"--concordance-batch-correction "
+            f"{args.concordance_batch_correction!r} requires --batch-column "
+            f"or --concordance-batch-column."
+        )
+    if args.concordance_batch_correction != "none" and not concordance_names:
+        logger.warning(
+            "--concordance-batch-correction %r has nothing to act on: no "
+            "--concordance-matrix was given.  Baselines are left uncorrected "
+            "by design; use --batch-correction for those.",
+            args.concordance_batch_correction)
     group_order = ([s.strip() for s in args.group_order.split(",") if s.strip()]
                    if args.group_order else None)
     skip_top_svd = _parse_skip_top_svd(args.skip_top_svd)
@@ -301,6 +351,8 @@ def main(argv: list[str] | None = None) -> int:
         skip_top_svd=skip_top_svd,
         batch_labels=batch_labels,
         batch_correction=args.batch_correction,
+        concordance_batch_labels=concordance_batch_labels,
+        concordance_batch_correction=args.concordance_batch_correction,
         harmony_theta=args.harmony_theta,
         per_cell_norm=args.per_cell_norm,
         post_norm_recenter=args.post_norm_recenter == "on",

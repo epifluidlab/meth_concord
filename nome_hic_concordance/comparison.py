@@ -824,6 +824,8 @@ def run_comparison(
     post_norm_recenter: bool = False,
     plot_format: str = "png",
     harmony_theta=None,
+    concordance_batch_labels=None,
+    concordance_batch_correction: str = "none",
 ) -> dict:
     """Run the full §4.2 suite; write summary.json; return the headline dict."""
     out = ensure_dir(output_dir)
@@ -861,6 +863,28 @@ def run_comparison(
         summary["batch_correction"] = {
             "method": batch_correction, "applied_on": "umap_svd_scores",
             "matrices": sorted(matrices)}
+
+    # (a0') The concordance matrices get their own, EARLIER correction, on the
+    # raw per-bin values rather than the scores, and only on them.  The
+    # baselines come off a different stage of a different pipeline, so a
+    # setting tuned for one is not the setting for the other; this is the same
+    # split nome_hic_concordance draws between --batch-correction and
+    # --concordance-batch-correction, and it is what lets a winning
+    # concordance-stage setting be reproduced here.  Applied after the
+    # common-cell intersection so the batch means are those of the cells the
+    # analysis actually uses, and before every normalization, since per-bin QN
+    # turns a batch offset into a batch-ordered ranking and preserves it.
+    if (concordance_batch_labels is not None
+            and concordance_batch_correction != "none"):
+        from . import batch_correction as _bc
+        touched = [n for n in concordance_names if n in matrices]
+        for name in touched:
+            matrices[name] = _bc.correct_and_report(
+                matrices[name], concordance_batch_labels,
+                concordance_batch_correction, random_state, name)
+        summary["concordance_batch_correction"] = {
+            "method": concordance_batch_correction,
+            "applied_on": "raw_matrix_per_bin", "matrices": sorted(touched)}
 
     # (a) Marginal.
     summary["marginal"] = marginal_analysis(

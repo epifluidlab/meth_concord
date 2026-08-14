@@ -430,6 +430,44 @@ def _harmony_correction(
 # ---------------------------------------------------------------------------
 
 
+def correct_and_report(matrix: pd.DataFrame, batch_labels, method: str,
+                       random_state: int, label: str,
+                       stage: str = "concordance") -> pd.DataFrame:
+    """Per-bin batch correction of a cells × bins matrix, with a before/after F.
+
+    Used by both CLIs for the concordance-matrix stage, which sits between the
+    two corrections that do NOT touch these values: one corrects the
+    mean-accessibility matrix seeding the RWR graph, the other the SVD scores
+    just before UMAP.  Batch enters the concordance itself in between — through
+    per-cell coverage driving the DM shrinkage and what RWR imputes — and a
+    correction on ten SVD components cannot separate what is already mixed into
+    the bins.  This removes each batch's per-bin mean while leaving the
+    cell-type centroids in place.
+
+    It must run BEFORE the per-bin quantile normalization: QN ranks cells
+    within a bin, and a batch offset simply becomes a batch-ordered ranking, so
+    QN preserves rather than removes it.
+
+    The before/after ANOVA F is logged so "the correction ran" and "the
+    correction worked" stay distinguishable.
+    """
+    bl = (batch_labels.reindex(matrix.index)
+          if isinstance(batch_labels, (pd.Series, pd.DataFrame))
+          else batch_labels)
+    f_pre = batch_anova_f_per_bin(matrix, bl)
+    out = apply_batch_correction(matrix, bl, method=method,
+                                 random_state=random_state)
+    f_post = batch_anova_f_per_bin(out, bl)
+    logger.info(
+        f"[{stage} batch correction: {method}] {label}: "
+        f"per-bin ANOVA F over batches median "
+        f"{float(np.nanmedian(f_pre)):.2f} → {float(np.nanmedian(f_post)):.2f} "
+        f"(90th pct {float(np.nanpercentile(f_pre, 90)):.2f} → "
+        f"{float(np.nanpercentile(f_post, 90)):.2f})"
+    )
+    return out
+
+
 def batch_anova_f_per_bin(
     matrix: pd.DataFrame, batch_labels,
 ) -> pd.Series:

@@ -870,39 +870,16 @@ def _get_chrom_sizes_from_bam(bam_path: str) -> dict[str, int]:
 
 def _correct_concordance_batch(df, batch_labels, method: str,
                                random_state: int, label: str):
-    """Per-bin batch correction of a cells × bins concordance matrix.
+    """Step-7 concordance-matrix batch correction.
 
-    The pipeline's other two corrections do NOT touch these values: Step 5
-    corrects the mean-accessibility matrix that seeds the RWR graph, and Step 7
-    corrects the SVD scores just before UMAP.  Batch enters the concordance
-    itself in between — through per-cell coverage driving the DM shrinkage and
-    what RWR imputes — and a correction on ten SVD components cannot separate
-    what is already mixed into the bins.  This removes each batch's per-bin
-    mean while leaving the cell-type centroids in place.
-
-    It must run BEFORE the per-bin quantile normalization: QN ranks cells
-    within a bin, and a batch offset simply becomes a batch-ordered ranking, so
-    QN preserves rather than removes it.
-
-    The before/after ANOVA F is logged so "the correction ran" and "the
-    correction worked" stay distinguishable.
+    Lives in batch_correction so nome_hic_compare applies the identical
+    transform to the same matrices; see
+    :func:`batch_correction.correct_and_report` for why this stage exists at
+    all and why it has to precede the per-bin normalization.
     """
     from . import batch_correction as _bc
-    bl = (batch_labels.reindex(df.index)
-          if isinstance(batch_labels, (pd.Series, pd.DataFrame))
-          else batch_labels)
-    f_pre = _bc.batch_anova_f_per_bin(df, bl)
-    out = _bc.apply_batch_correction(df, bl, method=method,
-                                     random_state=random_state)
-    f_post = _bc.batch_anova_f_per_bin(out, bl)
-    logger.info(
-        f"[concordance batch correction: {method}] {label}: "
-        f"per-bin ANOVA F over batches median "
-        f"{float(np.nanmedian(f_pre)):.2f} → {float(np.nanmedian(f_post)):.2f} "
-        f"(90th pct {float(np.nanpercentile(f_pre, 90)):.2f} → "
-        f"{float(np.nanpercentile(f_post, 90)):.2f})"
-    )
-    return out
+    return _bc.correct_and_report(df, batch_labels, method, random_state,
+                                  label)
 
 
 def _resolve_concordance_combine(args) -> str:
