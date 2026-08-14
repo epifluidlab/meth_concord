@@ -518,3 +518,50 @@ def test_a_real_path_containing_an_equals_sign_still_loads(tmp_path):
     odd = tmp_path / "run=1.parquet"
     base.to_parquet(odd)
     assert cc._plain_path(str(odd), "--accessibility-matrix") == str(odd)
+
+
+def test_unnamed_baseline_is_not_called_concordance(tmp_path, caplog):
+    """It used to be: a bare --baseline-matrix inherited the concordance
+    default, so a BASELINE was labelled as the thing it is the control for in
+    every figure, table and UMAP filename."""
+    from nome_hic_concordance import comparison_cli as cc
+    name, path = cc._parse_named("/x/acc.parquet", "baseline",
+                                 "--baseline-matrix")
+    assert (name, path) == ("baseline", "/x/acc.parquet")
+    assert cc._parse_named("/x/c.parquet")[0] == "concordance"
+    assert cc._parse_named("gch_mean=/x/acc.parquet")[0] == "gch_mean"
+
+
+def test_two_bare_paths_collide_loudly_instead_of_overwriting(tmp_path):
+    """The silent version put one matrix in BOTH baseline_names and
+    concordance_names, so the variance partition regressed it on itself."""
+    import pandas as pd, pytest
+    from nome_hic_concordance import comparison_cli as cc
+    base, conc, labels, _ = _batched()
+    a, b = tmp_path / "a.parquet", tmp_path / "b.parquet"
+    base.to_parquet(a)
+    conc.to_parquet(b)
+    sheet = pd.DataFrame({"cell_name": labels.index, "group": labels.to_numpy()})
+    sp = tmp_path / "s.tsv"
+    sheet.to_csv(sp, sep="\t", index=False)
+    with pytest.raises(ValueError, match="already taken"):
+        cc.main(["--concordance-matrix", str(a),
+                 "--concordance-matrix", str(b),
+                 "--samples", str(sp), "--output-dir", str(tmp_path / "o")])
+
+
+def test_a_baseline_may_not_shadow_a_fixed_matrix_name(tmp_path):
+    import pandas as pd, pytest
+    from nome_hic_concordance import comparison_cli as cc
+    base, conc, labels, _ = _batched()
+    a, b = tmp_path / "a.parquet", tmp_path / "b.parquet"
+    base.to_parquet(a)
+    conc.to_parquet(b)
+    sheet = pd.DataFrame({"cell_name": labels.index, "group": labels.to_numpy()})
+    sp = tmp_path / "s.tsv"
+    sheet.to_csv(sp, sep="\t", index=False)
+    with pytest.raises(ValueError, match="already taken by a baseline"):
+        cc.main(["--accessibility-matrix", str(a),
+                 "--baseline-matrix", f"accessibility={a}",
+                 "--concordance-matrix", f"gch={b}",
+                 "--samples", str(sp), "--output-dir", str(tmp_path / "o")])

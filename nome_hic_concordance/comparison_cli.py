@@ -80,12 +80,24 @@ def _parse_skip_top_svd(specs: list[str]) -> dict[str, int]:
     return out
 
 
-def _parse_named(spec: str) -> tuple[str, str]:
-    """Parse 'name=path' (or bare 'path' -> name 'concordance')."""
+def _parse_named(spec: str, default_name: str = "concordance",
+                 flag: str = "--concordance-matrix") -> tuple[str, str]:
+    """Parse 'name=path'; a bare path falls back to ``default_name``.
+
+    The fallback must follow the FLAG, not the parser: an unnamed
+    --baseline-matrix used to come out called 'concordance', which labelled a
+    baseline as the thing it is the control for in every figure, table and
+    UMAP filename.
+    """
     if "=" in spec:
         name, path = spec.split("=", 1)
         return name.strip(), path.strip()
-    return "concordance", spec.strip()
+    logger.warning(
+        "%s was given a bare path, so it is named %r — every figure, table and "
+        "UMAP filename will use that.  Pass NAME=PATH to name it yourself, "
+        "e.g. %s gch_mean=%s",
+        flag, default_name, flag, spec.strip())
+    return default_name, spec.strip()
 
 
 def _plain_path(value: str, flag: str) -> str:
@@ -266,14 +278,28 @@ def main(argv: list[str] | None = None) -> int:
         matrices["compartment"] = pd.read_parquet(
             _plain_path(args.compartment_matrix, "--compartment-matrix"))
         baseline_names.append("compartment")
+    def _register(spec, default_name, flag, into):
+        name, path = _parse_named(spec, default_name, flag)
+        if name in matrices:
+            # Silently overwriting is the dangerous outcome: two bare paths
+            # both land on the same auto-name, one matrix replaces the other,
+            # and it ends up in BOTH baseline_names and concordance_names --
+            # so the variance partition regresses that matrix on itself and
+            # reports R2 = 1 with an all-zero residual.
+            held = ("a baseline" if name in baseline_names
+                    else "a concordance matrix")
+            raise ValueError(
+                f"{flag}: matrix name {name!r} is already taken by {held}.  "
+                f"Every matrix needs a distinct name — pass NAME=PATH, e.g. "
+                f"{flag} {name}2={path}")
+        matrices[name] = pd.read_parquet(path)
+        into.append(name)
+
     for spec in args.baseline_matrix:
-        name, path = _parse_named(spec)
-        matrices[name] = pd.read_parquet(path)
-        baseline_names.append(name)
+        _register(spec, "baseline", "--baseline-matrix", baseline_names)
     for spec in args.concordance_matrix:
-        name, path = _parse_named(spec)
-        matrices[name] = pd.read_parquet(path)
-        concordance_names.append(name)
+        _register(spec, "concordance", "--concordance-matrix",
+                  concordance_names)
 
     # Every matrix is cells x bins with 'chrom:start' columns, so the filter
     # is a column drop -- applied to ALL of them so baselines and concordance
