@@ -626,3 +626,38 @@ def test_a_bin_constant_within_batch_but_not_across_is_still_held_out(monkeypatc
     raw.iloc[:, 0] = np.where(batch.to_numpy() == "b1", 5.0, -5.0)
     bc.apply_batch_correction(raw, batch, method="combat")
     assert raw.columns[0] not in set(seen[0].index)
+
+
+def test_a_correction_that_returns_nan_is_refused_not_returned(monkeypatch):
+    """The silent failure this replaces: an all-NaN matrix survives a
+    --min-cell-coverage 0 filter, is imputed to zero, and scores exactly at
+    chance — indistinguishable from 'this feature carries no signal'."""
+    raw, batch = _sparse_matrix(missing=0.0)
+    monkeypatch.setattr(
+        bc, "apply_batch_correction",
+        lambda m, b, method, random_state: pd.DataFrame(
+            np.nan, index=m.index, columns=m.columns))
+    with pytest.raises(ValueError, match="returned NaN for"):
+        bc.correct_and_report(raw, batch, "combat", 0, "C")
+
+
+def test_partial_nan_from_a_correction_is_refused_too(monkeypatch):
+    raw, batch = _sparse_matrix(missing=0.0)
+
+    def half_dead(m, b, method, random_state):
+        out = m.copy()
+        out.iloc[:, 0] = np.nan
+        return out
+
+    monkeypatch.setattr(bc, "apply_batch_correction", half_dead)
+    with pytest.raises(ValueError, match=r"NaN for 40 of"):
+        bc.correct_and_report(raw, batch, "combat", 0, "C")
+
+
+def test_positions_already_missing_are_not_counted_as_deleted(monkeypatch):
+    """Re-masking the input's own NaNs must not look like data loss."""
+    raw, batch = _sparse_matrix(missing=0.3)
+    monkeypatch.setattr(bc, "apply_batch_correction",
+                        lambda m, b, method, random_state: m.fillna(0.0))
+    out = bc.correct_and_report(raw, batch, "combat", 0, "C")
+    assert (out.isna() == raw.isna()).all().all()

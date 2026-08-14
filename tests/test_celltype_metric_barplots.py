@@ -290,3 +290,47 @@ def test_unknown_concordance_batch_column_fails_loudly(tmp_path):
                 "--concordance-batch-column", "nope",
                 "--concordance-batch-correction", "center",
                 "--output-dir", str(tmp_path / "y")])
+
+
+def test_a_degenerate_arm_is_called_out_not_reported_as_chance(tmp_path, caplog):
+    """Chance-level metrics have two causes — a feature with no cell-type
+    information, and an arm that broke upstream — and they must be tellable
+    apart in the log."""
+    import logging
+    m = _mod()
+    p = _batched_inputs(tmp_path)
+    dead = pd.read_parquet(p["c"])
+    dead.iloc[:, :] = np.nan
+    dead.to_parquet(tmp_path / "dead.parquet")
+    out = tmp_path / "o"
+    with caplog.at_level(logging.ERROR):
+        assert m.main(["--concordance-c", str(tmp_path / "dead.parquet"),
+                       "--concordance-d", p["d"],
+                       "--baseline-1d", p["b1"], "--baseline-3d", p["b3"],
+                       "--samples", p["samples"], "--n-svd", "5",
+                       "--n-perm", "0", "--plot-format", "png",
+                       "--output-dir", str(out)]) == 0
+    assert "no variance" in caplog.text
+    tab = pd.read_csv(out / "GCH_metrics.tsv", sep="\t").set_index("arm")
+    assert tab.loc["C", "score_sd"] == 0.0
+    assert tab.loc["D", "score_sd"] > 0.0
+
+
+def test_a_correction_that_kills_the_matrix_stops_the_run(tmp_path,
+                                                          monkeypatch):
+    """Better a failed run than a bar sitting at chance for the wrong
+    reason."""
+    m = _mod()
+    from nome_hic_concordance import batch_correction as bc
+    p = _batched_inputs(tmp_path)
+    monkeypatch.setattr(
+        bc, "apply_batch_correction",
+        lambda mat, b, method, random_state: pd.DataFrame(
+            np.nan, index=mat.index, columns=mat.columns))
+    with pytest.raises(ValueError, match="returned NaN for"):
+        m.main(["--concordance-c", p["c"], "--concordance-d", p["d"],
+                "--baseline-1d", p["b1"], "--baseline-3d", p["b3"],
+                "--samples", p["samples"], "--n-svd", "5", "--n-perm", "0",
+                "--plot-format", "png", "--batch-column", "exp_batch",
+                "--concordance-batch-correction", "combat",
+                "--output-dir", str(tmp_path / "x")])

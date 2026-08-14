@@ -157,10 +157,21 @@ def score_matrix(raw, name, labels, args, out_dir, batch_labels=None):
                 pd.DataFrame(scores, index=common),
                 batch_labels.reindex(common), method=args.batch_correction,
                 random_state=args.random_seed).to_numpy()
+    # A degenerate score matrix scores exactly at chance, which is also what a
+    # feature carrying no cell-type information scores.  The two are worth
+    # telling apart: the first is a broken arm, the second is a result.
+    sd = float(np.nanstd(scores))
+    if not np.isfinite(sd) or sd < 1e-12:
+        logger.error(
+            f"[{name}] the SVD scores have no variance (sd={sd:g}), so every "
+            f"metric below is chance, not a measurement.  This happens when an "
+            f"upstream step returned NaN or a constant and the NaNs were then "
+            f"imputed to zero — check the batch-correction log for this arm.")
     m = _metrics.label_agreement(scores, labels.loc[common], k=args.knn_k,
                                  random_state=args.random_seed,
                                  n_perm=args.n_perm)
     m["n_bins"] = float(norm.shape[1])
+    m["score_sd"] = sd
     return m
 
 

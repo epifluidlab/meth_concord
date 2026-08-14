@@ -498,6 +498,23 @@ def correct_and_report(matrix: pd.DataFrame, batch_labels, method: str,
     missing = matrix.isna()
     if missing.any().any():
         out = out.where(~missing)
+    # A batch correction may not DELETE data.  When it does, the result is
+    # usually all-NaN, and nothing downstream notices: a coverage filter of 0
+    # keeps the dead bins, the NaNs are imputed to zero, the SVD of a constant
+    # matrix has no variance, and every label-agreement metric lands exactly on
+    # chance -- which reads as "this feature carries no cell-type information"
+    # rather than as a failed correction.  Refuse instead.
+    lost = int((matrix.notna() & out.isna()).to_numpy().sum())
+    if lost:
+        total = int(matrix.notna().to_numpy().sum())
+        raise ValueError(
+            f"{method} batch correction on {label!r} returned NaN for "
+            f"{lost:,} of {total:,} observed values.  This is a failure of the "
+            f"correction, not a property of the data: downstream it would "
+            f"silently become an all-zero matrix and score exactly at chance.  "
+            f"Try --*-batch-correction center, or fewer batch variables (they "
+            f"are combined into one composite batch, so several columns can "
+            f"leave batches with too few cells to standardise).")
     f_post = batch_anova_f_per_bin(out, bl)
     logger.info(
         f"[{stage} batch correction: {method}] {label}: "
