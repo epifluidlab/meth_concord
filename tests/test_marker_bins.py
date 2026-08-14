@@ -872,3 +872,120 @@ def test_end_to_end_warns_when_one_state_takes_everything(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "fall on ONE side" in r.stderr
     assert "--sign-reference median" in r.stderr
+
+
+class _SArgsExpected(_Args2):
+    sign_reference = "expected"
+
+
+def test_expected_reference_is_the_independence_prediction():
+    m = _mod()
+    # p=0.5 -> E[F]=0.5 -> 2E[F]-1 = 0, so the reference is zero whatever C is.
+    assert m.expected_directional(np.array([0.5]), np.array([3.0]))[0] == 0.0
+    # p=0.8 -> E[F] = .64/(.64+.04) = 0.941; 2E[F]-1 = 0.882
+    got = m.expected_directional(np.array([0.8]), np.array([1.0]))[0]
+    assert got == pytest.approx(0.64 / 0.68 * 2 - 1, abs=1e-12)
+    # The reference scales with C and flips with it.
+    assert m.expected_directional(np.array([0.8]), np.array([-1.0]))[0] == \
+        pytest.approx(-got)
+    # A closed mark predicts co-CLOSED, i.e. a negative reference.
+    assert m.expected_directional(np.array([0.2]), np.array([1.0]))[0] < 0
+
+
+def test_expected_reference_finds_excess_direction_a_global_one_cannot():
+    """Two bins, both co-closed in absolute terms, but one is co-closed by MORE
+    than its own level predicts and the other by less.  A single genome-wide
+    threshold cannot separate them; each bin's own prediction can."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    ct = np.repeat(np.arange(3), 30)
+    n = len(ct)
+    # bin 0: level 0.2 (mostly closed), bin 1: level 0.35 (less so).
+    p = np.array([0.2, 0.35])
+    C = np.array([1.0, 1.0])
+    ref = m.expected_directional(p, C)                    # both negative
+    # Bin 0 sits ABOVE its prediction, bin 1 BELOW — opposite excesses, and
+    # both raw values are negative, so zero calls them both co-closed.
+    D = np.vstack([np.full(n, ref[0] + 0.25), np.full(n, ref[1] - 0.25)]).T
+    D = D + rng.normal(0, 0.02, D.shape)
+    assert (D < 0).all(), "both bins are co-closed in absolute terms"
+
+    zero = m.sign_summary(D, ct, 3, _SArgsZero())
+    assert zero["always_co_closed"].all(), "zero cannot tell them apart"
+
+    exp = m.sign_summary(D, ct, 3, _SArgsExpected(),
+                         expected=np.tile(ref, (n, 1)))
+    assert exp["always_co_open"][0] and not exp["always_co_closed"][0]
+    assert exp["always_co_closed"][1] and not exp["always_co_open"][1]
+
+
+def test_expected_reference_without_the_components_stops_the_run():
+    m = _mod()
+    X = np.zeros((30, 4))
+    ct = np.repeat(np.arange(3), 10)
+    with pytest.raises(SystemExit, match="marginal and coordination"):
+        m.sign_summary(X, ct, 3, _SArgsExpected())
+
+
+def test_end_to_end_expected_reference_reads_the_sibling_components(tmp_path):
+    rng = np.random.default_rng(6)
+    n_ct, n_per, nb = 3, 30, 40
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    cells = [f"cell{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    p = rng.uniform(0.1, 0.4, nb)                 # a mostly-closed mark
+    C = np.abs(rng.normal(1.0, 0.2, nb))
+    import importlib.util as _il
+    spec = _il.spec_from_file_location("mk2", _SCRIPT)
+    mm = _il.module_from_spec(spec)
+    spec.loader.exec_module(mm)
+    ref = mm.expected_directional(p, C)
+    # Small relative to |ref| (0.38..0.88 here), so D stays negative in
+    # every bin -- one-sided against zero -- while still splitting around
+    # each bin's OWN reference.
+    excess = rng.normal(0, 0.08, nb)
+    D = ref + excess + rng.normal(0, 0.01, (n, nb))
+    out_dir = tmp_path / "ctx"
+    out_dir.mkdir()
+    pd.DataFrame(D, index=cells, columns=bins).to_parquet(
+        out_dir / "concordance_directional.parquet")
+    pd.DataFrame(np.tile(p, (n, 1)), index=cells, columns=bins).to_parquet(
+        out_dir / "concordance_marginal.parquet")
+    pd.DataFrame(np.tile(C, (n, 1)), index=cells, columns=bins).to_parquet(
+        out_dir / "concordance_coordination.parquet")
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        stab, sep="\t", index=False)
+
+    import json
+
+    def run(mode, sub):
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--matrix",
+             f"g={out_dir / 'concordance_directional.parquet'}",
+             "--samples", str(stab), "--cell-type-column", "cell_type",
+             "--batch-column", "sample", "--n-bins", "10",
+             "--n-permutations", "40", "--sign-reference", mode,
+             "--output-dir", str(tmp_path / sub), "--plot-format", "png"],
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        # The *_total counts, not the BED membership flags: those are capped
+        # at --n-bins, so they measure the cap rather than the classification.
+        s = json.loads(
+            (tmp_path / sub / "marker_bins_summary.json").read_text())
+        return (pd.read_csv(tmp_path / sub / "bin_scores_g.tsv", sep="\t"),
+                s["matrices"]["g"], r)
+
+    _, zsum, _ = run("zero", "z")
+    assert zsum["n_always_co_closed_total"] == nb, "one-sided against zero"
+    assert zsum["n_always_co_open_total"] == 0
+    exp, esum, res = run("expected", "e")
+    assert "expected-D reference" in res.stderr
+    # Each bin now has its OWN reference, so the column is not constant.
+    assert exp["d_reference"].nunique() > 1
+    frac_open = esum["n_always_co_open_total"] / nb
+    assert 0.2 < frac_open < 0.8, frac_open
+    assert (tmp_path / "e" / "bin_scores_g.always_co_open.bed").exists()

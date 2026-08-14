@@ -578,3 +578,70 @@ def test_flow_has_something_to_flow_once_the_reference_is_relative(tmp_path):
     # Anti-correlated by construction: co-open goes to co-unmethylated.
     assert med.loc["co-open", "co-unmethylated"] > med.loc["co-open",
                                                            "co-methylated"]
+
+
+class _SArgsExp(_SArgs):
+    state_reference = "expected"
+
+
+def test_state_expected_reference_separates_excess_from_level():
+    """Both bins co-closed in absolute terms; one is co-closed by more than
+    its own level predicts and the other by less.  Zero calls them the same."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    p = np.array([0.2, 0.35])
+    C = np.array([1.0, 1.0])
+    ref = m.expected_directional(p, C)
+    n = 60
+    X = pd.DataFrame(
+        np.vstack([np.full(n, ref[0] + 0.25), np.full(n, ref[1] - 0.25)]).T
+        + rng.normal(0, 0.02, (n, 2)),
+        index=[f"c{i}" for i in range(n)], columns=["chr1:0", "chr1:250000"])
+    assert (X.to_numpy() < 0).all()
+    zero, _, _ = m.bin_states(X, ("co-open", "co-closed"), _SArgs())
+    assert list(zero) == ["co-closed", "co-closed"]
+    exp, _, _ = m.bin_states(X, ("co-open", "co-closed"), _SArgsExp(),
+                             np.tile(ref, (n, 1)))
+    assert list(exp) == ["co-open", "co-closed"]
+
+
+def test_state_expected_needs_the_components(tmp_path):
+    m = _mod()
+    X = pd.DataFrame(np.zeros((30, 3)), index=[f"c{i}" for i in range(30)],
+                     columns=[f"chr1:{i}" for i in range(3)])
+    with pytest.raises(SystemExit, match="marginal and coordination"):
+        m.bin_states(X, ("co-open", "co-closed"), _SArgsExp())
+
+
+def test_state_expected_end_to_end_uses_the_sibling_parquets(tmp_path):
+    m = _mod()
+    rng = np.random.default_rng(2)
+    n, nb = 60, 60
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    for ctx, lo, hi in (("GCH", 0.1, 0.4), ("HCG", 0.6, 0.9)):
+        d = tmp_path / ctx
+        d.mkdir()
+        p = rng.uniform(lo, hi, nb)
+        C = np.abs(rng.normal(1.0, 0.2, nb))
+        ref = m.expected_directional(p, C)
+        D = ref + rng.normal(0, 0.06, nb) + rng.normal(0, 0.01, (n, nb))
+        pd.DataFrame(D, index=cells, columns=bins).to_parquet(
+            d / "concordance_directional.parquet")
+        pd.DataFrame(np.tile(p, (n, 1)), index=cells, columns=bins).to_parquet(
+            d / "concordance_marginal.parquet")
+        pd.DataFrame(np.tile(C, (n, 1)), index=cells, columns=bins).to_parquet(
+            d / "concordance_coordination.parquet")
+    args = ["--gch-d", str(tmp_path / "GCH" / "concordance_directional.parquet"),
+            "--hcg-d", str(tmp_path / "HCG" / "concordance_directional.parquet"),
+            "--min-cells", "5", "--plot-format", "png",
+            "--per-bin-correlation", "off"]
+    assert m.main(args + ["--output-dir", str(tmp_path / "z")]) == 0
+    assert m.main(args + ["--state-reference", "expected",
+                          "--output-dir", str(tmp_path / "e")]) == 0
+    z = pd.read_csv(tmp_path / "z" / "D_state_flow_counts.tsv", sep="\t",
+                    index_col=0).to_numpy()
+    e = pd.read_csv(tmp_path / "e" / "D_state_flow_counts.tsv", sep="\t",
+                    index_col=0).to_numpy()
+    assert z.max() / z.sum() > 0.9, "zero: everything in one cell"
+    assert e.max() / e.sum() < 0.75, "expected: a table with content"

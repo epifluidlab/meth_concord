@@ -448,7 +448,36 @@ _STATE_COLOR = {"co-open": "#D1495B", "co-closed": "#4A6FA5",
 _CANONICAL = {("co-open", "co-unmethylated"), ("co-closed", "co-methylated")}
 
 
-def bin_states(M: pd.DataFrame, names, args):
+def expected_directional(marginal, coordination):
+    """D under no direction beyond the bin's own level: C·(2·E[F] − 1).
+
+    Under independence at marginal p̄ the two co-states have probabilities p̄²
+    and (1−p̄)², so E[F] = p̄²/(p̄² + (1−p̄)²); subtracting C·(2E[F]−1) from D
+    leaves 2C·(F − E[F]), the excess co-openness over what the level implies.
+    The stored marginal is the mean of the two ends', so p̄² slightly
+    over-predicts co-openness when they differ — the per-end values are not
+    kept.  The denominator is ≥ 0.5 and never zero.
+    """
+    p = np.clip(np.asarray(marginal, dtype=float), 0.0, 1.0)
+    with np.errstate(invalid="ignore"):
+        ef = p ** 2 / (p ** 2 + (1.0 - p) ** 2)
+    return np.asarray(coordination, dtype=float) * (2.0 * ef - 1.0)
+
+
+def _sibling_components(path, name):
+    """The marginal and coordination parquets written beside a directional one."""
+    out = {}
+    for kind in ("marginal", "coordination"):
+        cand = Path(path).with_name(f"concordance_{kind}.parquet")
+        if not cand.exists():
+            raise SystemExit(
+                f"--state-reference expected needs the {kind} component for "
+                f"{name}: no concordance_{kind}.parquet beside {path}.")
+        out[kind] = _load(str(cand))
+    return out
+
+
+def bin_states(M: pd.DataFrame, names, args, expected=None):
     """Label each bin by the sign its cells agree on: (labels, mean, q).
 
     Under the default 'fdr' rule a bin is called only when its cells actually
@@ -467,12 +496,15 @@ def bin_states(M: pd.DataFrame, names, args):
     X = M.to_numpy(float)
     n = np.isfinite(X).sum(axis=0).astype(float)
     with np.errstate(invalid="ignore", divide="ignore"):
+        if args.state_reference == "expected":
+            if expected is None:
+                raise SystemExit("--state-reference expected needs the "
+                                 "marginal and coordination components.")
+            X = X - np.asarray(expected, float)     # per cell, per bin
         mean = np.nanmean(X, axis=0)
-        ref = 0.0
         if args.state_reference == "median":
             finite = mean[np.isfinite(mean)]
-            ref = float(np.median(finite)) if finite.size else 0.0
-        mean = mean - ref
+            mean = mean - (float(np.median(finite)) if finite.size else 0.0)
         sd = np.nanstd(X, axis=0, ddof=1)
         tt = mean / (sd / np.sqrt(np.maximum(n, 1)))
         p = 2.0 * _t.sf(np.abs(tt), np.maximum(n - 1, 1))
@@ -669,8 +701,8 @@ def main(argv=None) -> int:
                          "'mixed' means the cells do not agree rather than "
                          "'near an arbitrary line'.  'threshold': |mean| > "
                          "--state-threshold.")
-    ap.add_argument("--state-reference", choices=["zero", "median"],
-                    default="zero",
+    ap.add_argument("--state-reference",
+                    choices=["zero", "median", "expected"], default="zero",
                     help="What a bin's state is judged against.  'zero' is the "
                          "literal reading and is almost always degenerate on "
                          "real data: sign(2F−1) = sign(mean level − 0.5), so "
@@ -679,7 +711,12 @@ def main(argv=None) -> int:
                          "everywhere, and the flow collapses to one ribbon.  "
                          "'median' judges each bin against the genome-wide "
                          "median of the per-bin means, which is the version "
-                         "with something to flow.")
+                         "with something to flow.  'expected' gives each bin "
+                         "its OWN reference, C·(2·E[F]−1) from its marginal, "
+                         "so a bin is co-open only when MORE co-open than its "
+                         "level implies; it reads the marginal and "
+                         "coordination components from beside the --gch-d / "
+                         "--hcg-d parquets.")
     ap.add_argument("--state-fdr", type=float, default=0.05)
     ap.add_argument("--state-threshold", type=float, default=0.0,
                     help="Only with --state-rule threshold.")
@@ -780,9 +817,19 @@ def main(argv=None) -> int:
                      and (stat_key == "D" or args.state_flow_c == "on"))
         if want_flow:
             G, H = _aligned(gch, hcg)
-            g_lab, g_mean, g_q = bin_states(G, ("co-open", "co-closed"), args)
+            exp_g = exp_h = None
+            if args.state_reference == "expected":
+                cg = _sibling_components(gch_path, f"{stat_key} GCH")
+                ch = _sibling_components(hcg_path, f"{stat_key} HCG")
+                al = lambda d: d.reindex(index=G.index, columns=G.columns)  # noqa: E731
+                exp_g = expected_directional(al(cg["marginal"]),
+                                             al(cg["coordination"]))
+                exp_h = expected_directional(al(ch["marginal"]),
+                                             al(ch["coordination"]))
+            g_lab, g_mean, g_q = bin_states(G, ("co-open", "co-closed"), args,
+                                            exp_g)
             h_lab, h_mean, h_q = bin_states(
-                H, ("co-methylated", "co-unmethylated"), args)
+                H, ("co-methylated", "co-unmethylated"), args, exp_h)
             tab = flow_table(g_lab, h_lab)
             for side, lab in (("GCH", g_lab), ("HCG", h_lab)):
                 called = lab[(lab != "mixed") & (lab != "unusable")]

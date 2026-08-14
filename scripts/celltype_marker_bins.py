@@ -257,6 +257,33 @@ def select_stable_bins(X, cell_type_ids, n_ct, b_icc, args, n_want):
     return sel, spread, int(clean.size)
 
 
+def expected_directional(marginal, coordination):
+    """D under no direction beyond the bin's own level: C·(2·E[F] − 1).
+
+    F is the realized share of concordant pairs that are co-open.  Under
+    independence at marginal p̄ the two co-states have probabilities p̄² and
+    (1−p̄)², so
+
+        E[F] = p̄² / (p̄² + (1−p̄)²)
+
+    and subtracting C·(2E[F]−1) from D leaves 2C·(F − E[F]) — the EXCESS
+    co-openness over what the bin's mean level already implies.  That is the
+    same coordination-versus-level control the rest of the analysis rests on,
+    applied to direction instead of magnitude, and unlike a genome-wide median
+    it gives each bin its own reference.
+
+    One approximation: the stored marginal is the MEAN of the two ends'
+    marginals, and P(both open) = p̄₁p̄₂ ≤ p̄², so using p̄² slightly
+    over-predicts co-openness when the two ends differ.  Correcting it would
+    need the per-end marginals, which are not kept.  The denominator is
+    p̄² + (1−p̄)² ≥ 0.5, so it never divides by zero.
+    """
+    p = np.clip(np.asarray(marginal, dtype=float), 0.0, 1.0)
+    with np.errstate(invalid="ignore"):
+        ef = p ** 2 / (p ** 2 + (1.0 - p) ** 2)
+    return np.asarray(coordination, dtype=float) * (2.0 * ef - 1.0)
+
+
 def sign_reference(grand, mode: str) -> float:
     """The value a bin's D is called co-open / co-closed against.
 
@@ -284,7 +311,7 @@ def sign_reference(grand, mode: str) -> float:
     return float(np.median(v)) if v.size else 0.0
 
 
-def sign_summary(raw, cell_type_ids, n_ct, args):
+def sign_summary(raw, cell_type_ids, n_ct, args, expected=None):
     """Per-bin co-open / co-closed evidence for a DIRECTIONAL matrix.
 
     Must be computed on the RAW values.  D = C·(2F−1) carries its meaning in
@@ -300,16 +327,30 @@ def sign_summary(raw, cell_type_ids, n_ct, args):
     :func:`sign_reference`, not necessarily against zero.
     """
     X = np.asarray(raw, float)
-    means, usable = _group_stats(X, cell_type_ids, n_ct,
+    with np.errstate(invalid="ignore"):
+        grand = np.nanmean(X, axis=0)
+        if args.sign_reference == "expected":
+            if expected is None:
+                sys.exit("--sign-reference expected needs the marginal and "
+                         "coordination components; pass --marginal-matrix / "
+                         "--coordination-matrix, or keep them beside the "
+                         "directional parquet.")
+            # A per-CELL, per-bin reference, so it is subtracted before any
+            # aggregation rather than after.
+            ref_mat = np.asarray(expected, float)
+            ref_report = np.nanmean(ref_mat, axis=0)
+        else:
+            ref_mat = sign_reference(grand, args.sign_reference)
+            ref_report = np.full(X.shape[1], float(ref_mat))
+        Z = X - ref_mat
+    means, usable = _group_stats(Z, cell_type_ids, n_ct,
                                  args.min_cells_per_group)
     covered = usable.sum(axis=0)
     with np.errstate(invalid="ignore"):
-        grand = np.nanmean(X, axis=0)
-        ref = sign_reference(grand, args.sign_reference)
-        lo = np.nanmin(means, axis=0) - ref
-        hi = np.nanmax(means, axis=0) - ref
-        fin = np.isfinite(X).sum(axis=0)
-        pos = np.nansum(X > ref, axis=0)
+        lo = np.nanmin(means, axis=0)
+        hi = np.nanmax(means, axis=0)
+        fin = np.isfinite(Z).sum(axis=0)
+        pos = np.nansum(Z > 0, axis=0)
         frac_pos = np.where(fin > 0, pos / np.maximum(fin, 1), np.nan)
     enough = covered >= max(args.min_groups, 2)
     lo = np.where(enough, lo, np.nan)
@@ -317,7 +358,7 @@ def sign_summary(raw, cell_type_ids, n_ct, args):
     c = args.sign_min_consistency
     co_open = np.isfinite(lo) & (lo > 0) & (frac_pos >= c)
     co_closed = np.isfinite(hi) & (hi < 0) & ((1.0 - frac_pos) >= c)
-    return {"d_mean": grand, "d_reference": np.full(X.shape[1], ref),
+    return {"d_mean": grand, "d_reference": ref_report,
             "d_group_min": lo, "d_group_max": hi,
             "frac_cells_positive": frac_pos, "n_groups_used": covered,
             "always_co_open": co_open, "always_co_closed": co_closed}
@@ -955,8 +996,19 @@ def main():
                          "Computed on the RAW values, since the normalisation "
                          "used for selection destroys the sign.  Writes "
                          "bin_scores_<name>.always_co_{open,closed}.bed.")
-    ap.add_argument("--sign-reference", choices=["zero", "median"],
-                    default="zero",
+    ap.add_argument("--marginal-matrix", action="append", default=None,
+                    metavar="NAME=PATH",
+                    help="Marginal component p̄ for --sign-reference expected "
+                         "(repeatable).  Defaults to concordance_marginal."
+                         "parquet beside the --matrix parquet.")
+    ap.add_argument("--coordination-matrix", action="append", default=None,
+                    metavar="NAME=PATH",
+                    help="Coordination component C for --sign-reference "
+                         "expected (repeatable).  Defaults to "
+                         "concordance_coordination.parquet beside the "
+                         "--matrix parquet.")
+    ap.add_argument("--sign-reference",
+                    choices=["zero", "median", "expected"], default="zero",
                     help="What co-open / co-closed is judged against.  'zero' "
                          "is the literal reading, and on real data it is "
                          "almost always degenerate: sign(2F−1) equals "
@@ -968,7 +1020,15 @@ def main():
                          "region.  'median' judges each bin against the "
                          "genome-wide median instead ('more co-open than the "
                          "typical bin'), which is the version that varies "
-                         "along the genome.")
+                         "along the genome.  'expected' gives each bin its "
+                         "OWN reference, C·(2·E[F]−1) with E[F] = p̄²/(p̄²+"
+                         "(1−p̄)²) from that bin's marginal, so a bin counts "
+                         "as co-open only when it is MORE co-open than its own "
+                         "mean level already implies — the coordination-versus-"
+                         "level control applied to direction rather than to "
+                         "magnitude.  Needs the marginal and coordination "
+                         "components, taken from beside the --matrix parquet "
+                         "unless given explicitly.")
     ap.add_argument("--sign-min-consistency", type=float, default=0.6,
                     help="Fraction of cells that must fall on the dominant "
                          "side for a bin to be called always co-open / "
@@ -1074,6 +1134,18 @@ def main():
         if '=' in c:
             k, v = c.split('=', 1)
             comp_cmap_override[k.strip().lower()] = v.strip()
+    def _named_map(specs, flag):
+        out = {}
+        for c in (specs or []):
+            if "=" not in c:
+                sys.exit(f"{flag} must be NAME=PATH, got {c!r}")
+            k, v = c.split("=", 1)
+            out[k.strip()] = v.strip()
+        return out
+
+    marginal_explicit = _named_map(args.marginal_matrix, "--marginal-matrix")
+    coord_explicit = _named_map(args.coordination_matrix,
+                                "--coordination-matrix")
     mean_explicit = {}
     for c in (args.mean_matrix or []):
         if "=" not in c:
@@ -1292,7 +1364,33 @@ def main():
         summary_sign = {}
         if sign_on:
             raw = M_raw.reindex(index=M.index, columns=M.columns)
-            sg = sign_summary(raw, ct_id, len(ct_u), args)
+            expected = None
+            if args.sign_reference == "expected":
+                comps = {}
+                for kind, explicit in (("marginal", marginal_explicit),
+                                       ("coordination", coord_explicit)):
+                    cp = explicit.get(name)
+                    if not cp:
+                        cand = Path(path).with_name(
+                            f"concordance_{kind}.parquet")
+                        cp = str(cand) if cand.exists() else None
+                    if not cp or not Path(cp).exists():
+                        sys.exit(
+                            f"--sign-reference expected needs the {kind} "
+                            f"component for {name!r}: no --{kind}-matrix given "
+                            f"and no concordance_{kind}.parquet beside "
+                            f"{path}.")
+                    # Reindexed onto the SAME cells and bins as D, so the
+                    # reference is per (cell, bin) and aligned, not broadcast
+                    # from a different grid.
+                    comps[kind] = pd.read_parquet(cp).reindex(
+                        index=M.index, columns=M.columns)
+                expected = expected_directional(comps["marginal"],
+                                                comps["coordination"])
+                print(f"  {name}: per-bin expected-D reference from "
+                      f"{Path(path).parent}/concordance_{{marginal,"
+                      f"coordination}}.parquet", file=sys.stderr)
+            sg = sign_summary(raw, ct_id, len(ct_u), args, expected)
             n_want = args.n_bins
             for key, rank_by, ascending in (
                     ("always_co_open", "d_group_min", False),
