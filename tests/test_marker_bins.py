@@ -474,3 +474,332 @@ def test_mean_cmap_endpoints_match_nomeseq_convention():
     b_lo, y_hi = meth(0.0)[:3], meth(1.0)[:3]
     assert b_lo[2] > b_lo[0]                           # low methylation = blue-ish
     assert y_hi[0] > 0.7 and y_hi[1] > 0.7 and y_hi[2] < 0.5   # high = yellow
+
+
+# ------------------------------------ stable / directional / contrast sets --
+
+class _Args2(_Args):
+    sign_min_consistency = 0.6
+
+
+def _flat_data(seed=0, n_per=40, n_ct=4):
+    """Marker bins, FLAT bins (equal cell-type means, low noise), NOISY flat
+    bins (equal means, high noise) and batch bins."""
+    rng = np.random.default_rng(seed)
+    ct = np.repeat(np.arange(n_ct), n_per)
+    batch = np.tile([0, 1], n_ct * n_per // 2)
+    n = len(ct)
+    mk = rng.normal(0, 2, (n_ct, 20))[ct] + rng.normal(0, .3, (n, 20))
+    flat = rng.normal(0, .15, (n, 20))                       # equal + quiet
+    noisy = rng.normal(0, 3.0, (n, 20))                      # equal + loud
+    batchy = np.where(batch[:, None] == 0, 1.5, -1.5) + rng.normal(0, .3, (n, 20))
+    X = np.hstack([mk, flat, noisy, batchy])
+    classes = np.array(["marker"] * 20 + ["flat"] * 20 + ["noisy"] * 20
+                       + ["batchy"] * 20)
+    return X, ct, batch, classes
+
+
+def test_stable_set_finds_flat_bins_not_noisy_ones():
+    """The trap this avoids: ranking on LOW cell-type ICC returns the noisiest
+    bins, because ICC has sampling noise in its denominator."""
+    m = _mod()
+    X, ct, batch, classes = _flat_data()
+    b_icc = m._batch_icc(X, ct, batch, 2, _icc(), 3, 2)
+    sel, spread, _ = m.select_stable_bins(X, ct, 4, b_icc, _Args2(), 20)
+    picked = classes[sel]
+    assert (picked == "flat").mean() > 0.9, picked
+    assert "batchy" not in picked, "a flat-but-batchy bin is sample, not biology"
+    # The ICC ranking would have gone the other way, which is the whole point.
+    ct_icc, _ = _icc()(X, ct, 4, 3, 3)
+    by_icc = classes[np.argsort(np.where(np.isfinite(ct_icc), ct_icc, np.inf))[:20]]
+    assert (by_icc == "noisy").mean() > 0.5, by_icc
+
+
+def test_stable_and_marker_sets_do_not_overlap_when_both_fit():
+    """Only when both sets fit the bins that qualify.  Ask for more marker bins
+    than there are variable ones and the documented fill takes flat bins, which
+    is why this pins n_bins to the 20 the fixture actually plants."""
+    m = _mod()
+    X, ct, batch, classes = _flat_data()
+
+    class A(_Args2):
+        n_bins = 20
+
+    sel, ct_icc, b_icc, _ = m.select_marker_bins(X, ct, 4, [(batch, 2)],
+                                                 _icc(), A())
+    stable, _, _ = m.select_stable_bins(X, ct, 4, b_icc, A(), 20)
+    assert not set(sel.tolist()) & set(stable.tolist())
+    assert (classes[sel] == "marker").all()
+    assert (classes[stable] == "flat").all()
+
+
+def _signed_data(seed=0, n_per=30, n_ct=3):
+    """Bins that are positive in every cell type, negative in every cell type,
+    and ones whose sign flips between them."""
+    rng = np.random.default_rng(seed)
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    up = 1.5 + rng.normal(0, .2, (n, 10))
+    down = -1.5 + rng.normal(0, .2, (n, 10))
+    flip = np.where(ct[:, None] % 2 == 0, 1.2, -1.2) + rng.normal(0, .2, (n, 10))
+    X = np.hstack([up, down, flip])
+    classes = np.array(["up"] * 10 + ["down"] * 10 + ["flip"] * 10)
+    return X, ct, classes
+
+
+def test_sign_summary_calls_co_open_co_closed_and_refuses_flippers():
+    m = _mod()
+    X, ct, classes = _signed_data()
+    sg = m.sign_summary(X, ct, 3, _Args2())
+    assert (sg["always_co_open"][classes == "up"]).all()
+    assert (sg["always_co_closed"][classes == "down"]).all()
+    # A bin that is co-open in one cell type and co-closed in another is neither.
+    assert not sg["always_co_open"][classes == "flip"].any()
+    assert not sg["always_co_closed"][classes == "flip"].any()
+    assert not (sg["always_co_open"] & sg["always_co_closed"]).any()
+
+
+def test_sign_needs_every_cell_type_to_agree_not_just_the_mean():
+    """A bin whose grand mean is positive only because one cell type is
+    strongly positive is not 'always co-open'."""
+    m = _mod()
+    rng = np.random.default_rng(3)
+    ct = np.repeat(np.arange(3), 30)
+    x = np.where(ct == 0, 5.0, -0.4)[:, None] + rng.normal(0, .1, (90, 1))
+    sg = m.sign_summary(x, ct, 3, _Args2())
+    assert sg["d_mean"][0] > 0, "the grand mean IS positive"
+    assert not sg["always_co_open"][0], "but two cell types are co-closed"
+
+
+def test_contrast_finds_the_planted_split_and_scales_with_effect():
+    m = _mod()
+    rng = np.random.default_rng(7)
+    ct = np.repeat(np.arange(4), 30)
+    in_mask = ct < 2
+    hit = np.where(in_mask, 1.5, -1.5)[:, None] + rng.normal(0, .5, (120, 10))
+    miss = rng.normal(0, .5, (120, 10))
+    X = np.hstack([hit, miss])
+    cs = m.contrast_stats(X, in_mask, 3)
+    q = m._bh_fdr(cs["p"])
+    assert (q[:10] < 0.01).all(), "the planted bins must survive FDR"
+    assert (q[10:] > 0.05).all(), "and the null bins must not"
+    assert (cs["d"][:10] > 2).all() and (np.abs(cs["d"][10:]) < 1).all()
+    assert np.allclose(cs["diff"][:10], 3.0, atol=0.4)
+
+
+def test_contrast_is_undefined_when_one_arm_is_too_small():
+    m = _mod()
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(20, 5))
+    in_mask = np.zeros(20, bool)
+    in_mask[:2] = True                      # 2 cells vs --min-cells-per-group 3
+    cs = m.contrast_stats(X, in_mask, 3)
+    assert np.isnan(cs["p"]).all(), "too few cells must not produce a p-value"
+
+
+def test_cramers_v_spots_a_contrast_that_is_really_a_batch():
+    m = _mod()
+    import pandas as pd
+    cells = [f"c{i}" for i in range(40)]
+    grp = pd.Series([i < 20 for i in range(40)], index=cells)
+    same = pd.Series(["b1"] * 20 + ["b2"] * 20, index=cells)
+    mixed = pd.Series(["b1", "b2"] * 20, index=cells)
+    assert m._cramers_v(grp, same) > 0.9, "perfectly confounded"
+    assert m._cramers_v(grp, mixed) < 0.2, "balanced across batches"
+
+
+def test_end_to_end_stable_sign_and_contrast(tmp_path):
+    """All three new BEDs off one run of the real script."""
+    import json
+    rng = np.random.default_rng(11)
+    n_ct, n_per = 4, 30
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    marker = rng.normal(0, 2, (n_ct, 20))[ct] + rng.normal(0, .3, (n, 20))
+    flat = rng.normal(0, .15, (n, 20))
+    up = 1.5 + rng.normal(0, .2, (n, 20))          # co-open in every cell type
+    down = -1.5 + rng.normal(0, .2, (n, 20))       # co-closed in every one
+    split = np.where((ct < 2)[:, None], 2.0, -2.0) + rng.normal(0, .4, (n, 20))
+    X = np.hstack([marker, flat, up, down, split])
+    cells = [f"cell{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    # The filename is what --sign-split auto keys on.
+    mat = tmp_path / "concordance_directional.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "40",
+         "--contrast", "tumour=CT0,CT1",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+
+    def bed(kind):
+        return pd.read_csv(out / f"bin_scores_gch.{kind}.bed", sep="\t")
+
+    def block(df):        # which planted block each row came from
+        return (df["start"] // 250000 // 20).value_counts()
+
+    # Blocks 1/2/3 all lack cell-type structure -- after per-bin QN they are
+    # equally flat, and the invariant set may draw from any of them.  What it
+    # must never take is a block that DOES vary by cell type.
+    stable = bed("stable")
+    assert not {0, 4} & set(block(stable).index), block(stable)
+    marker = bed("selected")
+    assert block(marker).idxmax() in (0, 4), "the marker set takes the varying ones"
+    co_open, co_closed = bed("always_co_open"), bed("always_co_closed")
+    assert block(co_open).idxmax() == 2 and len(co_open) == 20
+    assert block(co_closed).idxmax() == 3 and len(co_closed) == 20
+    assert (co_open["d_group_min"] > 0).all()
+    assert (co_closed["d_group_max"] < 0).all()
+    contrast = bed("contrast_tumour")
+    assert block(contrast).idxmax() == 4, "block 4 is the planted split"
+    assert (contrast["contrast_tumour_fdr"] < 0.05).all()
+    assert (contrast["contrast_tumour_diff"] > 0).all(), "in-set is the high arm"
+
+    s = json.loads((out / "marker_bins_summary.json").read_text())["matrices"]["gch"]
+    assert s["n_always_co_open"] == 20 and s["n_always_co_closed"] == 20
+    assert s["median_spread_stable"] < s["median_spread_marker"]
+    c = s["contrasts"]["tumour"]
+    assert c["n_cells_in"] == 60 and c["n_cells_out"] == 60
+    assert c["batch_confounding_cramers_v"]["sample"] < 0.2, "fixture is balanced"
+
+
+def test_sign_is_read_off_raw_values_not_normalised_ones(tmp_path):
+    """Every raw value is positive here, so every bin is co-open.  The per-cell
+    rank + recenter used for SELECTION centres each cell on zero, so a sign read
+    after normalisation would find nothing."""
+    import json
+    rng = np.random.default_rng(5)
+    n_ct, n_per = 3, 30
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    X = 2.0 + rng.normal(0, .3, (n, 40)) + rng.normal(0, 1.0, (n_ct, 40))[ct]
+    X = np.abs(X)                                   # strictly positive
+    cells = [f"cell{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "concordance_directional.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "10", "--n-permutations", "40",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    s = json.loads((out / "marker_bins_summary.json").read_text())["matrices"]["gch"]
+    assert s["n_always_co_open_total"] == 40, "every bin is positive throughout"
+    assert s["n_always_co_closed_total"] == 0
+    scores = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
+    # The normalised values the selection ran on are NOT all positive, which is
+    # exactly why the sign has to come from the raw matrix.
+    assert (scores["frac_cells_positive"] == 1.0).all()
+
+
+def test_sign_split_off_for_a_matrix_that_is_not_directional(tmp_path):
+    """'auto' keys on the filename because only D's sign means open vs closed;
+    for C it means concordant vs anti-concordant."""
+    import json
+    rng = np.random.default_rng(2)
+    ct = np.repeat(np.arange(3), 30)
+    X = 1.0 + rng.normal(0, .2, (90, 30))
+    cells = [f"cell{i}" for i in range(90)]
+    bins = [f"chr1:{i * 250000}" for i in range(30)]
+    mat = tmp_path / "concordance_coordination.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * 90,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * 45}).to_csv(stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"c={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "10", "--n-permutations", "40",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    assert not (out / "bin_scores_c.always_co_open.bed").exists()
+    s = json.loads((out / "marker_bins_summary.json").read_text())["matrices"]["c"]
+    assert "n_always_co_open" not in s
+    # ... but the invariant set is emitted for any matrix.
+    assert (out / "bin_scores_c.stable.bed").exists()
+
+
+def test_contrast_warns_when_the_groups_are_their_own_batch(tmp_path):
+    """The realistic failure: tumours sequenced in their own run against cell
+    lines from another.  --max-batch-icc cannot catch it, because batch does
+    not vary WITHIN a cell type there, so every bin's batch ICC is undefined
+    and 'passed the filter' means 'was never tested'."""
+    import json
+    rng = np.random.default_rng(4)
+    ct = np.repeat(["tumor1", "tumor2", "GM12878", "IMR90", "monocyte"], 24)
+    n = len(ct)
+    tumour = np.isin(ct, ["tumor1", "tumor2"])
+    batch = np.where(tumour, "runA", "runB")       # nested inside cell type
+    X = np.hstack([np.where(tumour, 2.0, -2.0)[:, None] + rng.normal(0, .4, (n, 20)),
+                   rng.normal(0, 1, (n, 20))])
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "concordance_directional.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n, "cell_type": ct,
+                  "sample": batch}).to_csv(stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "10", "--n-permutations", "40",
+         "--contrast", "meningioma=tumor1,tumor2",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "confounded with sample" in r.stderr
+    assert "cannot help" in r.stderr, "the nested-batch caveat must be said"
+    s = json.loads((out / "marker_bins_summary.json").read_text())
+    c = s["matrices"]["gch"]["contrasts"]["meningioma"]
+    assert c["batch_confounding_cramers_v"]["sample"] > 0.9
+    assert c["n_selected_batch_judged"] == 0, "nothing could be judged"
+
+
+def test_contrast_on_an_absent_group_is_reported_not_silent(tmp_path):
+    rng = np.random.default_rng(0)
+    ct = np.repeat(["A", "B", "C"], 30)
+    n = len(ct)
+    X = rng.normal(0, 1, (n, 30))
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(30)]
+    mat = tmp_path / "m.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n, "cell_type": ct,
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"g={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "5", "--n-permutations", "40",
+         "--contrast", "x=A,nosuchtype", "--contrast", "y=A,B,C",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "no cells for ['nosuchtype']" in r.stderr
+    assert (out / "bin_scores_g.contrast_x.bed").exists(), "A alone still works"
+    # 'every group' leaves nothing to contrast against, so it is skipped.
+    assert "skipped" in r.stderr
+    assert not (out / "bin_scores_g.contrast_y.bed").exists()

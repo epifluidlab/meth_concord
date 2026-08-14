@@ -20,6 +20,28 @@ concordance is cell-type-specific:
                  nome_hic_concordance and nome_hic_compare, so only the NUMBER
                  is emitted here.
 
+Three further bin sets are written as BED alongside the marker set, each ranked
+by its own statistic but filtered for batch the same way:
+
+  STABLE          the invariant counterpart -- bins whose cell-type means sit
+                  closest together (--stable-bins).  Ranked by the SD of those
+                  means, NOT by low cell-type ICC, which would return the
+                  noisiest bins rather than the flattest.
+
+  CO-OPEN /       for a DIRECTIONAL matrix (D = C(2F-1)), the bins coordinated
+  CO-CLOSED       between OPEN states in every cell type, and those coordinated
+                  between CLOSED states in every cell type (--sign-split).
+                  Read off the RAW values: the normalisation used for selection
+                  destroys the sign that carries the meaning.
+
+  CONTRAST        bins separating a NAMED set of cell types from all the others
+                  (--contrast LABEL=g1,g2), e.g. two meningioma tumours against
+                  a panel of GM12878, IMR90 and monocyte.  Welch t with BH-FDR
+                  and Cohen's d, plus the association between the contrast and
+                  each batch variable, since a condition processed on its own
+                  makes "separates the groups" and "separates the batches" the
+                  same statement.
+
 Bins are selected on ALL cells and the heatmap shows ALL cells; the honesty
 comes from the CONTROL (the bins we did NOT pick still separate cell types),
 not from holding cells out.  Selection prefers batch-invariant bins but fills
@@ -169,6 +191,163 @@ def select_marker_bins(X, cell_type_ids, n_ct, batch_specs, icc_fn, args):
     dirty = ranked[~is_clean[ranked]]
     sel = np.concatenate([clean, dirty[: args.n_bins - clean.size]])
     return sel, ct_icc, b_icc, int(clean.size)
+
+
+def _group_stats(X, group_ids, n_groups, min_cells):
+    """(means, usable) per group per bin; a group with too few finite cells is
+    masked out rather than contributing a mean of one cell."""
+    X = np.asarray(X, float)
+    means = np.full((n_groups, X.shape[1]), np.nan)
+    usable = np.zeros((n_groups, X.shape[1]), bool)
+    for g in range(n_groups):
+        rows = X[group_ids == g]
+        if not rows.shape[0]:
+            continue
+        n = np.isfinite(rows).sum(axis=0)
+        usable[g] = n >= min_cells
+        with np.errstate(invalid="ignore"):
+            means[g] = np.where(n > 0, np.nanmean(rows, axis=0), np.nan)
+    return np.where(usable, means, np.nan), usable
+
+
+def celltype_spread(X, cell_type_ids, n_ct, args):
+    """SD of the cell-type MEANS per bin — small means invariant.
+
+    Ranking stability by LOW cell-type ICC is only safe once the bins are on a
+    common scale.  On raw values it returns the NOISIEST bins rather than the
+    flattest, because ICC puts sampling noise in its denominator and a bin that
+    is pure noise has a between-group share near zero.  The spread of the group
+    means penalises noise directly — with n cells per group it is
+    ~sqrt(var_between + var_within / n), small only when the bin is both flat
+    across cell types AND measured reliably.
+
+    Under the default --matrix-norm quantile the point is largely moot: per-bin
+    QN gives every bin the same total variance, so low ICC and low spread rank
+    almost identically.  The spread is used anyway because it survives the
+    settings where that is not true (--matrix-norm zscore, or an unnormalised
+    caller), and because it reads in the same units as the heatmap.
+    """
+    means, usable = _group_stats(X, cell_type_ids, n_ct,
+                                 args.min_cells_per_group)
+    covered = usable.sum(axis=0)
+    with np.errstate(invalid="ignore"):
+        spread = np.nanstd(means, axis=0, ddof=1)
+    return np.where(covered >= max(args.min_groups, 2), spread, np.nan)
+
+
+def select_stable_bins(X, cell_type_ids, n_ct, b_icc, args, n_want):
+    """The invariant counterpart of :func:`select_marker_bins`.
+
+    The batch filter applies exactly as it does to the marker set: a bin that
+    is flat across cell types but driven by batch is not invariant, it is
+    sample.  Same clean-first, fill-by-rank policy, so the two sets are
+    selected by the same rules and can be compared.
+    """
+    spread = celltype_spread(X, cell_type_ids, n_ct, args)
+    usable = np.flatnonzero(np.isfinite(spread))
+    if usable.size == 0:
+        return np.array([], int), spread, 0
+    ranked = usable[np.argsort(spread[usable])]          # flattest first
+    is_clean = ~(np.isfinite(b_icc) & (b_icc > args.max_batch_icc))
+    clean = ranked[is_clean[ranked]]
+    if clean.size >= n_want:
+        return clean[:n_want], spread, int(n_want)
+    dirty = ranked[~is_clean[ranked]]
+    sel = np.concatenate([clean, dirty[: n_want - clean.size]])
+    return sel, spread, int(clean.size)
+
+
+def sign_summary(raw, cell_type_ids, n_ct, args):
+    """Per-bin co-open / co-closed evidence for a DIRECTIONAL matrix.
+
+    Must be computed on the RAW values.  D = C·(2F−1) carries its meaning in
+    its sign — positive is coordination between OPEN states, negative between
+    CLOSED ones — and the normalisation used for selection destroys exactly
+    that: per-bin quantile normalisation re-maps every bin onto a common
+    distribution and the per-cell rank re-centres each cell, after which "above
+    zero" no longer means co-open.
+
+    Returns the per-cell-type mean range and the fraction of cells on the
+    positive side, so a bin is called only when EVERY cell type agrees and the
+    cells within them mostly do too.
+    """
+    X = np.asarray(raw, float)
+    means, usable = _group_stats(X, cell_type_ids, n_ct,
+                                 args.min_cells_per_group)
+    covered = usable.sum(axis=0)
+    with np.errstate(invalid="ignore"):
+        lo = np.nanmin(means, axis=0)
+        hi = np.nanmax(means, axis=0)
+        fin = np.isfinite(X).sum(axis=0)
+        pos = np.nansum(X > 0, axis=0)
+        frac_pos = np.where(fin > 0, pos / np.maximum(fin, 1), np.nan)
+        grand = np.nanmean(X, axis=0)
+    enough = covered >= max(args.min_groups, 2)
+    lo = np.where(enough, lo, np.nan)
+    hi = np.where(enough, hi, np.nan)
+    c = args.sign_min_consistency
+    co_open = np.isfinite(lo) & (lo > 0) & (frac_pos >= c)
+    co_closed = np.isfinite(hi) & (hi < 0) & ((1.0 - frac_pos) >= c)
+    return {"d_mean": grand, "d_group_min": lo, "d_group_max": hi,
+            "frac_cells_positive": frac_pos, "n_groups_used": covered,
+            "always_co_open": co_open, "always_co_closed": co_closed}
+
+
+def contrast_stats(X, in_mask, min_cells):
+    """Welch two-sample t per bin for one group set against all the others.
+
+    Welch rather than pooled: the two arms are a handful of samples of one
+    condition against everything else, so equal variances are not a safe
+    assumption.  Returns NaN for bins either arm cannot cover, which keeps them
+    out of the multiple-testing correction rather than in it at p = 1.
+    """
+    from scipy.stats import t as _t
+
+    X = np.asarray(X, float)
+    out = {}
+    for tag, m in (("in", in_mask), ("out", ~in_mask)):
+        rows = X[m]
+        n = np.isfinite(rows).sum(axis=0)
+        with np.errstate(invalid="ignore"):
+            out[f"n_{tag}"] = n
+            out[f"mean_{tag}"] = np.where(n > 0, np.nanmean(rows, axis=0),
+                                          np.nan)
+            out[f"var_{tag}"] = np.where(n > 1, np.nanvar(rows, axis=0, ddof=1),
+                                         np.nan)
+    n1, n2 = out["n_in"], out["n_out"]
+    v1, v2 = out["var_in"], out["var_out"]
+    diff = out["mean_in"] - out["mean_out"]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s1, s2 = v1 / np.maximum(n1, 1), v2 / np.maximum(n2, 1)
+        se = np.sqrt(s1 + s2)
+        tstat = diff / se
+        df = (s1 + s2) ** 2 / (s1 ** 2 / np.maximum(n1 - 1, 1)
+                               + s2 ** 2 / np.maximum(n2 - 1, 1))
+        p = 2.0 * _t.sf(np.abs(tstat), df)
+        # Cohen's d on the pooled SD, so the effect size is readable next to
+        # the p-value that a large n would otherwise make look decisive.
+        sp = np.sqrt(((n1 - 1) * v1 + (n2 - 1) * v2)
+                     / np.maximum(n1 + n2 - 2, 1))
+        d = diff / sp
+    bad = (n1 < min_cells) | (n2 < min_cells) | ~np.isfinite(se) | (se <= 0)
+    for k, v in (("diff", diff), ("t", tstat), ("p", p), ("d", d)):
+        out[k] = np.where(bad, np.nan, v)
+    return out
+
+
+def _cramers_v(a: pd.Series, b: pd.Series) -> float:
+    """Association between two categorical vectors, 0 (none) to 1 (identical
+    partition).  Used to warn when a requested contrast is confounded with
+    batch, where 'the bins that separate these groups' and 'the bins that
+    separate these batches' are the same bins."""
+    from scipy.stats import chi2_contingency
+
+    tab = pd.crosstab(a, b)
+    if tab.shape[0] < 2 or tab.shape[1] < 2:
+        return 0.0
+    chi2 = chi2_contingency(tab.to_numpy())[0]
+    n = int(tab.to_numpy().sum())
+    return float(np.sqrt(chi2 / (n * (min(tab.shape) - 1))))
 
 
 def _prep(M, name, out_dir, args):
@@ -723,6 +902,48 @@ def main():
                          "companion heatmaps per matrix, e.g. gch=PRGn_r. "
                          "Defaults: gch=PRGn_r, hcg=BrBG_r (kept distinct from "
                          "the concordance maps and from each other).")
+    ap.add_argument("--stable-bins", choices=["on", "off"], default="on",
+                    help="Also emit the INVARIANT set: the bins whose "
+                         "cell-type means sit closest together, ranked by the "
+                         "SD of those means rather than by low cell-type ICC "
+                         "(low ICC returns the noisiest bins, since ICC has "
+                         "sampling noise in its denominator).  Same batch "
+                         "filter as the marker set — a bin flat across cell "
+                         "types but driven by batch is sample, not biology.  "
+                         "Writes bin_scores_<name>.stable.bed.")
+    ap.add_argument("--n-stable-bins", type=int, default=0,
+                    help="Size of the invariant set (0 = same as --n-bins).")
+    ap.add_argument("--sign-split", choices=["auto", "on", "off"],
+                    default="auto",
+                    help="For a DIRECTIONAL matrix (D = C·(2F−1)), also emit "
+                         "the bins that are co-open in every cell type and "
+                         "those co-closed in every cell type.  'auto' turns "
+                         "this on for a matrix whose filename contains "
+                         "'directional', which is the only combine mode whose "
+                         "sign carries that meaning: for C the sign is "
+                         "concordant vs anti-concordant, not open vs closed.  "
+                         "Computed on the RAW values, since the normalisation "
+                         "used for selection destroys the sign.  Writes "
+                         "bin_scores_<name>.always_co_{open,closed}.bed.")
+    ap.add_argument("--sign-min-consistency", type=float, default=0.6,
+                    help="Fraction of cells that must fall on the dominant "
+                         "side for a bin to be called always co-open / "
+                         "co-closed, on top of every cell-type mean agreeing.")
+    ap.add_argument("--contrast", action="append", default=None,
+                    metavar="LABEL=GROUP[,GROUP...]",
+                    help="Rank bins by how well they separate the named "
+                         "cell-type groups from ALL the others (repeatable), "
+                         "e.g. --contrast meningioma=tumor1,tumor2 against a "
+                         "panel of GM12878, IMR90 and monocyte.  Welch t per "
+                         "bin with BH-FDR and Cohen's d.  Writes "
+                         "bin_scores_<name>.contrast_<label>.bed.  The "
+                         "association between the contrast and each batch "
+                         "variable is reported: when samples of one condition "
+                         "were processed together, 'the bins separating these "
+                         "groups' and 'the bins separating these batches' are "
+                         "the same bins, and the result means nothing.")
+    ap.add_argument("--n-contrast-bins", type=int, default=0,
+                    help="Bins per contrast BED (0 = same as --n-bins).")
     ap.add_argument("--max-batch-icc", type=float, default=0.1,
                     help="Drop a candidate bin whose within-cell-type between-"
                          "batch ICC exceeds this — it is sample-driven.")
@@ -814,6 +1035,17 @@ def main():
         if "=" not in c:
             sys.exit(f"--mean-matrix must be NAME=PATH, got {c!r}")
         k, v = c.split("=", 1); mean_explicit[k.strip()] = v.strip()
+    contrasts = []
+    for spec in (args.contrast or []):
+        if "=" not in spec:
+            sys.exit(f"--contrast must be LABEL=GROUP[,GROUP...], got {spec!r}")
+        lab, groups = spec.split("=", 1)
+        lab = lab.strip().replace("/", "_").replace(" ", "_")
+        want = [g.strip() for g in groups.split(",") if g.strip()]
+        if not lab or not want:
+            sys.exit(f"--contrast needs a label and at least one group: {spec!r}")
+        contrasts.append((lab, want))
+
     out_dir = ensure_dir(Path(args.output_dir))
     summary = {}
 
@@ -852,6 +1084,11 @@ def main():
                   file=sys.stderr)
             continue
 
+        # The co-open / co-closed call needs the values BEFORE normalisation:
+        # per-bin QN and the per-cell rank both destroy the sign that carries
+        # the meaning.  Kept here and re-aligned to the surviving bins below.
+        M_raw = M.copy()
+
         # Normalise exactly as nome_hic_concordance / nome_hic_compare do before
         # the UMAP (quantile per-bin + per-cell rank + recenter for signed), so
         # the selected bins live in the same feature space as the embedding.
@@ -879,8 +1116,11 @@ def main():
 
         # Select on ALL cells: more coverage means more bins pass than a train
         # split would (a hard filter on half the cells left only a couple dozen).
+        # One materialised copy of the selection matrix, shared by every
+        # ranking below so they cannot disagree about what was measured.
+        Msel = M.to_numpy()
         sel, ct_icc, b_icc, n_clean = select_marker_bins(
-            M.to_numpy(), ct_id, len(ct_u), batch_specs, ctv.icc_per_region, args)
+            Msel, ct_id, len(ct_u), batch_specs, ctv.icc_per_region, args)
         if sel.size == 0:
             print(f"  {name}: no usable bins — lower --min-groups?",
                   file=sys.stderr)
@@ -978,22 +1218,146 @@ def main():
             "bin": M.columns, "celltype_icc": ct_icc,
             "celltype_pvalue": ct_p, "celltype_fdr": ct_fdr,
             "batch_icc": b_icc, "selected": M.columns.isin(sel_bins)})
+        extra_cols: list[str] = []
+        subsets: dict[str, np.ndarray] = {}
+
+        # (2) INVARIANT set: flattest across cell types, same batch filter.
+        if args.stable_bins == "on":
+            n_want = args.n_stable_bins or args.n_bins
+            stable_sel, spread, n_stable_clean = select_stable_bins(
+                Msel, ct_id, len(ct_u), b_icc, args, n_want)
+            is_stable = np.zeros(M.shape[1], bool)
+            is_stable[stable_sel] = True
+            scores_df["celltype_mean_spread"] = spread
+            scores_df["stable"] = is_stable
+            extra_cols += ["celltype_mean_spread", "stable"]
+            subsets["stable"] = is_stable
+            summary_stable = {
+                "n_stable": int(stable_sel.size),
+                "n_stable_batch_clean": int(n_stable_clean),
+                "median_celltype_icc_stable": _nanmedian(ct_icc[stable_sel]),
+                "median_spread_stable": _nanmedian(spread[stable_sel]),
+                "median_spread_marker": _nanmedian(spread[sel])}
+        else:
+            summary_stable = {}
+
+        # (3) Directional sign: always co-open / always co-closed, on RAW values.
+        sign_on = (args.sign_split == "on"
+                   or (args.sign_split == "auto"
+                       and "directional" in Path(path).name.lower()))
+        summary_sign = {}
+        if sign_on:
+            raw = M_raw.reindex(index=M.index, columns=M.columns)
+            sg = sign_summary(raw, ct_id, len(ct_u), args)
+            n_want = args.n_bins
+            for key, rank_by, ascending in (
+                    ("always_co_open", "d_group_min", False),
+                    ("always_co_closed", "d_group_max", True)):
+                hit = np.flatnonzero(sg[key])
+                order = np.argsort(sg[rank_by][hit])
+                hit = hit[order if ascending else order[::-1]][:n_want]
+                mask = np.zeros(M.shape[1], bool)
+                mask[hit] = True
+                scores_df[key] = mask
+                subsets[key] = mask
+                summary_sign[f"n_{key}"] = int(mask.sum())
+                summary_sign[f"n_{key}_total"] = int(sg[key].sum())
+            for c in ("d_mean", "d_group_min", "d_group_max",
+                      "frac_cells_positive"):
+                scores_df[c] = sg[c]
+            extra_cols += ["d_mean", "d_group_min", "d_group_max",
+                           "frac_cells_positive", "always_co_open",
+                           "always_co_closed"]
+
+        # (4) Group-set contrasts: these groups against every other.
+        summary_contrast = {}
+        for label, want in contrasts:
+            present = [g for g in want if g in set(ct_u)]
+            missing = [g for g in want if g not in set(ct_u)]
+            if missing:
+                print(f"  contrast {label!r}: no cells for {missing} "
+                      f"(available: {ct_u})", file=sys.stderr)
+            if not present or len(present) == len(ct_u):
+                print(f"  contrast {label!r}: needs at least one group in the "
+                      f"set and one outside — skipped", file=sys.stderr)
+                continue
+            in_mask = ct.isin(present).to_numpy()
+            cs = contrast_stats(Msel, in_mask, args.min_cells_per_group)
+            q = _bh_fdr(cs["p"])
+            rank = np.where(np.isfinite(cs["t"]), np.abs(cs["t"]), -np.inf)
+            keep_rank = np.argsort(rank)[::-1][: args.n_contrast_bins
+                                               or args.n_bins]
+            keep_rank = keep_rank[np.isfinite(rank[keep_rank])]
+            # A contrast bin driven by batch is worthless in exactly the same
+            # way a marker bin is, so it faces the same filter.
+            clean = ~(np.isfinite(b_icc) & (b_icc > args.max_batch_icc))
+            mask = np.zeros(M.shape[1], bool)
+            mask[keep_rank] = True
+            pre = f"contrast_{label}"
+            scores_df[f"{pre}_diff"] = cs["diff"]
+            scores_df[f"{pre}_cohens_d"] = cs["d"]
+            scores_df[f"{pre}_pvalue"] = cs["p"]
+            scores_df[f"{pre}_fdr"] = q
+            scores_df[pre] = mask
+            extra_cols += [f"{pre}_diff", f"{pre}_cohens_d", f"{pre}_pvalue",
+                           f"{pre}_fdr", pre]
+            subsets[pre] = mask
+            # Confounding check: if the contrast IS a batch, the bins that
+            # separate the groups are the bins that separate the batches.
+            conf = {c: _cramers_v(pd.Series(in_mask, index=M.index),
+                                  batch_df[c]) for c in bcols}
+            worst = max(conf, key=conf.get) if conf else None
+            # How many selected bins the batch filter could even JUDGE.  It is
+            # a WITHIN-cell-type statistic, so when a batch is nested inside
+            # cell type -- the usual shape of a confounded design -- there is
+            # no within-cell-type batch contrast to measure, every bin comes
+            # back NaN and "passed the batch filter" means "was never tested".
+            judged = int(np.sum(mask & np.isfinite(b_icc)))
+            summary_contrast[label] = {
+                "groups_in": present, "n_cells_in": int(in_mask.sum()),
+                "n_cells_out": int((~in_mask).sum()),
+                "n_selected": int(mask.sum()),
+                "n_fdr_0.05": int(np.nansum(q < 0.05)),
+                "n_selected_batch_clean": int(np.sum(mask & clean)),
+                "n_selected_batch_judged": judged,
+                "batch_confounding_cramers_v": conf}
+            if worst and conf[worst] > 0.5:
+                print(f"  WARNING contrast {label!r} is confounded with "
+                      f"{worst} (Cramer's V {conf[worst]:.2f}): these cells "
+                      f"were largely processed apart from the rest, so a bin "
+                      f"that separates the groups cannot be distinguished "
+                      f"from one that separates the batches.", file=sys.stderr)
+                if judged < mask.sum():
+                    print(f"    and --max-batch-icc cannot help: it is a "
+                          f"WITHIN-cell-type statistic and only "
+                          f"{judged}/{int(mask.sum())} selected bins even have "
+                          f"one, because {worst} does not vary inside a cell "
+                          f"type here.  These bins are a hypothesis to test on "
+                          f"samples processed together, not a result.",
+                          file=sys.stderr)
+
         scores_df.to_csv(out_dir / f"bin_scores_{name}.tsv", sep="\t",
                          index=False)
 
         # BED files (0-based, half-open) with the same statistics: one with ALL
-        # bins, one with only the bins used in the plot (selected).
+        # bins, one per selected subset.
         coords = _bins_to_bed(M.columns, infer_bin_size(M.columns), chrom_sizes)
         bed = pd.DataFrame(coords, columns=["chrom", "start", "end"])
         for c in ("celltype_icc", "celltype_pvalue", "celltype_fdr",
-                  "batch_icc", "selected"):
+                  "batch_icc", "selected", *extra_cols):
             bed[c] = scores_df[c].values
         bed = bed.sort_values(["chrom", "start"]).reset_index(drop=True)
         bed.to_csv(out_dir / f"bin_scores_{name}.all.bed", sep="\t",
                    index=False, na_rep="NA")
-        bed[bed["selected"]].drop(columns="selected").to_csv(
-            out_dir / f"bin_scores_{name}.selected.bed", sep="\t", index=False,
-            na_rep="NA")
+        flags = ["selected", *subsets]
+        for key in flags:
+            # Every membership flag is dropped from a subset file: the one it
+            # was selected by is constant True there, and the others belong to
+            # a different question.  The per-bin STATISTICS all stay, since
+            # they are what the bins are for.
+            bed[bed[key]].drop(columns=flags).to_csv(
+                out_dir / f"bin_scores_{name}.{key}.bed", sep="\t",
+                index=False, na_rep="NA")
         summary[name] = {
             "n_cells": int(M.shape[0]), "n_bins": int(M.shape[1]),
             "n_selected": int(sel.size),
@@ -1003,7 +1367,9 @@ def main():
             "nonselected_silhouette": (None if not np.isfinite(sil)
                                        else float(sil)),
             "nonselected_perm_p": (None if not np.isfinite(perm_p)
-                                   else float(perm_p))}
+                                   else float(perm_p)),
+            **summary_stable, **summary_sign,
+            **({"contrasts": summary_contrast} if summary_contrast else {})}
         print(f"\n=== {name}: {M.shape[0]} cells x {M.shape[1]} bins ===")
         print(f"  selected {sel.size} bins ({n_clean} batch-invariant): "
               f"median cell-type ICC {_nanmedian(ct_icc[sel]):.3f}, "
@@ -1012,6 +1378,26 @@ def main():
             print(f"  NOTE: only {n_clean} bins passed --max-batch-icc "
                   f"{args.max_batch_icc}; the rest were filled by cell-type ICC "
                   f"(raise the cut to admit more, or lower --n-bins).")
+        if summary_stable:
+            print(f"  invariant set: {summary_stable['n_stable']} bins "
+                  f"({summary_stable['n_stable_batch_clean']} batch-invariant), "
+                  f"median cell-type-mean spread "
+                  f"{summary_stable['median_spread_stable']:.4f} against "
+                  f"{summary_stable['median_spread_marker']:.4f} for the marker "
+                  f"set -> bin_scores_{name}.stable.bed")
+        for key in ("always_co_open", "always_co_closed"):
+            if f"n_{key}" in summary_sign:
+                print(f"  {key.replace('_', ' ')}: "
+                      f"{summary_sign[f'n_{key}']} written of "
+                      f"{summary_sign[f'n_{key}_total']} qualifying "
+                      f"-> bin_scores_{name}.{key}.bed")
+        for lab, s in summary_contrast.items():
+            print(f"  contrast {lab} ({'+'.join(s['groups_in'])}, "
+                  f"{s['n_cells_in']} vs {s['n_cells_out']} cells): "
+                  f"{s['n_selected']} bins written, "
+                  f"{s['n_fdr_0.05']} at FDR<0.05, "
+                  f"{s['n_selected_batch_clean']}/{s['n_selected']} "
+                  f"batch-invariant -> bin_scores_{name}.contrast_{lab}.bed")
         print(f"  heatmap on all {M.shape[0]} cells -> {fig_hm.name}")
         print(f"  per-bin stats -> bin_scores_{name}.{{all,selected}}.bed "
               f"(chrom/start/end, cell-type ICC, ANOVA p, BH-FDR, batch ICC)")
