@@ -464,3 +464,53 @@ def test_empty_result_names_the_likely_cause_instead_of_crashing(tmp_path):
         m.main(["--gch-d", str(gp), "--hcg-d", str(hp),
                 "--min-cells", "999", "--plot-format", "png",
                 "--output-dir", str(tmp_path / "o")])
+
+
+def test_blacklist_bed_drops_bins_from_both_contexts(tmp_path):
+    m = _mod()
+    g, h = _pair(n_cells=30, n_bins=20)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp)
+    h.to_parquet(hp)
+    bed = tmp_path / "bl.bed"
+    bed.write_text("chr1\t0\t1000000\n")          # covers bins 0-3
+    out = tmp_path / "out"
+    assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
+                   "--blacklist-bed", str(bed), "--plot-format", "png",
+                   "--per-bin-correlation", "off", "--state-flow", "off",
+                   "--output-dir", str(out)]) == 0
+    per_bin = pd.read_csv(out / "D_gch_vs_hcg_per_bin.tsv", sep="\t")
+    assert len(per_bin) == 16
+    assert not any(str(b).endswith((":0", ":250000", ":500000", ":750000"))
+                   for b in per_bin["bin"])
+
+
+def test_blacklist_applies_before_the_batch_correction(tmp_path):
+    """Order matters: a blacklisted bin left in place would still shape the
+    correction, and ComBat pools across bins to build its priors."""
+    m = _mod()
+    calls = []
+    from nome_hic_concordance import batch_correction as bc
+    orig = bc.correct_and_report
+    bc.correct_and_report = lambda df, *a, **k: (calls.append(df.shape[1])
+                                                 or orig(df, *a, **k))
+    try:
+        g, h = _pair(n_cells=30, n_bins=20)
+        gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+        g.to_parquet(gp)
+        h.to_parquet(hp)
+        sp = tmp_path / "s.tsv"
+        pd.DataFrame({"cell_name": g.index,
+                      "exp_batch": ["b1", "b2"] * 15}).to_csv(
+            sp, sep="\t", index=False)
+        bed = tmp_path / "bl.bed"
+        bed.write_text("chr1\t0\t1000000\n")
+        assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp),
+                       "--min-cells", "5", "--blacklist-bed", str(bed),
+                       "--samples", str(sp), "--batch-column", "exp_batch",
+                       "--batch-correction", "center", "--plot-format", "png",
+                       "--per-bin-correlation", "off", "--state-flow", "off",
+                       "--output-dir", str(tmp_path / "o")]) == 0
+    finally:
+        bc.correct_and_report = orig
+    assert calls == [16, 16], calls

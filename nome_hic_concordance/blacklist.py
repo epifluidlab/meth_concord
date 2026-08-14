@@ -201,3 +201,78 @@ def infer_bin_size(columns: pd.Index) -> int | None:
     if not diffs:
         return None
     return int(reduce(math.gcd, diffs))
+
+
+def blacklisted_bin_mask(columns, blacklist: dict, bin_size: int | None = None):
+    """Boolean array, True where a ``chrom:start`` bin overlaps the blacklist.
+
+    Bin-level rather than read-level: these matrices are already built, so the
+    only thing left to do about a blacklisted region is drop the bins covering
+    it.  That is coarser than the Step-2 read filter -- a 250 kb bin is dropped
+    for overlapping a 1 kb blacklist interval -- so prefer re-running Step 2
+    with ``--blacklist-bed`` when the matrices can be rebuilt, and use this
+    when they cannot.
+
+    Chromosome names are matched with and without a ``chr`` prefix, since a
+    BED and a matrix that disagree about it are otherwise silently disjoint --
+    which looks like a clean blacklist rather than a broken one.
+    """
+    import numpy as _np
+
+    cols = list(columns)
+    if bin_size is None:
+        bin_size = infer_bin_size(pd.Index(cols))
+    if not bin_size:
+        raise ValueError(
+            "Cannot infer the bin size from the column labels, so a bin's "
+            "interval is unknown; pass bin_size explicitly.")
+    out = _np.zeros(len(cols), dtype=bool)
+    for i, col in enumerate(cols):
+        s = str(col)
+        if ":" not in s:
+            continue
+        chrom, start_str = s.split(":", 1)
+        try:
+            start = int(start_str)
+        except ValueError:
+            continue
+        alt = chrom[3:] if chrom.lower().startswith("chr") else "chr" + chrom
+        for name in (chrom, alt):
+            if name in blacklist and interval_overlaps_blacklist(
+                    name, start, start + int(bin_size), blacklist):
+                out[i] = True
+                break
+    return out
+
+
+def drop_blacklisted_bins(df: pd.DataFrame, bed_paths, bin_size=None,
+                          who: str = "matrix"):
+    """Drop the columns of a cells × bins frame that overlap any of the BEDs."""
+    paths = [p for p in (bed_paths or []) if p]
+    if not paths:
+        return df
+    merged: dict = {}
+    for p in paths:
+        for chrom, ivals in load_blacklist_bed(p).items():
+            merged[chrom] = (ivals if chrom not in merged
+                             else np.vstack([merged[chrom], ivals]))
+    for chrom, ivals in merged.items():                 # re-merge across files
+        order = np.argsort(ivals[:, 0], kind="stable")
+        ivals = ivals[order]
+        keep = [ivals[0]]
+        for s, e in ivals[1:]:
+            if s <= keep[-1][1]:
+                keep[-1] = (keep[-1][0], max(keep[-1][1], e))
+            else:
+                keep.append((s, e))
+        merged[chrom] = np.asarray(keep, dtype=np.int64)
+    hit = blacklisted_bin_mask(df.columns, merged, bin_size)
+    if hit.any():
+        logger.info(f"{who}: dropped {int(hit.sum()):,} of {df.shape[1]:,} "
+                    f"bins overlapping {len(paths)} blacklist file(s).")
+    else:
+        logger.warning(
+            f"{who}: the blacklist matched NO bin.  Check the chromosome "
+            f"naming and the coordinates — an empty filter and a clean "
+            f"genome look identical downstream.")
+    return df.loc[:, ~hit]

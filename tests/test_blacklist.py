@@ -138,3 +138,66 @@ def test_infer_bin_size():
 def test_infer_bin_size_returns_none_when_singletons():
     cols = pd.Index(["chr1:0", "chr2:0"])
     assert bl.infer_bin_size(cols) is None
+
+
+# ------------------------------------------------------- bin-level filtering --
+
+def _bin_frame(n=8, size=250_000, chrom="chr1"):
+    import pandas as pd
+    return pd.DataFrame(
+        np.arange(2 * n).reshape(2, n).astype(float),
+        index=["c0", "c1"],
+        columns=[f"{chrom}:{i * size}" for i in range(n)])
+
+
+def test_blacklisted_bin_mask_flags_any_overlap(tmp_path):
+    from nome_hic_concordance import blacklist as bl
+    df = _bin_frame()
+    bed = tmp_path / "b.bed"
+    # 1 bp inside bin 2, and a range spanning bins 5-6.
+    bed.write_text("chr1\t500001\t500002\nchr1\t1300000\t1600000\n")
+    hit = bl.blacklisted_bin_mask(df.columns, bl.load_blacklist_bed(str(bed)))
+    assert list(np.flatnonzero(hit)) == [2, 5, 6]
+
+
+def test_bin_mask_matches_chrom_names_with_and_without_the_prefix(tmp_path):
+    """A BED and a matrix that disagree about 'chr' are otherwise silently
+    disjoint, which looks like a clean blacklist rather than a broken one."""
+    from nome_hic_concordance import blacklist as bl
+    bed = tmp_path / "b.bed"
+    bed.write_text("1\t0\t250000\n")
+    hit = bl.blacklisted_bin_mask(_bin_frame().columns,
+                                  bl.load_blacklist_bed(str(bed)))
+    assert list(np.flatnonzero(hit)) == [0]
+    bed2 = tmp_path / "b2.bed"
+    bed2.write_text("chr1\t0\t250000\n")
+    hit2 = bl.blacklisted_bin_mask(_bin_frame(chrom="1").columns,
+                                   bl.load_blacklist_bed(str(bed2)))
+    assert list(np.flatnonzero(hit2)) == [0]
+
+
+def test_drop_blacklisted_bins_merges_across_files(tmp_path):
+    from nome_hic_concordance import blacklist as bl
+    df = _bin_frame()
+    a, b = tmp_path / "a.bed", tmp_path / "b.bed"
+    a.write_text("chr1\t0\t100000\n")
+    b.write_text("chr1\t50000\t300000\nchr1\t1750000\t1800000\n")
+    out = bl.drop_blacklisted_bins(df, [str(a), str(b)])
+    assert list(out.columns) == [f"chr1:{i * 250000}" for i in (2, 3, 4, 5, 6)]
+
+
+def test_drop_blacklisted_bins_is_a_noop_without_paths():
+    from nome_hic_concordance import blacklist as bl
+    df = _bin_frame()
+    assert bl.drop_blacklisted_bins(df, None) is df
+    assert bl.drop_blacklisted_bins(df, []) is df
+
+
+def test_a_blacklist_that_matches_nothing_warns(tmp_path, caplog):
+    from nome_hic_concordance import blacklist as bl
+    bed = tmp_path / "b.bed"
+    bed.write_text("chr9\t0\t1000\n")
+    with caplog.at_level("WARNING"):
+        out = bl.drop_blacklisted_bins(_bin_frame(), [str(bed)])
+    assert out.shape[1] == 8
+    assert "matched NO bin" in caplog.text

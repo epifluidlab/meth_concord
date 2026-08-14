@@ -595,6 +595,17 @@ def main(argv=None) -> int:
     ap.add_argument("--min-cells", type=int, default=10,
                     help="Minimum observed cells per bin, per context (10).")
     ap.add_argument("--exclude-chrom", default="")
+    ap.add_argument("--blacklist-bed", action="append", default=None,
+                    metavar="BED",
+                    help="Repeatable.  Drop every bin overlapping one of these "
+                         "intervals (ENCODE blacklist, CpG islands+shores, any "
+                         "custom set); .gz is fine.  Bin-level, because these "
+                         "matrices are already built — a 250 kb bin goes for "
+                         "overlapping a 1 kb interval, so prefer re-running "
+                         "step 2 with --blacklist-bed when the matrices can be "
+                         "rebuilt.  Applied to BOTH contexts, before the "
+                         "batch correction, so neither the correction nor the "
+                         "correlation sees a blacklisted bin.")
     ap.add_argument("--samples", default=None,
                     help="Sample sheet, required by --batch-correction and "
                          "--per-batch-check.")
@@ -683,6 +694,12 @@ def main(argv=None) -> int:
         logger.info(f"--- {stat_key} ---")
         gch = _drop_chroms(_load(gch_path), excl)
         hcg = _drop_chroms(_load(hcg_path), excl)
+        if args.blacklist_bed:
+            from nome_hic_concordance.blacklist import drop_blacklisted_bins
+            gch = drop_blacklisted_bins(gch, args.blacklist_bed,
+                                        who=f"{stat_key} GCH")
+            hcg = drop_blacklisted_bins(hcg, args.blacklist_bed,
+                                        who=f"{stat_key} HCG")
 
         if args.per_batch_check:
             logger.info(f"{stat_key}: per-batch correlations")
