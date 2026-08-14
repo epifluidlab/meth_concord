@@ -24,14 +24,19 @@ Residual arms additionally run comparison.variance_partition on the NORMALIZED
 target and baselines (the order run_comparison uses), then re-prep the residual
 before scoring — again matching comparison.residual_umap.
 
-TWO THINGS TO KNOW
-------------------
+THREE THINGS TO KNOW
+--------------------
 1. nome_hic_compare computes its reported metrics from the SVD scores WITHOUT
    batch correction -- harmony is applied only inside the UMAP call, for the
    picture.  This script therefore defaults to ``--batch-correction none`` so
    its numbers reproduce the ones in comparison_metrics.  Passing
    ``--batch-correction harmony`` here corrects the scores before scoring,
    which is a different (and stricter) question.
+1b. ``--concordance-batch-correction`` is a THIRD, earlier stage, on the C and
+   D matrices themselves rather than on the scores, matching the flag of the
+   same name in nome_hic_concordance and nome_hic_compare.  It reaches the C
+   and D arms, their residuals and the random control, and deliberately not
+   the 1D/3D baselines those arms are measured against.
 2. The random control is a per-bin permutation of the concordance matrix
    across cells: it preserves every bin's value distribution and the exact NaN
    pattern, and destroys only the cell association.  It is the floor for this
@@ -159,9 +164,31 @@ def score_matrix(raw, name, labels, args, out_dir, batch_labels=None):
     return m
 
 
-def build_arms(mats, labels, args, out_dir, batch_labels):
+def build_arms(mats, labels, args, out_dir, batch_labels,
+               concordance_batch_labels=None):
     """Every arm's metric dict, keyed as in ARM_STYLE."""
     results: dict[str, dict] = {}
+
+    def correct(df, nm):
+        """The concordance-stage correction, on the raw per-bin values.
+
+        Only C and D get it, never the baselines: they come off a different
+        stage, and correcting them with a setting tuned for concordance would
+        weaken the very control these bars exist to measure against.  Same
+        split, and the same shared implementation, as nome_hic_compare.
+        """
+        if (args.concordance_batch_correction == "none"
+                or concordance_batch_labels is None):
+            return df
+        from nome_hic_concordance import batch_correction as _bc
+        return _bc.correct_and_report(
+            df, concordance_batch_labels, args.concordance_batch_correction,
+            args.random_seed, nm)
+
+    mats = dict(mats)
+    src_raw = mats[args.random_source.upper()]      # before the correction
+    mats["C"] = correct(mats["C"], "C")
+    mats["D"] = correct(mats["D"], "D")
 
     results["baseline_1d"] = score_matrix(
         mats["1D"], "baseline_1d", labels, args, out_dir, batch_labels)
@@ -188,9 +215,13 @@ def build_arms(mats, labels, args, out_dir, batch_labels):
             results[name] = score_matrix(resid, f"residual_{name}", labels,
                                          args, out_dir, batch_labels)
 
+    # The floor has to travel the SAME road as the real arms, correction
+    # included, or it stops being a floor: harmony in particular can invent
+    # clustering, and only an arm that also passes through it can absorb that.
+    # Shuffled FIRST, so the correction meets a matrix with no cell
+    # association left, exactly as it would if the data carried no signal.
     results["random"] = score_matrix(
-        _shuffle_within_bins(mats[args.random_source.upper()],
-                             args.random_seed),
+        correct(_shuffle_within_bins(src_raw, args.random_seed), "random"),
         "random", labels, args, out_dir, batch_labels)
     return results
 
@@ -287,6 +318,29 @@ def main(argv=None) -> int:
                     help="Applied to the SVD scores BEFORE scoring.  Default "
                          "'none' reproduces nome_hic_compare, which batch-"
                          "corrects only the UMAP, not the reported metrics.")
+    ap.add_argument("--concordance-batch-column", default=None,
+                    help="Batch variable(s) for --concordance-batch-correction "
+                         "when they should differ from --batch-column; "
+                         "comma-separated.  Defaults to --batch-column.")
+    ap.add_argument("--concordance-batch-correction",
+                    choices=["none", "center", "zscore", "combat", "harmony"],
+                    default="none",
+                    help="Batch-correct the C and D matrices themselves, per "
+                         "bin on their raw values, before the coverage filter "
+                         "and every normalization.  A different stage from "
+                         "--batch-correction, which acts on the SVD scores: "
+                         "batch is already mixed into the concordance bins "
+                         "(per-cell coverage drives the DM shrinkage and what "
+                         "RWR imputes), and ten SVD components cannot separate "
+                         "it out afterwards.  Same flag, same shared "
+                         "implementation and same semantics as in "
+                         "nome_hic_concordance and nome_hic_compare, so a "
+                         "setting chosen there transfers here unchanged.  The "
+                         "1D and 3D baselines are deliberately left alone — "
+                         "they are what the concordance arms are measured "
+                         "against.  The random control DOES get it, since a "
+                         "floor that skipped the correction could not absorb "
+                         "structure the correction itself creates.")
     ap.add_argument("--harmony-theta", type=float, default=None)
     ap.add_argument("--random-source", choices=["c", "d"], default="d",
                     help="Which concordance matrix the random control shuffles.")
@@ -312,18 +366,33 @@ def main(argv=None) -> int:
 
     samples = pd.read_csv(args.samples, sep="\t")
     labels = samples.set_index(args.cell_column)[args.group_column].dropna()
-    batch_labels = None
-    if args.batch_column:
-        cols = [c.strip() for c in args.batch_column.split(",") if c.strip()]
-        idx = samples.set_index(args.cell_column)
+    idx = samples.set_index(args.cell_column)
+
+    def _batch_series(spec, flag):
+        cols = [c.strip() for c in spec.split(",") if c.strip()]
         missing = [c for c in cols if c not in idx.columns]
         if missing:
-            raise SystemExit(f"--batch-column not in {args.samples}: {missing}")
-        batch_labels = idx[cols[0]] if len(cols) == 1 else idx[cols]
+            raise SystemExit(f"{flag} not in {args.samples}: {missing}")
+        return idx[cols[0]] if len(cols) == 1 else idx[cols]
+
+    batch_labels = (_batch_series(args.batch_column, "--batch-column")
+                    if args.batch_column else None)
+    # Falls back to --batch-column, so the common case stays one flag.
+    concordance_batch_labels = (
+        _batch_series(args.concordance_batch_column,
+                      "--concordance-batch-column")
+        if args.concordance_batch_column else batch_labels)
+    if (args.concordance_batch_correction != "none"
+            and concordance_batch_labels is None):
+        raise SystemExit(
+            f"--concordance-batch-correction "
+            f"{args.concordance_batch_correction!r} requires --batch-column "
+            f"or --concordance-batch-column.")
     logger.info(f"{len(labels)} labelled cells, "
                 f"{labels.nunique()} groups; context {args.context}.")
 
-    results = build_arms(mats, labels, args, out_dir, batch_labels)
+    results = build_arms(mats, labels, args, out_dir, batch_labels,
+                         concordance_batch_labels)
 
     tab = pd.DataFrame(
         [{"arm": key, "label": lab, **(results.get(key) or {})}

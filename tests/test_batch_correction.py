@@ -510,3 +510,48 @@ def test_run_umap_applies_batch_correction_on_scores(tmp_path):
         f"{batch_r2(raw):.3f} -> {batch_r2(corr):.3f}")
     # and it must not have destroyed the coordinates (still a real embedding)
     assert np.isfinite(corr[["UMAP1", "UMAP2"]].to_numpy()).all()
+
+
+# ------------------------------------------------ correct_and_report contract --
+
+def _sparse_matrix(seed=0, n=40, nb=12, missing=0.3):
+    rng = np.random.default_rng(seed)
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    batch = pd.Series(["b1", "b2"] * (n // 2), index=cells)
+    X = rng.normal(0, 1, (n, nb)) + np.where(
+        batch.to_numpy() == "b1", 3.0, -3.0)[:, None]
+    X[rng.random((n, nb)) < missing] = np.nan
+    return pd.DataFrame(X, index=cells, columns=bins), batch
+
+
+def test_correct_and_report_restores_the_missing_pattern(monkeypatch):
+    """Harmony reconstructs from PCs and ComBat imputes in order to run at all,
+    so both hand back a value for every (cell, bin).  Passing that downstream
+    would give the coverage filter a fully covered matrix and silently disable
+    it — a bin no cell covers would survive as pure per-bin-mean fill.
+
+    The densifying backend is stubbed rather than invoked, so the contract is
+    pinned whether or not the optional packages are installed.
+    """
+    raw, batch = _sparse_matrix()
+    assert raw.isna().any().any(), "the fixture must actually be sparse"
+    monkeypatch.setattr(bc, "apply_batch_correction",
+                        lambda m, b, method, random_state: m.fillna(0.0))
+    out = bc.correct_and_report(raw, batch, "combat", 0, "t")
+    assert out.shape == raw.shape
+    assert (out.isna() == raw.isna()).all().all(), "NaN pattern must survive"
+
+
+def test_correct_and_report_leaves_a_dense_matrix_dense():
+    raw, batch = _sparse_matrix(missing=0.0)
+    out = bc.correct_and_report(raw, batch, "center", 0, "t")
+    assert not out.isna().any().any()
+
+
+def test_correct_and_report_reduces_the_batch_effect_it_reports():
+    raw, batch = _sparse_matrix(missing=0.0)
+    pre = float(np.nanmedian(bc.batch_anova_f_per_bin(raw, batch)))
+    out = bc.correct_and_report(raw, batch, "center", 0, "t")
+    post = float(np.nanmedian(bc.batch_anova_f_per_bin(out, batch)))
+    assert pre > 50 and post < pre / 100, (pre, post)

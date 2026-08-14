@@ -160,3 +160,133 @@ def test_missing_batch_column_fails_loudly(tmp_path):
                 "--baseline-1d", p["b1"], "--baseline-3d", p["b3"],
                 "--samples", p["samples"], "--batch-column", "nope",
                 "--output-dir", str(tmp_path / "o2")])
+
+
+# ----------------------------------------- concordance-stage batch correction --
+
+def _batched_inputs(tmp_path, n_cells=60, n_bins=30, offset=3.0, seed=1):
+    """As _inputs, but C and D carry a batch effect and the baselines do not,
+    so a correction that leaks onto the baselines shows up in their bars.
+
+    Both the cell-type signal and the batch effect are PER-BIN patterns, not
+    per-cell offsets.  A per-cell offset would prove nothing here: the default
+    --per-cell-norm rank already removes it, so there would be nothing left for
+    the correction to do.  Per-bin is also the real shape of the problem, and
+    the reason this stage exists — per-bin QN turns a per-bin batch offset into
+    a batch-ordered ranking and preserves it.
+    """
+    rng = np.random.default_rng(seed)
+    cells = [f"c{i}" for i in range(n_cells)]
+    bins = [f"chr1:{i * 250000}" for i in range(n_bins)]
+    g = np.repeat([0, 1, 2], n_cells // 3)
+    batch = np.array(["b1", "b2"] * (n_cells // 2))
+    bi = (batch == "b2").astype(int)
+    ct_pattern = rng.normal(0, 1.0, (3, n_bins))
+    batch_pattern = rng.normal(0, offset, (2, n_bins))
+    paths = {}
+    for name, scale, batchy in (("c", 1.2, True), ("d", 1.0, True),
+                                ("b1", 1.5, False), ("b3", 0.8, False)):
+        base = ct_pattern[g] * scale + rng.normal(0, 0.4, (n_cells, n_bins))
+        if batchy:
+            base = base + batch_pattern[bi]
+        p = tmp_path / f"{name}.parquet"
+        pd.DataFrame(base, index=cells, columns=bins).to_parquet(p)
+        paths[name] = str(p)
+    sp = tmp_path / "samples.tsv"
+    pd.DataFrame({"cell_name": cells,
+                  "group": np.repeat(["A", "B", "C"], n_cells // 3),
+                  "exp_batch": batch,
+                  "lib_batch": np.tile(["L1", "L1", "L2", "L2"],
+                                       n_cells // 4)}).to_csv(
+        sp, sep="\t", index=False)
+    paths["samples"] = str(sp)
+    return paths
+
+
+def _run_batched(tmp_path, sub, extra):
+    m = _mod()
+    p = _batched_inputs(tmp_path)
+    out = tmp_path / sub
+    argv = ["--concordance-c", p["c"], "--concordance-d", p["d"],
+            "--baseline-1d", p["b1"], "--baseline-3d", p["b3"],
+            "--samples", p["samples"], "--context", "GCH",
+            "--n-svd", "5", "--n-perm", "0", "--plot-format", "png",
+            "--output-dir", str(out)] + extra
+    assert m.main(argv) == 0
+    return pd.read_csv(out / "GCH_metrics.tsv", sep="\t").set_index("arm")
+
+
+def test_concordance_stage_correction_lifts_c_and_d_only(tmp_path):
+    """It must reach the concordance arms and leave the baselines they are
+    measured against exactly where they were."""
+    off = _run_batched(tmp_path, "off", ["--batch-column", "exp_batch"])
+    on = _run_batched(tmp_path, "on",
+                      ["--batch-column", "exp_batch",
+                       "--concordance-batch-correction", "center"])
+    assert on.loc["C", "knn_purity"] > off.loc["C", "knn_purity"]
+    assert on.loc["D", "knn_purity"] > off.loc["D", "knn_purity"]
+    assert (on.loc["baseline_1d", "knn_purity"]
+            == off.loc["baseline_1d", "knn_purity"]), "baseline must not move"
+
+
+def test_the_random_floor_also_goes_through_the_correction(tmp_path):
+    """A floor that skipped the correction could not absorb structure the
+    correction itself introduces."""
+    m = _mod()
+    p = _batched_inputs(tmp_path)
+    seen = []
+    from nome_hic_concordance import batch_correction as bc
+    orig = bc.correct_and_report
+    bc.correct_and_report = lambda df, bl, meth, rs, nm: (seen.append(nm)
+                                                          or orig(df, bl, meth,
+                                                                  rs, nm))
+    try:
+        out = tmp_path / "o"
+        assert m.main(["--concordance-c", p["c"], "--concordance-d", p["d"],
+                       "--baseline-1d", p["b1"], "--baseline-3d", p["b3"],
+                       "--samples", p["samples"], "--n-svd", "5",
+                       "--n-perm", "0", "--plot-format", "png",
+                       "--batch-column", "exp_batch",
+                       "--concordance-batch-correction", "center",
+                       "--output-dir", str(out)]) == 0
+    finally:
+        bc.correct_and_report = orig
+    assert seen == ["C", "D", "random"], seen
+
+
+def test_concordance_batch_column_may_differ_from_batch_column(tmp_path):
+    """The two corrections act at different stages, so a sweep can land on
+    different variables for each."""
+    a = _run_batched(tmp_path, "a",
+                     ["--batch-column", "lib_batch",
+                      "--concordance-batch-column", "exp_batch",
+                      "--concordance-batch-correction", "center"])
+    b = _run_batched(tmp_path, "b",
+                     ["--batch-column", "lib_batch",
+                      "--concordance-batch-correction", "center"])
+    # exp_batch is the variable carrying the planted offset; lib_batch is not,
+    # so pointing the correction at it does strictly less.
+    assert a.loc["C", "knn_purity"] > b.loc["C", "knn_purity"]
+
+
+def test_correction_without_a_batch_column_fails_loudly(tmp_path):
+    m = _mod()
+    p = _batched_inputs(tmp_path)
+    with pytest.raises(SystemExit, match="concordance-batch-correction"):
+        m.main(["--concordance-c", p["c"], "--concordance-d", p["d"],
+                "--baseline-1d", p["b1"], "--baseline-3d", p["b3"],
+                "--samples", p["samples"],
+                "--concordance-batch-correction", "center",
+                "--output-dir", str(tmp_path / "x")])
+
+
+def test_unknown_concordance_batch_column_fails_loudly(tmp_path):
+    m = _mod()
+    p = _batched_inputs(tmp_path)
+    with pytest.raises(SystemExit, match="--concordance-batch-column"):
+        m.main(["--concordance-c", p["c"], "--concordance-d", p["d"],
+                "--baseline-1d", p["b1"], "--baseline-3d", p["b3"],
+                "--samples", p["samples"],
+                "--concordance-batch-column", "nope",
+                "--concordance-batch-correction", "center",
+                "--output-dir", str(tmp_path / "y")])

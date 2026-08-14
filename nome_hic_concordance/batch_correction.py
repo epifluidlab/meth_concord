@@ -450,6 +450,12 @@ def correct_and_report(matrix: pd.DataFrame, batch_labels, method: str,
 
     The before/after ANOVA F is logged so "the correction ran" and "the
     correction worked" stay distinguishable.
+
+    The original NaN pattern is restored afterwards.  ComBat and Harmony cannot
+    take NaNs, so :func:`_impute_for_dense_solver` fills them and Harmony's PC
+    reconstruction densifies the matrix regardless; returning that would hand
+    downstream code a value for every (cell, bin) and silently defeat the
+    coverage filter, which decides what a bin IS on how many cells cover it.
     """
     bl = (batch_labels.reindex(matrix.index)
           if isinstance(batch_labels, (pd.Series, pd.DataFrame))
@@ -457,6 +463,9 @@ def correct_and_report(matrix: pd.DataFrame, batch_labels, method: str,
     f_pre = batch_anova_f_per_bin(matrix, bl)
     out = apply_batch_correction(matrix, bl, method=method,
                                  random_state=random_state)
+    missing = matrix.isna()
+    if missing.any().any():
+        out = out.where(~missing)
     f_post = batch_anova_f_per_bin(out, bl)
     logger.info(
         f"[{stage} batch correction: {method}] {label}: "
