@@ -870,8 +870,11 @@ def test_end_to_end_warns_when_one_state_takes_everything(tmp_path):
          "--output-dir", str(tmp_path / "out"), "--plot-format", "png"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert "fall on ONE side" in r.stderr
+    assert "fall on one side" in r.stderr
     assert "--sign-reference median" in r.stderr
+    # The BEDs are top-N by rank, so the warning is about the sign TEST, not
+    # about what was written.
+    assert "BEDs are unaffected" in r.stderr
 
 
 class _SArgsExpected(_Args2):
@@ -989,3 +992,84 @@ def test_end_to_end_expected_reference_reads_the_sibling_components(tmp_path):
     frac_open = esum["n_always_co_open_total"] / nb
     assert 0.2 < frac_open < 0.8, frac_open
     assert (tmp_path / "e" / "bin_scores_g.always_co_open.bed").exists()
+
+
+def test_sign_bins_are_top_n_by_rank_not_by_threshold():
+    """A reference biased the same way for every bin slides a threshold but
+    cannot move a ranking — which is the whole reason for a fixed size."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    ct = np.repeat(np.arange(3), 20)
+    n, nb = len(ct), 200
+    strength = np.linspace(-1.0, 1.0, nb)
+    D = strength + rng.normal(0, 0.02, (n, nb))
+    sg = m.sign_summary(D, ct, 3, _SArgsZero())
+    open_idx, n_agree = m.select_sign_bins(sg, "always_co_open",
+                                           "d_group_min", False, 50)
+    assert open_idx.size == 50 and n_agree == 50
+    assert set(open_idx.tolist()) == set(range(nb - 50, nb)), "the most positive"
+
+    # Shift every bin by a constant, as a biased reference would: now nearly
+    # everything passes the threshold, yet the SAME 50 bins are selected.
+    shifted = m.sign_summary(D + 0.9, ct, 3, _SArgsZero())
+    assert shifted["always_co_open"].mean() > 0.9, "the threshold has moved"
+    again, _ = m.select_sign_bins(shifted, "always_co_open", "d_group_min",
+                                  False, 50)
+    np.testing.assert_array_equal(np.sort(open_idx), np.sort(again))
+
+
+def test_sign_bins_fill_by_rank_when_too_few_agree():
+    m = _mod()
+    rng = np.random.default_rng(1)
+    ct = np.repeat(np.arange(3), 20)
+    n, nb = len(ct), 100
+    # Only 10 bins are positive in every cell type; the rest are negative.
+    strength = np.r_[np.full(10, 0.5), np.full(90, -0.5)]
+    D = strength + rng.normal(0, 0.02, (n, nb))
+    sg = m.sign_summary(D, ct, 3, _SArgsZero())
+    idx, n_agree = m.select_sign_bins(sg, "always_co_open", "d_group_min",
+                                      False, 40)
+    assert idx.size == 40, "the set is always the requested size"
+    assert n_agree == 10, "and reports how many actually agreed"
+    assert set(idx[:10].tolist()) == set(range(10)), "agreeing ones come first"
+
+
+def test_both_sign_beds_are_written_at_the_requested_size(tmp_path):
+    import json
+    rng = np.random.default_rng(5)
+    n_ct, n_per, nb = 3, 30, 300
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    cells = [f"cell{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    # Everything positive: a threshold would call all 300 co-open and leave
+    # the co-closed BED empty.
+    D = np.linspace(0.1, 2.0, nb) + rng.normal(0, 0.02, (n, nb))
+    mat = tmp_path / "concordance_directional.parquet"
+    pd.DataFrame(D, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"g={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "40", "--n-sign-bins", "60",
+         "--n-permutations", "40", "--output-dir", str(out),
+         "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    op = pd.read_csv(out / "bin_scores_g.always_co_open.bed", sep="\t")
+    cl = pd.read_csv(out / "bin_scores_g.always_co_closed.bed", sep="\t")
+    assert len(op) == 60 and len(cl) == 60, "both sets, both the asked size"
+    # Comparable in size to the marker and invariant sets, which is the point.
+    assert len(pd.read_csv(out / "bin_scores_g.selected.bed", sep="\t")) == 40
+    assert len(pd.read_csv(out / "bin_scores_g.stable.bed", sep="\t")) == 40
+    s = json.loads((out / "marker_bins_summary.json").read_text())["matrices"]["g"]
+    assert s["n_always_co_closed"] == 60
+    assert s["n_always_co_closed_agreeing"] == 0, "none truly co-closed here"
+    assert s["n_always_co_open_agreeing"] == 60
+    # The two sets are the opposite ends of the same ranking.
+    assert set(op["start"]) & set(cl["start"]) == set()

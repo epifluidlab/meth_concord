@@ -518,12 +518,35 @@ def bin_states(M: pd.DataFrame, names, args, expected=None):
     q = _bh(p)
     pos, neg = names
     lab = np.full(X.shape[1], "mixed", dtype=object)
+    # +1 / -1 / 0 per bin.  Direction has to come from the RULE, not from
+    # sign(mean): under the quantile rule every bin can share a sign and the
+    # two tails are still the two directions, which is the entire point of
+    # using a share instead of a threshold.
+    side = np.zeros(X.shape[1], dtype=int)
     if args.state_rule == "fdr":
         called = np.isfinite(q) & (q < args.state_fdr)
+        side = np.sign(np.where(np.isfinite(mean), mean, 0.0)).astype(int)
+    elif args.state_rule == "quantile":
+        # A fixed SHARE per direction rather than a threshold.  Every
+        # absolute rule inherits whatever bias the reference carries -- zero
+        # puts nearly every bin on the low side, and a reference that is off
+        # the other way puts nearly every bin on the high side -- while the
+        # RANKING survives both.  Terciles by default also give the 3x3 table
+        # balanced margins, so its colours show association and nothing else.
+        finite = np.flatnonzero(np.isfinite(mean))
+        k = int(round(args.state_quantile * finite.size))
+        called = np.zeros(X.shape[1], bool)
+        if k > 0:
+            order = finite[np.argsort(mean[finite], kind="stable")]
+            called[order[:k]] = True            # lowest share
+            called[order[-k:]] = True           # highest share
+            side[order[:k]] = -1
+            side[order[-k:]] = 1
     else:
         called = np.isfinite(mean) & (np.abs(mean) > args.state_threshold)
-    lab[called & (mean > 0)] = pos
-    lab[called & (mean < 0)] = neg
+        side = np.sign(np.where(np.isfinite(mean), mean, 0.0)).astype(int)
+    lab[called & (side > 0)] = pos
+    lab[called & (side < 0)] = neg
     lab[~np.isfinite(mean)] = "unusable"
     return lab, mean, q
 
@@ -852,7 +875,8 @@ def main(argv=None) -> int:
     ap.add_argument("--state-flow-c", choices=["on", "off"], default="off",
                     help="Draw the state flow for C too.  Off by default "
                          "because C's sign does not mean open vs closed.")
-    ap.add_argument("--state-rule", choices=["fdr", "threshold"], default="fdr",
+    ap.add_argument("--state-rule",
+                    choices=["fdr", "threshold", "quantile"], default="fdr",
                     help="How a bin earns a direction.  'fdr': a one-sample t "
                          "of its cells against zero, BH-adjusted over bins, so "
                          "'mixed' means the cells do not agree rather than "
@@ -874,6 +898,12 @@ def main(argv=None) -> int:
                          "level implies; it reads the marginal and "
                          "coordination components from beside the --gch-d / "
                          "--hcg-d parquets.")
+    ap.add_argument("--state-quantile", type=float, default=1.0 / 3.0,
+                    help="--state-rule quantile: the share of bins taken in "
+                         "EACH direction (1/3 = terciles).  Both margins are "
+                         "then fixed by construction, so the 3x3 table's "
+                         "colours are association alone, and no reference bias "
+                         "can push every bin into one state.")
     ap.add_argument("--state-fdr", type=float, default=0.05)
     ap.add_argument("--state-threshold", type=float, default=0.0,
                     help="Only with --state-rule threshold.")

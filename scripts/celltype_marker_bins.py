@@ -28,11 +28,15 @@ by its own statistic but filtered for batch the same way:
                   means, NOT by low cell-type ICC, which would return the
                   noisiest bins rather than the flattest.
 
-  CO-OPEN /       for a DIRECTIONAL matrix (D = C(2F-1)), the bins coordinated
-  CO-CLOSED       between OPEN states in every cell type, and those coordinated
-                  between CLOSED states in every cell type (--sign-split).
-                  Read off the RAW values: the normalisation used for selection
-                  destroys the sign that carries the meaning.
+  CO-OPEN /       for a DIRECTIONAL matrix (D = C(2F-1)), the most co-open
+  CO-CLOSED       and the most co-closed bins (--sign-split), read off the RAW
+                  values since the normalisation used for selection destroys
+                  the sign that carries the meaning.  Top --n-sign-bins by
+                  rank in each direction, not everything past a threshold:
+                  that keeps them the same size as the marker and invariant
+                  sets for a genomic-enrichment comparison, and a reference
+                  bias common to every bin slides a threshold but not a rank.
+                  --sign-reference decides what "co-open" is measured against.
 
   CONTRAST        bins separating a NAMED set of cell types from all the others
                   (--contrast LABEL=g1,g2), e.g. two meningioma tumours against
@@ -362,6 +366,42 @@ def sign_summary(raw, cell_type_ids, n_ct, args, expected=None):
             "d_group_min": lo, "d_group_max": hi,
             "frac_cells_positive": frac_pos, "n_groups_used": covered,
             "always_co_open": co_open, "always_co_closed": co_closed}
+
+
+def select_sign_bins(sg, key, rank_by, ascending, n_want):
+    """The n_want most co-open (or co-closed) bins, agreeing ones first.
+
+    A fixed size rather than a threshold, for two reasons.  It makes this set
+    directly comparable to the marker and invariant sets, which are already
+    top-N, so a genomic-enrichment comparison between them is not really a
+    comparison of set sizes.  And it is robust to the reference: any bias
+    common to every bin — and the expected-D reference carries one, since the
+    stored marginal is the mean of the two ends' — slides the whole
+    distribution across a threshold while leaving the RANKING untouched.  A
+    threshold turns that into "almost every bin is co-open"; a rank does not
+    notice it.
+
+    Ranked by the per-cell-type extreme (min for co-open, max for co-closed):
+    "how co-open is this bin even in its LEAST co-open cell type".  Bins where
+    every cell type agrees come first; if fewer than n_want do, the rest are
+    filled by the same ranking, and the agreeing count is reported so the
+    trade-off is visible — the same clean-first-then-fill policy as
+    :func:`select_marker_bins`.
+    """
+    v = np.asarray(sg[rank_by], float)
+    usable = np.flatnonzero(np.isfinite(v))
+    if usable.size == 0:
+        return np.array([], int), 0
+    order = usable[np.argsort(v[usable], kind="stable")]
+    if not ascending:
+        order = order[::-1]
+    agree = np.asarray(sg[key], bool)[order]
+    clean = order[agree]
+    if clean.size >= n_want:
+        return clean[:n_want], int(n_want)
+    rest = order[~agree]
+    return (np.concatenate([clean, rest[:max(n_want - clean.size, 0)]]),
+            int(clean.size))
 
 
 def contrast_stats(X, in_mask, min_cells):
@@ -1029,6 +1069,14 @@ def main():
                          "magnitude.  Needs the marginal and coordination "
                          "components, taken from beside the --matrix parquet "
                          "unless given explicitly.")
+    ap.add_argument("--n-sign-bins", type=int, default=0,
+                    help="Bins per direction in the co-open / co-closed BEDs "
+                         "(0 = same as --n-bins).  A fixed SIZE, not a "
+                         "threshold: it keeps this set comparable with the "
+                         "marker and invariant sets for a genomic-enrichment "
+                         "comparison, and it is unmoved by a reference that is "
+                         "biased for every bin alike — which slides a "
+                         "threshold but not a ranking.")
     ap.add_argument("--sign-min-consistency", type=float, default=0.6,
                     help="Fraction of cells that must fall on the dominant "
                          "side for a bin to be called always co-open / "
@@ -1391,18 +1439,18 @@ def main():
                       f"{Path(path).parent}/concordance_{{marginal,"
                       f"coordination}}.parquet", file=sys.stderr)
             sg = sign_summary(raw, ct_id, len(ct_u), args, expected)
-            n_want = args.n_bins
+            n_want = args.n_sign_bins or args.n_bins
             for key, rank_by, ascending in (
                     ("always_co_open", "d_group_min", False),
                     ("always_co_closed", "d_group_max", True)):
-                hit = np.flatnonzero(sg[key])
-                order = np.argsort(sg[rank_by][hit])
-                hit = hit[order if ascending else order[::-1]][:n_want]
+                hit, n_agree = select_sign_bins(sg, key, rank_by, ascending,
+                                                n_want)
                 mask = np.zeros(M.shape[1], bool)
                 mask[hit] = True
                 scores_df[key] = mask
                 subsets[key] = mask
                 summary_sign[f"n_{key}"] = int(mask.sum())
+                summary_sign[f"n_{key}_agreeing"] = int(n_agree)
                 summary_sign[f"n_{key}_total"] = int(sg[key].sum())
             for c in ("d_mean", "d_reference", "d_group_min", "d_group_max",
                       "frac_cells_positive"):
@@ -1414,14 +1462,19 @@ def main():
                          + sg["always_co_closed"].sum())
             big = max(int(sg["always_co_open"].sum()),
                       int(sg["always_co_closed"].sum()))
-            if called and big / called > 0.9 and args.sign_reference == "zero":
-                print(f"  NOTE {name}: {100 * big / called:.1f}% of the called "
-                      f"bins fall on ONE side.  Against --sign-reference zero "
-                      f"that is expected rather than informative: "
-                      f"sign(2F−1) = sign(mean level − 0.5), so a mark whose "
-                      f"genome-wide mean is not near 0.5 lands on one side "
-                      f"everywhere.  Re-run with --sign-reference median for "
-                      f"the version that varies along the genome.",
+            if called and big / called > 0.9:
+                why = ("sign(2F−1) = sign(mean level − 0.5), so a mark whose "
+                       "genome-wide mean is not near 0.5 lands on one side "
+                       "everywhere; try --sign-reference median or expected"
+                       if args.sign_reference == "zero" else
+                       "a reference offset shared by every bin does this, and "
+                       "the expected-D one carries one (the stored marginal is "
+                       "the MEAN of the two ends')")
+                print(f"  NOTE {name}: {100 * big / called:.1f}% of the bins "
+                      f"that PASS the sign test fall on one side.  {why}.  The "
+                      f"BEDs are unaffected: they take the top "
+                      f"{args.n_sign_bins or args.n_bins} by rank in each "
+                      f"direction, which a common offset cannot move.",
                       file=sys.stderr)
 
         # (4) Group-set contrasts: these groups against every other.

@@ -735,3 +735,64 @@ def test_both_styles_can_be_emitted(tmp_path):
                    "--output-dir", str(out)]) == 0
     assert (out / "D_state_table.png").exists()
     assert (out / "D_state_flow.png").exists()
+
+
+class _SArgsQuant(_SArgs):
+    state_rule = "quantile"
+    state_quantile = 1.0 / 3.0
+
+
+def test_quantile_rule_is_unmoved_by_a_reference_that_shifts_everything():
+    """The failure it answers: with the reference off in one direction, an
+    absolute rule calls nearly every bin one state.  A share cannot."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    nb, n = 300, 60
+    strength = np.linspace(-1, 1, nb)
+    X = pd.DataFrame(strength + rng.normal(0, 0.02, (n, nb)),
+                     index=[f"c{i}" for i in range(n)],
+                     columns=[f"chr1:{i * 250000}" for i in range(nb)])
+    lab = m.bin_states(X, ("co-open", "co-closed"), _SArgsQuant())[0]
+    assert (lab == "co-open").sum() == 100
+    assert (lab == "co-closed").sum() == 100
+    assert (lab == "mixed").sum() == 100
+
+    shifted = m.bin_states(X + 5.0, ("co-open", "co-closed"),
+                           _SArgsQuant())[0]
+    np.testing.assert_array_equal(lab, shifted), "a common shift changes nothing"
+    # ...whereas the fdr rule collapses entirely under the same shift.
+    fdr_shift = m.bin_states(X + 5.0, ("co-open", "co-closed"), _SArgs())[0]
+    assert (fdr_shift == "co-open").mean() > 0.95
+
+
+def test_quantile_rule_gives_the_table_balanced_margins(tmp_path):
+    m = _mod()
+    rng = np.random.default_rng(2)
+    n, nb = 60, 300
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    z = rng.normal(0, 1, nb)
+    g = pd.DataFrame(-3.0 + z + rng.normal(0, .05, (n, nb)),
+                     index=cells, columns=bins)
+    h = pd.DataFrame(2.0 - 0.8 * z + rng.normal(0, .05, (n, nb)),
+                     index=cells, columns=bins)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp)
+    h.to_parquet(hp)
+    out = tmp_path / "out"
+    assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
+                   "--plot-format", "png", "--per-bin-correlation", "off",
+                   "--state-rule", "quantile",
+                   "--output-dir", str(out)]) == 0
+    tab = pd.read_csv(out / "D_state_flow_counts.tsv", sep="\t", index_col=0)
+    assert tab.sum(axis=1).tolist() == [100, 100, 100], "GCH margins fixed"
+    assert tab.sum(axis=0).tolist() == [100, 100, 100], "HCG margins fixed"
+    # Anti-coupled by construction, and with the margins fixed that shows up
+    # purely as enrichment on the canonical diagonal.
+    enr = pd.read_csv(out / "D_state_table_enrichment.tsv", sep="\t")
+    canon = enr[((enr["gch_state"] == "co-open")
+                 & (enr["hcg_state"] == "co-unmethylated"))
+                | ((enr["gch_state"] == "co-closed")
+                   & (enr["hcg_state"] == "co-methylated"))]
+    assert (canon["log2_obs_over_exp"] > 0.5).all()
+    assert (canon["q"] < 0.001).all()
