@@ -412,9 +412,11 @@ def test_end_to_end_emits_the_density_and_the_flow(tmp_path):
     assert {"pearson_r", "pearson_q", "spearman_rho", "spearman_q"} \
         <= set(tab.columns)
     assert tab["pearson_r"].median() > 0.5
-    # The flow is directional-only unless asked for on C.
-    assert (out / "D_state_flow.png").exists()
-    assert not (out / "C_state_flow.png").exists()
+    # The 3x3 table is the default view; directional-only unless asked on C.
+    assert (out / "D_state_table.png").exists()
+    assert (out / "D_state_table_enrichment.tsv").exists()
+    assert not (out / "D_state_flow.png").exists(), "alluvial is opt-in now"
+    assert not (out / "C_state_table.png").exists()
     counts = pd.read_csv(out / "D_state_flow_counts.tsv", sep="\t", index_col=0)
     assert list(counts.index) == list(m._GCH_STATES)
     assert int(counts.to_numpy().sum()) == 60
@@ -436,7 +438,7 @@ def test_the_new_views_can_be_switched_off(tmp_path):
                    "--output-dir", str(out)]) == 0
     assert (out / "D_gch_vs_hcg_scatter.png").exists()
     assert not (out / "D_per_bin_across_cell_density.png").exists()
-    assert not (out / "D_state_flow.png").exists()
+    assert not (out / "D_state_table.png").exists()
 
 
 def test_flow_can_be_requested_for_c_too(tmp_path):
@@ -448,7 +450,9 @@ def test_flow_can_be_requested_for_c_too(tmp_path):
     out = tmp_path / "out"
     assert m.main(["--gch-c", str(gp), "--hcg-c", str(hp),
                    "--min-cells", "5", "--plot-format", "png",
-                   "--state-flow-c", "on", "--output-dir", str(out)]) == 0
+                   "--state-flow-c", "on", "--state-flow-style", "both",
+                   "--output-dir", str(out)]) == 0
+    assert (out / "C_state_table.png").exists()
     assert (out / "C_state_flow.png").exists()
 
 
@@ -645,3 +649,89 @@ def test_state_expected_end_to_end_uses_the_sibling_parquets(tmp_path):
                     index_col=0).to_numpy()
     assert z.max() / z.sum() > 0.9, "zero: everything in one cell"
     assert e.max() / e.sum() < 0.75, "expected: a table with content"
+
+
+# ------------------------------------------------------------ 3x3 state table --
+
+def _tab(counts):
+    m = _mod()
+    return pd.DataFrame(counts, index=list(m._GCH_STATES),
+                        columns=list(m._HCG_STATES))
+
+
+def test_enrichment_is_against_independence_not_the_raw_count():
+    """The point of the colour: with both margins lopsided, the biggest cell is
+    biggest under NO relationship, so counts cannot show association."""
+    m = _mod()
+    # Perfectly independent table: every cell's observed equals its expected.
+    row = np.array([600, 100, 300])[:, None]
+    col = np.array([500, 100, 400])[None, :]
+    indep = (row * col / 1000).astype(int)
+    st = m.flow_enrichment(_tab(indep))
+    assert np.allclose(st["log2_ratio"], 0.0, atol=1e-9)
+    assert np.nanmax(np.abs(st["residual"])) < 1e-6
+    # ...yet one cell holds 30% of everything.
+    assert indep.max() / indep.sum() > 0.28
+
+
+def test_enrichment_flags_the_canonical_diagonal():
+    m = _mod()
+    st = m.flow_enrichment(_tab([[500, 20, 100], [20, 10, 20],
+                                 [100, 20, 500]]))
+    i_open, i_closed = 0, 2
+    j_un, j_me = 0, 2
+    assert st["log2_ratio"][i_open, j_un] > 0.3
+    assert st["log2_ratio"][i_open, j_me] < -0.3
+    assert st["q"][i_open, j_un] < 0.001 and st["q"][i_open, j_me] < 0.001
+
+
+def test_cells_with_a_tiny_expected_count_are_not_tested():
+    """A handful of bins can be '5x enriched' with q<0.001 under the normal
+    approximation and would otherwise set the colour scale for the figure."""
+    m = _mod()
+    st = m.flow_enrichment(_tab([[1000, 2, 400], [2, 4, 2], [400, 2, 1000]]))
+    assert not st["reliable"][1, 1], "expected count here is under 5"
+    assert np.isnan(st["q"][1, 1]) and np.isnan(st["residual"][1, 1])
+    assert st["reliable"][0, 0] and np.isfinite(st["q"][0, 0])
+    # The ratio is still reported, just not tested.
+    assert np.isfinite(st["log2_ratio"][1, 1])
+
+
+def test_state_table_is_the_default_view_and_writes_its_numbers(tmp_path):
+    m = _mod()
+    g, h = _within_bin_pair(n_cells=60, n_bins=120, within_rho=0.5, bin_rho=0.6)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp)
+    h.to_parquet(hp)
+    out = tmp_path / "out"
+    assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
+                   "--plot-format", "png", "--per-bin-correlation", "off",
+                   "--state-reference", "median",
+                   "--output-dir", str(out)]) == 0
+    assert (out / "D_state_table.png").exists()
+    assert not (out / "D_state_flow.png").exists()
+    enr = pd.read_csv(out / "D_state_table_enrichment.tsv", sep="\t")
+    assert len(enr) == 9
+    assert {"n", "expected", "pct_total", "pct_of_gch_row", "pct_of_hcg_col",
+            "log2_obs_over_exp", "adjusted_residual", "p", "q",
+            "testable"} <= set(enr.columns)
+    assert enr["n"].sum() == 120
+    # Row percentages sum to 100 within each GCH state that has any bins.
+    for _, grp in enr.groupby("gch_state"):
+        if grp["n"].sum():
+            assert grp["pct_of_gch_row"].sum() == pytest.approx(100.0)
+
+
+def test_both_styles_can_be_emitted(tmp_path):
+    m = _mod()
+    g, h = _within_bin_pair(n_cells=40, n_bins=60)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp)
+    h.to_parquet(hp)
+    out = tmp_path / "out"
+    assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
+                   "--plot-format", "png", "--per-bin-correlation", "off",
+                   "--state-flow-style", "both", "--state-reference", "median",
+                   "--output-dir", str(out)]) == 0
+    assert (out / "D_state_table.png").exists()
+    assert (out / "D_state_flow.png").exists()

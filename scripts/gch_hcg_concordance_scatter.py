@@ -21,13 +21,18 @@ TWO COMPANION VIEWS, because collapsing the cells first can hide the answer
   drawn alongside: cells are shuffled per bin WITHIN batch, so a batch x bin
   effect shared by the two contexts stays in the null rather than counting as
   signal.
-* STATE FLOW (--state-flow, on by default for D).  Each bin gets a GCH state
+* STATE TABLE (--state-flow, on by default for D).  Each bin gets a GCH state
   (co-open / mixed / co-closed) and an HCG state (co-unmethylated / mixed /
-  co-methylated), drawn as two stacked bars with ribbons between them, so the
-  percentage keeping the canonical pairing -- open with unmethylated, closed
-  with methylated -- and the percentage switching are read off directly.  A
-  state is assigned only when a bin's cells agree on a sign (one-sample t,
-  BH-adjusted); otherwise it is 'mixed'.
+  co-methylated), and the 3x3 table of the two is drawn with each cell's
+  count, its share of all bins and its share of its GCH row -- the last being
+  "of the co-open bins, how many end up co-unmethylated".  Colour is
+  log2(observed / expected under independence), NOT the count: with both marks
+  far off 50% the co-closed x co-methylated cell is the largest under no
+  relationship at all, so a count scale would show the margins rather than the
+  association.  Cells whose expected count is under 5 keep their numbers but
+  are not tested.  --state-flow-style flow draws the older stacked bars with
+  ribbons instead, 'both' emits each.  A state is assigned only when a bin's
+  cells agree on a sign (one-sample t, BH-adjusted); otherwise it is 'mixed'.
 
 Give it the D pair, the C pair, or both; one figure per pair:
 
@@ -530,6 +535,148 @@ def flow_table(g_lab, h_lab) -> pd.DataFrame:
     return tab.reindex(index=_GCH_STATES, columns=_HCG_STATES).fillna(0).astype(int)
 
 
+def flow_enrichment(tab: pd.DataFrame) -> dict:
+    """Observed vs independence-expected for each cell of the 3x3 table.
+
+    The raw count is the wrong thing to colour by.  With 45% of bins co-closed
+    and 48% co-methylated, the co-closed/co-methylated cell holds ~22% of the
+    genome under NO relationship at all, and it will always be the darkest
+    square on a count scale — the same confusion between a margin and a signal
+    that made the zero-referenced states degenerate.
+
+    So: log2(observed / expected) for the colour, and the ADJUSTED Pearson
+    residual for significance, which is the one that is ~N(0,1) under
+    independence,
+
+        r = (O - E) / sqrt(E * (1 - row_frac) * (1 - col_frac))
+
+    unlike the plain (O-E)/sqrt(E), whose variance depends on the margins and
+    which would over-call the big cells.
+    """
+    O = tab.to_numpy(dtype=float)
+    n = O.sum()
+    row, col = O.sum(axis=1), O.sum(axis=0)
+    E = np.outer(row, col) / n if n else np.zeros_like(O)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where((O > 0) & (E > 0), O / np.where(E > 0, E, np.nan),
+                         np.nan)
+        log2r = np.log2(ratio)
+        denom = np.sqrt(E * (1 - row[:, None] / n) * (1 - col[None, :] / n))
+        resid = np.where(denom > 0, (O - E) / denom, np.nan)
+    from scipy.stats import norm
+    # The normal approximation for the residual (and log2 O/E as a stable
+    # ratio) needs an expected count of at least ~5.  Below that a cell of a
+    # handful of bins can be 5x "enriched" with q<0.001 and set the colour
+    # scale for the whole figure, which is the tail wagging the dog.  Such
+    # cells keep their counts and their colour but are not tested and do not
+    # bound the scale.
+    reliable = E >= 5.0
+    p = np.where(reliable, 2.0 * norm.sf(np.abs(resid)), np.nan)
+    return {"observed": O, "expected": E, "log2_ratio": log2r,
+            "residual": np.where(reliable, resid, np.nan),
+            "p": p, "q": _bh(p.ravel()).reshape(p.shape),
+            "reliable": reliable, "n": n, "row": row, "col": col}
+
+
+def flow_heatmap(tab: pd.DataFrame, stat_key, out_path, args):
+    """The 3x3 table itself, coloured by enrichment over independence.
+
+    Each cell carries its count, its share of all classified bins, and its
+    share of its GCH row — the last being the "of the co-open bins, how many
+    end up co-unmethylated" number.  Colour is log2(O/E), so a cell is dark
+    because the combination is over-represented, not because both margins are
+    large.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
+
+    st = flow_enrichment(tab)
+    total = int(st["n"])
+    if total == 0:
+        logger.warning(f"{stat_key}: no bins classified — no heatmap.")
+        return None
+    O, log2r, row, col = st["observed"], st["log2_ratio"], st["row"], st["col"]
+    scale_from = np.where(st["reliable"], np.abs(log2r), np.nan)
+    lim = (float(np.nanmax(scale_from)) if np.isfinite(scale_from).any()
+           else 1.0)
+    lim = min(max(lim, 0.5), 3.0)
+
+    fig, ax = plt.subplots(figsize=(7.6, 6.4))
+    im = ax.imshow(np.where(np.isfinite(log2r), log2r, 0.0), cmap="RdBu_r",
+                   vmin=-lim, vmax=lim, aspect="auto")
+    for i in range(O.shape[0]):
+        for j in range(O.shape[1]):
+            if not np.isfinite(log2r[i, j]):
+                # An empty cell is not "average"; grey it so it cannot read as
+                # the midpoint of a diverging scale.
+                ax.add_patch(plt.Rectangle((j - .5, i - .5), 1, 1,
+                                           color="#EDEFF2", lw=0))
+            shade = abs(log2r[i, j]) / lim if np.isfinite(log2r[i, j]) else 0
+            colr = "white" if shade > 0.65 else "#111827"
+            pct_row = 100 * O[i, j] / row[i] if row[i] else np.nan
+            mark = stars_q(st["q"][i, j])
+            ax.text(j, i - 0.13, f"{int(O[i, j]):,}{mark}", ha="center",
+                    va="center", fontsize=12, color=colr, fontweight="bold")
+            ax.text(j, i + 0.16,
+                    f"{100 * O[i, j] / total:.1f}% of all\n"
+                    f"{pct_row:.1f}% of row", ha="center", va="center",
+                    fontsize=8.2, color=colr)
+            if not st["reliable"][i, j]:
+                # Its own line, below the block: three lines of text do not
+                # fit inside a small cell.
+                ax.text(j, i + 0.39, "E < 5, untested", ha="center",
+                        va="center", fontsize=7.0, color=colr, style="italic")
+    ax.set_xticks(range(len(_HCG_STATES)))
+    ax.set_xticklabels([f"{s}\n{int(c):,} ({100 * c / total:.1f}%)"
+                        for s, c in zip(_HCG_STATES, col)], fontsize=9)
+    ax.set_yticks(range(len(_GCH_STATES)))
+    ax.set_yticklabels([f"{s}\n{int(r):,} ({100 * r / total:.1f}%)"
+                        for s, r in zip(_GCH_STATES, row)], fontsize=9)
+    ax.set_xlabel("HCG–HCG state", fontsize=10.5)
+    ax.set_ylabel("GCH–GCH state", fontsize=10.5)
+    ax.set_xticks(np.arange(-.5, len(_HCG_STATES), 1), minor=True)
+    ax.set_yticks(np.arange(-.5, len(_GCH_STATES), 1), minor=True)
+    ax.grid(which="minor", color="white", lw=2)
+    ax.tick_params(which="minor", length=0)
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    cb.set_label("log$_2$(observed / expected under independence)", fontsize=9)
+
+    canon = sum(O[_GCH_STATES.index(g), _HCG_STATES.index(h)]
+                for g, h in _CANONICAL)
+    ax.set_title(f"{stat_key}: GCH–GCH state × HCG–HCG state, per bin",
+                 fontsize=11.5, pad=18)
+    ax.annotate(f"{total:,} bins   ·   canonical (co-open×co-unmethylated, "
+                f"co-closed×co-methylated) = {100 * canon / total:.1f}%"
+                f"   ·   {_association(tab, total)}"
+                f"   ·   * q<0.05 on the adjusted residual",
+                xy=(0.5, 1.0), xytext=(0, 4), xycoords="axes fraction",
+                textcoords="offset points", ha="center", va="bottom",
+                fontsize=8.2, color="#4B5563")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return {"n_bins": total, "canonical_frac": canon / total,
+            "association": _association(tab, total), "stats": st}
+
+
+def stars_q(q) -> str:
+    if not np.isfinite(q):
+        return ""
+    return "***" if q < 0.001 else "**" if q < 0.01 else "*" if q < 0.05 else ""
+
+
+def _association(tab: pd.DataFrame, total: int) -> str:
+    from scipy.stats import chi2_contingency
+    sub = tab.loc[tab.sum(axis=1) > 0, tab.sum(axis=0) > 0]
+    if sub.shape[0] < 2 or sub.shape[1] < 2:
+        return "association undefined (one state occupied)"
+    chi2, pval, _, _ = chi2_contingency(sub.to_numpy())
+    v = float(np.sqrt(chi2 / (total * (min(sub.shape) - 1))))
+    return f"Cramér's V = {v:.3f}, {_fmt_p(pval)}"
+
+
 def flow_figure(tab: pd.DataFrame, stat_key, out_path, args):
     """Two stacked bars with ribbons: where each GCH state goes in HCG."""
     import matplotlib
@@ -692,6 +839,16 @@ def main(argv=None) -> int:
                          "are read off directly.  Directional only — for C the "
                          "sign is concordant vs anti-concordant, not open vs "
                          "closed, so it is skipped unless --state-flow-c on.")
+    ap.add_argument("--state-flow-style",
+                    choices=["heatmap", "flow", "both"], default="heatmap",
+                    help="'heatmap' (default) draws the 3x3 table itself, "
+                         "coloured by log2(observed/expected) under "
+                         "independence, with each cell's count, share of all "
+                         "bins and share of its GCH row.  Colouring by the "
+                         "COUNT would be misleading: with both marks far off "
+                         "50%, the co-closed x co-methylated cell is the "
+                         "largest under no relationship at all.  'flow' is "
+                         "the stacked bars with ribbons; 'both' emits each.")
     ap.add_argument("--state-flow-c", choices=["on", "off"], default="off",
                     help="Draw the state flow for C too.  Off by default "
                          "because C's sign does not mean open vs closed.")
@@ -850,12 +1007,42 @@ def main(argv=None) -> int:
                           "hcg_q": h_q}).to_csv(
                 out_dir / f"{stat_key}_state_flow_per_bin.tsv", sep="\t",
                 index=False)
-            fpath = out_dir / f"{stat_key}_state_flow.{args.plot_format}"
-            info = flow_figure(tab, stat_key, fpath, args)
+            info = None
+            if args.state_flow_style in ("heatmap", "both"):
+                hpath = (out_dir /
+                         f"{stat_key}_state_table.{args.plot_format}")
+                info = flow_heatmap(tab, stat_key, hpath, args)
+                if info:
+                    st = info["stats"]
+                    rows = []
+                    for i, g in enumerate(_GCH_STATES):
+                        for j, h in enumerate(_HCG_STATES):
+                            rows.append({
+                                "gch_state": g, "hcg_state": h,
+                                "n": int(st["observed"][i, j]),
+                                "expected": st["expected"][i, j],
+                                "pct_total": 100 * st["observed"][i, j] / st["n"],
+                                "pct_of_gch_row": (
+                                    100 * st["observed"][i, j] / st["row"][i]
+                                    if st["row"][i] else np.nan),
+                                "pct_of_hcg_col": (
+                                    100 * st["observed"][i, j] / st["col"][j]
+                                    if st["col"][j] else np.nan),
+                                "log2_obs_over_exp": st["log2_ratio"][i, j],
+                                "adjusted_residual": st["residual"][i, j],
+                                "p": st["p"][i, j], "q": st["q"][i, j],
+                                "testable": bool(st["reliable"][i, j])})
+                    pd.DataFrame(rows).to_csv(
+                        out_dir / f"{stat_key}_state_table_enrichment.tsv",
+                        sep="\t", index=False, na_rep="NA")
+                    logger.info(f"{stat_key}: wrote {hpath}")
+            if args.state_flow_style in ("flow", "both"):
+                fpath = out_dir / f"{stat_key}_state_flow.{args.plot_format}"
+                info = flow_figure(tab, stat_key, fpath, args) or info
             if info:
                 logger.info(f"{stat_key}: {info['n_bins']:,} bins classified, "
                             f"canonical {100 * info['canonical_frac']:.1f}%, "
-                            f"{info['association']} → {fpath}")
+                            f"{info['association']}")
     return 0
 
 
