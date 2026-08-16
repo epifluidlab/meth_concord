@@ -450,7 +450,7 @@ def test_flow_can_be_requested_for_c_too(tmp_path):
     out = tmp_path / "out"
     assert m.main(["--gch-c", str(gp), "--hcg-c", str(hp),
                    "--min-cells", "5", "--plot-format", "png",
-                   "--state-flow-c", "on", "--state-flow-style", "both",
+                   "--state-flow-c", "on", "--state-flow-style", "all",
                    "--output-dir", str(out)]) == 0
     assert (out / "C_state_table.png").exists()
     assert (out / "C_state_flow.png").exists()
@@ -731,7 +731,7 @@ def test_both_styles_can_be_emitted(tmp_path):
     out = tmp_path / "out"
     assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
                    "--plot-format", "png", "--per-bin-correlation", "off",
-                   "--state-flow-style", "both", "--state-reference", "median",
+                   "--state-flow-style", "all", "--state-reference", "median",
                    "--output-dir", str(out)]) == 0
     assert (out / "D_state_table.png").exists()
     assert (out / "D_state_flow.png").exists()
@@ -796,3 +796,100 @@ def test_quantile_rule_gives_the_table_balanced_margins(tmp_path):
                    & (enr["hcg_state"] == "co-methylated"))]
     assert (canon["log2_obs_over_exp"] > 0.5).all()
     assert (canon["q"] < 0.001).all()
+
+
+# ---------------------------------------------------------------- slope view --
+
+def test_zscore_is_immune_to_a_shift_or_a_rescale():
+    """Why the slope view needs no reference: a z-score is already measured
+    against the genome, so the offset that broke every threshold is gone."""
+    m = _mod()
+    v = np.array([-3.0, -1.0, 0.0, 2.0, 5.0])
+    z = m._zscore(v)
+    np.testing.assert_allclose(m._zscore(v + 100.0), z, atol=1e-12)
+    np.testing.assert_allclose(m._zscore(v * 7.0), z, atol=1e-12)
+    assert abs(z.mean()) < 1e-12 and abs(z.std() - 1) < 1e-12
+    assert np.isnan(m._zscore(np.zeros(5))).all(), "no spread, no z"
+
+
+def test_slope_figure_reports_where_each_state_lands(tmp_path):
+    m = _mod()
+    rng = np.random.default_rng(0)
+    nb = 300
+    zg = np.linspace(-2, 2, nb)
+    # Anti-coupled: the most co-open bins are the least co-methylated.
+    h = -0.8 * zg + rng.normal(0, 0.3, nb)
+    lab = np.where(zg > 0.7, "co-open",
+                   np.where(zg < -0.7, "co-closed", "mixed"))
+    out = tmp_path / "s.png"
+    info = m.slope_figure(zg, h, lab, "D", out, _SlopeArgs())
+    assert out.exists()
+    assert info["n_bins"] == nb
+    assert info["pearson_r"] < -0.8
+    by = {r["gch_state"]: r for r in info["by_state"]}
+    # co-open ends up LOW on the HCG axis and co-closed high — the canonical
+    # pairing, read off a continuous scale instead of a 3x3 table.
+    assert by["co-open"]["mean_hcg_z"] < by["mixed"]["mean_hcg_z"]
+    assert by["mixed"]["mean_hcg_z"] < by["co-closed"]["mean_hcg_z"]
+
+
+class _SlopeArgs:
+    slope_max_lines = 0
+    random_seed = 42
+
+
+def test_slope_line_cap_is_drawing_only(tmp_path):
+    """Subsampling may thin the hairball but must not change a number."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    nb = 500
+    zg = rng.normal(0, 1, nb)
+    h = 0.5 * zg + rng.normal(0, 0.5, nb)
+    lab = np.full(nb, "mixed", dtype=object)
+
+    class Capped(_SlopeArgs):
+        slope_max_lines = 50
+
+    full = m.slope_figure(zg, h, lab, "D", tmp_path / "a.png", _SlopeArgs())
+    cut = m.slope_figure(zg, h, lab, "D", tmp_path / "b.png", Capped())
+    assert full["n_bins"] == cut["n_bins"] == nb
+    assert full["pearson_r"] == pytest.approx(cut["pearson_r"])
+    assert (full["by_state"][0]["mean_hcg_z"]
+            == pytest.approx(cut["by_state"][0]["mean_hcg_z"]))
+
+
+def test_slope_is_emitted_by_default_with_its_z_table(tmp_path):
+    m = _mod()
+    g, h = _within_bin_pair(n_cells=40, n_bins=120, within_rho=0.4,
+                            bin_rho=0.7)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp)
+    h.to_parquet(hp)
+    out = tmp_path / "out"
+    assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
+                   "--plot-format", "png", "--per-bin-correlation", "off",
+                   "--output-dir", str(out)]) == 0
+    assert (out / "D_state_slope.png").exists()
+    assert (out / "D_state_table.png").exists(), "heatmap is still default too"
+    z = pd.read_csv(out / "D_state_slope_z.tsv", sep="\t")
+    assert len(z) == 120
+    assert {"bin", "gch_state", "hcg_state", "gch_z", "hcg_z",
+            "delta_z"} == set(z.columns)
+    ok = z["gch_z"].notna()
+    assert abs(z.loc[ok, "gch_z"].mean()) < 1e-9
+    np.testing.assert_allclose(z.loc[ok, "delta_z"],
+                               z.loc[ok, "hcg_z"] - z.loc[ok, "gch_z"],
+                               atol=1e-9)
+
+
+def test_unknown_style_is_rejected(tmp_path):
+    m = _mod()
+    g, h = _within_bin_pair(n_cells=30, n_bins=40)
+    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
+    g.to_parquet(gp)
+    h.to_parquet(hp)
+    with pytest.raises(SystemExit, match="unknown"):
+        m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
+                "--plot-format", "png", "--per-bin-correlation", "off",
+                "--state-flow-style", "heatmap,sankey",
+                "--output-dir", str(tmp_path / "o")])

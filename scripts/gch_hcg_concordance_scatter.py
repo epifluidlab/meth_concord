@@ -30,9 +30,15 @@ TWO COMPANION VIEWS, because collapsing the cells first can hide the answer
   far off 50% the co-closed x co-methylated cell is the largest under no
   relationship at all, so a count scale would show the margins rather than the
   association.  Cells whose expected count is under 5 keep their numbers but
-  are not tested.  --state-flow-style flow draws the older stacked bars with
-  ribbons instead, 'both' emits each.  A state is assigned only when a bin's
-  cells agree on a sign (one-sample t, BH-adjusted); otherwise it is 'mixed'.
+  are not tested.  A state is assigned only when a bin's cells agree on a sign
+  (one-sample t, BH-adjusted); otherwise it is 'mixed'.
+* STATE SLOPE (also on by default).  The same comparison without the rounding:
+  each bin is one line from its GCH z-score to its HCG z-score, so a bin that
+  sits just inside a state boundary is drawn where it is rather than in a
+  corner, and the thick lines show where each GCH state lands on average.  It
+  needs no reference and no threshold -- a z-score is already measured against
+  the genome, and the common offset that broke every absolute rule cannot move
+  it.  --state-flow-style picks any of heatmap / slope / flow.
 
 Give it the D pair, the C pair, or both; one figure per pair:
 
@@ -700,6 +706,110 @@ def _association(tab: pd.DataFrame, total: int) -> str:
     return f"Cramér's V = {v:.3f}, {_fmt_p(pval)}"
 
 
+def _zscore(v):
+    """Standardise across BINS, so a value means "relative to the typical bin".
+
+    This is what makes the two contexts comparable on one axis, and it does the
+    job the state reference had to do discretely: a z-score is already measured
+    against the genome, so no threshold has to be chosen and no reference bias
+    can move every bin the same way (a common offset has no effect on z at all).
+    """
+    v = np.asarray(v, float)
+    ok = np.isfinite(v)
+    if ok.sum() < 3:
+        return np.full(v.shape, np.nan)
+    mu, sd = np.nanmean(v[ok]), np.nanstd(v[ok])
+    return (v - mu) / sd if sd > 0 else np.full(v.shape, np.nan)
+
+
+def slope_figure(g_mean, h_mean, g_lab, stat_key, out_path, args):
+    """One line per bin, from its GCH z-score to its HCG z-score.
+
+    The 3x3 table answers "how many bins move from A to B" after committing to
+    three states; this keeps every bin's position and shows the same thing
+    continuously, so a bin that sits just inside a state boundary is drawn
+    where it actually is rather than rounded to a corner.  Lines are coloured
+    by the bin's GCH state, so the two figures can be read against each other.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
+    zg, zh = _zscore(g_mean), _zscore(h_mean)
+    ok = np.isfinite(zg) & np.isfinite(zh)
+    if ok.sum() < 10:
+        logger.warning(f"{stat_key}: too few bins for the slope figure.")
+        return None
+    zg, zh, lab = zg[ok], zh[ok], np.asarray(g_lab, dtype=object)[ok]
+
+    fig, ax = plt.subplots(figsize=(6.8, 6.6))
+    # A LineCollection rather than thousands of plot() calls: at ~10k bins the
+    # per-artist overhead is the whole runtime of the figure.
+    idx = np.arange(zg.size)
+    if args.slope_max_lines and zg.size > args.slope_max_lines:
+        # DRAWING only -- every summary below still uses every bin.
+        idx = np.random.default_rng(args.random_seed if hasattr(
+            args, "random_seed") else 42).choice(
+            zg.size, args.slope_max_lines, replace=False)
+    segs = np.stack([np.column_stack([np.zeros(idx.size), zg[idx]]),
+                     np.column_stack([np.ones(idx.size), zh[idx]])], axis=1)
+    cols = [_STATE_COLOR.get(s, "#B8BDC4") for s in lab[idx]]
+    ax.add_collection(LineCollection(segs, colors=cols, linewidths=0.35,
+                                     alpha=0.10, zorder=1))
+
+    # The readable signal through the hairball: where each GCH state ends up.
+    rows = []
+    for st in _GCH_STATES:
+        m = lab == st
+        if m.sum() < 3:
+            continue
+        gm, hm = float(np.mean(zg[m])), float(np.mean(zh[m]))
+        se = float(np.std(zh[m]) / np.sqrt(m.sum()))
+        ax.plot([0, 1], [gm, hm], color=_STATE_COLOR[st], lw=3.0, zorder=3,
+                solid_capstyle="round",
+                label=f"{st}  (n={int(m.sum()):,}) → {hm:+.2f}")
+        ax.errorbar([1], [hm], yerr=[1.96 * se], color=_STATE_COLOR[st],
+                    capsize=4, lw=2.0, zorder=4)
+        rows.append({"gch_state": st, "n": int(m.sum()), "mean_gch_z": gm,
+                     "mean_hcg_z": hm, "sem_hcg_z": se})
+
+    for x, v in ((0, zg), (1, zh)):
+        parts = ax.violinplot([v], positions=[x], widths=0.22,
+                              showextrema=False, showmedians=True)
+        for b in parts["bodies"]:
+            b.set_facecolor("#9AA0A6")
+            b.set_alpha(0.30)
+        parts["cmedians"].set_color("#374151")
+    ax.axhline(0, color="#C9CED6", lw=0.9, zorder=0)
+    ax.set_xlim(-0.35, 1.35)
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["GCH–GCH\n(co-closed ← → co-open)",
+                        "HCG–HCG\n(co-unmethylated ← → co-methylated)"],
+                       fontsize=9.5)
+    ax.set_ylabel("z-score across bins, per context")
+    r = correlations(zg, zh)
+    ax.set_title(f"{stat_key}: each bin's relative state in both contexts",
+                 fontsize=11.5, pad=18)
+    ax.annotate(f"{int(ok.sum()):,} bins   ·   {caption(r)}"
+                + ("" if idx.size == zg.size else
+                   f"   ·   {idx.size:,} lines drawn, all bins summarised"),
+                xy=(0.5, 1.0), xytext=(0, 4), xycoords="axes fraction",
+                textcoords="offset points", ha="center", va="bottom",
+                fontsize=8.2, color="#4B5563")
+    ax.legend(fontsize=8.2, frameon=False, loc="upper center",
+              bbox_to_anchor=(0.5, -0.09), ncol=3)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return {"n_bins": int(ok.sum()), "pearson_r": r["pearson_r"],
+            "spearman_rho": r["spearman_rho"], "by_state": rows,
+            "z_gch": zg, "z_hcg": zh, "bin_ok": ok}
+
+
 def flow_figure(tab: pd.DataFrame, stat_key, out_path, args):
     """Two stacked bars with ribbons: where each GCH state goes in HCG."""
     import matplotlib
@@ -862,16 +972,25 @@ def main(argv=None) -> int:
                          "are read off directly.  Directional only — for C the "
                          "sign is concordant vs anti-concordant, not open vs "
                          "closed, so it is skipped unless --state-flow-c on.")
-    ap.add_argument("--state-flow-style",
-                    choices=["heatmap", "flow", "both"], default="heatmap",
-                    help="'heatmap' (default) draws the 3x3 table itself, "
-                         "coloured by log2(observed/expected) under "
-                         "independence, with each cell's count, share of all "
-                         "bins and share of its GCH row.  Colouring by the "
-                         "COUNT would be misleading: with both marks far off "
-                         "50%, the co-closed x co-methylated cell is the "
-                         "largest under no relationship at all.  'flow' is "
-                         "the stacked bars with ribbons; 'both' emits each.")
+    ap.add_argument("--state-flow-style", default="heatmap,slope",
+                    help="Comma-separated, any of heatmap / slope / flow "
+                         "(default 'heatmap,slope'; 'all' for every one).  "
+                         "'heatmap' is the 3x3 table coloured by "
+                         "log2(observed/expected) under independence — "
+                         "colouring by the COUNT would show the margins, since "
+                         "with both marks far off 50% the co-closed x "
+                         "co-methylated cell is the largest under no "
+                         "relationship at all.  'slope' connects each BIN "
+                         "between its GCH and HCG z-scores, keeping the "
+                         "continuous position instead of rounding it to a "
+                         "state, and needing no reference or threshold at all "
+                         "(a z-score is already measured against the genome, "
+                         "and a common offset cannot move it).  'flow' is the "
+                         "stacked bars with ribbons.")
+    ap.add_argument("--slope-max-lines", type=int, default=4000,
+                    help="Draw at most this many bin lines in the slope figure "
+                         "(0 = all).  A DRAWING limit only: every summary line, "
+                         "correlation and table still uses every bin.")
     ap.add_argument("--state-flow-c", choices=["on", "off"], default="off",
                     help="Draw the state flow for C too.  Off by default "
                          "because C's sign does not mean open vs closed.")
@@ -1037,8 +1156,16 @@ def main(argv=None) -> int:
                           "hcg_q": h_q}).to_csv(
                 out_dir / f"{stat_key}_state_flow_per_bin.tsv", sep="\t",
                 index=False)
+            styles = {t.strip() for t in args.state_flow_style.split(",")
+                      if t.strip()}
+            if "all" in styles:
+                styles = {"heatmap", "slope", "flow"}
+            unknown = styles - {"heatmap", "slope", "flow"}
+            if unknown:
+                raise SystemExit(f"--state-flow-style: unknown {sorted(unknown)}"
+                                 f"; pick from heatmap, slope, flow, all.")
             info = None
-            if args.state_flow_style in ("heatmap", "both"):
+            if "heatmap" in styles:
                 hpath = (out_dir /
                          f"{stat_key}_state_table.{args.plot_format}")
                 info = flow_heatmap(tab, stat_key, hpath, args)
@@ -1066,7 +1193,27 @@ def main(argv=None) -> int:
                         out_dir / f"{stat_key}_state_table_enrichment.tsv",
                         sep="\t", index=False, na_rep="NA")
                     logger.info(f"{stat_key}: wrote {hpath}")
-            if args.state_flow_style in ("flow", "both"):
+            if "slope" in styles:
+                spath = out_dir / f"{stat_key}_state_slope.{args.plot_format}"
+                sl = slope_figure(g_mean, h_mean, g_lab, stat_key, spath, args)
+                if sl:
+                    zg = np.full(len(G.columns), np.nan)
+                    zh = np.full(len(G.columns), np.nan)
+                    zg[sl["bin_ok"]] = sl["z_gch"]
+                    zh[sl["bin_ok"]] = sl["z_hcg"]
+                    pd.DataFrame({"bin": G.columns, "gch_state": g_lab,
+                                  "hcg_state": h_lab, "gch_z": zg,
+                                  "hcg_z": zh, "delta_z": zh - zg}).to_csv(
+                        out_dir / f"{stat_key}_state_slope_z.tsv",
+                        sep="\t", index=False, na_rep="NA")
+                    logger.info(
+                        f"{stat_key}: slope {sl['n_bins']:,} bins, "
+                        f"z Pearson r = {sl['pearson_r']:+.3f}, "
+                        f"Spearman ρ = {sl['spearman_rho']:+.3f}; "
+                        + ", ".join(f"{r['gch_state']} → mean HCG z "
+                                    f"{r['mean_hcg_z']:+.2f}"
+                                    for r in sl["by_state"]))
+            if "flow" in styles:
                 fpath = out_dir / f"{stat_key}_state_flow.{args.plot_format}"
                 info = flow_figure(tab, stat_key, fpath, args) or info
             if info:
