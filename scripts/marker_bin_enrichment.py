@@ -38,6 +38,17 @@ a BH-FDR across categories (positive log2FC = enriched, negative = depleted).
 Gene-set (GO/KEGG) enrichment is a hypergeometric over-representation test of the
 foreground-bin genes against the universe of all-bin genes.
 
+Continuous tracks (``--signal-track``, e.g. Repli-seq early/late) get the
+per-bin mean compared foreground-vs-background, reported as BOTH the signed
+difference of means and the rank AUC.  The AUC is the effect size belonging to
+the Mann-Whitney p-value and is scale-free, so it is the one that can be
+compared BETWEEN tracks -- a difference of means cannot, since an early track
+and a late one are not on the same scale.  Its interval comes from a block
+bootstrap over megabase blocks (--signal-block-bp), because these signals are
+organised into domains far larger than a bin and the p-value beside it treats
+the bins as independent.  scripts/bin_set_signal_summary.py draws several bin
+sets and contexts from those TSVs as one panel.
+
 Chromosome names are matched with the leading ``chr`` stripped, so ``chr1`` and
 ``1`` are treated as the same contig.
 """
@@ -520,17 +531,79 @@ def _signal_bin_means(bins: pd.DataFrame, path: str) -> np.ndarray:
     return _binned_mean(bins, sig)
 
 
-def _signal_enrichment(bins, fg, tracks):
+def _auc(a, b) -> float:
+    """P(a random fg bin exceeds a random bg one), ties counted as half.
+
+    The rank statistic the Mann-Whitney p-value already tests, expressed as an
+    effect size.  0.5 is no effect.  Scale-free, which ``difference`` is not:
+    raw signal units differ between tracks, so a difference of means cannot be
+    compared between an early-replication track and a late one without knowing
+    both scales.  Comparing several tracks in one figure needs this.
+    """
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    if a.size == 0 or b.size == 0:
+        return np.nan
+    from scipy.stats import rankdata
+    r = rankdata(np.concatenate([a, b]))          # ties -> average rank
+    return float((r[:a.size].sum() - a.size * (a.size + 1) / 2)
+                 / (a.size * b.size))
+
+
+def _block_ids(bins, block_bp):
+    """Contiguous genomic blocks, for a bootstrap that respects autocorrelation.
+
+    Replication timing (and most of what these tracks carry) is organised into
+    domains far larger than a bin, so neighbouring bins are not independent
+    draws.  Resampling BINS would understate the uncertainty badly; resampling
+    megabase blocks keeps whole domains together.
+    """
+    chrom = bins["chrom"].map(_canon).to_numpy()
+    blk = (bins["start"].to_numpy() // max(int(block_bp), 1)).astype(np.int64)
+    return np.array([f"{c}:{b}" for c, b in zip(chrom, blk)])
+
+
+def _auc_block_ci(val, fg, blocks, n_boot, seed=42):
+    """Block-bootstrap CI for the AUC → (lo, hi)."""
+    ok = np.isfinite(val)
+    if n_boot <= 0 or not ok.any():
+        return np.nan, np.nan
+    uniq = np.unique(blocks[ok])
+    if uniq.size < 5:
+        return np.nan, np.nan
+    idx_of = {u: np.flatnonzero(ok & (blocks == u)) for u in uniq}
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(int(n_boot)):
+        pick = rng.choice(uniq, uniq.size, replace=True)
+        sel = np.concatenate([idx_of[u] for u in pick])
+        a, b = val[sel][fg[sel]], val[sel][~fg[sel]]
+        if a.size and b.size:
+            out.append(_auc(a, b))
+    if len(out) < 20:
+        return np.nan, np.nan
+    return tuple(float(x) for x in np.percentile(out, [2.5, 97.5]))
+
+
+def _signal_enrichment(bins, fg, tracks, block_bp=10_000_000, n_boot=200):
     """fg-vs-bg Mann-Whitney on the per-bin MEAN of each continuous track
-    (replication timing, ...).  Reports the signed difference of means (not a
-    ratio -- the signal may be negative)."""
+    (replication timing, ...).
+
+    Reports the signed difference of means (not a ratio -- the signal may be
+    negative) AND the rank AUC, which is what makes several tracks comparable
+    in one figure.  The AUC's interval comes from a BLOCK bootstrap over
+    genomic blocks, because the p-value beside it treats 250 kb bins as
+    independent and megabase-scale domains mean they are not.
+    """
     from scipy.stats import mannwhitneyu
     rows, series = [], {}
+    blocks = _block_ids(bins, block_bp)
     for label, path in tracks.items():
         val = _signal_bin_means(bins, path)
         series[label] = val
-        a = val[fg & np.isfinite(val)]
-        b = val[(~fg) & np.isfinite(val)]
+        keep = np.isfinite(val)
+        a = val[fg & keep]
+        b = val[(~fg) & keep]
         m_fg = float(a.mean()) if a.size else np.nan
         m_bg = float(b.mean()) if b.size else np.nan
         p = np.nan
@@ -539,8 +612,20 @@ def _signal_enrichment(bins, fg, tracks):
                 p = float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
             except ValueError:
                 p = np.nan
+        auc = _auc(a, b)
+        lo, hi = _auc_block_ci(val, fg, blocks, n_boot)
+        sd_fg = float(a.std(ddof=1)) if a.size > 1 else np.nan
+        sd_bg = float(b.std(ddof=1)) if b.size > 1 else np.nan
+        pooled = np.sqrt(((max(a.size - 1, 0) * (sd_fg ** 2 if a.size > 1 else 0)
+                           + max(b.size - 1, 0)
+                           * (sd_bg ** 2 if b.size > 1 else 0))
+                          / max(a.size + b.size - 2, 1)))
         rows.append({"annotation": label, "mean_signal_fg": m_fg,
                      "mean_signal_bg": m_bg, "difference": m_fg - m_bg,
+                     "sd_signal_fg": sd_fg, "sd_signal_bg": sd_bg,
+                     "cohens_d": ((m_fg - m_bg) / pooled if pooled > 0
+                                  else np.nan),
+                     "auc": auc, "auc_lo": lo, "auc_hi": hi,
                      "n_fg": int(a.size), "n_bg": int(b.size), "pvalue": p})
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -869,7 +954,9 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
 
     # (4b) continuous signal tracks (replication timing, ...) --------------
     if signal_tracks:
-        sig_df, series = _signal_enrichment(bins, fg, signal_tracks)
+        sig_df, series = _signal_enrichment(
+            bins, fg, signal_tracks, block_bp=args.signal_block_bp,
+            n_boot=args.signal_bootstrap)
         sig_df.to_csv(tsv("signal_enrichment"), sep="\t", index=False)
         pages.append(("signal", ("Continuous signals (fg - bg mean)", sig_df)))
         # Per-bin values (for custom re-plotting) + a standalone publication
@@ -1047,6 +1134,14 @@ def main(argv=None):
                          "background (Mann-Whitney) and reported as a signed "
                          "difference of means.  bigWig needs pyBigWig.  Path or "
                          "URL. Repeatable, e.g. RT_early=early.bw RT_late=late.bw.")
+    ap.add_argument("--signal-block-bp", type=int, default=10_000_000,
+                    help="Block size for the AUC's block bootstrap (10 Mb).  "
+                         "Bins inside one block move together, which is what "
+                         "makes the interval honest for a signal organised "
+                         "into domains -- replication timing above all.")
+    ap.add_argument("--signal-bootstrap", type=int, default=200,
+                    help="Block-bootstrap resamples for the AUC interval "
+                         "(0 disables).")
     ap.add_argument("--gene-sets", action="append", default=None,
                     metavar="LABEL=GMT|URL",
                     help="Gene-set database in GMT format (e.g. Enrichr/MSigDB "

@@ -504,3 +504,102 @@ def test_background_name_must_match_a_bed_name(tmp_path):
         m.main(["--bed", f"gch={tmp_path/'bins.all.bed'}",
                 "--background-bed", f"hcg={tmp_path/'bins.all.bed'}",
                 "--output-dir", str(tmp_path / "out")])
+
+
+# ------------------------------------------------ scale-free signal effect --
+
+def test_auc_is_the_rank_effect_size_of_the_mann_whitney():
+    m = _mod()
+    assert m._auc([3, 4, 5], [0, 1, 2]) == 1.0        # complete separation
+    assert m._auc([0, 1, 2], [3, 4, 5]) == 0.0
+    assert m._auc([1, 2, 3], [1, 2, 3]) == 0.5        # ties -> a half each
+    assert np.isnan(m._auc([], [1, 2]))
+
+
+def test_auc_is_invariant_to_the_track_scale_and_the_difference_is_not():
+    """The reason the summary figure uses the AUC: two tracks on different
+    scales cannot be compared by their difference of means."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    a, b = rng.normal(1, 1, 400), rng.normal(0, 1, 400)
+    auc = m._auc(a, b)
+    assert m._auc(a * 1000, b * 1000) == pytest.approx(auc)
+    assert m._auc(a + 50, b + 50) == pytest.approx(auc)
+    # ...whereas the difference of means scales with the units.
+    assert (a * 1000).mean() - (b * 1000).mean() > 100 * (a.mean() - b.mean())
+
+
+def test_block_ci_is_wider_than_a_per_bin_one_when_bins_are_correlated():
+    """Signal is organised into domains, so neighbouring bins are not
+    independent and a per-bin interval is too narrow."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    n_blocks, per = 20, 40
+    # One value per DOMAIN, repeated across its bins: 800 bins carrying only
+    # 20 independent draws.
+    domain = rng.normal(0, 1, n_blocks)
+    val = np.repeat(domain, per)
+    fg = np.zeros(val.size, bool)
+    fg[np.repeat(np.arange(n_blocks) % 2 == 0, per)] = True
+    blocks = np.repeat([f"chr1:{i}" for i in range(n_blocks)], per)
+    lo, hi = m._auc_block_ci(val, fg, blocks, n_boot=200)
+    # A bin-level bootstrap on the same data, for comparison.
+    rng2 = np.random.default_rng(2)
+    per_bin = [m._auc(val[i][fg[i]], val[i][~fg[i]])
+               for i in (rng2.integers(0, val.size, val.size)
+                         for _ in range(200))]
+    assert (hi - lo) > 2 * (np.percentile(per_bin, 97.5)
+                            - np.percentile(per_bin, 2.5))
+
+
+def test_signal_enrichment_reports_the_effect_size_columns(tmp_path):
+    pytest.importorskip("scipy")
+    m = _mod()
+    BS = 250_000
+    bins = _bins([("chr1", i * BS, (i + 1) * BS) for i in range(60)])
+    fg = np.zeros(60, bool)
+    fg[:20] = True
+    rng = np.random.default_rng(0)
+    noisy = tmp_path / "t.bedGraph"
+    with open(noisy, "w") as fh:
+        for i in range(60):
+            v = (2.0 if i < 20 else 0.0) + rng.normal(0, 0.1)
+            fh.write(f"chr1\t{i * BS}\t{(i + 1) * BS}\t{v}\n")
+    # 60 x 250 kb spans 15 Mb, so the default 10 Mb block gives two blocks and
+    # no interval -- correct, but not what this test is about.
+    df, _ = m._signal_enrichment(bins, fg, {"early": str(noisy)},
+                                 block_bp=1_000_000, n_boot=60)
+    r = df.iloc[0]
+    assert {"auc", "auc_lo", "auc_hi", "cohens_d", "sd_signal_fg",
+            "sd_signal_bg"} <= set(df.columns)
+    assert r["auc"] == pytest.approx(1.0), "the foreground is entirely higher"
+    assert r["cohens_d"] > 5 and r["difference"] == pytest.approx(2.0, abs=0.1)
+    assert r["auc_lo"] <= r["auc"] <= r["auc_hi"] + 1e-12
+
+
+def test_auc_survives_a_zero_variance_track_where_cohens_d_cannot(tmp_path):
+    """Two constant groups have no pooled SD, so d is undefined -- while the
+    rank effect size is still exactly 1.  Another reason the figure leads with
+    the AUC."""
+    pytest.importorskip("scipy")
+    m = _mod()
+    BS = 250_000
+    bins = _bins([("chr1", i * BS, (i + 1) * BS) for i in range(60)])
+    fg = np.zeros(60, bool)
+    fg[:20] = True
+    flat = tmp_path / "flat.bedGraph"
+    with open(flat, "w") as fh:
+        for i in range(60):
+            fh.write(f"chr1\t{i * BS}\t{(i + 1) * BS}\t{2.0 if i < 20 else 0.0}\n")
+    r = m._signal_enrichment(bins, fg, {"early": str(flat)}, n_boot=40)[0].iloc[0]
+    assert np.isnan(r["cohens_d"])
+    assert r["auc"] == pytest.approx(1.0)
+
+
+def test_too_few_blocks_gives_no_interval_rather_than_a_fake_one(tmp_path):
+    m = _mod()
+    val = np.arange(40, dtype=float)
+    fg = np.zeros(40, bool)
+    fg[:20] = True
+    blocks = np.repeat(["chr1:0", "chr1:1"], 20)      # only two blocks
+    assert np.isnan(m._auc_block_ci(val, fg, blocks, n_boot=100)).all()
