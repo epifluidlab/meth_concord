@@ -208,3 +208,108 @@ def test_runs_as_a_subprocess(tmp_path):
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "median" in r.stderr
+
+
+# ----------------------------------------------- single panel + normalisation --
+
+def _single_argv(d, out, tracks=("F121_NPC_early", "F121_NPC_late"),
+                 contexts=("HCG", "GCH"), extra=None):
+    args = []
+    for ctx in contexts:
+        args += ["--background", f"{ctx}={d / 'all.bed'}",
+                 "--bin-set", f"{ctx}:variable={d / 'variable.bed'}",
+                 "--bin-set", f"{ctx}:invariant={d / 'invariant.bed'}"]
+    for n in tracks:
+        args += ["--signal-track", f"{n}={d / (n + '.bedGraph')}"]
+    return args + ["--layout", "single", "--plot-format", "png",
+                   "--output-dir", str(out)] + (extra or [])
+
+
+def test_single_panel_layout_writes_the_figure(tmp_path):
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    d = _fixture(tmp_path / "in")
+    out = tmp_path / "o"
+    assert m.main(_single_argv(d, out, extra=["--normalize",
+                                              "log2-median"])) == 0
+    assert (out / "bin_set_signal_summary.png").exists()
+    st = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t")
+    assert len(st) == 8, "2 contexts x 2 tracks x 2 sets"
+    assert set(st["track"]) == {"F121_NPC_early", "F121_NPC_late"}
+
+
+def test_log2_median_puts_the_background_at_zero(tmp_path):
+    """The point of the conventional enrichment axis: the background is the
+    reference, so a set's box reads as fold-enrichment over the genome."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    val = np.exp(rng.normal(0, 0.5, 501))          # strictly positive
+    bg = np.ones(501, bool)
+    bg[:100] = False                                # a set, excluded from ref
+    # An ODD background count so the median is a real element: with an even one
+    # the median of the log ratios lands on the GEOMETRIC midpoint of the two
+    # middle values while the reference is their arithmetic one, and the two
+    # differ in the sixth decimal.
+    assert int(bg.sum()) % 2 == 1
+    out, ylab = m.normalise(val, "log2-median", bg)
+    assert np.median(out[bg]) == pytest.approx(0.0, abs=1e-12)
+    assert "log" in ylab
+
+
+def test_log2_median_refuses_a_signal_that_is_already_a_log_ratio(tmp_path):
+    m = _mod()
+    val = np.array([-1.0, 0.5, 2.0])
+    with pytest.raises(SystemExit, match="already a log ratio"):
+        m.normalise(val, "log2-median", np.ones(3, bool))
+
+
+def test_zscore_handles_a_signed_signal(tmp_path):
+    m = _mod()
+    rng = np.random.default_rng(1)
+    val = rng.normal(-3, 2, 400)                    # negative throughout
+    out, ylab = m.normalise(val, "zscore", np.ones(400, bool))
+    assert abs(float(np.mean(out))) < 1e-9
+    assert abs(float(np.std(out)) - 1) < 1e-9
+    assert "z-score" in ylab
+
+
+def test_the_table_keeps_raw_units_whatever_the_figure_is_drawn_in(tmp_path):
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    d = _fixture(tmp_path / "in")
+    raw = m.main(_single_argv(d, tmp_path / "raw",
+                              extra=["--normalize", "none"]))
+    norm = m.main(_single_argv(d, tmp_path / "norm",
+                               extra=["--normalize", "log2-median"]))
+    assert raw == norm == 0
+    a = pd.read_csv(tmp_path / "raw" / "bin_set_signal_stats.tsv", sep="\t")
+    b = pd.read_csv(tmp_path / "norm" / "bin_set_signal_stats.tsv", sep="\t")
+    cols = ["median_set", "median_background", "difference_of_means"]
+    pd.testing.assert_frame_equal(a[cols], b[cols])
+    assert a["median_background"].max() > 5, "raw units, not a log ratio"
+
+
+def test_single_panel_without_a_normalisation_warns(tmp_path, caplog):
+    """Two tracks on one raw axis would show the assay difference, not the
+    bin-set difference."""
+    import logging
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    d = _fixture(tmp_path / "in")
+    with caplog.at_level(logging.WARNING):
+        assert m.main(_single_argv(d, tmp_path / "o",
+                                   extra=["--normalize", "none"])) == 0
+    assert "only honest if the tracks share a scale" in caplog.text
+
+
+def test_grid_layout_needs_no_normalisation_and_says_nothing(tmp_path, caplog):
+    import logging
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    d = _fixture(tmp_path / "in")
+    args = [a for a in _single_argv(d, tmp_path / "o") if a != "single"]
+    args[args.index("--layout")] = "--layout"
+    args.insert(args.index("--layout") + 1, "grid")
+    with caplog.at_level(logging.WARNING):
+        assert m.main(args) == 0
+    assert "share a scale" not in caplog.text

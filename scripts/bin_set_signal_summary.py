@@ -9,8 +9,16 @@ PDFs.
 The plot is the conventional one for a continuous track at a set of regions: the
 DISTRIBUTION of the per-bin signal, background against each bin set, in the
 track's own units, with a Mann-Whitney test of each set against the background.
-One panel per (timing group x context), so every panel has its own y-axis and
-tracks on different scales are never forced onto a shared one.
+By default one panel per (timing group x context), so every panel has its own
+y-axis and tracks on different scales are never forced onto a shared one.
+
+``--layout single`` puts everything in ONE panel instead, ordered context-major
+so each context's early/late pair sits together -- for the compact version of the
+figure with a single sample.  That shares one y-axis across tracks, so it needs
+``--normalize``: ``log2-median`` is the conventional enrichment axis, log2 of the
+signal over the genome-wide median, which puts the background at 0 and makes each
+set read as fold-enrichment over the genome average.  The stats TSV always
+reports the RAW units, whatever the figure is drawn in.
 
     python scripts/bin_set_signal_summary.py \\
         --background GCH=out/marker_gch/bin_scores_gch.all.bed \\
@@ -104,7 +112,48 @@ def track_group(name, rules=None) -> str:
     return "signal"
 
 
-def gather(backgrounds, bin_sets, tracks, mbe):
+def normalise(val, mode, background_mask):
+    """Put a track on a scale that can share an axis with another track.
+
+    Necessary for a single-panel layout and only there: with one panel per
+    track, each keeps its own axis and its own units, which is always the more
+    faithful thing to plot.  Two tracks in one panel do not have that option --
+    an early Repli-seq track and a late one are not on the same scale, and a
+    shared raw axis would show the difference between the two ASSAYS rather than
+    the difference between the bin sets.
+
+    'log2-median' is the conventional enrichment axis: log2 of the signal over
+    the genome-wide (background) median, so the background sits at 0 and a set's
+    box reads directly as fold-enrichment over the genome average.  It needs
+    positive values, so it refuses a track that is already a log ratio.
+    'zscore' works whatever the sign, at the cost of a less concrete axis.
+    """
+    v = np.asarray(val, float)
+    if mode == "none":
+        return v, "per-bin mean signal"
+    ref = v[background_mask & np.isfinite(v)]
+    if ref.size == 0:
+        return v, "per-bin mean signal"
+    if mode == "log2-median":
+        med = float(np.median(ref))
+        if med <= 0 or np.nanmin(v) <= 0:
+            sys.exit(
+                "--normalize log2-median needs strictly positive signal (its "
+                "reference is a ratio to the genome-wide median), and this "
+                "track has values at or below zero -- it is probably already a "
+                "log ratio.  Use --normalize zscore, or --layout grid, which "
+                "needs no normalisation at all.")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.log2(v / med), "log$_2$(signal / genome median)"
+    if mode == "zscore":
+        mu, sd = float(np.mean(ref)), float(np.std(ref))
+        if sd <= 0:
+            return v - mu, "signal − genome mean"
+        return (v - mu) / sd, "signal, z-score across bins"
+    raise ValueError(mode)
+
+
+def gather(backgrounds, bin_sets, tracks, mbe, normalize="none"):
     """Per-bin signal for every (context, track), plus each set's membership.
 
     Returns ``{context: {"values": {track: array}, "sets": {label: mask},
@@ -115,9 +164,8 @@ def gather(backgrounds, bin_sets, tracks, mbe):
         bins = mbe._read_bins_any(bg_path)
         key = bins[["chrom", "start", "end"]].astype(str).agg("|".join, axis=1)
         pos = {k: i for i, k in enumerate(key)}
-        values = {}
-        for label, path in tracks.items():
-            values[label] = mbe._signal_bin_means(bins, path)
+        raw = {label: mbe._signal_bin_means(bins, path)
+               for label, path in tracks.items()}
         sets = {}
         for (c, label), sp in bin_sets.items():
             if c != ctx:
@@ -138,7 +186,16 @@ def gather(backgrounds, bin_sets, tracks, mbe):
             m = np.zeros(len(bins), bool)
             m[idx] = True
             sets[label] = m
-        out[ctx] = {"bins": bins, "values": values, "sets": sets}
+        # The normalisation reference is the background -- every bin outside
+        # every named set -- so a set cannot move its own baseline.
+        any_set = np.zeros(len(bins), bool)
+        for m in sets.values():
+            any_set |= m
+        values, ylab = {}, "per-bin mean signal"
+        for label, v in raw.items():
+            values[label], ylab = normalise(v, normalize, ~any_set)
+        out[ctx] = {"bins": bins, "values": values, "sets": sets,
+                    "raw": raw, "ylabel": ylab}
     return out
 
 
@@ -147,7 +204,9 @@ def stats_table(data, groups):
     from scipy.stats import mannwhitneyu
     rows = []
     for ctx, d in data.items():
-        for track, val in d["values"].items():
+        # Raw values: the table is the record of what was measured, and a
+        # figure-side rescaling should not change the numbers reported.
+        for track, val in d.get("raw", d["values"]).items():
             ok = np.isfinite(val)
             for label, mask in d["sets"].items():
                 a = val[mask & ok]
@@ -199,8 +258,49 @@ def _stars(q):
             else "ns")
 
 
+def _draw_slot(ax, d, sets, colors, val, base, per):
+    """Background box then one per set, at consecutive positions from ``base``.
+
+    Background first so the eye reads left to right from "every bin" to "this
+    subset", and the background EXCLUDES every named set -- otherwise the subsets
+    sit on both sides of their own comparison.
+    """
+    ok = np.isfinite(val)
+    series = [("background", val[ok & ~_any_set(d, sets)], _BG_COLOR)]
+    for s_ in sets:
+        series.append((s_, val[ok & d["sets"][s_]], colors[s_]))
+    drawn = []
+    for k, (lab, v, col) in enumerate(series):
+        if v.size == 0:
+            continue
+        bp = ax.boxplot([v], positions=[base + k], widths=0.72,
+                        patch_artist=True, showfliers=False,
+                        medianprops=dict(color="#111827", lw=1.4),
+                        whiskerprops=dict(color="#4B5563"),
+                        capprops=dict(color="#4B5563"))
+        bp["boxes"][0].set(facecolor=col, alpha=0.85, lw=0.6,
+                           edgecolor="#374151")
+        if lab != "background":
+            drawn.append((base + k, lab, col))
+    return drawn
+
+
+def _mark(ax, marks, q_of, key_of):
+    """Significance stars, after every box exists.
+
+    The y-limit is not final until then; annotating against a partial one
+    scatters the stars across the panel and into the title.
+    """
+    lo, hi = ax.get_ylim()
+    ax.set_ylim(lo, hi + 0.14 * (hi - lo))
+    top = ax.get_ylim()[1] - 0.045 * (hi - lo)
+    for x, lab, col in marks:
+        ax.annotate(_stars(q_of.get(key_of(x) + (lab,), np.nan)), (x, top),
+                    ha="center", va="center", fontsize=7.6, color=col)
+
+
 def figure(data, stats, out_path, args):
-    """Grouped boxplots: background vs each set, per track, per panel."""
+    """Boxplots of the signal: background against each set, per track."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -215,63 +315,71 @@ def figure(data, stats, out_path, args):
     tracks_by_group = {
         g: sorted(stats.loc[stats["track_group"] == g, "track"].unique())
         for g in groups}
-
-    n_row, n_col = len(groups), len(contexts)
-    widths = [max(2.6, 1.35 * len(tracks_by_group[g])) for g in groups]
-    fig, axes = plt.subplots(
-        n_row, n_col, squeeze=False,
-        figsize=(max(widths) * n_col + 1.0, 3.5 * n_row + 0.8))
     q_of = {(r["context"], r["track"], r["bin_set"]): r["fdr"]
             for _, r in stats.iterrows()}
+    per = len(sets) + 1
+    ylab = data[contexts[0]]["ylabel"]
 
-    for ri, g in enumerate(groups):
+    if args.layout == "single":
+        # Slots run context-major, timing-minor: HCG early, HCG late, then GCH
+        # early, GCH late -- the reading order the comparison is stated in.
+        slots = [(ctx, t) for ctx in contexts
+                 for g in groups for t in tracks_by_group[g]]
+        fig, ax = plt.subplots(figsize=(1.45 * per * len(slots) / 3 + 2.6, 5.4))
+        marks, centres, labels = [], [], []
+        for i, (ctx, track) in enumerate(slots):
+            base = i * (per + 1)
+            marks += _draw_slot(ax, data[ctx], sets, colors,
+                                data[ctx]["values"][track], base, per)
+            centres.append(base + (per - 1) / 2)
+            labels.append(track)
+        _mark(ax, marks, q_of,
+              lambda x: slots[int(round(x)) // (per + 1)])
+        ax.set_xticks(centres)
+        ax.set_xticklabels(labels, fontsize=8.6, rotation=18, ha="right")
+        ax.set_ylabel(ylab)
+        if args.normalize != "none":
+            ax.axhline(0.0, color="#9AA0A6", lw=1.0, ls="--", zorder=0)
+        # A second row of labels for the context, spanning its own slots, and a
+        # divider between contexts so the two comparisons are visually separate.
+        n_per_ctx = len(slots) // max(len(contexts), 1)
         for ci, ctx in enumerate(contexts):
-            ax = axes[ri][ci]
-            d = data[ctx]
-            tracks = tracks_by_group[g]
-            per = len(sets) + 1                  # background + one per set
-            centres, labels, marks = [], [], []
-            for ti, track in enumerate(tracks):
-                val = d["values"][track]
-                ok = np.isfinite(val)
-                base = ti * (per + 1)
-                # Background first, then the sets, so the eye reads left to
-                # right from "everything" to "this subset".
-                series = [("background", val[ok & ~_any_set(d, sets)],
-                           _BG_COLOR)]
-                for s in sets:
-                    series.append((s, val[ok & d["sets"][s]], colors[s]))
-                for k, (lab, v, col) in enumerate(series):
-                    if v.size == 0:
-                        continue
-                    bp = ax.boxplot([v], positions=[base + k], widths=0.72,
-                                    patch_artist=True, showfliers=False,
-                                    medianprops=dict(color="#111827", lw=1.4),
-                                    whiskerprops=dict(color="#4B5563"),
-                                    capprops=dict(color="#4B5563"))
-                    bp["boxes"][0].set(facecolor=col, alpha=0.85, lw=0.6,
-                                       edgecolor="#374151")
-                    if lab != "background":
-                        marks.append((base + k, lab, col))
-                centres.append(base + (per - 1) / 2)
-                labels.append(track)
-            # Stars only after every box exists: the y-limit is not final until
-            # then, and annotating against a partial one scatters them across
-            # the panel and into the title.
-            lo, hi = ax.get_ylim()
-            ax.set_ylim(lo, hi + 0.14 * (hi - lo))
-            top = ax.get_ylim()[1] - 0.045 * (hi - lo)
-            for x, lab, col in marks:
-                track = labels[int(x) // (per + 1)]
-                ax.annotate(_stars(q_of.get((ctx, track, lab), np.nan)),
-                            (x, top), ha="center", va="center", fontsize=7.6,
-                            color=col)
-            ax.set_xticks(centres)
-            ax.set_xticklabels(labels, fontsize=8, rotation=20, ha="right")
-            ax.set_ylabel("per-bin mean signal" if ci == 0 else "")
-            ax.set_title(f"{ctx}–{ctx} concordance · {g.upper()}", fontsize=10.5)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
+            lo = ci * n_per_ctx * (per + 1)
+            hi = lo + (n_per_ctx - 1) * (per + 1) + per - 1
+            ax.annotate(f"{ctx}–{ctx} concordance", ((lo + hi) / 2, -0.155),
+                        xycoords=("data", "axes fraction"), ha="center",
+                        fontsize=10, fontweight="bold")
+            if ci:
+                ax.axvline(lo - 1.0, color="#D1D5DB", lw=1.0)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    else:
+        n_row, n_col = len(groups), len(contexts)
+        widths = [max(2.6, 1.35 * len(tracks_by_group[g])) for g in groups]
+        fig, axes = plt.subplots(
+            n_row, n_col, squeeze=False,
+            figsize=(max(widths) * n_col + 1.0, 3.5 * n_row + 0.8))
+        for ri, g in enumerate(groups):
+            for ci, ctx in enumerate(contexts):
+                ax = axes[ri][ci]
+                tracks = tracks_by_group[g]
+                marks, centres, labels = [], [], []
+                for ti, track in enumerate(tracks):
+                    base = ti * (per + 1)
+                    marks += _draw_slot(ax, data[ctx], sets, colors,
+                                        data[ctx]["values"][track], base, per)
+                    centres.append(base + (per - 1) / 2)
+                    labels.append(track)
+                _mark(ax, marks, q_of,
+                      lambda x, _c=ctx, _t=labels: (
+                          _c, _t[int(round(x)) // (per + 1)]))
+                ax.set_xticks(centres)
+                ax.set_xticklabels(labels, fontsize=8, rotation=20, ha="right")
+                ax.set_ylabel(ylab if ci == 0 else "")
+                ax.set_title(f"{ctx}–{ctx} concordance · {g.upper()}",
+                             fontsize=10.5)
+                for side in ("top", "right"):
+                    ax.spines[side].set_visible(False)
 
     handles = [plt.Rectangle((0, 0), 1, 1, facecolor=_BG_COLOR, alpha=0.85,
                              edgecolor="#374151", label="background (all bins)")]
@@ -280,7 +388,7 @@ def figure(data, stats, out_path, args):
     fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.02, 0.99),
                ncol=len(handles), frameon=False, fontsize=9)
     fig.suptitle(args.title or "Signal at each bin set", fontsize=12.5, y=1.04)
-    fig.text(0.5, -0.015,
+    fig.text(0.5, -0.055 if args.layout == "single" else -0.015,
              "boxes: median, quartiles, 1.5 IQR whiskers; outliers hidden.  "
              "Stars: Mann-Whitney of the set against the rest of the bins, "
              "BH-adjusted over the figure — anticonservative, since bins inside "
@@ -321,6 +429,23 @@ def main(argv=None) -> int:
                     metavar="GROUP=t1,t2",
                     help="Group the tracks into panel rows explicitly.  Without "
                          "it an '_early' / '_late' token in the name is used.")
+    ap.add_argument("--layout", choices=["grid", "single"], default="grid",
+                    help="'grid' (default) is one panel per (timing group x "
+                         "context), each with its own y-axis, which is the "
+                         "faithful default because two tracks are rarely on the "
+                         "same scale.  'single' puts every track in ONE panel, "
+                         "ordered context-major so each context's early/late "
+                         "pair sits together; it needs --normalize to make the "
+                         "shared axis mean anything.")
+    ap.add_argument("--normalize", choices=["none", "log2-median", "zscore"],
+                    default="none",
+                    help="Rescale each track before plotting.  'log2-median' is "
+                         "the conventional enrichment axis -- log2 of the signal "
+                         "over the genome-wide median, so the background sits at "
+                         "0 and each set reads as fold-enrichment over the "
+                         "genome average; it needs strictly positive signal.  "
+                         "'zscore' works whatever the sign.  The stats TSV always "
+                         "reports the RAW units.")
     ap.add_argument("--title", default=None)
     ap.add_argument("--plot-format", choices=["pdf", "png", "svg"],
                     default="pdf")
@@ -349,8 +474,15 @@ def main(argv=None) -> int:
                 if t.strip():
                     rules[t.strip()] = grp
 
+    if args.layout == "single" and args.normalize == "none" and len(tracks) > 1:
+        logger.warning(
+            "--layout single with --normalize none puts every track on ONE raw "
+            "axis.  That is only honest if the tracks share a scale; an early "
+            "and a late Repli-seq track do not, and the panel would then show "
+            "the difference between the two assays rather than between the bin "
+            "sets.  --normalize log2-median is the usual fix.")
     mbe = _enrich_mod()
-    data = gather(backgrounds, bin_sets, tracks, mbe)
+    data = gather(backgrounds, bin_sets, tracks, mbe, args.normalize)
     stats = stats_table(data, rules)
     stats.to_csv(out_dir / "bin_set_signal_stats.tsv", sep="\t", index=False)
     path = out_dir / f"bin_set_signal_summary.{args.plot_format}"
