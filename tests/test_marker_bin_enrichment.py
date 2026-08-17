@@ -403,3 +403,104 @@ def test_signal_enrichment_bigwig(tmp_path):
             "--signal-track", f"RT={tmp_path/'rt.bw'}", "--output-dir", str(out)])
     sig = pd.read_csv(out / "gch_signal_enrichment.tsv", sep="\t")
     assert sig[sig["annotation"] == "RT"].iloc[0]["difference"] > 1.5
+
+
+# ------------------------------------------------- explicit background BEDs --
+
+def test_background_bed_makes_a_foreground_only_file_usable(tmp_path):
+    """The subset BEDs celltype_marker_bins writes drop their membership flags,
+    so on their own they are the foreground compared against nothing."""
+    pytest.importorskip("scipy")
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    _planted(tmp_path)
+    allb = pd.read_csv(tmp_path / "bins.all.bed", sep="\t")
+    sel = allb[allb["selected"]].drop(columns="selected")
+    sel.to_csv(tmp_path / "sel.bed", sep="\t", index=False)
+    out = tmp_path / "out"
+    m.main(["--bed", f"gch={tmp_path/'sel.bed'}",
+            "--background-bed", f"gch={tmp_path/'bins.all.bed'}",
+            "--chromhmm", str(tmp_path / "hmm.bed"),
+            "--output-dir", str(out)])
+    s = __import__("json").loads((out / "enrichment_summary.json").read_text())
+    # The 30 selected bins are the foreground; the other 170 the background,
+    # NOT all 200 (which would put the foreground on both sides).
+    assert s["gch"]["n_foreground"] == 30
+    assert s["gch"]["n_bins"] == 200
+    hmm = pd.read_csv(out / "gch_chromhmm_enrichment.tsv", sep="\t")
+    enh = hmm[hmm["annotation"] == "state:Enh"].iloc[0]
+    assert enh["log2_fold_change"] > 0 and enh["fdr"] < 0.05
+
+
+def test_background_containing_the_foreground_is_deduplicated(tmp_path):
+    m = _mod()
+    BS = 250_000
+    fg = _bins([("chr1", i * BS, (i + 1) * BS) for i in range(10)])
+    fg.to_csv(tmp_path / "fg.bed", sep="\t", index=False)
+    allb = _bins([("chr1", i * BS, (i + 1) * BS) for i in range(40)])
+    allb.to_csv(tmp_path / "all.bed", sep="\t", index=False)
+    bins, mask, desc = m._split_with_background(
+        str(tmp_path / "fg.bed"), str(tmp_path / "all.bed"), "gch")
+    assert len(bins) == 40, "each bin appears exactly once"
+    assert mask.sum() == 10 and (~mask).sum() == 30
+    assert "10 fg / 30 bg" in desc
+    # No coordinate is on both sides.
+    key = bins[["chrom", "start", "end"]].astype(str).agg("|".join, axis=1)
+    assert not (set(key[mask]) & set(key[~mask]))
+
+
+def test_a_disjoint_background_is_kept_whole(tmp_path):
+    m = _mod()
+    BS = 250_000
+    _bins([("chr1", i * BS, (i + 1) * BS) for i in range(5)]).to_csv(
+        tmp_path / "fg.bed", sep="\t", index=False)
+    _bins([("chr2", i * BS, (i + 1) * BS) for i in range(12)]).to_csv(
+        tmp_path / "bg.bed", sep="\t", index=False)
+    bins, mask, _ = m._split_with_background(
+        str(tmp_path / "fg.bed"), str(tmp_path / "bg.bed"), "gch")
+    assert mask.sum() == 5 and (~mask).sum() == 12
+
+
+def test_a_plain_three_column_bed_works_as_the_background(tmp_path):
+    """So the background can be any region set, not only our own output."""
+    m = _mod()
+    BS = 250_000
+    _bins([("chr1", i * BS, (i + 1) * BS) for i in range(5)]).to_csv(
+        tmp_path / "fg.bed", sep="\t", index=False)
+    pd.DataFrame([("chr1", i * BS, (i + 1) * BS) for i in range(30)]).to_csv(
+        tmp_path / "plain.bed", sep="\t", index=False, header=False)
+    bins, mask, _ = m._split_with_background(
+        str(tmp_path / "fg.bed"), str(tmp_path / "plain.bed"), "gch")
+    assert mask.sum() == 5 and (~mask).sum() == 25
+
+
+def test_a_background_that_is_only_the_foreground_stops_the_run(tmp_path):
+    m = _mod()
+    BS = 250_000
+    b = _bins([("chr1", i * BS, (i + 1) * BS) for i in range(6)])
+    b.to_csv(tmp_path / "fg.bed", sep="\t", index=False)
+    b.to_csv(tmp_path / "bg.bed", sep="\t", index=False)
+    with pytest.raises(SystemExit, match="no background bins left"):
+        m._split_with_background(str(tmp_path / "fg.bed"),
+                                 str(tmp_path / "bg.bed"), "gch")
+
+
+def test_a_foreground_only_bed_without_a_background_says_what_to_do(tmp_path):
+    """The failure it replaces was silent: fg = every bin, background empty,
+    and every enrichment a comparison of the foreground with itself."""
+    m = _mod()
+    BS = 250_000
+    _bins([("chr1", i * BS, (i + 1) * BS) for i in range(8)]).to_csv(
+        tmp_path / "fg.bed", sep="\t", index=False)
+    with pytest.raises(SystemExit, match="--background-bed"):
+        m.main(["--bed", f"gch={tmp_path/'fg.bed'}",
+                "--output-dir", str(tmp_path / "out")])
+
+
+def test_background_name_must_match_a_bed_name(tmp_path):
+    m = _mod()
+    _planted(tmp_path)
+    with pytest.raises(SystemExit, match="no matching --bed"):
+        m.main(["--bed", f"gch={tmp_path/'bins.all.bed'}",
+                "--background-bed", f"hcg={tmp_path/'bins.all.bed'}",
+                "--output-dir", str(tmp_path / "out")])

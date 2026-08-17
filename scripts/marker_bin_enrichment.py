@@ -17,10 +17,18 @@ specific) bins are and WHAT they mean:
 Every analysis is OPTIONAL and runs only when its annotation is supplied, so the
 script degrades gracefully; results go to per-context TSVs and a multi-page PDF.
 
-Foreground vs background.  A bin is FOREGROUND if it was ``selected`` for the
-heatmap (or, with ``--fdr``, if ``celltype_fdr`` is below the cut); the rest are
-BACKGROUND.  The universe is every bin in the input, so the enrichment is
-unbiased by the bin-selection itself.
+Foreground vs background.  Given the ``.all.bed``, a bin is FOREGROUND if it
+was ``selected`` for the heatmap (or, with ``--fdr``, if ``celltype_fdr`` is
+below the cut) and the rest are BACKGROUND, so the universe is every bin in the
+input and the enrichment is unbiased by the bin-selection itself.
+
+The subset BEDs -- ``.selected.bed``, ``.stable.bed``, ``.always_co_open.bed``,
+``.contrast_<label>.bed`` -- drop their membership flags by design, so they
+carry no column to split on and are foreground ONLY.  Give each one a universe
+with ``--background-bed NAME=PATH``: a marker BED or a plain 3-column BED, and
+usually the matching ``.all.bed``.  Bins in both files count as foreground
+alone, so a background that CONTAINS the foreground does the right thing rather
+than putting those bins on both sides of every comparison.
 
 Enrichment model.  The bins are large (250 kb by default), so the natural
 question is COVERAGE, not point overlap: for each region annotation the fraction
@@ -104,6 +112,59 @@ def _read_marker_bed(path: str) -> pd.DataFrame:
     df["start"] = df["start"].astype(int)
     df["end"] = df["end"].astype(int)
     return df
+
+
+def _read_bins_any(path: str) -> pd.DataFrame:
+    """A bin set from either a marker BED (with a header) or a plain BED.
+
+    The foreground-only files celltype_marker_bins writes -- .selected.bed,
+    .stable.bed, .always_co_open.bed, .contrast_<label>.bed -- have their
+    membership flags dropped by design, so they carry no 'selected' column to
+    split on and can only be used together with an explicit background.  A
+    plain three-column BED is accepted too, so the background can be any region
+    set rather than something this pipeline produced.
+    """
+    with open(path) as fh:
+        first = fh.readline()
+    header = first.lower().startswith(("chrom", "#chrom"))
+    if header:
+        return _read_marker_bed(path)
+    df = _read_bed(path)
+    return df[["chrom", "start", "end"]]
+
+
+def _split_with_background(fg_path: str, bg_path: str, name: str):
+    """Foreground and background from two files → (bins, fg_mask, description).
+
+    A bin present in BOTH is foreground: the common case is a background of
+    every bin (the .all.bed), which contains the foreground, and leaving the
+    duplicates in would put those bins on both sides of every comparison --
+    inflating the background toward the foreground and shrinking every effect
+    toward zero.
+    """
+    fg_df = _read_bins_any(fg_path)
+    bg_df = _read_bins_any(bg_path)
+    key = ["chrom", "start", "end"]
+    fg_keys = set(map(tuple, fg_df[key].astype(str).to_numpy()))
+    dup = np.array([tuple(r) in fg_keys
+                    for r in bg_df[key].astype(str).to_numpy()], dtype=bool)
+    if dup.any():
+        print(f"  {name}: {int(dup.sum()):,} of {len(bg_df):,} background bins "
+              f"are also foreground and were removed from the background "
+              f"(a background that CONTAINS the foreground is the usual case, "
+              f"e.g. the .all.bed).", file=sys.stderr)
+    bg_df = bg_df.loc[~dup]
+    if len(fg_df) == 0:
+        sys.exit(f"{name}: --bed {fg_path} has no bins.")
+    if len(bg_df) == 0:
+        sys.exit(f"{name}: no background bins left after removing the "
+                 f"foreground from {bg_path}.  An enrichment needs something "
+                 f"to be enriched AGAINST; pass a wider background (the "
+                 f".all.bed, or a genome-wide bin set).")
+    bins = pd.concat([fg_df, bg_df], ignore_index=True, sort=False)
+    fg = np.zeros(len(bins), bool)
+    fg[:len(fg_df)] = True
+    return bins, fg, f"--background-bed ({len(fg_df):,} fg / {len(bg_df):,} bg)"
 
 
 def _read_bed(path: str, want_name=False):
@@ -717,18 +778,27 @@ def _signal_figure(series, fg, df, name, out_path):
 # ------------------------------------------------------------------- driver --
 
 def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
-                 annotations, gene_sets, signal_tracks, chrom_sizes, out_dir):
+                 annotations, gene_sets, signal_tracks, chrom_sizes, out_dir,
+                 bg_path=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
 
-    bins = _read_marker_bed(bed_path)
+    if bg_path:
+        bins, fg, fg_desc = _split_with_background(bed_path, bg_path, name)
+        if args.fdr is not None:
+            print(f"  {name}: --fdr is ignored when --background-bed gives the "
+                  f"split explicitly.", file=sys.stderr)
+    else:
+        bins = _read_marker_bed(bed_path)
     if chrom_sizes:                      # defensively clamp over-long bins
         cap = bins["chrom"].map(_canon).map(chrom_sizes)     # size or NaN
         clamped = np.minimum(bins["end"], cap.fillna(bins["end"]))
         bins["end"] = np.maximum(clamped, bins["start"] + 1).astype(int)
-    if args.fdr is not None and "celltype_fdr" in bins.columns:
+    if bg_path:
+        pass                                    # split already decided above
+    elif args.fdr is not None and "celltype_fdr" in bins.columns:
         fg = (bins["celltype_fdr"].values < args.fdr)
         fg_desc = f"celltype_fdr < {args.fdr}"
     elif "selected" in bins.columns:
@@ -736,8 +806,12 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
             ["true", "1", "yes"]).values
         fg_desc = "selected == True"
     else:
-        fg = np.ones(len(bins), bool)
-        fg_desc = "ALL bins (no 'selected' column; provide the .all.bed)"
+        sys.exit(
+            f"{name}: {bed_path} has no 'selected' column, so there is no "
+            f"background to compare against and every enrichment would be the "
+            f"foreground against itself.  Either pass the bin_scores_<ctx>."
+            f"all.bed (which carries the flag), or give this foreground its "
+            f"own background with --background-bed {name}=<bed>.")
     n_fg, n_bg = int(fg.sum()), int((~fg).sum())
     print(f"\n=== {name}: {len(bins)} bins, {n_fg} foreground ({fg_desc}), "
           f"{n_bg} background ===")
@@ -903,9 +977,20 @@ def main(argv=None):
     ap.add_argument("--bed", action="append", required=True, metavar="NAME=PATH",
                     help="bin_scores_<ctx>.all.bed from celltype_marker_bins.py, "
                          "e.g. gch=out/bin_scores_gch.all.bed. Repeatable.")
+    ap.add_argument("--background-bed", action="append", default=None,
+                    metavar="NAME=PATH",
+                    help="Background bin set for the matching --bed NAME, when "
+                         "the foreground file carries no 'selected' column — "
+                         "which is every subset BED celltype_marker_bins "
+                         "writes (.selected, .stable, .always_co_open, "
+                         ".contrast_*), since those drop the membership flags.  "
+                         "A marker BED or a plain 3-column BED.  Bins present "
+                         "in both are counted as foreground only, so passing "
+                         "the .all.bed as the background does the right thing.")
     ap.add_argument("--fdr", type=float, default=None,
                     help="Define foreground by celltype_fdr < FDR instead of the "
-                         "'selected' column.")
+                         "'selected' column.  Ignored when --background-bed "
+                         "gives the split explicitly.")
     ap.add_argument("--genome", default=None,
                     choices=sorted(_GENOME),
                     help="Auto-DOWNLOAD the standard annotations for this genome "
@@ -1079,14 +1164,23 @@ def main(argv=None):
             if rv is not None:
                 signal_tracks[label] = rv
 
+    backgrounds = _parse_pairs(args.background_bed, "--background-bed")
+    beds = _parse_pairs(args.bed, "--bed")
+    unknown = set(backgrounds) - set(beds)
+    if unknown:
+        sys.exit(f"--background-bed names with no matching --bed: "
+                 f"{sorted(unknown)}; --bed has {sorted(beds)}.")
     summaries = {}
-    for name, path in _parse_pairs(args.bed, "--bed").items():
+    for name, path in beds.items():
         rp = _resolve(path, cache, f"--bed {name}")
         if rp is None:
             continue
+        bg = backgrounds.get(name)
+        if bg:
+            bg = _resolve(bg, cache, f"--background-bed {name}")
         s = _run_context(name, rp, args, genes, gene_features, chromhmm,
                          annotations, gene_sets, signal_tracks, chrom_sizes,
-                         out_dir)
+                         out_dir, bg_path=bg)
         if s is not None:
             summaries[name] = s
     if not summaries:
