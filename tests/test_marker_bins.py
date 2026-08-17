@@ -1109,3 +1109,112 @@ def test_both_sign_beds_are_written_at_the_requested_size(tmp_path):
     assert s["n_always_co_open_agreeing"] == 60
     # The two sets are the opposite ends of the same ranking.
     assert set(op["start"]) & set(cl["start"]) == set()
+
+
+# ------------------------------------------------ stability versus the level --
+
+def _level_crossed(seed=0, n_ct=4, n_per=30, per_class=25):
+    """Four bin classes crossing "flat across cell types" with "level of D",
+    so a set that is level-blind can be caught taking both halves."""
+    rng = np.random.default_rng(seed)
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    blocks, classes = [], []
+    for label, level, spread in (("flat_LOW", -1.5, 0.0),
+                                 ("flat_HIGH", 1.5, 0.0),
+                                 ("var_LOW", -1.5, 1.0),
+                                 ("var_HIGH", 1.5, 1.0)):
+        ctm = rng.normal(0, spread, (n_ct, per_class))
+        blocks.append(level + ctm[ct] + rng.normal(0, 0.15, (n, per_class)))
+        classes += [label] * per_class
+    return np.hstack(blocks), ct, np.array(classes)
+
+
+def _run_level(tmp_path, sub, extra=None):
+    X, ct, classes = _level_crossed()
+    n = len(ct)
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    d = tmp_path / sub
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(
+        d / "concordance_directional.parquet")
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        d / "s.tsv", sep="\t", index=False)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix",
+         f"g={d / 'concordance_directional.parquet'}",
+         "--samples", str(d / "s.tsv"), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "30", "--n-permutations", "40",
+         "--output-dir", str(d / "o"), "--plot-format", "png"] + (extra or []),
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    sc = pd.read_csv(d / "o" / "bin_scores_g.tsv", sep="\t")
+    sc["class"] = classes
+    return sc, r
+
+
+def test_stability_is_blind_to_the_level_by_design(tmp_path):
+    """The answer to 'are the stable bins always highly concordant': no.  Level
+    is invisible to the ranking, which runs after per-bin QN."""
+    sc, _ = _run_level(tmp_path, "any")
+    st = sc[sc["stable"]]
+    kinds = set(st["class"])
+    assert kinds == {"flat_LOW", "flat_HIGH"}, kinds
+    # Both halves, in comparable numbers -- not one or the other.
+    frac_low = (st["class"] == "flat_LOW").mean()
+    assert 0.25 < frac_low < 0.75, frac_low
+    # And the spread statistic genuinely cannot separate them.
+    by = sc.groupby("class")["celltype_mean_spread"].mean()
+    assert abs(by["flat_HIGH"] - by["flat_LOW"]) < 0.2 * by["var_HIGH"]
+
+
+def test_bin_mean_raw_is_reported_so_the_level_can_be_checked(tmp_path):
+    sc, _ = _run_level(tmp_path, "col")
+    assert "bin_mean_raw" in sc.columns
+    by = sc.groupby("class")["bin_mean_raw"].mean()
+    assert by["flat_HIGH"] > 1.0 and by["flat_LOW"] < -1.0
+    # Present in the BEDs too, which is where it is actually needed.
+    for kind in ("all", "selected", "stable"):
+        bed = pd.read_csv(tmp_path / "col" / "o" / f"bin_scores_g.{kind}.bed",
+                          sep="\t")
+        assert "bin_mean_raw" in bed.columns, kind
+
+
+def test_stable_level_high_keeps_only_the_high_half(tmp_path):
+    # 20 < the 25 bins in the eligible class, so no fill from outside the pool
+    # is needed -- the fill is documented behaviour and would blur the point.
+    sc, r = _run_level(tmp_path, "high", ["--stable-level", "high",
+                                          "--n-stable-bins", "20"])
+    st = sc[sc["stable"]]
+    assert set(st["class"]) == {"flat_HIGH"}, set(st["class"])
+    assert (st["bin_mean_raw"] > 0).all()
+    assert "--stable-level high keeps" in r.stderr
+
+
+def test_stable_level_low_keeps_only_the_low_half(tmp_path):
+    sc, _ = _run_level(tmp_path, "low", ["--stable-level", "low",
+                                         "--n-stable-bins", "20"])
+    st = sc[sc["stable"]]
+    assert set(st["class"]) == {"flat_LOW"}, set(st["class"])
+    assert (st["bin_mean_raw"] < 0).all()
+
+
+def test_stable_level_still_ranks_by_flatness_within_the_pool(tmp_path):
+    """The restriction narrows the pool; it does not become the ranking.
+
+    Compared within the BATCH-CLEAN part of the pool, because the batch filter
+    takes precedence over the spread ranking -- a flat bin that batch drives is
+    not invariant, so it is passed over however flat it looks.
+    """
+    sc, _ = _run_level(tmp_path, "rank", ["--stable-level", "high",
+                                          "--n-stable-bins", "20"])
+    med = sc["bin_mean_raw"].median()
+    clean = ~(sc["batch_icc"].notna() & (sc["batch_icc"] > 0.1))
+    pool = sc[(sc["bin_mean_raw"] > med) & clean]
+    st = pool[pool["stable"]]
+    rest = pool[~pool["stable"]]
+    assert len(st) and len(rest)
+    assert st["celltype_mean_spread"].max() <= rest["celltype_mean_spread"].min()

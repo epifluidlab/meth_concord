@@ -26,7 +26,15 @@ by its own statistic but filtered for batch the same way:
   STABLE          the invariant counterpart -- bins whose cell-type means sit
                   closest together (--stable-bins).  Ranked by the SD of those
                   means, NOT by low cell-type ICC, which would return the
-                  noisiest bins rather than the flattest.
+                  noisiest bins rather than the flattest.  Stability says
+                  NOTHING about the level of concordance: the ranking runs on
+                  the per-bin quantile-normalised matrix, where every bin shares
+                  one distribution across cells, so a bin flat at low
+                  concordance and one flat at high concordance are equally
+                  invariant and both are taken.  bin_mean_raw is reported on
+                  every output so that can be checked, and --stable-level
+                  high/low narrows the pool first when what is wanted is
+                  "constitutively coordinated" rather than "unchanging".
 
   CO-OPEN /       for a DIRECTIONAL matrix (D = C(2F-1)), the most co-open
   CO-CLOSED       and the most co-closed bins (--sign-split), read off the RAW
@@ -239,15 +247,25 @@ def celltype_spread(X, cell_type_ids, n_ct, args):
     return np.where(covered >= max(args.min_groups, 2), spread, np.nan)
 
 
-def select_stable_bins(X, cell_type_ids, n_ct, b_icc, args, n_want):
+def select_stable_bins(X, cell_type_ids, n_ct, b_icc, args, n_want,
+                       eligible=None):
     """The invariant counterpart of :func:`select_marker_bins`.
 
     The batch filter applies exactly as it does to the marker set: a bin that
     is flat across cell types but driven by batch is not invariant, it is
     sample.  Same clean-first, fill-by-rank policy, so the two sets are
     selected by the same rules and can be compared.
+
+    ``eligible`` restricts the POOL before ranking (see --stable-level).  It has
+    to be a restriction rather than part of the ranking: the ranking runs on the
+    normalised matrix, where per-bin level does not exist, so "flat AND high"
+    cannot be expressed as one score.  Stability alone says nothing about the
+    level -- a bin flat at low concordance and one flat at high concordance are
+    equally invariant, and both are selected unless this narrows the pool.
     """
     spread = celltype_spread(X, cell_type_ids, n_ct, args)
+    if eligible is not None:
+        spread = np.where(eligible, spread, np.nan)
     usable = np.flatnonzero(np.isfinite(spread))
     if usable.size == 0:
         return np.array([], int), spread, 0
@@ -1031,6 +1049,20 @@ def main():
                          "Writes bin_scores_<name>.stable.bed.")
     ap.add_argument("--n-stable-bins", type=int, default=0,
                     help="Size of the invariant set (0 = same as --n-bins).")
+    ap.add_argument("--stable-level", choices=["any", "high", "low"],
+                    default="any",
+                    help="Restrict the invariant set by CONCORDANCE LEVEL.  "
+                         "'any' (default) is stability alone, which says "
+                         "nothing about the level: selection ranks on the "
+                         "per-bin quantile-normalised matrix, where every bin "
+                         "shares one distribution across cells, so a bin flat "
+                         "at LOW concordance and one flat at HIGH concordance "
+                         "are equally invariant and both are taken.  'high' / "
+                         "'low' keep only bins whose raw per-bin mean is above "
+                         "/ below the genome-wide median before ranking, for "
+                         "'constitutively coordinated' rather than merely "
+                         "'unchanging'.  The raw mean is reported as "
+                         "bin_mean_raw either way.")
     ap.add_argument("--sign-split", choices=["auto", "on", "off"],
                     default="auto",
                     help="For a DIRECTIONAL matrix (D = C·(2F−1)), also emit "
@@ -1385,8 +1417,17 @@ def main():
             M.to_numpy(), ct_id, len(ct_u), args.min_cells_per_group,
             args.min_groups, return_stats=True)
         ct_fdr = _bh_fdr(ct_p)
+        # The per-bin RAW mean, purely as a reported column.  Selection runs on
+        # the per-bin quantile-normalised matrix, where every bin has been
+        # mapped onto the same distribution across cells, so the level is
+        # invisible to every ranking here -- a stable bin is flat across cell
+        # types and may sit anywhere on the level axis.  Without this column
+        # that could not even be checked afterwards.
+        raw_mean = np.asarray(
+            M_raw.reindex(index=M.index, columns=M.columns).mean(axis=0),
+            dtype=float)
         scores_df = pd.DataFrame({
-            "bin": M.columns, "celltype_icc": ct_icc,
+            "bin": M.columns, "bin_mean_raw": raw_mean, "celltype_icc": ct_icc,
             "celltype_pvalue": ct_p, "celltype_fdr": ct_fdr,
             "batch_icc": b_icc, "selected": M.columns.isin(sel_bins)})
         extra_cols: list[str] = []
@@ -1395,8 +1436,23 @@ def main():
         # (2) INVARIANT set: flattest across cell types, same batch filter.
         if args.stable_bins == "on":
             n_want = args.n_stable_bins or args.n_bins
+            eligible = None
+            if args.stable_level != "any":
+                # Level is not part of the ranking and cannot be: after per-bin
+                # QN it is gone.  So it is applied as a POOL restriction before
+                # ranking, against the genome-wide median -- the same relative
+                # reading --sign-reference median uses, and for the same reason
+                # (an absolute cut on D is a cut on the base rate).
+                med = float(np.nanmedian(raw_mean))
+                eligible = (raw_mean > med if args.stable_level == "high"
+                            else raw_mean < med)
+                print(f"  {name}: --stable-level {args.stable_level} keeps "
+                      f"{int(np.sum(eligible & np.isfinite(raw_mean))):,} of "
+                      f"{len(raw_mean):,} bins eligible for the invariant set "
+                      f"(raw per-bin mean vs the genome-wide median "
+                      f"{med:+.4g}).", file=sys.stderr)
             stable_sel, spread, n_stable_clean = select_stable_bins(
-                Msel, ct_id, len(ct_u), b_icc, args, n_want)
+                Msel, ct_id, len(ct_u), b_icc, args, n_want, eligible)
             is_stable = np.zeros(M.shape[1], bool)
             is_stable[stable_sel] = True
             scores_df["celltype_mean_spread"] = spread
@@ -1558,8 +1614,8 @@ def main():
         # bins, one per selected subset.
         coords = _bins_to_bed(M.columns, infer_bin_size(M.columns), chrom_sizes)
         bed = pd.DataFrame(coords, columns=["chrom", "start", "end"])
-        for c in ("celltype_icc", "celltype_pvalue", "celltype_fdr",
-                  "batch_icc", "selected", *extra_cols):
+        for c in ("bin_mean_raw", "celltype_icc", "celltype_pvalue",
+                  "celltype_fdr", "batch_icc", "selected", *extra_cols):
             bed[c] = scores_df[c].values
         bed = bed.sort_values(["chrom", "start"]).reset_index(drop=True)
         bed.to_csv(out_dir / f"bin_scores_{name}.all.bed", sep="\t",
