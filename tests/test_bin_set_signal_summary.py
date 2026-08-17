@@ -1,8 +1,8 @@
-"""Bin-set vs signal-track summary panel.
+"""Bin-set vs signal-track summary figure.
 
-The figure exists to show a 2x2 interaction -- (bin set) x (early vs late) --
-so the tests are about the interaction being computed and labelled correctly,
-and about the scale-free effect size the comparison depends on.
+The comparison is background-vs-set WITHIN a track, so the tests are about the
+sets and the background being the same bins measured the same way, and about
+tracks on different scales never being forced onto one axis.
 """
 
 from __future__ import annotations
@@ -18,6 +18,9 @@ import pytest
 
 _SCRIPT = (Path(__file__).resolve().parent.parent / "scripts"
            / "bin_set_signal_summary.py")
+_BS = 250_000
+_TRACKS = ("Cas129_NPC_rep1_early", "Cas129_NPC_rep2_early", "F121_NPC_early",
+           "Cas129_NPC_rep1_late", "Cas129_NPC_rep2_late", "F121_NPC_late")
 
 
 def _mod():
@@ -28,166 +31,180 @@ def _mod():
     return m
 
 
-_EARLY = ["Cas129_NPC_rep1_early", "Cas129_NPC_rep2_early", "F121_NPC_early"]
-_LATE = ["Cas129_NPC_rep1_late", "Cas129_NPC_rep2_late", "F121_NPC_late"]
-
-
-def _tsv(path, prefers, jitter=0.01, seed=0):
-    """One signal_enrichment.tsv where the set prefers 'early' or 'late'."""
+def _fixture(d: Path, nb=400, seed=0):
+    """A domain-structured timing landscape, with the invariant set in early
+    sequence and the variable set in late.  Late tracks are on a ~40x larger
+    scale, so a figure that shared one y-axis would be unreadable."""
+    d.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    sign = 1.0 if prefers == "early" else -1.0
-    rows = []
-    for t in _EARLY + _LATE:
-        d = sign * (0.18 if t in _EARLY else -0.16) + rng.normal(0, jitter)
-        auc = 0.5 + d
-        rows.append({"annotation": t, "mean_signal_fg": 1.0,
-                     "mean_signal_bg": 0.9, "difference": d,
-                     "sd_signal_fg": 0.3, "sd_signal_bg": 0.3,
-                     "cohens_d": 3 * d, "auc": auc, "auc_lo": auc - 0.03,
-                     "auc_hi": auc + 0.03, "n_fg": 500, "n_bg": 9000,
-                     "pvalue": 1e-20, "fdr": 1e-19})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
-    return str(path)
+    bins = pd.DataFrame({"chrom": "chr1", "start": np.arange(nb) * _BS,
+                         "end": (np.arange(nb) + 1) * _BS})
+    rt = np.repeat(rng.normal(0, 1, nb // 20), 20) + rng.normal(0, 0.25, nb)
+    order = np.argsort(rt)[::-1]
+    inv = np.zeros(nb, bool)
+    inv[order[:80]] = True
+    var = np.zeros(nb, bool)
+    var[order[-80:]] = True
+    b = bins.copy()
+    b["selected"] = var
+    b["stable"] = inv
+    b.to_csv(d / "all.bed", sep="\t", index=False)
+    bins[var].to_csv(d / "variable.bed", sep="\t", index=False)
+    bins[inv].to_csv(d / "invariant.bed", sep="\t", index=False)
+    for name in _TRACKS:
+        sign = 1 if name.endswith("early") else -1
+        scale = 1.0 if sign > 0 else 40.0
+        v = scale * (5 + sign * rt + rng.normal(0, 0.2, nb))
+        with open(d / f"{name}.bedGraph", "w") as fh:
+            for i in range(nb):
+                fh.write(f"chr1\t{i * _BS}\t{(i + 1) * _BS}\t{v[i]:.4f}\n")
+    return d
 
 
-def _four(tmp_path):
-    return [f"GCH:variable={_tsv(tmp_path / 'gv.tsv', 'late', seed=1)}",
-            f"GCH:invariant={_tsv(tmp_path / 'gi.tsv', 'early', seed=2)}",
-            f"HCG:variable={_tsv(tmp_path / 'hv.tsv', 'late', seed=3)}",
-            f"HCG:invariant={_tsv(tmp_path / 'hi.tsv', 'early', seed=4)}"]
+def _argv(d, out, contexts=("GCH", "HCG"), extra=None):
+    args = []
+    for ctx in contexts:
+        args += ["--background", f"{ctx}={d / 'all.bed'}",
+                 "--bin-set", f"{ctx}:variable={d / 'variable.bed'}",
+                 "--bin-set", f"{ctx}:invariant={d / 'invariant.bed'}"]
+    for name in _TRACKS:
+        args += ["--signal-track", f"{name}={d / (name + '.bedGraph')}"]
+    return args + ["--plot-format", "png", "--output-dir", str(out)] + (extra
+                                                                       or [])
 
 
 # --------------------------------------------------------------- unit tests --
 
-def test_label_parsing():
+def test_track_group_reads_the_conventional_suffix():
     m = _mod()
-    assert m._parse_enrichment("GCH:stable=/a/b.tsv") == ("GCH", "stable",
-                                                          "/a/b.tsv")
-    with pytest.raises(SystemExit, match="CONTEXT:SET"):
-        m._parse_enrichment("GCH_stable=/a/b.tsv")
-    with pytest.raises(SystemExit, match="CONTEXT:SET=PATH"):
-        m._parse_enrichment("GCH:stable")
+    assert m.track_group("Cas129_NPC_rep1_early") == "early"
+    assert m.track_group("F121_NPC_late") == "late"
+    assert m.track_group("GC_content") == "signal"
+    # A name that merely CONTAINS the word is not a timing track.
+    assert m.track_group("clearly_mapped") == "signal"
+    assert m.track_group("earlyish") == "signal"
 
 
-def test_track_groups_are_read_off_the_conventional_suffix():
+def test_track_group_override_wins():
     m = _mod()
-    df = pd.DataFrame({"annotation": _EARLY + _LATE + ["GC_content"]})
-    got = m.assign_groups(df.copy())
-    assert list(got.loc[got["annotation"].isin(_EARLY), "track_group"]) == \
-        ["early"] * 3
-    assert list(got.loc[got["annotation"].isin(_LATE), "track_group"]) == \
-        ["late"] * 3
-    assert got.loc[got["annotation"] == "GC_content", "track_group"].iloc[0] \
-        == "other"
+    assert m.track_group("G1b", {"G1b": "early"}) == "early"
 
 
-def test_a_name_that_merely_contains_early_is_not_matched():
-    """'earlyish' or 'clearly' must not be read as an early track."""
+def test_label_parsing_is_explicit_about_its_format():
     m = _mod()
-    df = pd.DataFrame({"annotation": ["clearly_mapped", "earlyish",
-                                      "sample.early"]})
-    got = m.assign_groups(df.copy())
-    assert list(got["track_group"]) == ["other", "other", "early"]
-
-
-def test_track_group_override():
-    m = _mod()
-    df = pd.DataFrame({"annotation": ["G1b", "G2", "unknown"]})
-    got = m.assign_groups(df.copy(), ["early=G1b", "late=G2"])
-    assert list(got["track_group"]) == ["early", "late", "other"]
-
-
-def test_interaction_signs_the_preference_per_set():
-    m = _mod()
-    rows = []
-    for bset, prefers in (("invariant", "early"), ("variable", "late")):
-        for t in _EARLY + _LATE:
-            hi = (t in _EARLY) == (prefers == "early")
-            rows.append({"context": "GCH", "bin_set": bset, "annotation": t,
-                         "auc": 0.7 if hi else 0.3})
-    inter = m.interaction(m.assign_groups(pd.DataFrame(rows)))
-    by = inter.set_index("bin_set")["contrast"]
-    assert by["invariant"] > 0.3, "prefers early -> positive"
-    assert by["variable"] < -0.3, "prefers late -> negative"
-    # Opposite signs IS the reversal the figure is about.
-    assert np.sign(by["invariant"]) != np.sign(by["variable"])
-
-
-def test_interaction_skips_a_set_missing_one_group():
-    m = _mod()
-    rows = [{"context": "GCH", "bin_set": "x", "annotation": t, "auc": 0.6}
-            for t in _EARLY]                        # early only, no late
-    assert m.interaction(m.assign_groups(pd.DataFrame(rows))).empty
-
-
-def test_interaction_reports_the_across_track_range_not_a_ci():
-    m = _mod()
-    rows = []
-    for t, auc in zip(_EARLY, (0.60, 0.70, 0.80)):
-        rows.append({"context": "GCH", "bin_set": "x", "annotation": t,
-                     "auc": auc})
-    for t in _LATE:
-        rows.append({"context": "GCH", "bin_set": "x", "annotation": t,
-                     "auc": 0.40})
-    r = m.interaction(m.assign_groups(pd.DataFrame(rows))).iloc[0]
-    assert r["min_auc_early"] == 0.60 and r["max_auc_early"] == 0.80
-    assert r["contrast"] == pytest.approx(0.70 - 0.40)
+    assert m._parse_labelled("GCH:stable=/a.bed", "--bin-set") == (
+        "GCH", "stable", "/a.bed")
+    with pytest.raises(SystemExit, match="CONTEXT:LABEL"):
+        m._parse_labelled("GCH_stable=/a.bed", "--bin-set")
 
 
 # --------------------------------------------------------------- end to end --
 
-def test_end_to_end_writes_the_panel_and_its_numbers(tmp_path):
+def test_the_reversal_is_recovered_in_the_table(tmp_path):
+    """The result the figure exists for: the invariant set above background in
+    early and below in late, the variable set the mirror image."""
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("scipy")
+    m = _mod()
+    d = _fixture(tmp_path / "in")
+    out = tmp_path / "o"
+    assert m.main(_argv(d, out)) == 0
+    st = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t")
+    assert len(st) == 24, "2 contexts x 6 tracks x 2 sets"
+    for (grp, bset), sub in st.groupby(["track_group", "bin_set"]):
+        d_mean = sub["difference_of_means"]
+        expect_up = (grp == "early") == (bset == "invariant")
+        assert (d_mean > 0).all() == expect_up, (grp, bset, d_mean.tolist())
+
+
+def test_the_figure_is_one_panel_per_group_and_context(tmp_path):
     pytest.importorskip("matplotlib")
     m = _mod()
+    d = _fixture(tmp_path / "in")
     out = tmp_path / "o"
-    assert m.main([a for s in _four(tmp_path) for a in ("--enrichment", s)]
-                  + ["--plot-format", "png", "--output-dir", str(out)]) == 0
+    assert m.main(_argv(d, out)) == 0
     assert (out / "bin_set_signal_summary.png").exists()
-    long = pd.read_csv(out / "bin_set_signal_long.tsv", sep="\t")
-    assert len(long) == 24, "4 set/context combinations x 6 tracks"
-    assert set(long["track_group"]) == {"early", "late"}
-    inter = pd.read_csv(out / "bin_set_signal_interaction.tsv", sep="\t")
-    assert len(inter) == 4
-    # The claim, in four numbers: invariant positive, variable negative, in
-    # both contexts.
-    for _, r in inter.iterrows():
-        assert (r["contrast"] > 0) == (r["bin_set"] == "invariant"), r.to_dict()
 
 
-def test_an_old_tsv_without_the_auc_says_what_to_re_run(tmp_path):
+def test_tracks_keep_their_own_units(tmp_path):
+    """No z-scoring, no common axis: the late tracks are ~40x the early ones
+    and the table must still report them in their own scale."""
+    pytest.importorskip("matplotlib")
     m = _mod()
-    old = tmp_path / "old.tsv"
-    pd.DataFrame([{"annotation": "F121_NPC_early", "mean_signal_fg": 1.0,
-                   "mean_signal_bg": 0.9, "difference": 0.1,
-                   "pvalue": 1e-9, "fdr": 1e-8}]).to_csv(
-        old, sep="\t", index=False)
-    with pytest.raises(SystemExit, match="not comparable between tracks"):
-        m.main(["--enrichment", f"GCH:stable={old}",
+    d = _fixture(tmp_path / "in")
+    out = tmp_path / "o"
+    assert m.main(_argv(d, out)) == 0
+    st = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t")
+    early = st[st["track_group"] == "early"]["mean_background"].mean()
+    late = st[st["track_group"] == "late"]["mean_background"].mean()
+    assert late > 20 * early
+
+
+def test_background_excludes_the_set_being_tested(tmp_path):
+    """Otherwise the set sits on both sides and the difference shrinks."""
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    d = _fixture(tmp_path / "in")
+    out = tmp_path / "o"
+    assert m.main(_argv(d, out, contexts=("GCH",))) == 0
+    st = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t")
+    allb = pd.read_csv(d / "all.bed", sep="\t")
+    for _, r in st.iterrows():
+        n_set = int(allb["stable" if r["bin_set"] == "invariant"
+                         else "selected"].sum())
+        assert r["n_set"] == n_set
+        assert r["n_background"] == len(allb) - n_set
+
+
+def test_a_set_off_the_background_grid_is_reported(tmp_path, caplog):
+    import logging
+    pytest.importorskip("matplotlib")
+    m = _mod()
+    d = _fixture(tmp_path / "in")
+    off = pd.read_csv(d / "invariant.bed", sep="\t")
+    off["start"] += 1                       # same region, wrong grid
+    off["end"] += 1
+    off.to_csv(d / "off.bed", sep="\t", index=False)
+    out = tmp_path / "o"
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(SystemExit, match="no bin overlaps"):
+            m.main(["--background", f"GCH={d / 'all.bed'}",
+                    "--bin-set", f"GCH:x={d / 'off.bed'}",
+                    "--signal-track", f"e={d / (_TRACKS[0] + '.bedGraph')}",
+                    "--plot-format", "png", "--output-dir", str(out)])
+    assert "not in the GCH background" in caplog.text
+
+
+def test_a_bin_set_needs_a_background_for_its_context(tmp_path):
+    m = _mod()
+    d = _fixture(tmp_path / "in")
+    with pytest.raises(SystemExit, match="no --background HCG"):
+        m.main(["--background", f"GCH={d / 'all.bed'}",
+                "--bin-set", f"HCG:x={d / 'invariant.bed'}",
+                "--signal-track", f"e={d / (_TRACKS[0] + '.bedGraph')}",
                 "--output-dir", str(tmp_path / "o")])
 
 
-def test_tracks_in_neither_group_are_kept_but_warned_about(tmp_path):
+def test_ungrouped_tracks_still_plot(tmp_path):
+    """A track with no early/late token is its own row, not an error."""
     pytest.importorskip("matplotlib")
     m = _mod()
-    df = pd.read_csv(_tsv(tmp_path / "a.tsv", "early"), sep="\t")
-    df.loc[len(df)] = {**df.iloc[0].to_dict(), "annotation": "GC_content"}
-    df.to_csv(tmp_path / "a.tsv", sep="\t", index=False)
+    d = _fixture(tmp_path / "in")
     out = tmp_path / "o"
-    assert m.main(["--enrichment", f"GCH:stable={tmp_path / 'a.tsv'}",
+    assert m.main(["--background", f"GCH={d / 'all.bed'}",
+                   "--bin-set", f"GCH:invariant={d / 'invariant.bed'}",
+                   "--signal-track", f"GC_content={d / (_TRACKS[0] + '.bedGraph')}",
                    "--plot-format", "png", "--output-dir", str(out)]) == 0
-    long = pd.read_csv(out / "bin_set_signal_long.tsv", sep="\t")
-    assert (long["track_group"] == "other").sum() == 1
-    inter = pd.read_csv(out / "bin_set_signal_interaction.tsv", sep="\t")
-    assert inter.iloc[0]["n_early"] == 3, "the stray track is not counted in"
+    st = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t")
+    assert set(st["track_group"]) == {"signal"}
+    assert (out / "bin_set_signal_summary.png").exists()
 
 
 def test_runs_as_a_subprocess(tmp_path):
     pytest.importorskip("matplotlib")
-    args = [a for s in _four(tmp_path) for a in ("--enrichment", s)]
-    r = subprocess.run([sys.executable, str(_SCRIPT)] + args
-                       + ["--plot-format", "png",
-                          "--output-dir", str(tmp_path / "o")],
+    d = _fixture(tmp_path / "in")
+    r = subprocess.run([sys.executable, str(_SCRIPT)]
+                       + _argv(d, tmp_path / "o"),
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert "contrast" in r.stderr
+    assert "median" in r.stderr
