@@ -9,8 +9,23 @@ Answers whether accessibility coordination and methylation coordination pick
 out the SAME regions -- a bin-level question, which is why the cells are
 collapsed rather than correlated within bins.
 
-TWO COMPANION VIEWS, because collapsing the cells first can hide the answer
---------------------------------------------------------------------------
+WHAT CAN AND CANNOT BE ASKED OF THIS DATA
+----------------------------------------
+Two identities hold exactly for any pair of binary ends with marginals p1, p2:
+
+    pi_open - pi_closed  = p1 + p2 - 1
+    O_open - E_open      = O_closed - E_closed  = Cov
+
+The second says coordination has no direction of its own -- the excess of
+co-open pairs over chance and the excess of co-closed pairs over chance are the
+SAME NUMBER -- and the first says whatever direction is seen is the level.  So
+"co-open coordination versus co-closed coordination" is not a third degree of
+freedom, and any classification of BINS into co-open and co-closed is a
+classification by level under another name.  The views below are built around
+that rather than against it.
+
+COMPANION VIEWS
+---------------
 * PER-BIN ACROSS-CELL CORRELATION (--per-bin-correlation, on by default).  For
   each bin, the paired (GCH, HCG) values across cells give one Pearson r and
   one Spearman rho; the genome-wide density of those values says whether the
@@ -31,15 +46,26 @@ TWO COMPANION VIEWS, because collapsing the cells first can hide the answer
   relationship at all, so a count scale would show the margins rather than the
   association.  Cells whose expected count is under 5 keep their numbers but
   are not tested.  A state is assigned only when a bin's cells agree on a sign
-  (one-sample t, BH-adjusted); otherwise it is 'mixed'.
-* STATE SLOPE (also on by default).  The same comparison without the rounding:
-  each bin is one line from its GCH z-score to its HCG z-score, so a bin that
-  sits just inside a state boundary is drawn where it is rather than in a
-  corner, and the thick lines show where each GCH state lands on average.  It
-  needs no reference and no threshold -- a z-score is already measured against
-  the genome, and the common offset that broke every absolute rule cannot move
-  it.  --state-flow-style picks any of heatmap / slope / flow.
-
+  (one-sample t, BH-adjusted); otherwise it is 'mixed'.  Read it knowing the
+  margins are set by each mark's level; only the enrichment is informative.
+* CO-STATE BY (CELL, BIN) (--costate-table, on by default).  The one that
+  answers "how many co-open are co-unmethylated" without the confound.  Every
+  (cell, bin) observation is classified from its own components -- co-high if
+  C > 0 and F > 0.5, co-low if C > 0 and F < 0.5, mixed if there is no
+  coordination to give a direction -- and the 3x3 is counted STRATIFIED BY BIN.
+  Within one bin the level is fixed, so what varies across cells is which cells
+  are locally co-open, and the Mantel-Haenszel odds ratio pools those
+  within-bin comparisons.  The crude and stratified ORs are shown side by side:
+  the gap between them is the part of the naive answer that was level.
+  --costate-stratify bin-batch splits the strata by batch too, since batch is a
+  CELL property and survives stratifying by bin alone.  CIs come from a
+  cell-level bootstrap -- one cell appears in every bin, so millions of rows
+  rest on ~1,500 independent units.
+* LEVEL GRID (--level-grid, on by default).  Accepts that direction is level
+  and asks what that leaves open: given a bin's accessibility level and its
+  methylation level, how STRONG is its coordination?  Level on both axes in
+  quantile bands, mean C in the cells.  No co-state call anywhere in it, so no
+  level confound in disguise.
 Give it the D pair, the C pair, or both; one figure per pair:
 
     python scripts/gch_hcg_concordance_scatter.py \\
@@ -475,6 +501,30 @@ def expected_directional(marginal, coordination):
     return np.asarray(coordination, dtype=float) * (2.0 * ef - 1.0)
 
 
+def _components(gch_path, hcg_path, stat_key):
+    """The marginal / coordination / direction siblings for both contexts.
+
+    All three come from beside the given parquet, as the pipeline writes them.
+    Missing components are a skip with a named reason rather than a crash: the
+    scatter itself does not need them.
+    """
+    out = {}
+    for ctx, path in (("GCH", gch_path), ("HCG", hcg_path)):
+        got = {}
+        for kind in ("marginal", "coordination", "direction"):
+            cand = Path(path).with_name(f"concordance_{kind}.parquet")
+            if not cand.exists():
+                logger.warning(
+                    f"{stat_key}: no concordance_{kind}.parquet beside {path} — "
+                    f"skipping the (cell, bin) co-state table and the level "
+                    f"grid, which are built from the components rather than "
+                    f"from {Path(path).name}.")
+                return None
+            got[kind] = _load(str(cand))
+        out[ctx] = got
+    return out
+
+
 def _sibling_components(path, name):
     """The marginal and coordination parquets written beside a directional one."""
     out = {}
@@ -706,108 +756,176 @@ def _association(tab: pd.DataFrame, total: int) -> str:
     return f"Cramér's V = {v:.3f}, {_fmt_p(pval)}"
 
 
-def _zscore(v):
-    """Standardise across BINS, so a value means "relative to the typical bin".
+def costate_figure(tab, boot, stat_key, out_path, args, n_strata_used):
+    """The (cell, bin) 3x3, its stratified enrichment, and crude vs MH.
 
-    This is what makes the two contexts comparable on one axis, and it does the
-    job the state reference had to do discretely: a z-score is already measured
-    against the genome, so no threshold has to be chosen and no reference bias
-    can move every bin the same way (a common offset has no effect on z at all).
-    """
-    v = np.asarray(v, float)
-    ok = np.isfinite(v)
-    if ok.sum() < 3:
-        return np.full(v.shape, np.nan)
-    mu, sd = np.nanmean(v[ok]), np.nanstd(v[ok])
-    return (v - mu) / sd if sd > 0 else np.full(v.shape, np.nan)
-
-
-def slope_figure(g_mean, h_mean, g_lab, stat_key, out_path, args):
-    """One line per bin, from its GCH z-score to its HCG z-score.
-
-    The 3x3 table answers "how many bins move from A to B" after committing to
-    three states; this keeps every bin's position and shows the same thing
-    continuously, so a bin that sits just inside a state boundary is drawn
-    where it actually is rather than rounded to a corner.  Lines are coloured
-    by the bin's GCH state, so the two figures can be read against each other.
+    Colour is log2(observed / STRATIFIED expected): the expectation is summed
+    from each stratum's own margins, so it is the excess that survives holding
+    the bin (and optionally the batch) fixed.  Colouring by the unstratified
+    expectation would put the level confound straight back into the picture.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.collections import LineCollection
+    from nome_hic_concordance import costate as cs
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
-    zg, zh = _zscore(g_mean), _zscore(h_mean)
-    ok = np.isfinite(zg) & np.isfinite(zh)
-    if ok.sum() < 10:
-        logger.warning(f"{stat_key}: too few bins for the slope figure.")
+    O = tab.sum(axis=0).astype(float)
+    total = O.sum()
+    if total == 0:
+        logger.warning(f"{stat_key}: no usable (cell, bin) observations.")
         return None
-    zg, zh, lab = zg[ok], zh[ok], np.asarray(g_lab, dtype=object)[ok]
+    # Stratified expectation: sum_i row_i(s) col_j(s) / n(s) over strata s.
+    rows = tab.sum(axis=2).astype(float)
+    cols = tab.sum(axis=1).astype(float)
+    n_s = tab.sum(axis=(1, 2)).astype(float)
+    ok_s = n_s > 0
+    E = np.einsum("si,sj->ij", rows[ok_s] / n_s[ok_s, None], cols[ok_s])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log2r = np.where((O > 0) & (E > 0), np.log2(O / E), np.nan)
+    lim = min(max(float(np.nanmax(np.abs(log2r))) if np.isfinite(log2r).any()
+                  else 0.5, 0.3), 2.0)
 
-    fig, ax = plt.subplots(figsize=(6.8, 6.6))
-    # A LineCollection rather than thousands of plot() calls: at ~10k bins the
-    # per-artist overhead is the whole runtime of the figure.
-    idx = np.arange(zg.size)
-    if args.slope_max_lines and zg.size > args.slope_max_lines:
-        # DRAWING only -- every summary below still uses every bin.
-        idx = np.random.default_rng(args.random_seed if hasattr(
-            args, "random_seed") else 42).choice(
-            zg.size, args.slope_max_lines, replace=False)
-    segs = np.stack([np.column_stack([np.zeros(idx.size), zg[idx]]),
-                     np.column_stack([np.ones(idx.size), zh[idx]])], axis=1)
-    cols = [_STATE_COLOR.get(s, "#B8BDC4") for s in lab[idx]]
-    ax.add_collection(LineCollection(segs, colors=cols, linewidths=0.35,
-                                     alpha=0.10, zorder=1))
+    fig, axes = plt.subplots(1, 3, figsize=(16.2, 5.1),
+                             gridspec_kw={"width_ratios": [1.25, 1, 1]})
+    ax = axes[0]
+    im = ax.imshow(np.where(np.isfinite(log2r), log2r, 0.0), cmap="RdBu_r",
+                   vmin=-lim, vmax=lim, aspect="auto")
+    for i in range(3):
+        for j in range(3):
+            shade = (abs(log2r[i, j]) / lim if np.isfinite(log2r[i, j]) else 0)
+            colr = "white" if shade > 0.65 else "#111827"
+            row_n = rows.sum(axis=0)[i]
+            pr = (f"{100 * O[i, j] / row_n:.1f}% of row" if row_n
+                  else "row empty")
+            ax.text(j, i - 0.12, f"{int(O[i, j]):,}", ha="center", va="center",
+                    fontsize=11.5, color=colr, fontweight="bold")
+            ax.text(j, i + 0.16, f"{100 * O[i, j] / total:.1f}% of all\n{pr}",
+                    ha="center", va="center", fontsize=8.0, color=colr)
+    ax.set_xticks(range(3))
+    ax.set_xticklabels([f"{s}\n{int(c):,}" for s, c in
+                        zip(cs.HCG_STATES, cols.sum(axis=0))], fontsize=8.6)
+    ax.set_yticks(range(3))
+    ax.set_yticklabels([f"{s}\n{int(r):,}" for s, r in
+                        zip(cs.GCH_STATES, rows.sum(axis=0))], fontsize=8.6)
+    ax.set_xlabel("HCG–HCG co-state of that cell at that bin")
+    ax.set_ylabel("GCH–GCH co-state")
+    ax.set_xticks(np.arange(-.5, 3, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, 3, 1), minor=True)
+    ax.grid(which="minor", color="white", lw=2)
+    ax.tick_params(which="minor", length=0)
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    cb.set_label("log$_2$(observed / stratified expected)", fontsize=8.6)
+    ax.set_title(f"{int(total):,} (cell, bin) observations", fontsize=10.5)
 
-    # The readable signal through the hairball: where each GCH state ends up.
-    rows = []
-    for st in _GCH_STATES:
-        m = lab == st
-        if m.sum() < 3:
-            continue
-        gm, hm = float(np.mean(zg[m])), float(np.mean(zh[m]))
-        se = float(np.std(zh[m]) / np.sqrt(m.sum()))
-        ax.plot([0, 1], [gm, hm], color=_STATE_COLOR[st], lw=3.0, zorder=3,
-                solid_capstyle="round",
-                label=f"{st}  (n={int(m.sum()):,}) → {hm:+.2f}")
-        ax.errorbar([1], [hm], yerr=[1.96 * se], color=_STATE_COLOR[st],
-                    capsize=4, lw=2.0, zorder=4)
-        rows.append({"gch_state": st, "n": int(m.sum()), "mean_gch_z": gm,
-                     "mean_hcg_z": hm, "sem_hcg_z": se})
+    # Crude against stratified: the gap IS the level confound.
+    ax = axes[1]
+    crude = cs.odds_ratio(tab)
+    mh = cs.mantel_haenszel(tab)
+    ys, labs = [], []
+    for k, (name, est) in enumerate((("crude (pooled)", crude),
+                                     ("stratified (MH)", mh))):
+        ci = (boot or {}).get("crude" if k == 0 else "mh")
+        ax.plot([est], [k], "o", ms=9, color="#B0453A" if k == 0 else "#1F6F8B",
+                zorder=3)
+        if ci:
+            ax.plot([ci[0], ci[1]], [k, k], lw=2.5,
+                    color="#B0453A" if k == 0 else "#1F6F8B", zorder=2)
+        ys.append(k)
+        labs.append(f"{name}\nOR = {est:.2f}"
+                    + (f"  [{ci[0]:.2f}, {ci[1]:.2f}]" if ci else ""))
+    ax.axvline(1.0, color="#9AA0A6", lw=1.0, ls="--")
+    ax.set_yticks(ys)
+    ax.set_yticklabels(labs, fontsize=9)
+    ax.set_ylim(-0.6, 1.6)
+    ax.set_xscale("log")
+    ax.set_xlabel("odds ratio: co-open × co-unmethylated\n(and co-closed × "
+                  "co-methylated) over the cross pairings")
+    ax.set_title(f"{n_strata_used:,} strata "
+                 f"({'bin × batch' if args.costate_stratify == 'bin-batch' else 'bin'})",
+                 fontsize=10.5)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
 
-    for x, v in ((0, zg), (1, zh)):
-        parts = ax.violinplot([v], positions=[x], widths=0.22,
-                              showextrema=False, showmedians=True)
-        for b in parts["bodies"]:
-            b.set_facecolor("#9AA0A6")
-            b.set_alpha(0.30)
-        parts["cmedians"].set_color("#374151")
-    ax.axhline(0, color="#C9CED6", lw=0.9, zorder=0)
-    ax.set_xlim(-0.35, 1.35)
-    ax.set_xticks([0, 1])
-    ax.set_xticklabels(["GCH–GCH\n(co-closed ← → co-open)",
-                        "HCG–HCG\n(co-unmethylated ← → co-methylated)"],
-                       fontsize=9.5)
-    ax.set_ylabel("z-score across bins, per context")
-    r = correlations(zg, zh)
-    ax.set_title(f"{stat_key}: each bin's relative state in both contexts",
-                 fontsize=11.5, pad=18)
-    ax.annotate(f"{int(ok.sum()):,} bins   ·   {caption(r)}"
-                + ("" if idx.size == zg.size else
-                   f"   ·   {idx.size:,} lines drawn, all bins summarised"),
-                xy=(0.5, 1.0), xytext=(0, 4), xycoords="axes fraction",
-                textcoords="offset points", ha="center", va="bottom",
-                fontsize=8.2, color="#4B5563")
-    ax.legend(fontsize=8.2, frameon=False, loc="upper center",
-              bbox_to_anchor=(0.5, -0.09), ncol=3)
+    ax = axes[2]
+    lor = cs.per_stratum_log_or(tab)
+    lor = lor[np.isfinite(lor)]
+    if lor.size:
+        ax.hist(lor, bins=40, color="#1F6F8B", alpha=0.75)
+        ax.axvline(0, color="#9AA0A6", lw=1.0, ls="--")
+        ax.axvline(float(np.median(lor)), color="#B0453A", lw=1.8,
+                   label=f"median {np.median(lor):+.2f}  "
+                         f"({100 * np.mean(lor > 0):.0f}% > 0)")
+        ax.legend(fontsize=8.4, frameon=False)
+    ax.set_xlabel("log odds ratio within one stratum")
+    ax.set_ylabel("strata")
+    ax.set_title("is it every stratum, or a few?", fontsize=10.5)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
+
+    p = (boot or {}).get("mh")
+    fig.suptitle(f"{stat_key}: cross-mark co-state of the same cell at the "
+                 f"same bin" + (f"   (MH OR = {mh:.2f}, {_fmt_p(p[2])})"
+                                if p else f"   (MH OR = {mh:.2f})"),
+                 fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
-    return {"n_bins": int(ok.sum()), "pearson_r": r["pearson_r"],
-            "spearman_rho": r["spearman_rho"], "by_state": rows,
-            "z_gch": zg, "z_hcg": zh, "bin_ok": ok}
+    return {"n_obs": int(total), "crude_or": crude, "mh_or": mh,
+            "n_strata": int(n_strata_used),
+            "frac_strata_positive": (float(np.mean(lor > 0)) if lor.size
+                                     else np.nan)}
+
+
+def level_grid_figure(grid, names, stat_key, out_path, args):
+    """Level x level, coloured by coordination strength.
+
+    The honest use of the identity that direction IS level: stop calling it
+    direction, put level on both axes, and ask what the coordination MAGNITUDE
+    does across that grid.  Nothing here is a co-state call, so nothing here
+    can be a level confound in disguise.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
+    xb = list(dict.fromkeys(grid["x_band"]))
+    yb = list(dict.fromkeys(grid["y_band"]))
+    fig, axes = plt.subplots(1, len(names), figsize=(6.2 * len(names), 5.4),
+                             squeeze=False)
+    for ax, (key, pretty) in zip(axes[0], names.items()):
+        M = np.full((len(xb), len(yb)), np.nan)
+        N = np.zeros_like(M)
+        for _, r in grid.iterrows():
+            M[xb.index(r["x_band"]), yb.index(r["y_band"])] = r[f"mean_{key}"]
+            N[xb.index(r["x_band"]), yb.index(r["y_band"])] = r["n_bins"]
+        im = ax.imshow(M, cmap="viridis", aspect="auto")
+        finite = M[np.isfinite(M)]
+        mid = (finite.max() + finite.min()) / 2 if finite.size else 0
+        for i in range(len(xb)):
+            for j in range(len(yb)):
+                if not np.isfinite(M[i, j]):
+                    continue
+                sem = grid[(grid.x_band == xb[i])
+                           & (grid.y_band == yb[j])][f"sem_{key}"].iloc[0]
+                ax.text(j, i, f"{M[i, j]:.3g}\n±{sem:.2g}\nn={int(N[i, j]):,}",
+                        ha="center", va="center", fontsize=8.4,
+                        color="white" if M[i, j] < mid else "#111827")
+        ax.set_xticks(range(len(yb)))
+        ax.set_xticklabels(yb)
+        ax.set_yticks(range(len(xb)))
+        ax.set_yticklabels(xb)
+        ax.set_xlabel("HCG methylation level (per-bin mean, quantile band)")
+        ax.set_ylabel("GCH accessibility level (per-bin mean, quantile band)")
+        ax.set_title(pretty, fontsize=10.5)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    fig.suptitle(f"{stat_key}: coordination strength across the two levels",
+                 fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return True
 
 
 def flow_figure(tab: pd.DataFrame, stat_key, out_path, args):
@@ -972,25 +1090,16 @@ def main(argv=None) -> int:
                          "are read off directly.  Directional only — for C the "
                          "sign is concordant vs anti-concordant, not open vs "
                          "closed, so it is skipped unless --state-flow-c on.")
-    ap.add_argument("--state-flow-style", default="heatmap,slope",
-                    help="Comma-separated, any of heatmap / slope / flow "
-                         "(default 'heatmap,slope'; 'all' for every one).  "
+    ap.add_argument("--state-flow-style", default="heatmap",
+                    help="Comma-separated, any of heatmap / flow "
+                         "(default 'heatmap'; 'all' for both).  "
                          "'heatmap' is the 3x3 table coloured by "
                          "log2(observed/expected) under independence — "
                          "colouring by the COUNT would show the margins, since "
                          "with both marks far off 50% the co-closed x "
                          "co-methylated cell is the largest under no "
-                         "relationship at all.  'slope' connects each BIN "
-                         "between its GCH and HCG z-scores, keeping the "
-                         "continuous position instead of rounding it to a "
-                         "state, and needing no reference or threshold at all "
-                         "(a z-score is already measured against the genome, "
-                         "and a common offset cannot move it).  'flow' is the "
+                         "relationship at all.  'flow' is the "
                          "stacked bars with ribbons.")
-    ap.add_argument("--slope-max-lines", type=int, default=4000,
-                    help="Draw at most this many bin lines in the slope figure "
-                         "(0 = all).  A DRAWING limit only: every summary line, "
-                         "correlation and table still uses every bin.")
     ap.add_argument("--state-flow-c", choices=["on", "off"], default="off",
                     help="Draw the state flow for C too.  Off by default "
                          "because C's sign does not mean open vs closed.")
@@ -1026,6 +1135,41 @@ def main(argv=None) -> int:
     ap.add_argument("--state-fdr", type=float, default=0.05)
     ap.add_argument("--state-threshold", type=float, default=0.0,
                     help="Only with --state-rule threshold.")
+    ap.add_argument("--costate-table", choices=["on", "off"], default="on",
+                    help="The 3x3 of GCH co-state against HCG co-state over "
+                         "(CELL, BIN) observations, stratified by bin.  This is "
+                         "the one that answers 'how many co-open are "
+                         "co-unmethylated' without a level confound: within a "
+                         "bin the level is fixed, so what varies across cells "
+                         "is which cells are locally co-open, and the "
+                         "Mantel-Haenszel odds ratio pools those within-bin "
+                         "comparisons.  Needs the coordination and direction "
+                         "components beside the --gch-*/--hcg-* parquets.")
+    ap.add_argument("--costate-stratify", choices=["bin", "bin-batch"],
+                    default="bin",
+                    help="'bin-batch' splits each stratum by batch as well, so "
+                         "the association is only measured between cells "
+                         "processed together — batch is a CELL property and "
+                         "survives stratifying by bin alone.  Needs "
+                         "--batch-column.")
+    ap.add_argument("--costate-min-coordination", type=float, default=0.0,
+                    help="A (cell, bin) needs C above this to be given a "
+                         "direction at all; below it there is no coordination "
+                         "for a direction to describe and it counts as mixed.")
+    ap.add_argument("--costate-bootstrap", type=int, default=200,
+                    help="Cell-level bootstrap resamples for the odds-ratio CIs "
+                         "(0 disables).  Cells, not observations: one cell "
+                         "appears in every bin, so millions of rows rest on "
+                         "~1,500 independent units.")
+    ap.add_argument("--level-grid", choices=["on", "off"], default="on",
+                    help="Level x level grid coloured by mean coordination C. "
+                         "Since the direction of coordination IS the marginal "
+                         "level (pi_open - pi_closed = p1 + p2 - 1 exactly), "
+                         "this asks the question that phrasing leaves open: "
+                         "given a bin's accessibility and methylation levels, "
+                         "how STRONG is its long-range coordination?")
+    ap.add_argument("--level-bins", type=int, default=3,
+                    help="Quantile bands per axis of that grid (3 = terciles).")
     ap.add_argument("--density", action="store_true", default=True,
                     help="Colour points by local density (default on).")
     ap.add_argument("--no-density", dest="density", action="store_false")
@@ -1047,12 +1191,19 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     excl = {c.strip() for c in args.exclude_chrom.split(",") if c.strip()}
 
-    needs_batch = args.batch_correction != "none" or args.per_batch_check
+    needs_batch = (args.batch_correction != "none"
+                   or args.per_batch_check
+                   or args.costate_stratify == "bin-batch"
+                   # The permuted null for the per-bin correlation is
+                   # stronger when it can shuffle WITHIN batch.
+                   or (args.per_bin_correlation == "on"
+                       and bool(args.batch_column)))
     batch = None
     if needs_batch:
         if not (args.samples and args.batch_column):
-            raise SystemExit("--batch-correction / --per-batch-check need "
-                             "--samples and --batch-column.")
+            raise SystemExit("--batch-correction / --per-batch-check / "
+                             "--costate-stratify bin-batch need --samples and "
+                             "--batch-column.")
         batch = batch_series(args.samples, args.cell_column, args.batch_column)
 
     for stat_key, gch_path, hcg_path in pairs:
@@ -1159,11 +1310,11 @@ def main(argv=None) -> int:
             styles = {t.strip() for t in args.state_flow_style.split(",")
                       if t.strip()}
             if "all" in styles:
-                styles = {"heatmap", "slope", "flow"}
-            unknown = styles - {"heatmap", "slope", "flow"}
+                styles = {"heatmap", "flow"}
+            unknown = styles - {"heatmap", "flow"}
             if unknown:
                 raise SystemExit(f"--state-flow-style: unknown {sorted(unknown)}"
-                                 f"; pick from heatmap, slope, flow, all.")
+                                 f"; pick from heatmap, flow, all.")
             info = None
             if "heatmap" in styles:
                 hpath = (out_dir /
@@ -1193,26 +1344,6 @@ def main(argv=None) -> int:
                         out_dir / f"{stat_key}_state_table_enrichment.tsv",
                         sep="\t", index=False, na_rep="NA")
                     logger.info(f"{stat_key}: wrote {hpath}")
-            if "slope" in styles:
-                spath = out_dir / f"{stat_key}_state_slope.{args.plot_format}"
-                sl = slope_figure(g_mean, h_mean, g_lab, stat_key, spath, args)
-                if sl:
-                    zg = np.full(len(G.columns), np.nan)
-                    zh = np.full(len(G.columns), np.nan)
-                    zg[sl["bin_ok"]] = sl["z_gch"]
-                    zh[sl["bin_ok"]] = sl["z_hcg"]
-                    pd.DataFrame({"bin": G.columns, "gch_state": g_lab,
-                                  "hcg_state": h_lab, "gch_z": zg,
-                                  "hcg_z": zh, "delta_z": zh - zg}).to_csv(
-                        out_dir / f"{stat_key}_state_slope_z.tsv",
-                        sep="\t", index=False, na_rep="NA")
-                    logger.info(
-                        f"{stat_key}: slope {sl['n_bins']:,} bins, "
-                        f"z Pearson r = {sl['pearson_r']:+.3f}, "
-                        f"Spearman ρ = {sl['spearman_rho']:+.3f}; "
-                        + ", ".join(f"{r['gch_state']} → mean HCG z "
-                                    f"{r['mean_hcg_z']:+.2f}"
-                                    for r in sl["by_state"]))
             if "flow" in styles:
                 fpath = out_dir / f"{stat_key}_state_flow.{args.plot_format}"
                 info = flow_figure(tab, stat_key, fpath, args) or info
@@ -1220,6 +1351,91 @@ def main(argv=None) -> int:
                 logger.info(f"{stat_key}: {info['n_bins']:,} bins classified, "
                             f"canonical {100 * info['canonical_frac']:.1f}%, "
                             f"{info['association']}")
+
+        # ---- (cell, bin) co-state, stratified by bin -----------------------
+        comps = None
+        if args.costate_table == "on" or args.level_grid == "on":
+            comps = _components(gch_path, hcg_path, stat_key)
+        if args.costate_table == "on" and comps:
+            from nome_hic_concordance import costate as cs
+            G0, _ = _aligned(gch, hcg)
+            al = lambda d: d.reindex(index=G0.index,           # noqa: E731
+                                     columns=G0.columns).to_numpy(float)
+            g_code = cs.costate_codes(al(comps["GCH"]["coordination"]),
+                                      al(comps["GCH"]["direction"]),
+                                      args.costate_min_coordination)
+            h_code = cs.costate_codes(al(comps["HCG"]["coordination"]),
+                                      al(comps["HCG"]["direction"]),
+                                      args.costate_min_coordination)
+            bcodes = None
+            if args.costate_stratify == "bin-batch":
+                if batch is None:
+                    raise SystemExit("--costate-stratify bin-batch needs "
+                                     "--samples and --batch-column.")
+                from nome_hic_concordance.batch_correction import (
+                    _coerce_batch_df, _composite_label)
+                lab = _composite_label(_coerce_batch_df(batch, G0.index))
+                bcodes = pd.factorize(lab.reindex(G0.index))[0]
+            tab = cs.stratified_counts(g_code, h_code, batch_codes=bcodes)
+            used = int(np.sum(tab.sum(axis=(1, 2)) > 0))
+            boot = cs.bootstrap_ors(g_code, h_code, args.costate_bootstrap,
+                                    args.random_seed if hasattr(
+                                        args, "random_seed") else 42, bcodes)
+            cpath = (out_dir /
+                     f"{stat_key}_costate_by_cell.{args.plot_format}")
+            ci = costate_figure(tab, boot, stat_key, cpath, args, used)
+            if ci:
+                pooled = tab.sum(axis=0)
+                pd.DataFrame(
+                    [{"gch_state": cs.GCH_STATES[i],
+                      "hcg_state": cs.HCG_STATES[j],
+                      "n_observations": int(pooled[i, j])}
+                     for i in range(3) for j in range(3)]).to_csv(
+                    out_dir / f"{stat_key}_costate_by_cell_counts.tsv",
+                    sep="\t", index=False)
+                pd.DataFrame({"log_or": cs.per_stratum_log_or(tab)}).to_csv(
+                    out_dir / f"{stat_key}_costate_per_stratum.tsv",
+                    sep="\t", index=False, na_rep="NA")
+                mhci = (boot or {}).get("mh")
+                logger.info(
+                    f"{stat_key}: {ci['n_obs']:,} (cell, bin) observations in "
+                    f"{used:,} strata — crude OR {ci['crude_or']:.2f}, "
+                    f"Mantel-Haenszel OR {ci['mh_or']:.2f}"
+                    + (f" [{mhci[0]:.2f}, {mhci[1]:.2f}] {_fmt_p(mhci[2])}"
+                       if mhci else "")
+                    + f"; {100 * ci['frac_strata_positive']:.0f}% of strata "
+                      f"positive → {cpath.name}")
+
+        # ---- level x level, coloured by coordination -----------------------
+        if args.level_grid == "on" and comps:
+            from nome_hic_concordance import costate as cs
+            G0, _ = _aligned(gch, hcg)
+            per_bin = lambda d: np.nanmean(                     # noqa: E731
+                d.reindex(index=G0.index, columns=G0.columns).to_numpy(float),
+                axis=0)
+            try:
+                grid, xe, ye = cs.level_grid(
+                    per_bin(comps["GCH"]["marginal"]),
+                    per_bin(comps["HCG"]["marginal"]),
+                    {"C_gch": per_bin(comps["GCH"]["coordination"]),
+                     "C_hcg": per_bin(comps["HCG"]["coordination"])},
+                    n_bins=args.level_bins,
+                    labels=(["closed", "mid", "open"]
+                            if args.level_bins == 3 else None))
+            except ValueError as exc:
+                logger.warning(f"{stat_key}: level grid skipped ({exc})")
+            else:
+                grid.to_csv(out_dir / f"{stat_key}_level_grid.tsv", sep="\t",
+                            index=False, na_rep="NA")
+                lpath = out_dir / f"{stat_key}_level_grid.{args.plot_format}"
+                level_grid_figure(
+                    grid, {"C_gch": "GCH–GCH coordination C",
+                           "C_hcg": "HCG–HCG coordination C"},
+                    stat_key, lpath, args)
+                logger.info(f"{stat_key}: level grid "
+                            f"({args.level_bins}x{args.level_bins}, cuts "
+                            f"GCH {np.round(xe, 3)}, HCG {np.round(ye, 3)}) "
+                            f"→ {lpath.name}")
     return 0
 
 

@@ -798,98 +798,117 @@ def test_quantile_rule_gives_the_table_balanced_margins(tmp_path):
     assert (canon["q"] < 0.001).all()
 
 
-# ---------------------------------------------------------------- slope view --
+# ------------------------------------------- (cell, bin) co-state + level grid --
 
-def test_zscore_is_immune_to_a_shift_or_a_rescale():
-    """Why the slope view needs no reference: a z-score is already measured
-    against the genome, so the offset that broke every threshold is gone."""
+def _with_components(tmp_path, n=80, nb=200, coupling=0.12, seed=0):
+    """A full component set per context, with the confound AND the signal.
+
+    Bins differ in level, which is the confound; within each bin the two marks
+    are coupled across cells through a shared latent, which is the signal.  A
+    crude table sees mostly the first; a bin-stratified one sees the second.
+    """
+    rng = np.random.default_rng(seed)
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    lvl_g = rng.uniform(0.1, 0.45, nb)
+    lvl_h = np.clip(1.0 - lvl_g + rng.normal(0, 0.05, nb), 0.05, 0.95)
+    z = rng.normal(0, 1, (n, nb))
+    for ctx, lvl, sgn in (("GCH", lvl_g, 1.0), ("HCG", lvl_h, -1.0)):
+        d = tmp_path / ctx
+        d.mkdir(exist_ok=True, parents=True)
+        F = np.clip(lvl + coupling * sgn * z + rng.normal(0, .04, (n, nb)),
+                    .01, .99)
+        C = np.abs(rng.normal(1.0, .2, (n, nb)))
+        for name, mat in (("directional", C * (2 * F - 1)),
+                          ("coordination", C), ("direction", F),
+                          ("marginal", np.tile(lvl, (n, 1)))):
+            pd.DataFrame(mat, index=cells, columns=bins).to_parquet(
+                d / f"concordance_{name}.parquet")
+    sp = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells,
+                  "exp_batch": ["b1", "b2"] * (n // 2)}).to_csv(
+        sp, sep="\t", index=False)
+    return (str(tmp_path / "GCH" / "concordance_directional.parquet"),
+            str(tmp_path / "HCG" / "concordance_directional.parquet"), str(sp))
+
+
+def _run_costate(tmp_path, sub, extra=None):
     m = _mod()
-    v = np.array([-3.0, -1.0, 0.0, 2.0, 5.0])
-    z = m._zscore(v)
-    np.testing.assert_allclose(m._zscore(v + 100.0), z, atol=1e-12)
-    np.testing.assert_allclose(m._zscore(v * 7.0), z, atol=1e-12)
-    assert abs(z.mean()) < 1e-12 and abs(z.std() - 1) < 1e-12
-    assert np.isnan(m._zscore(np.zeros(5))).all(), "no spread, no z"
+    gp, hp, sp = _with_components(tmp_path)
+    out = tmp_path / sub
+    assert m.main(["--gch-d", gp, "--hcg-d", hp, "--min-cells", "5",
+                   "--plot-format", "png", "--per-bin-correlation", "off",
+                   "--state-flow", "off", "--costate-bootstrap", "40",
+                   "--samples", sp, "--output-dir", str(out)]
+                  + (extra or [])) == 0
+    return out
 
 
-def test_slope_figure_reports_where_each_state_lands(tmp_path):
+def test_costate_table_answers_the_question_per_cell_and_bin(tmp_path):
+    out = _run_costate(tmp_path, "o")
+    assert (out / "D_costate_by_cell.png").exists()
+    counts = pd.read_csv(out / "D_costate_by_cell_counts.tsv", sep="\t")
+    assert len(counts) == 9
+    total = counts["n_observations"].sum()
+    assert total > 10000, "one observation per (cell, bin), not per bin"
+    # The canonical pairing dominates the co-open row, which is the sentence
+    # this figure exists to produce.
+    op = counts[counts.gch_state == "co-open"].set_index("hcg_state")
+    assert (op.loc["co-unmethylated", "n_observations"]
+            > op.loc["co-methylated", "n_observations"])
+    per = pd.read_csv(out / "D_costate_per_stratum.tsv", sep="\t")
+    assert len(per) == 200, "one row per bin stratum"
+
+
+def test_costate_is_skipped_with_a_reason_when_components_are_absent(tmp_path):
     m = _mod()
-    rng = np.random.default_rng(0)
-    nb = 300
-    zg = np.linspace(-2, 2, nb)
-    # Anti-coupled: the most co-open bins are the least co-methylated.
-    h = -0.8 * zg + rng.normal(0, 0.3, nb)
-    lab = np.where(zg > 0.7, "co-open",
-                   np.where(zg < -0.7, "co-closed", "mixed"))
-    out = tmp_path / "s.png"
-    info = m.slope_figure(zg, h, lab, "D", out, _SlopeArgs())
-    assert out.exists()
-    assert info["n_bins"] == nb
-    assert info["pearson_r"] < -0.8
-    by = {r["gch_state"]: r for r in info["by_state"]}
-    # co-open ends up LOW on the HCG axis and co-closed high — the canonical
-    # pairing, read off a continuous scale instead of a 3x3 table.
-    assert by["co-open"]["mean_hcg_z"] < by["mixed"]["mean_hcg_z"]
-    assert by["mixed"]["mean_hcg_z"] < by["co-closed"]["mean_hcg_z"]
-
-
-class _SlopeArgs:
-    slope_max_lines = 0
-    random_seed = 42
-
-
-def test_slope_line_cap_is_drawing_only(tmp_path):
-    """Subsampling may thin the hairball but must not change a number."""
-    m = _mod()
-    rng = np.random.default_rng(1)
-    nb = 500
-    zg = rng.normal(0, 1, nb)
-    h = 0.5 * zg + rng.normal(0, 0.5, nb)
-    lab = np.full(nb, "mixed", dtype=object)
-
-    class Capped(_SlopeArgs):
-        slope_max_lines = 50
-
-    full = m.slope_figure(zg, h, lab, "D", tmp_path / "a.png", _SlopeArgs())
-    cut = m.slope_figure(zg, h, lab, "D", tmp_path / "b.png", Capped())
-    assert full["n_bins"] == cut["n_bins"] == nb
-    assert full["pearson_r"] == pytest.approx(cut["pearson_r"])
-    assert (full["by_state"][0]["mean_hcg_z"]
-            == pytest.approx(cut["by_state"][0]["mean_hcg_z"]))
-
-
-def test_slope_is_emitted_by_default_with_its_z_table(tmp_path):
-    m = _mod()
-    g, h = _within_bin_pair(n_cells=40, n_bins=120, within_rho=0.4,
-                            bin_rho=0.7)
+    g, h = _pair(n_cells=30, n_bins=40)
     gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
     g.to_parquet(gp)
     h.to_parquet(hp)
-    out = tmp_path / "out"
+    out = tmp_path / "o"
     assert m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
                    "--plot-format", "png", "--per-bin-correlation", "off",
-                   "--output-dir", str(out)]) == 0
-    assert (out / "D_state_slope.png").exists()
-    assert (out / "D_state_table.png").exists(), "heatmap is still default too"
-    z = pd.read_csv(out / "D_state_slope_z.tsv", sep="\t")
-    assert len(z) == 120
-    assert {"bin", "gch_state", "hcg_state", "gch_z", "hcg_z",
-            "delta_z"} == set(z.columns)
-    ok = z["gch_z"].notna()
-    assert abs(z.loc[ok, "gch_z"].mean()) < 1e-9
-    np.testing.assert_allclose(z.loc[ok, "delta_z"],
-                               z.loc[ok, "hcg_z"] - z.loc[ok, "gch_z"],
-                               atol=1e-9)
+                   "--state-flow", "off", "--output-dir", str(out)]) == 0
+    assert not (out / "D_costate_by_cell.png").exists()
+    assert not (out / "D_level_grid.png").exists()
+    # ...but the scatter, which needs no components, is still there.
+    assert (out / "D_gch_vs_hcg_scatter.png").exists()
 
 
-def test_unknown_style_is_rejected(tmp_path):
+def test_bin_batch_stratification_needs_a_batch_column(tmp_path):
     m = _mod()
-    g, h = _within_bin_pair(n_cells=30, n_bins=40)
-    gp, hp = tmp_path / "g.parquet", tmp_path / "h.parquet"
-    g.to_parquet(gp)
-    h.to_parquet(hp)
-    with pytest.raises(SystemExit, match="unknown"):
-        m.main(["--gch-d", str(gp), "--hcg-d", str(hp), "--min-cells", "5",
+    gp, hp, _sp = _with_components(tmp_path)
+    # Caught by the up-front batch gate, before any matrix is loaded.
+    with pytest.raises(SystemExit, match="bin-batch need"):
+        m.main(["--gch-d", gp, "--hcg-d", hp, "--min-cells", "5",
                 "--plot-format", "png", "--per-bin-correlation", "off",
-                "--state-flow-style", "heatmap,sankey",
+                "--state-flow", "off", "--costate-bootstrap", "0",
+                "--costate-stratify", "bin-batch",
                 "--output-dir", str(tmp_path / "o")])
+
+
+def test_bin_batch_stratification_multiplies_the_strata(tmp_path):
+    out = _run_costate(tmp_path, "o", ["--batch-column", "exp_batch",
+                                       "--costate-stratify", "bin-batch"])
+    per = pd.read_csv(out / "D_costate_per_stratum.tsv", sep="\t")
+    assert len(per) == 400, "200 bins x 2 batches"
+
+
+def test_level_grid_puts_level_on_both_axes(tmp_path):
+    out = _run_costate(tmp_path, "o")
+    assert (out / "D_level_grid.png").exists()
+    grid = pd.read_csv(out / "D_level_grid.tsv", sep="\t")
+    assert len(grid) == 9
+    assert set(grid["x_band"]) == {"closed", "mid", "open"}
+    assert {"mean_C_gch", "sem_C_gch", "mean_C_hcg", "n_bins"} <= set(grid.columns)
+    assert grid["n_bins"].sum() == 200
+    # Nothing here is a co-state call, so nothing here can be a level confound.
+    assert "co-open" not in grid.columns
+
+
+def test_level_bins_is_configurable(tmp_path):
+    out = _run_costate(tmp_path, "o", ["--level-bins", "4"])
+    grid = pd.read_csv(out / "D_level_grid.tsv", sep="\t")
+    assert len(grid) == 16
+    assert set(grid["x_band"]) == {"Q1", "Q2", "Q3", "Q4"}
