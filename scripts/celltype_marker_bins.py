@@ -908,36 +908,43 @@ def _companion_group(sig, infix, cmap, value_label, name, sel_bins, main_order,
                      ct, batch_df, ct_colors, batch_colors, batch_order,
                      block_order, out_dir, args, zscore=False, symmetric=False):
     """Render one companion GROUP for an already-aligned signal ``sig`` (cells x
-    sel_bins): (A) fixed order borrowed from the concordance heatmap (NO
-    dendrogram), (B) reclustered on the signal, and (C) -- when --remove-batch is
-    on -- reclustered on the batch-corrected signal.  Returns the filenames."""
+    sel_bins).
+
+    Two orderings x two value versions:
+
+      fixedorder    cell order borrowed from the concordance heatmap, NO
+                    dendrogram, so the companion can be read against it column
+                    by column.
+      reclustered   clustered on the signal itself.
+
+    and, when --remove-batch is on, both again on the batch-corrected signal.
+    The corrected FIXED-ORDER panel is the one that makes the comparison honest:
+    --remove-batch already corrects the concordance matrix, so ``main_order``
+    comes from corrected values, and pairing it with a raw companion asks the
+    reader to compare a corrected ordering against an uncorrected signal.
+
+    Returns the filenames.
+    """
     made = []
     kw = dict(legend_order=block_order, legend_max=args.max_legend_levels,
               zscore=zscore, symmetric=symmetric)
-    fig_a = out_dir / f"marker_heatmap_{name}_{infix}_fixedorder.{args.plot_format}"
-    _heatmap(sig, list(sig.index), list(sel_bins), ct, batch_df, ct_colors,
-             batch_colors, batch_order,
-             f"{name.upper()}: {value_label}, concordance order "
-             f"({len(sel_bins)} marker bins)", fig_a, cmap, order=main_order,
-             value_label=value_label, **kw)
-    made.append(fig_a.name)
-    fig_b = out_dir / f"marker_heatmap_{name}_{infix}_reclustered.{args.plot_format}"
-    _heatmap(sig, list(sig.index), list(sel_bins), ct, batch_df, ct_colors,
-             batch_colors, batch_order,
-             f"{name.upper()}: {value_label}, own clustering "
-             f"({len(sel_bins)} marker bins)", fig_b, cmap,
-             value_label=value_label, **kw)
-    made.append(fig_b.name)
+    versions = [("", sig, "", value_label)]
     if args.remove_batch != "none":
-        sig_bc = _remove_batch(sig, ct, batch_df)
-        fig_c = (out_dir / f"marker_heatmap_{name}_{infix}_reclustered_"
-                 f"batchcorrected.{args.plot_format}")
-        _heatmap(sig_bc, list(sig_bc.index), list(sel_bins), ct, batch_df,
-                 ct_colors, batch_colors, batch_order,
-                 f"{name.upper()}: {value_label}, own clustering, batch-"
-                 f"corrected ({len(sel_bins)} marker bins)", fig_c, cmap,
-                 value_label=f"{value_label} (batch-corrected)", **kw)
-        made.append(fig_c.name)
+        versions.append(("_batchcorrected", _remove_batch(sig, ct, batch_df),
+                         ", batch-corrected",
+                         f"{value_label} (batch-corrected)"))
+    for tag, mat, note, vlabel in versions:
+        for suffix, order, how in (("fixedorder", main_order,
+                                    "concordance order"),
+                                   ("reclustered", None, "own clustering")):
+            fig = (out_dir / f"marker_heatmap_{name}_{infix}_{suffix}{tag}"
+                             f".{args.plot_format}")
+            _heatmap(mat, list(mat.index), list(sel_bins), ct, batch_df,
+                     ct_colors, batch_colors, batch_order,
+                     f"{name.upper()}: {value_label}, {how}{note} "
+                     f"({len(sel_bins)} marker bins)", fig, cmap, order=order,
+                     value_label=vlabel, **kw)
+            made.append(fig.name)
     return made
 
 

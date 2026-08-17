@@ -223,9 +223,43 @@ def test_remove_batch_adds_batchcorrected_companion(tmp_path):
          "--output-dir", str(out), "--plot-format", "png"],
         capture_output=True, text=True)
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
-    assert (out / "marker_heatmap_gch_mean_reclustered.png").exists()
-    assert (out / "marker_heatmap_gch_mean_reclustered_batchcorrected.png"
-            ).exists()
+    # Both orderings, both value versions.  The corrected FIXED-ORDER panel is
+    # the one that makes the comparison honest: --remove-batch corrects the
+    # concordance matrix too, so the borrowed cell order already comes from
+    # corrected values and pairing it with a raw signal compares two different
+    # things.
+    for suffix in ("fixedorder", "fixedorder_batchcorrected",
+                   "reclustered", "reclustered_batchcorrected"):
+        assert (out / f"marker_heatmap_gch_mean_{suffix}.png").exists(), suffix
+
+
+def test_without_remove_batch_no_corrected_companion_is_written(tmp_path):
+    """The corrected panels are tied to --remove-batch, not always emitted."""
+    X, ct, batch, _ = _data(seed=2, n_per=60)
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "gch.parquet"
+    pd.DataFrame(X, index=samples, columns=bins).to_parquet(mat)
+    pd.DataFrame(np.abs(X), index=samples, columns=bins).to_parquet(
+        tmp_path / "accessibility_mean.parquet")
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1" if b == 0 else "b2" for b in batch]}).to_csv(
+        stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "30", "--n-permutations", "40",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (out / "marker_heatmap_gch_mean_fixedorder.png").exists()
+    assert not (out / "marker_heatmap_gch_mean_fixedorder_batchcorrected.png"
+                ).exists()
+    assert not (out / "marker_heatmap_gch_mean_reclustered_batchcorrected.png"
+                ).exists()
 
 
 def test_compartment_companions_with_coarser_grid(tmp_path):
@@ -259,8 +293,10 @@ def test_compartment_companions_with_coarser_grid(tmp_path):
          "within-celltype", "--output-dir", str(out), "--plot-format", "png"],
         capture_output=True, text=True)
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
-    for suffix in ("fixedorder", "reclustered", "reclustered_batchcorrected"):
-        assert (out / f"marker_heatmap_gch_compartment_{suffix}.png").exists()
+    for suffix in ("fixedorder", "fixedorder_batchcorrected",
+                   "reclustered", "reclustered_batchcorrected"):
+        assert (out / f"marker_heatmap_gch_compartment_{suffix}.png").exists(), \
+            suffix
 
 
 def test_compartment_cmap_distinct_from_concordance_and_per_context():
