@@ -190,6 +190,28 @@ def _read_bed(path: str, want_name=False):
     return out
 
 
+def _read_annotation_manifest(path) -> dict:
+    """``label<TAB>path_or_url`` lines → dict.  '#' comments, blanks ignored.
+
+    A file rather than a heap of --annotation flags, because the domain-scale
+    sets worth testing at 250 kb (LADs, PMDs, compartments, a lifted-over
+    segmentation) are third-party downloads whose URLs move, and a manifest can
+    be fixed without touching a command line or this script.
+    """
+    out = {}
+    with open(path) as fh:
+        for ln, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t") if "\t" in line else line.split(None, 1)
+            if len(parts) < 2:
+                sys.exit(f"{path}:{ln}: expected 'label<TAB>path_or_url', "
+                         f"got {line!r}")
+            out[parts[0].strip()] = parts[1].strip()
+    return out
+
+
 def _read_chrom_sizes(path) -> dict:
     """{contig (chr-stripped): length} from a chrom.sizes / .fai (first 2 cols)."""
     sizes = {}
@@ -350,6 +372,11 @@ _GENOME = {
         "cpg_islands": f"{_UCSC}/hg38/database/cpgIslandExt.txt.gz",
         "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
                       "KEGG": f"{_ENRICHR}KEGG_2021_Human"},
+        # No LAD or full-stack ChromHMM entry: UCSC carries the Guelen LaminB1
+        # table for hg19 only, and the full-stack segmentation was published on
+        # hg19.  Lift them over and pass them with --annotation-manifest, or
+        # run in hg19.  PMDs likewise have no stable public URL -- see
+        # resources/annotations_human_domains.tsv for the citation.
     },
     "hg19": {
         "chrom_sizes": f"{_UCSC}/hg19/bigZips/hg19.chrom.sizes",
@@ -357,6 +384,14 @@ _GENOME = {
                            f"gencode.v19.annotation.gtf.gz",
         "cytoband": f"{_UCSC}/hg19/database/cytoBand.txt.gz",
         "cpg_islands": f"{_UCSC}/hg19/database/cpgIslandExt.txt.gz",
+        # Lamin-B1 LADs (Guelen et al. 2008, Tig3 DamID) as UCSC ships them.
+        # Megabase domains, so they survive a 250 kb bin -- unlike anything
+        # peak-scale, which at that width measures gene density instead.
+        "annotations": {"LAD": f"{_UCSC}/hg19/database/laminB1Lads.txt.gz"},
+        # Full-stack ChromHMM (Vu & Ernst 2022) was published on hg19; the
+        # mm10 path above is the same layout.
+        "chromhmm": f"{_FULLSTACK}/hg19/hg19_100_segments_segments.bed.gz",
+        "chromhmm_groups": f"{_FULLSTACK}/hg19/state_annotation_processed.tsv",
         "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
                       "KEGG": f"{_ENRICHR}KEGG_2021_Human"},
     },
@@ -1121,6 +1156,15 @@ def main(argv=None):
     ap.add_argument("--chromhmm-per-state", action="store_true",
                     help="Also write the per-state (un-collapsed) enrichment "
                          "table alongside the per-group one.")
+    ap.add_argument("--annotation-manifest", default=None, metavar="TSV",
+                    help="A file of 'label<TAB>path_or_url' lines, one per "
+                         "annotation, as an alternative to many --annotation "
+                         "flags.  See resources/annotations_human_domains.tsv "
+                         "for a starting point with the sources named: at a "
+                         "250 kb bin the sets worth testing are DOMAIN-scale "
+                         "(LADs, PMDs, compartments), since a peak-scale set "
+                         "covers ~0.1% of a bin and its coverage fraction "
+                         "mostly measures gene density.")
     ap.add_argument("--annotation", action="append", default=None,
                     metavar="LABEL=BED|URL",
                     help="Any functional annotation BED (enhancers, CpG islands, "
@@ -1223,6 +1267,21 @@ def main(argv=None):
         rv = _resolve(v, cache, f"annotation {k}")
         if rv is not None:
             annotations[k] = _read_bed(rv)
+    manifest = (_read_annotation_manifest(args.annotation_manifest)
+                if args.annotation_manifest else {})
+    for k, v in manifest.items():
+        if k not in annotations:
+            rv = _resolve(v, cache, f"annotation {k} (manifest)")
+            if rv is not None:
+                annotations[k] = _read_bed(rv)
+    for k, v in preset.get("annotations", {}).items():
+        if k not in annotations:
+            rv = _resolve(v, cache, f"annotation {k}")
+            if rv is not None:
+                # UCSC tables carry a leading bin column; _read_ucsc_bed skips it.
+                annotations[k] = (_read_ucsc_bed(rv, cols=(1, 2, 3))
+                                  if str(v).endswith(".txt.gz")
+                                  else _read_bed(rv))
     if preset.get("cytoband"):
         cb = _resolve(preset["cytoband"], cache, "cytoBand")
         if cb is not None:

@@ -52,7 +52,11 @@ by its own statistic but filtered for batch the same way:
                   and Cohen's d, plus the association between the contrast and
                   each batch variable, since a condition processed on its own
                   makes "separates the groups" and "separates the batches" the
-                  same statement.
+                  same statement.  --cnv-seg adds the copy-number check, which
+                  matters most for exactly this comparison: copy number moves
+                  coverage, coverage moves the DM shrinkage and what RWR
+                  imputes, so a tumour-vs-line contrast can separate on a
+                  deletion rather than on coordination.
 
 Bins are selected on ALL cells and the heatmap shows ALL cells; the honesty
 comes from the CONTROL (the bins we did NOT pick still separate cell types),
@@ -462,6 +466,105 @@ def contrast_stats(X, in_mask, min_cells):
     for k, v in (("diff", diff), ("t", tstat), ("p", p), ("d", d)):
         out[k] = np.where(bad, np.nan, v)
     return out
+
+
+def read_segments(path, sample_col=None):
+    """A copy-number segmentation → DataFrame[sample, chrom, start, end, value].
+
+    Accepts a headed file with those names, or the classic 6-column .seg
+    (ID, chrom, start, end, num_mark, seg.mean).  Values are assumed to be
+    log2 ratios, so 0 is copy-neutral; the analysis below only ever uses
+    DIFFERENCES between groups, so any centred scale works.
+    """
+    df = pd.read_csv(path, sep="\t", dtype={0: str}, comment="#")
+    cols = {c.lower().strip(): c for c in df.columns}
+    want = ("sample", "chrom", "start", "end", "value")
+    if all(w in cols for w in want):
+        out = df[[cols[w] for w in want]].copy()
+    elif df.shape[1] >= 6:
+        out = df.iloc[:, [0, 1, 2, 3, 5]].copy()          # .seg, skipping num_mark
+    else:
+        sys.exit(f"{path}: expected sample/chrom/start/end/value columns or a "
+                 f"6-column .seg (ID chrom start end num_mark seg.mean); got "
+                 f"{list(df.columns)}.")
+    out.columns = list(want)
+    out["sample"] = out["sample"].astype(str)
+    out["chrom"] = out["chrom"].astype(str).map(_canon_chrom)
+    for c in ("start", "end"):
+        out[c] = out[c].astype(float).astype(np.int64)
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    return out.dropna(subset=["value"])
+
+
+def segment_bin_means(bins, seg):
+    """Per-bin, overlap-weighted mean segment value → (n_samples, n_bins).
+
+    Overlap-weighted rather than midpoint-assigned: a 250 kb bin routinely
+    spans a segment boundary, and taking whichever segment covers the midpoint
+    would give the bin a copy number it only half has.
+    """
+    samples = sorted(seg["sample"].unique())
+    chrom = pd.Index(bins).str.split(":").str[0].map(_canon_chrom).to_numpy()
+    start = pd.Index(bins).str.split(":").str[1].astype(np.int64).to_numpy()
+    width = infer_bin_size_from(bins)
+    end = start + width
+    out = np.full((len(samples), len(bins)), np.nan)
+    for si, sample in enumerate(samples):
+        sub = seg[seg["sample"] == sample]
+        for c, g in sub.groupby("chrom"):
+            hit = np.flatnonzero(chrom == c)
+            if hit.size == 0:
+                continue
+            ss = g["start"].to_numpy()
+            ee = g["end"].to_numpy()
+            vv = g["value"].to_numpy()
+            order = np.argsort(ss)
+            ss, ee, vv = ss[order], ee[order], vv[order]
+            for i in hit:
+                lo = np.searchsorted(ee, start[i], "right")
+                hi = np.searchsorted(ss, end[i], "left")
+                if hi <= lo:
+                    continue
+                ov = (np.minimum(ee[lo:hi], end[i])
+                      - np.maximum(ss[lo:hi], start[i])).astype(float)
+                keep = ov > 0
+                if keep.any():
+                    out[si, i] = float(np.average(vv[lo:hi][keep],
+                                                  weights=ov[keep]))
+    return np.array(samples), out
+
+
+def infer_bin_size_from(bins) -> int:
+    """Bin width from consecutive starts on one chromosome (GCD of the gaps)."""
+    from nome_hic_concordance.blacklist import infer_bin_size
+    w = infer_bin_size(pd.Index(list(bins)))
+    if not w:
+        sys.exit("cannot infer the bin width from the column labels, so a "
+                 "segment cannot be mapped onto a bin.")
+    return int(w)
+
+
+def cnv_group_delta(bins, seg, cell_to_sample, in_cells, out_cells):
+    """Per-bin (mean CN in the contrast group) − (mean CN outside it).
+
+    The copy-number analogue of the batch check.  In a tumour-vs-line contrast
+    the two arms differ in copy number by construction, and copy number moves
+    coverage, which moves the DM shrinkage and what RWR imputes -- so a bin can
+    separate the groups for reasons that have nothing to do with coordination.
+    A bin over a recurrent deletion is the clearest case.
+    """
+    samples, mat = segment_bin_means(bins, seg)
+    idx = {s: i for i, s in enumerate(samples)}
+    def rows(cells):
+        got = sorted({cell_to_sample[c] for c in cells
+                      if cell_to_sample.get(c) in idx})
+        return [idx[s] for s in got]
+    ri, ro = rows(in_cells), rows(out_cells)
+    if not ri or not ro:
+        return None, samples, (len(ri), len(ro))
+    with np.errstate(invalid="ignore"):
+        delta = np.nanmean(mat[ri], axis=0) - np.nanmean(mat[ro], axis=0)
+    return delta, samples, (len(ri), len(ro))
 
 
 def _cramers_v(a: pd.Series, b: pd.Series) -> float:
@@ -1133,6 +1236,27 @@ def main():
                          "were processed together, 'the bins separating these "
                          "groups' and 'the bins separating these batches' are "
                          "the same bins, and the result means nothing.")
+    ap.add_argument("--cnv-seg", default=None, metavar="FILE",
+                    help="A copy-number segmentation (sample/chrom/start/end/"
+                         "value, or a 6-column .seg).  Turns on the CNV check "
+                         "for every --contrast: copy number moves coverage, "
+                         "coverage moves the DM shrinkage and what RWR "
+                         "imputes, so in a tumour-vs-line contrast a bin can "
+                         "separate the groups for reasons that are not "
+                         "coordination at all.  Reports how strongly the "
+                         "contrast tracks the group copy-number difference and "
+                         "how many selected bins sit in CN-different regions.")
+    ap.add_argument("--cnv-sample-column", default=None,
+                    help="Column in --samples whose values match the "
+                         "segmentation's sample IDs (default: the cell name).  "
+                         "Use it when the CNV calls are per donor or per "
+                         "library rather than per cell.")
+    ap.add_argument("--cnv-max-delta", type=float, default=0.0,
+                    help="Drop bins whose |group copy-number difference| "
+                         "exceeds this from the contrast pool BEFORE ranking "
+                         "(0 = report only).  0.2-0.3 on a log2 scale removes "
+                         "the clearly CN-different regions while keeping the "
+                         "copy-neutral genome.")
     ap.add_argument("--n-contrast-bins", type=int, default=0,
                     help="Bins per contrast BED (0 = same as --n-bins).")
     ap.add_argument("--max-batch-icc", type=float, default=0.1,
@@ -1248,6 +1372,33 @@ def main():
         if not lab or not want:
             sys.exit(f"--contrast needs a label and at least one group: {spec!r}")
         contrasts.append((lab, want))
+
+    seg = cell_to_sample = None
+    if args.cnv_seg:
+        if not contrasts:
+            print("  NOTE --cnv-seg does nothing without --contrast: the check "
+                  "is about a contrast being copy number rather than biology.",
+                  file=sys.stderr)
+        seg = read_segments(args.cnv_seg)
+        col = args.cnv_sample_column
+        if col and col not in samples.columns:
+            sys.exit(f"--cnv-sample-column {col!r} not in --samples "
+                     f"(columns: {samples.columns.tolist()}).")
+        cell_to_sample = dict(zip(
+            samples["cell_name"],
+            samples[col].astype(str) if col else samples["cell_name"]))
+        known = set(seg["sample"])
+        matched = {v for v in cell_to_sample.values() if v in known}
+        if not matched:
+            sys.exit(
+                f"--cnv-seg: none of its sample IDs match "
+                f"{col or 'cell_name'} in --samples.  Its IDs look like "
+                f"{sorted(known)[:3]}; the sheet has "
+                f"{sorted(set(cell_to_sample.values()))[:3]}.  Point "
+                f"--cnv-sample-column at the column that matches.")
+        print(f"CNV segmentation: {len(seg):,} segments over {len(known)} "
+              f"samples, {len(matched)} of them matched to cells.",
+              file=sys.stderr)
 
     out_dir = ensure_dir(Path(args.output_dir))
     summary = {}
@@ -1555,6 +1706,41 @@ def main():
             in_mask = ct.isin(present).to_numpy()
             cs = contrast_stats(Msel, in_mask, args.min_cells_per_group)
             q = _bh_fdr(cs["p"])
+            # The copy-number check, before anything is ranked: a bin whose two
+            # arms differ in copy number differs in coverage, and coverage is
+            # upstream of every value in this matrix.
+            cnv = cnv_info = None
+            if seg is not None:
+                cells_in = list(M.index[in_mask])
+                cells_out = list(M.index[~in_mask])
+                cnv, _samples, (n_in, n_out) = cnv_group_delta(
+                    M.columns, seg, cell_to_sample, cells_in, cells_out)
+                if cnv is None:
+                    print(f"  contrast {label!r}: no CNV samples on one side "
+                          f"({n_in} in, {n_out} out) — check skipped.",
+                          file=sys.stderr)
+                else:
+                    ok_c = np.isfinite(cnv) & np.isfinite(cs["d"])
+                    from scipy.stats import pearsonr, spearmanr
+                    r = sr = np.nan
+                    if int(ok_c.sum()) > 2:
+                        r = float(pearsonr(cnv[ok_c], cs["d"][ok_c])[0])
+                        sr = float(spearmanr(cnv[ok_c], cs["d"][ok_c])[0])
+                    cnv_info = {"n_samples_in": n_in, "n_samples_out": n_out,
+                                "n_bins_with_cnv": int(ok_c.sum()),
+                                "pearson_r_effect_vs_cnv": r,
+                                "spearman_rho_effect_vs_cnv": sr}
+                    scores_df[f"contrast_{label}_cnv_delta"] = cnv
+                    extra_cols.append(f"contrast_{label}_cnv_delta")
+                    if args.cnv_max_delta > 0:
+                        drop = np.isfinite(cnv) & (np.abs(cnv)
+                                                   > args.cnv_max_delta)
+                        cs["t"] = np.where(drop, np.nan, cs["t"])
+                        cnv_info["n_bins_dropped"] = int(drop.sum())
+                        print(f"  contrast {label!r}: --cnv-max-delta "
+                              f"{args.cnv_max_delta} removed "
+                              f"{int(drop.sum()):,} bins from the pool.",
+                              file=sys.stderr)
             rank = np.where(np.isfinite(cs["t"]), np.abs(cs["t"]), -np.inf)
             keep_rank = np.argsort(rank)[::-1][: args.n_contrast_bins
                                                or args.n_bins]
@@ -1584,6 +1770,14 @@ def main():
             # no within-cell-type batch contrast to measure, every bin comes
             # back NaN and "passed the batch filter" means "was never tested".
             judged = int(np.sum(mask & np.isfinite(b_icc)))
+            if cnv_info is not None:
+                sel_cnv = np.abs(cnv[mask & np.isfinite(cnv)])
+                cut = args.cnv_max_delta or 0.2
+                cnv_info["median_abs_cnv_delta_selected"] = (
+                    float(np.median(sel_cnv)) if sel_cnv.size else np.nan)
+                cnv_info["frac_selected_over_delta"] = (
+                    float(np.mean(sel_cnv > cut)) if sel_cnv.size else np.nan)
+                cnv_info["delta_cut_used"] = float(cut)
             summary_contrast[label] = {
                 "groups_in": present, "n_cells_in": int(in_mask.sum()),
                 "n_cells_out": int((~in_mask).sum()),
@@ -1591,7 +1785,29 @@ def main():
                 "n_fdr_0.05": int(np.nansum(q < 0.05)),
                 "n_selected_batch_clean": int(np.sum(mask & clean)),
                 "n_selected_batch_judged": judged,
-                "batch_confounding_cramers_v": conf}
+                "batch_confounding_cramers_v": conf,
+                **({"cnv": cnv_info} if cnv_info else {})}
+            if cnv_info and np.isfinite(cnv_info.get("frac_selected_over_delta",
+                                                      np.nan)):
+                rr = cnv_info["pearson_r_effect_vs_cnv"]
+                frac = cnv_info["frac_selected_over_delta"]
+                # The warning keys on WHERE THE SELECTED BINS ARE, not on the
+                # correlation.  Two step functions over complementary regions
+                # correlate near-perfectly while the effect sits exactly where
+                # the copy number does not, so a correlation alone would flag a
+                # clean result; it is reported as a diagnostic instead.
+                if frac > 0.3:
+                    print(f"  WARNING contrast {label!r} tracks COPY NUMBER: "
+                          f"the per-bin effect correlates with the group "
+                          f"copy-number difference at r = {rr:+.2f}, and "
+                          f"{100 * frac:.0f}% of the selected bins sit where "
+                          f"the two arms differ by more than "
+                          f"{cnv_info['delta_cut_used']:.2f}.  Copy number "
+                          f"moves coverage and coverage is upstream of every "
+                          f"value here, so these bins are not evidence of "
+                          f"differential coordination until the effect "
+                          f"survives inside copy-neutral regions — re-run with "
+                          f"--cnv-max-delta.", file=sys.stderr)
             if worst and conf[worst] > 0.5:
                 print(f"  WARNING contrast {label!r} is confounded with "
                       f"{worst} (Cramer's V {conf[worst]:.2f}): these cells "

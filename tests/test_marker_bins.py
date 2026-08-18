@@ -1218,3 +1218,142 @@ def test_stable_level_still_ranks_by_flatness_within_the_pool(tmp_path):
     rest = pool[~pool["stable"]]
     assert len(st) and len(rest)
     assert st["celltype_mean_spread"].max() <= rest["celltype_mean_spread"].min()
+
+
+# ------------------------------------------------------------ the CNV check --
+
+def _cnv_case(tmp_path, sub, cnv_drives=True, extra=None, seed=0):
+    """Two 'tumour' cell types against two 'line' ones.
+
+    With cnv_drives, the ONLY thing separating the arms is a deleted arm of the
+    genome -- the shape of a tumour-vs-line contrast where copy number, not
+    coordination, does the separating.
+    """
+    rng = np.random.default_rng(seed)
+    n_ct, n_per, nb = 4, 20, 120
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    tumour = ct < 2
+    X = rng.normal(0, 0.4, (n, nb))
+    half = nb // 3                                   # the "deleted" region
+    # A SMALL affected region either way.  Per-cell rank normalisation is
+    # compositional -- pushing most of the genome down pushes the rest up -- so
+    # shifting a large block would plant a mirror-image effect in its
+    # complement and both fixtures would look confounded.
+    if cnv_drives:
+        X[tumour, :20] -= 2.0                        # inside the deletion
+    else:
+        X[tumour, half:half + 20] -= 2.0             # copy-neutral ground
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    d = tmp_path / sub
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(
+        d / "concordance_directional.parquet")
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "donor": np.where(tumour, "tumour1", "line1"),
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        d / "s.tsv", sep="\t", index=False)
+    # Segmentation: the tumour donors are deleted over the first third only.
+    rows = []
+    for donor, lost in (("tumour1", True), ("line1", False)):
+        rows.append((donor, "chr1", 0, half * 250000, 10, -1.0 if lost else 0.0))
+        rows.append((donor, "chr1", half * 250000, nb * 250000, 10, 0.0))
+    pd.DataFrame(rows).to_csv(d / "cnv.seg", sep="\t", index=False,
+                              header=["ID", "chrom", "start", "end",
+                                      "num_mark", "seg.mean"])
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix",
+         f"g={d / 'concordance_directional.parquet'}",
+         "--samples", str(d / "s.tsv"), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "20",
+         "--contrast", "tumour=CT0,CT1", "--cnv-seg", str(d / "cnv.seg"),
+         "--cnv-sample-column", "donor",
+         "--output-dir", str(d / "o"), "--plot-format", "png"] + (extra or []),
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    import json
+    s = json.loads((d / "o" / "marker_bins_summary.json").read_text())
+    return s["matrices"]["g"]["contrasts"]["tumour"], r, d
+
+
+def test_segments_are_mapped_onto_bins_by_overlap():
+    """A 250 kb bin routinely spans a segment boundary; the midpoint's segment
+    would give it a copy number it only half has."""
+    m = _mod()
+    bins = ["chr1:0", "chr1:250000"]
+    seg = pd.DataFrame({"sample": ["s1"] * 2, "chrom": ["1", "1"],
+                        "start": [0, 125000], "end": [125000, 500000],
+                        "value": [-2.0, 0.0]})
+    samples, mat = m.segment_bin_means(bins, seg)
+    assert list(samples) == ["s1"]
+    assert mat[0, 0] == pytest.approx(-1.0), "half the bin at -2, half at 0"
+    assert mat[0, 1] == pytest.approx(0.0)
+
+
+def test_a_contrast_that_is_copy_number_is_called_out(tmp_path):
+    info, r, _ = _cnv_case(tmp_path, "driven", cnv_drives=True)
+    assert "tracks COPY NUMBER" in r.stderr
+    assert info["cnv"]["frac_selected_over_delta"] > 0.5
+
+
+def test_the_warning_keys_on_where_the_bins_are_not_on_the_correlation():
+    """Two step functions over complementary regions correlate near-perfectly
+    while the effect sits exactly where the copy number does not; a correlation
+    criterion alone would flag that clean result."""
+    effect = np.r_[np.zeros(40), np.full(80, -2.0)]
+    cnv = np.r_[np.full(40, -1.0), np.zeros(80)]
+    from scipy.stats import pearsonr
+    assert abs(pearsonr(cnv, effect)[0]) > 0.9        # correlation says "yes"
+    selected = np.arange(40, 120)                     # ...but nothing selected
+    assert np.mean(np.abs(cnv[selected]) > 0.2) == 0  # sits in a CNV region
+
+
+def test_a_copy_neutral_contrast_is_not_flagged(tmp_path):
+    info, r, _ = _cnv_case(tmp_path, "neutral", cnv_drives=False)
+    assert "tracks COPY NUMBER" not in r.stderr
+    assert info["cnv"]["frac_selected_over_delta"] < 0.3
+
+
+def test_cnv_max_delta_removes_the_affected_bins_from_the_pool(tmp_path):
+    info, r, d = _cnv_case(tmp_path, "filtered", cnv_drives=True,
+                           extra=["--cnv-max-delta", "0.5"])
+    assert info["cnv"]["n_bins_dropped"] == 40, "the deleted third"
+    assert "removed 40 bins from the pool" in r.stderr
+    bed = pd.read_csv(d / "o" / "bin_scores_g.contrast_tumour.bed", sep="\t")
+    # Nothing selected sits in the deleted region any more.
+    assert (bed["start"] >= 40 * 250000).all()
+
+
+def test_the_cnv_delta_is_reported_per_bin(tmp_path):
+    _info, _r, d = _cnv_case(tmp_path, "col", cnv_drives=True)
+    sc = pd.read_csv(d / "o" / "bin_scores_g.tsv", sep="\t")
+    col = "contrast_tumour_cnv_delta"
+    assert col in sc.columns
+    assert sc[col].iloc[:40].mean() == pytest.approx(-1.0)
+    assert sc[col].iloc[40:].mean() == pytest.approx(0.0)
+
+
+def test_unmatched_cnv_sample_ids_stop_the_run(tmp_path):
+    m = _mod()
+    _info, _r, d = _cnv_case(tmp_path, "match", cnv_drives=False)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix",
+         f"g={d / 'concordance_directional.parquet'}",
+         "--samples", str(d / "s.tsv"), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "20",
+         "--contrast", "tumour=CT0,CT1", "--cnv-seg", str(d / "cnv.seg"),
+         "--output-dir", str(d / "o2"), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "--cnv-sample-column" in r.stderr
+
+
+def test_seg_and_headed_formats_both_read():
+    m = _mod()
+    import io
+    headed = io.StringIO("sample\tchrom\tstart\tend\tvalue\ns1\tchr1\t0\t100\t-1\n")
+    df = m.read_segments(headed)
+    assert list(df.columns) == ["sample", "chrom", "start", "end", "value"]
+    assert df["chrom"].iloc[0] == "1", "chr prefix stripped for matching"

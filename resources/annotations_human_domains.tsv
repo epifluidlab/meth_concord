@@ -1,0 +1,43 @@
+# Domain-scale annotations for marker_bin_enrichment.py --annotation-manifest.
+#
+#   label<TAB>path_or_url
+#
+# WHY DOMAIN-SCALE.  At a 250 kb bin the test is COVERAGE of the bin, so a
+# peak-scale set (enhancers, cCREs, TF peaks) covers ~0.1% of a bin and its
+# coverage fraction ends up measuring gene density.  Sets worth testing at this
+# width are hundreds of kb to Mb.  To use a peak-scale set anyway, turn it into
+# a DENSITY track (bp-per-bin or peaks-per-bin, via bedtools) and pass it with
+# --signal-track instead of here.
+#
+# The entries below are third-party downloads.  Fill in the URL or a local path
+# for the ones you want; the citation is given so the file can be found even
+# when a URL has moved.  Anything that fails to download is reported and
+# skipped, so an out-of-date line will not stop a run.
+
+# --- lamina-associated domains ------------------------------------------
+# hg19 ships with the genome preset already (UCSC laminB1Lads, Guelen et al.
+# Nature 2008, Tig3 LaminB1 DamID).  For hg38, lift that over and point here.
+# LAD	/path/to/hg38_laminB1_lads.bed
+
+# --- partially methylated domains ---------------------------------------
+# Zhou W, Dinh HQ, Ramjan Z, et al. "DNA methylation loss in late-replicating
+# domains is linked to mitotic cell division." Nat Genet 2018;50:591-602.
+# Common solo-WCGW PMD and HMD coordinates, hg19 and hg38, from the paper's
+# supplementary data.  The single most relevant set for HCG concordance in
+# tumours: PMDs are megabase-scale, late-replicating, and are where pan-cancer
+# hypomethylation happens.
+# PMD	/path/to/PMD_coordinates_hg38.bed
+# HMD	/path/to/HMD_coordinates_hg38.bed
+
+# --- A/B compartments ----------------------------------------------------
+# From Hi-C in a relevant line (4DN).  Meningioma arises from arachnoid cap
+# cells, so a mesenchymal/fibroblast reference is nearer than a neuronal one.
+# compartment_A	/path/to/compartmentA.bed
+# compartment_B	/path/to/compartmentB.bed
+
+# --- recurrent copy-number regions --------------------------------------
+# GISTIC peaks from a published meningioma cohort.  READ THE CNV CAVEAT FIRST:
+# celltype_marker_bins.py --cnv-seg tests whether a contrast is copy number
+# rather than biology, and a hit here is uninterpretable until that passes.
+# meningioma_del	/path/to/gistic_del_peaks.bed
+# meningioma_amp	/path/to/gistic_amp_peaks.bed
