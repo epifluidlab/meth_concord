@@ -190,6 +190,33 @@ def _read_bed(path: str, want_name=False):
     return out
 
 
+def _read_pmd(path) -> dict:
+    """The Zhou et al. 2018 PMD file → {"PMD": ivals, "HMD": ivals}.
+
+    Six columns: chrom, start, end, score, class, label — where the label is
+    commonPMD / commonHMD / Neither.  Loading it whole would merge partially
+    METHYLATED domains with highly methylated ones and with the unclassified
+    remainder, and test their union against the genome, which is not a
+    question anyone means to ask.  'Neither' is dropped rather than kept as a
+    third set: it is the residue of the classification, not a domain type.
+    """
+    df = pd.read_csv(path, sep="\t", header=None, comment="#",
+                     compression="infer", dtype={0: str})
+    if df.shape[1] < 6:
+        raise ValueError(f"{path}: expected the 6-column PMD file "
+                         f"(chrom/start/end/score/class/label), got "
+                         f"{df.shape[1]} columns")
+    lab = df[5].astype(str)
+    out = {}
+    for key, want in (("PMD", "commonPMD"), ("HMD", "commonHMD")):
+        sub = df[lab == want]
+        if len(sub):
+            out[key] = pd.DataFrame({"chrom": sub[0].astype(str),
+                                     "start": sub[1].astype(int),
+                                     "end": sub[2].astype(int)})
+    return out
+
+
 def _read_annotation_manifest(path) -> dict:
     """``label<TAB>path_or_url`` lines → dict.  '#' comments, blanks ignored.
 
@@ -340,6 +367,11 @@ def _label_to_group(labels, ann, group_col, state_col=None):
 _ENRICHR = "https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName="
 _UCSC = "https://hgdownload.soe.ucsc.edu/goldenPath"
 _GENCODE = "https://ftp.ebi.ac.uk/pub/databases/gencode"
+_ZHOU = "https://zhouserver.research.chop.edu/GenomeAnnotation"
+_ERNST_GH = ("https://raw.githubusercontent.com/ernstlab/"
+             "full_stack_ChromHMM_annotations/main")
+_FULLSTACK_PUB = ("https://public.hoffman2.idre.ucla.edu/ernst/2K9RS//"
+                  "full_stack/full_stack_annotation_public_release")
 _FULLSTACK = ("https://public.hoffman2.idre.ucla.edu/ernst/2K9RS//full_stack/"
               "full_stack_annotation_public_release")
 _GENOME = {
@@ -372,11 +404,17 @@ _GENOME = {
         "cpg_islands": f"{_UCSC}/hg38/database/cpgIslandExt.txt.gz",
         "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
                       "KEGG": f"{_ENRICHR}KEGG_2021_Human"},
-        # No LAD or full-stack ChromHMM entry: UCSC carries the Guelen LaminB1
-        # table for hg19 only, and the full-stack segmentation was published on
-        # hg19.  Lift them over and pass them with --annotation-manifest, or
-        # run in hg19.  PMDs likewise have no stable public URL -- see
-        # resources/annotations_human_domains.tsv for the citation.
+        # Common PMD/HMD, Zhou et al. Nat Genet 2018 -- megabase domains, and
+        # where pan-cancer hypomethylation lives, so the set most worth testing
+        # against HCG concordance at this bin width.
+        "annotations": {"PMD": {"url": f"{_ZHOU}/hg38/PMD_coordinates_hg38"
+                                       f".bed.gz", "reader": "pmd"}},
+        # Full-stack ChromHMM (Vu & Ernst, Genome Biol 2021), lifted to hg38 by
+        # the authors.  No LAD entry: UCSC carries the Guelen table for hg19
+        # only, so an hg38 LAD set has to come through --annotation-manifest --
+        # see resources/annotations_human_domains.tsv.
+        "chromhmm": f"{_FULLSTACK_PUB}/hg38/hg38_genome_100_segments.bed.gz",
+        "chromhmm_groups": f"{_ERNST_GH}/state_annotations_processed.csv",
     },
     "hg19": {
         "chrom_sizes": f"{_UCSC}/hg19/bigZips/hg19.chrom.sizes",
@@ -384,14 +422,16 @@ _GENOME = {
                            f"gencode.v19.annotation.gtf.gz",
         "cytoband": f"{_UCSC}/hg19/database/cytoBand.txt.gz",
         "cpg_islands": f"{_UCSC}/hg19/database/cpgIslandExt.txt.gz",
-        # Lamin-B1 LADs (Guelen et al. 2008, Tig3 DamID) as UCSC ships them.
-        # Megabase domains, so they survive a 250 kb bin -- unlike anything
+        # Lamin-B1 LADs (Guelen et al. Nature 2008, Tig3 DamID) as UCSC ships
+        # them, and common PMD/HMD (Zhou et al. Nat Genet 2018).  Both are
+        # megabase domains, so they survive a 250 kb bin -- unlike anything
         # peak-scale, which at that width measures gene density instead.
-        "annotations": {"LAD": f"{_UCSC}/hg19/database/laminB1Lads.txt.gz"},
-        # Full-stack ChromHMM (Vu & Ernst 2022) was published on hg19; the
-        # mm10 path above is the same layout.
-        "chromhmm": f"{_FULLSTACK}/hg19/hg19_100_segments_segments.bed.gz",
-        "chromhmm_groups": f"{_FULLSTACK}/hg19/state_annotation_processed.tsv",
+        "annotations": {
+            "LAD": f"{_UCSC}/hg19/database/laminB1Lads.txt.gz",
+            "PMD": {"url": f"{_ZHOU}/hg19/PMD_coordinates_hg19.bed.gz",
+                    "reader": "pmd"}},
+        "chromhmm": f"{_FULLSTACK_PUB}/hg19/hg19_genome_100_segments.bed.gz",
+        "chromhmm_groups": f"{_ERNST_GH}/state_annotations_processed.csv",
         "gene_sets": {"GO_BP": f"{_ENRICHR}GO_Biological_Process_2021",
                       "KEGG": f"{_ENRICHR}KEGG_2021_Human"},
     },
@@ -1116,11 +1156,16 @@ def main(argv=None):
     ap.add_argument("--genome", default=None,
                     choices=sorted(_GENOME),
                     help="Auto-DOWNLOAD the standard annotations for this genome "
-                         "(GENCODE genes, UCSC chrom.sizes + cytoBand + CpG "
-                         "islands, Enrichr GO_BP + KEGG) into --cache-dir and use "
-                         "them for any input not given explicitly.  e.g. mm10 for "
-                         "GENCODE vM25.  (A tissue ChromHMM has no single "
-                         "canonical source, so pass --chromhmm yourself.)")
+                         "into --cache-dir and use them for any input not given "
+                         "explicitly: GENCODE genes, UCSC chrom.sizes + cytoBand "
+                         "+ CpG islands, Enrichr GO_BP + KEGG.  hg38 and hg19 "
+                         "add the domain-scale sets that a 250 kb bin can "
+                         "actually resolve -- common PMD/HMD (Zhou et al. 2018, "
+                         "split by class) and the full-stack ChromHMM "
+                         "segmentation collapsed to biological groups -- plus "
+                         "Lamin-B1 LADs for hg19, which is the only build UCSC "
+                         "ships them for.  The segmentation is ~39 MB and is "
+                         "cached after the first run.")
     ap.add_argument("--cache-dir", default=None, metavar="DIR",
                     help="Where downloaded annotations are cached and reused "
                          "(default: ~/.cache/marker_bin_enrichment/<genome>).")
@@ -1244,12 +1289,20 @@ def main(argv=None):
         gtsv = _resolve(args.chromhmm_groups or preset.get("chromhmm_groups"),
                         cache, "chromhmm-groups")
         if gtsv:
-            ann = pd.read_csv(gtsv, sep="\t", dtype=str)
-            if args.chromhmm_group_col not in ann.columns:
-                sys.exit(f"--chromhmm-group-col {args.chromhmm_group_col!r} not "
-                         f"in {gtsv}: {list(ann.columns)}")
+            # Sniffed, not assumed to be tab: the full-stack state annotation
+            # ships as TSV for mouse and CSV for human.
+            ann = pd.read_csv(gtsv, sep=None, engine="python", dtype=str)
+            gcol = args.chromhmm_group_col
+            if gcol not in ann.columns:
+                # Case-insensitive, for the same reason: the human file names
+                # the column 'Group' and the mouse one 'group'.
+                hit_ci = [c for c in ann.columns if c.lower() == gcol.lower()]
+                if not hit_ci:
+                    sys.exit(f"--chromhmm-group-col {gcol!r} not in {gtsv}: "
+                             f"{list(ann.columns)}")
+                gcol = hit_ci[0]
             mp, hit, tot, col = _label_to_group(
-                chromhmm["name"].unique(), ann, args.chromhmm_group_col,
+                chromhmm["name"].unique(), ann, gcol,
                 args.chromhmm_state_col)
             chromhmm["group"] = chromhmm["name"].map(mp)
             print(f"chromhmm groups: matched {hit}/{tot} states via column "
@@ -1275,13 +1328,22 @@ def main(argv=None):
             if rv is not None:
                 annotations[k] = _read_bed(rv)
     for k, v in preset.get("annotations", {}).items():
-        if k not in annotations:
-            rv = _resolve(v, cache, f"annotation {k}")
-            if rv is not None:
-                # UCSC tables carry a leading bin column; _read_ucsc_bed skips it.
-                annotations[k] = (_read_ucsc_bed(rv, cols=(1, 2, 3))
-                                  if str(v).endswith(".txt.gz")
-                                  else _read_bed(rv))
+        spec = v if isinstance(v, dict) else {"url": v}
+        if k in annotations:
+            continue
+        rv = _resolve(spec["url"], cache, f"annotation {k}")
+        if rv is None:
+            continue
+        if spec.get("reader") == "pmd":
+            # One file, several domain classes: it expands into named sets
+            # rather than being tested as their union.
+            for sub_k, sub_df in _read_pmd(rv).items():
+                annotations.setdefault(sub_k, sub_df)
+        elif str(spec["url"]).endswith(".txt.gz"):
+            # UCSC tables carry a leading bin column; _read_ucsc_bed skips it.
+            annotations[k] = _read_ucsc_bed(rv, cols=(1, 2, 3))
+        else:
+            annotations[k] = _read_bed(rv)
     if preset.get("cytoband"):
         cb = _resolve(preset["cytoband"], cache, "cytoBand")
         if cb is not None:

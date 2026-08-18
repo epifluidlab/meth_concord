@@ -603,3 +603,78 @@ def test_too_few_blocks_gives_no_interval_rather_than_a_fake_one(tmp_path):
     fg[:20] = True
     blocks = np.repeat(["chr1:0", "chr1:1"], 20)      # only two blocks
     assert np.isnan(m._auc_block_ci(val, fg, blocks, n_boot=100)).all()
+
+
+# ------------------------------------------------- the Zhou PMD/HMD reader --
+
+def _pmd_file(path):
+    """The published 6-column shape: chrom/start/end/score/class/label."""
+    rows = [("chr1", 0, 100000, "0.22", "PMD", "commonPMD"),
+            ("chr1", 100000, 200000, "0.32", "PMD", "commonPMD"),
+            ("chr1", 200000, 300000, "0.08", "HMD", "commonHMD"),
+            ("chr1", 300000, 400000, "NA", "NA", "Neither")]
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False, header=False)
+    return str(path)
+
+
+def test_pmd_file_splits_into_its_domain_classes(tmp_path):
+    """Loading it whole would test PMDs, HMDs and the unclassified remainder as
+    one set -- a union nobody means to ask about."""
+    m = _mod()
+    got = m._read_pmd(_pmd_file(tmp_path / "pmd.bed"))
+    assert set(got) == {"PMD", "HMD"}, "'Neither' is the residue, not a class"
+    assert len(got["PMD"]) == 2 and len(got["HMD"]) == 1
+    assert list(got["PMD"]["start"]) == [0, 100000]
+    assert list(got["HMD"]["end"]) == [300000]
+
+
+def test_pmd_reader_rejects_a_file_of_the_wrong_shape(tmp_path):
+    m = _mod()
+    p = tmp_path / "plain.bed"
+    pd.DataFrame([("chr1", 0, 100)]).to_csv(p, sep="\t", index=False,
+                                            header=False)
+    with pytest.raises(ValueError, match="6-column PMD file"):
+        m._read_pmd(str(p))
+
+
+def test_the_human_presets_point_at_the_domain_scale_sets():
+    m = _mod()
+    for build in ("hg38", "hg19"):
+        pre = m._GENOME[build]
+        assert pre["annotations"]["PMD"]["reader"] == "pmd"
+        assert build in pre["annotations"]["PMD"]["url"]
+        assert pre["chromhmm"].endswith(f"{build}_genome_100_segments.bed.gz")
+        assert pre["chromhmm_groups"].endswith(".csv")
+    # hg19 alone carries a LAD table; UCSC has none for hg38.
+    assert "LAD" in m._GENOME["hg19"]["annotations"]
+    assert "LAD" not in m._GENOME["hg38"]["annotations"]
+
+
+def test_a_comma_separated_state_annotation_is_sniffed(tmp_path):
+    """The full-stack annotation ships as TSV for mouse and CSV for human, and
+    the group column is 'group' in one and 'Group' in the other."""
+    m = _mod()
+    p = tmp_path / "states.csv"
+    p.write_text("state,mneumonics,Group\n1,Quies1,HET\n2,TSS1,TSS\n")
+    ann = pd.read_csv(p, sep=None, engine="python", dtype=str)
+    assert list(ann.columns) == ["state", "mneumonics", "Group"]
+    gcol = [c for c in ann.columns if c.lower() == "group"][0]
+    mp, hit, tot, col = m._label_to_group(["1_Quies1", "2_TSS1"], ann, gcol)
+    assert hit == tot == 2
+    assert mp["1_Quies1"] == "HET" and mp["2_TSS1"] == "TSS"
+
+
+def test_annotation_manifest_reads_labels_and_skips_comments(tmp_path):
+    m = _mod()
+    p = tmp_path / "man.tsv"
+    p.write_text("# a comment\n\nLAD\t/path/to/lad.bed\nPMD\t/path/to/pmd.bed\n")
+    got = m._read_annotation_manifest(str(p))
+    assert got == {"LAD": "/path/to/lad.bed", "PMD": "/path/to/pmd.bed"}
+
+
+def test_a_malformed_manifest_line_names_its_line_number(tmp_path):
+    m = _mod()
+    p = tmp_path / "man.tsv"
+    p.write_text("LAD\t/ok.bed\nbroken-line\n")
+    with pytest.raises(SystemExit, match=":2:"):
+        m._read_annotation_manifest(str(p))

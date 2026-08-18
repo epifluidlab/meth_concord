@@ -9,25 +9,28 @@
 # a DENSITY track (bp-per-bin or peaks-per-bin, via bedtools) and pass it with
 # --signal-track instead of here.
 #
-# The entries below are third-party downloads.  Fill in the URL or a local path
-# for the ones you want; the citation is given so the file can be found even
-# when a URL has moved.  Anything that fails to download is reported and
-# skipped, so an out-of-date line will not stop a run.
+# ALREADY AUTOMATIC.  --genome hg38 and --genome hg19 now fetch these into
+# --cache-dir with no entry needed here:
+#   PMD, HMD   common partially/highly methylated domains, Zhou et al. Nat
+#              Genet 2018.  The 6-column file is split by class, so PMD and HMD
+#              are tested separately rather than as their union.
+#   ChromHMM   full-stack 100-state segmentation (Vu & Ernst, Genome Biol 2021),
+#              hg38 lifted over by the authors, collapsed to ~16 biological
+#              groups via the state annotation CSV.  ~39 MB, cached after the
+#              first run.
+#   LAD        hg19 only (UCSC laminB1Lads, Guelen et al. Nature 2008).
+#   CpG islands, cytoBand Giemsa bands, GENCODE genes, GO/KEGG.
+#
+# Anything that fails to download is reported and skipped, so a stale line here
+# will not stop a run.
 
-# --- lamina-associated domains ------------------------------------------
-# hg19 ships with the genome preset already (UCSC laminB1Lads, Guelen et al.
-# Nature 2008, Tig3 LaminB1 DamID).  For hg38, lift that over and point here.
-# LAD	/path/to/hg38_laminB1_lads.bed
-
-# --- partially methylated domains ---------------------------------------
-# Zhou W, Dinh HQ, Ramjan Z, et al. "DNA methylation loss in late-replicating
-# domains is linked to mitotic cell division." Nat Genet 2018;50:591-602.
-# Common solo-WCGW PMD and HMD coordinates, hg19 and hg38, from the paper's
-# supplementary data.  The single most relevant set for HCG concordance in
-# tumours: PMDs are megabase-scale, late-replicating, and are where pan-cancer
-# hypomethylation happens.
-# PMD	/path/to/PMD_coordinates_hg38.bed
-# HMD	/path/to/HMD_coordinates_hg38.bed
+# --- lamina-associated domains, hg38 ------------------------------------
+# UCSC carries the LaminB1 table for hg19 only, so hg38 LADs must come from a
+# published set.  Supplementary data of:
+#   https://pmc.ncbi.nlm.nih.gov/articles/PMC9869549/
+# Download the LAD coordinates, then point this line at the local file (or lift
+# the hg19 UCSC table over with liftOver).
+# LAD	/path/to/hg38_LADs.bed
 
 # --- A/B compartments ----------------------------------------------------
 # From Hi-C in a relevant line (4DN).  Meningioma arises from arachnoid cap
