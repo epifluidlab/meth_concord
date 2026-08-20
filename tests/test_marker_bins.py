@@ -1832,3 +1832,66 @@ def test_coverage_report_flags_a_lopsided_contrast():
     r = m.coverage_report(counts, in_mask, ~in_mask)
     assert r["median_pairs_in"] == 12 and r["median_pairs_out"] == 60
     assert r["pairs_ratio"] == pytest.approx(0.2)
+
+
+# ------------------------------------------------------- stratification -----
+
+def _strat_frame(n=60, bins=3, effect=(1.0, 1.0), patient_shift=3.0, seed=0):
+    rng = np.random.default_rng(seed)
+    ct = np.array(["in"] * n + ["out"] * n)
+    pat = np.array([f"p{(i % 2) + 1}" for i in range(2 * n)])
+    X = rng.normal(0, 0.4, (2 * n, bins))
+    X += np.where((pat == "p1")[:, None], patient_shift, -patient_shift)
+    for j, e in enumerate(effect):
+        X[(ct == "in") & (pat == "p1"), j] += e
+    for j, e in enumerate(effect):
+        X[(ct == "in") & (pat == "p2"), j] += e
+    return X, ct == "in", ct == "out", pat
+
+
+def test_stratifying_removes_a_patient_main_effect():
+    """Both arms carry the patient's whole contribution, so comparing inside
+    a patient cancels it exactly -- including the parts no covariate models."""
+    m = _mod()
+    X, a, b, pat = _strat_frame(patient_shift=8.0, effect=(1.0, 1.0, 1.0))
+    comb, per = m.stratified_contrast(X, pat, a, b, 5, "welch")
+    assert comb["n_strata"] == 2
+    # the huge patient shift does not reach the estimate
+    np.testing.assert_allclose(comb["diff"], 1.0, atol=0.25)
+
+
+def test_the_stratified_difference_is_the_mean_of_within_stratum_ones():
+    m = _mod()
+    X, a, b, pat = _strat_frame(effect=(2.0, 2.0, 2.0))
+    comb, per = m.stratified_contrast(X, pat, a, b, 5, "welch")
+    mean_of_strata = np.mean([per[k]["diff"] for k in per], axis=0)
+    np.testing.assert_allclose(comb["diff"], mean_of_strata)
+
+
+def test_a_stratum_missing_an_arm_is_skipped():
+    m = _mod()
+    X, a, b, pat = _strat_frame()
+    pat = pat.copy()
+    pat[a] = "p1"                       # p2 now has no 'in' cells at all
+    comb, per = m.stratified_contrast(X, pat, a, b, 5, "welch")
+    assert comb is None, "one usable stratum is not a stratified analysis"
+    assert list(per) == ["p1"]
+
+
+def test_stratified_combination_is_not_a_consistency_test():
+    """Stouffer asks whether there is an average effect across strata, which a
+    bin real in ONE stratum still passes.  Requiring every stratum is the
+    different question, and the one 'specific' means."""
+    m = _mod()
+    rng = np.random.default_rng(2)
+    n = 80
+    ct = np.array(["in"] * n + ["out"] * n)
+    pat = np.array([f"p{(i % 2) + 1}" for i in range(2 * n)])
+    X = rng.normal(0, 0.4, (2 * n, 2))
+    X[(ct == "in") & (pat == "p1"), 0] += 2.0        # bin 0: p1 only
+    X[ct == "in", 1] += 2.0                          # bin 1: both
+    comb, per = m.stratified_contrast(X, pat, ct == "in", ct == "out", 5,
+                                      "welch")
+    assert comb["p"][0] < 0.01, "the combined test passes the p1-only bin"
+    mask, info = m.consistency_mask(per, 0.05)
+    assert list(mask) == [False, True], "consistency rejects it"

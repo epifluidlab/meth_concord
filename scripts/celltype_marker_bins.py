@@ -527,6 +527,67 @@ def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects")
     return out
 
 
+def stratified_contrast(X, strata, in_mask, out_mask, min_cells, test,
+                        V=None, mode="random-effects", min_strata=2):
+    """Run the contrast WITHIN each stratum, then combine across them.
+
+    The right treatment for a blocking factor that is biological rather than
+    technical -- patient above all.  Comparing tumour against monocyte inside
+    one patient removes that patient's whole contribution exactly, including
+    the parts no covariate would capture (CNV background, purity, tissue
+    handling), because both arms carry it equally.  Adjusting for patient as a
+    covariate assumes its effect is a constant added to every cell, which for
+    two patients is neither testable nor likely.
+
+    Combination is Stouffer's weighted z on the per-stratum results: it works
+    for whichever per-bin test was chosen, including a rank test that has no
+    standard error to pool.  Weights are sqrt(n) per stratum, so a patient
+    contributing twice the cells carries more evidence but not proportionally
+    more, which is right when the cells inside a patient are correlated.
+
+    Returns (combined, per_stratum).  ``combined['diff']`` is the mean of the
+    per-stratum differences: an average of within-patient effects, which is
+    the estimand here, rather than a pooled difference that a patient
+    imbalance would tilt.
+    """
+    from scipy.stats import norm
+
+    strata = np.asarray(strata)
+    per, zs, ws, diffs = {}, [], [], []
+    for lev in [x for x in pd.unique(strata) if x == x]:
+        keep = strata == lev
+        a, b = in_mask & keep, out_mask & keep
+        if int(a.sum()) < min_cells or int(b.sum()) < min_cells:
+            continue
+        if V is not None:
+            cs = weighted_contrast(X, V, a, b, min_cells, mode)
+        else:
+            cs = contrast_stats(X, a, min_cells, b, test)
+        per[str(lev)] = cs
+        with np.errstate(invalid="ignore"):
+            z = np.sign(cs["diff"]) * norm.isf(np.clip(cs["p"], 1e-300, 1) / 2)
+        zs.append(z)
+        diffs.append(cs["diff"])
+        ws.append(np.sqrt(min(int(a.sum()), int(b.sum()))))
+    if len(per) < min_strata:
+        return None, per
+    Z = np.vstack(zs)
+    D = np.vstack(diffs)
+    w = np.asarray(ws, float)[:, None]
+    ok = np.isfinite(Z).all(axis=0) & np.isfinite(D).all(axis=0)
+    with np.errstate(invalid="ignore"):
+        zc = np.nansum(w * Z, axis=0) / np.sqrt(np.nansum(w ** 2, axis=0))
+    combined = {
+        "diff": np.where(ok, np.nanmean(D, axis=0), np.nan),
+        "t": np.where(ok, zc, np.nan),
+        "p": np.where(ok, 2.0 * norm.sf(np.abs(zc)), np.nan),
+        "n_strata": len(per),
+        "n_in": np.nansum([per[k]["n_in"] for k in per], axis=0),
+        "n_out": np.nansum([per[k]["n_out"] for k in per], axis=0)}
+    combined["d"] = combined["diff"]
+    return combined, per
+
+
 def group_consistency(X, ct, groups, out_mask, min_cells, test, V=None,
                       mode="random-effects"):
     """Run the contrast once per group in the arm; return per-group diffs.
@@ -1736,6 +1797,20 @@ def main():
                          "one to use; 'precision' is the fixed-effect form "
                          "and is anticonservative when cells within an arm "
                          "genuinely differ.  Needs --delta-var.")
+    ap.add_argument("--contrast-stratify", default=None, metavar="COLUMN",
+                    help="Run the contrast WITHIN each level of this --samples "
+                         "column and combine across them (Stouffer's weighted "
+                         "z).  The right treatment for a BIOLOGICAL blocking "
+                         "factor -- patient above all: comparing the two arms "
+                         "inside one patient removes that patient's entire "
+                         "contribution, including CNV background and purity, "
+                         "which no covariate would capture.  Adjusting for "
+                         "patient instead assumes its effect is a constant "
+                         "added to every cell, which two patients cannot even "
+                         "test.  Technical batches (plate, sequencing run) "
+                         "belong in --batch-column and --remove-batch, not "
+                         "here.  Per-stratum differences are written to the "
+                         "BED so a bin carried by one stratum is visible.")
     ap.add_argument("--contrast-consistency", action="store_true",
                     help="Also run the contrast SEPARATELY for each group in "
                          "the arm and keep only bins that move the same way, "
@@ -2310,13 +2385,40 @@ def main():
                 Xc = center_cells(Xc)
             Vc = (V_df.reindex(index=M.index, columns=M.columns).to_numpy()
                   if V_df is not None else None)
-            if args.contrast_weight != "none":
-                cs = weighted_contrast(Xc, Vc, in_mask, out_mask,
-                                       args.min_cells_per_group,
-                                       args.contrast_weight)
-            else:
-                cs = contrast_stats(Xc, in_mask, args.min_cells_per_group,
-                                    out_mask, args.contrast_test)
+            strat_per, cs = {}, None
+            if args.contrast_stratify:
+                lev = batch_df_full.reindex(M.index)[args.contrast_stratify] \
+                    if args.contrast_stratify in batch_df_full.columns \
+                    else samples.set_index("cell_name")[
+                        args.contrast_stratify].reindex(M.index)
+                cs, strat_per = stratified_contrast(
+                    Xc, lev.to_numpy(), in_mask, out_mask,
+                    args.min_cells_per_group, args.contrast_test,
+                    Vc if args.contrast_weight != "none" else None,
+                    args.contrast_weight)
+                if cs is None:
+                    print(f"  contrast {label!r}: --contrast-stratify "
+                          f"{args.contrast_stratify!r} left fewer than two "
+                          f"strata with both arms present "
+                          f"({sorted(strat_per)}) -- falling back to the "
+                          f"unstratified contrast.", file=sys.stderr)
+                else:
+                    print(f"  contrast {label!r}: stratified by "
+                          f"{args.contrast_stratify} over "
+                          f"{cs['n_strata']} levels ({', '.join(strat_per)}); "
+                          f"the difference reported is the mean of the "
+                          f"within-stratum differences.", file=sys.stderr)
+                    for lv, gcs in strat_per.items():
+                        scores_df[f"contrast_{label}_diff_{lv}"] = gcs["diff"]
+                        extra_cols.append(f"contrast_{label}_diff_{lv}")
+            if cs is None:                     # not stratified, or it fell back
+                if args.contrast_weight != "none":
+                    cs = weighted_contrast(Xc, Vc, in_mask, out_mask,
+                                           args.min_cells_per_group,
+                                           args.contrast_weight)
+                else:
+                    cs = contrast_stats(Xc, in_mask, args.min_cells_per_group,
+                                        out_mask, args.contrast_test)
             if C_df is not None:
                 cov = coverage_report(
                     C_df.reindex(index=M.index, columns=M.columns)
@@ -2433,12 +2535,21 @@ def main():
                 keep_rank = keep_rank[np.isfinite(rank[keep_rank])]
                 mask[keep_rank] = True
             cons_info = {}
-            if args.contrast_consistency and len(present) > 1:
+            # When stratifying, consistency runs across the STRATA: combining
+            # per-stratum evidence (Stouffer) asks whether there is an average
+            # effect, which a bin real in one patient alone still passes.
+            # Requiring it in every patient is the different, stricter
+            # question, and the one "specific to this tumour type" means.
+            per_g = None
+            if args.contrast_consistency and strat_per and cs is not None:
+                per_g = strat_per
+            elif args.contrast_consistency and len(present) > 1:
                 per_g = group_consistency(
                     Xc, ct, present, out_mask, args.min_cells_per_group,
                     args.contrast_test,
                     Vc if args.contrast_weight != "none" else None,
                     args.contrast_weight)
+            if per_g is not None:
                 cmask, cons_info = consistency_mask(per_g, args.contrast_fdr)
                 if cmask is not None:
                     for g, gcs in per_g.items():
@@ -2455,8 +2566,9 @@ def main():
                           f"the same sign).", file=sys.stderr)
             elif args.contrast_consistency:
                 print(f"  contrast {label!r}: --contrast-consistency needs "
-                      f"more than one group in the arm; {present} has one.",
-                      file=sys.stderr)
+                      f"more than one group in the arm, or "
+                      f"--contrast-stratify; the arm {present} has one group "
+                      f"and no strata.", file=sys.stderr)
             # A contrast bin driven by batch is worthless in exactly the same
             # way a marker bin is, so it faces the same filter.
             clean = ~(np.isfinite(b_icc) & (b_icc > args.max_batch_icc))
