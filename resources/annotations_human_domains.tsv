@@ -47,6 +47,27 @@
 # None of the 7 cell types is meningeal.  cLAD is the cross-cell-type invariant
 # part and travels; per-cell-type tracks do not.
 
+# --- replication timing, hg38 -------------------------------------------
+# scripts/fetch_4dn_repliseq.py builds log2(early/late) from the 4DN 2-stage
+# Repli-seq fractions: 12 human cell types and states, plus three
+# genotypes of one engineered iPSC line (15 tracks in all).
+#
+#   python scripts/fetch_4dn_repliseq.py --output-dir rt_hg38
+#
+# 4DN releases the two fractions SEPARATELY as 5 kb RPKM bedGraphs, not a
+# timing track, so the ratio is built here -- at 250 kb, by summing each
+# fraction over the bin and then dividing.  At native 5 kb, 14% of early bins
+# are zero and a per-bin ratio is mostly pseudocount; ratio-of-totals and
+# mean-of-ratios are different numbers and only the first is meaningful.
+#
+# Use signal_track_flags.txt with --signal-track.  Signed, so
+# bin_set_signal_summary needs --normalize zscore.  --derive-domain-bed writes
+# early/late BEDs at the sign cut for coverage-style tests.
+#
+# Sanity check that also validates the LAD fetcher: in HFFc6 this track
+# correlates with the 4DN LaminB1 DamID signal at r = -0.84, early being
+# lamina-distal.
+
 # --- A/B compartments ----------------------------------------------------
 # From Hi-C in a relevant line (4DN).  Meningioma arises from arachnoid cap
 # cells, so a mesenchymal/fibroblast reference is nearer than a neuronal one.

@@ -37,30 +37,25 @@ log ratio.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _4dn import cell_name, download, search  # noqa: E402
+
+
 logger = logging.getLogger("fetch_4dn_damid")
 
-_API = "https://data.4dnucleome.org/search/"
-_FIELDS = ("&field=accession&field=track_and_facet_info&field=genome_assembly"
-           "&field=file_type_detailed&field=description&field=open_data_url"
-           "&field=file_size&field=md5sum")
 
-
-def query_files(assembly="GRCh38", timeout=120):
+def query_files(assembly="GRCh38", timeout=180):
     """Every DamID-seq bigWig record the portal lists, as JSON."""
-    url = (f"{_API}?type=FileProcessed&file_format.file_format=bw"
-           f"&track_and_facet_info.experiment_type=DamID-seq"
-           f"&limit=all{_FIELDS}&format=json")
-    logger.info("querying 4DN ...")
-    with urllib.request.urlopen(url, timeout=timeout) as fh:
-        return json.load(fh).get("@graph", [])
+    return search({"type": "FileProcessed",
+                   "file_format.file_format": "bw",
+                   "track_and_facet_info.experiment_type": "DamID-seq"},
+                  timeout=timeout)
 
 
 def select(records, assembly="GRCh38", bin_size="250kb", replicate_mean=True):
@@ -81,31 +76,9 @@ def select(records, assembly="GRCh38", bin_size="250kb", replicate_mean=True):
             continue
         if replicate_mean and "mean of replicates" not in desc:
             continue
-        cell = (tf.get("biosource_name") or "?").split(" (")[0].replace(" ", "_")
+        cell = cell_name(tf.get("biosource_name"))
         out.setdefault(cell, r)
     return dict(sorted(out.items()))
-
-
-def download(rec, dest: Path, timeout=600):
-    """Fetch via open_data_url; verify the md5 the portal recorded."""
-    import hashlib
-
-    url = rec.get("open_data_url")
-    if not url:
-        raise SystemExit(
-            f"{rec['accession']}: no open_data_url on the record, so the file "
-            f"is only reachable through the portal's authenticated download.")
-    if dest.exists() and rec.get("md5sum"):
-        if hashlib.md5(dest.read_bytes()).hexdigest() == rec["md5sum"]:
-            logger.info(f"  {dest.name}: cached")
-            return dest
-    logger.info(f"  {dest.name}: downloading {rec.get('file_size', 0) / 1e6:.1f} MB")
-    with urllib.request.urlopen(url, timeout=timeout) as fh:
-        dest.write_bytes(fh.read())
-    got = hashlib.md5(dest.read_bytes()).hexdigest()
-    if rec.get("md5sum") and got != rec["md5sum"]:
-        raise SystemExit(f"{dest}: md5 {got} != recorded {rec['md5sum']}")
-    return dest
 
 
 def bigwig_grid(path, grid_bp, chroms=None):
