@@ -60,6 +60,22 @@
 # are zero and a per-bin ratio is mostly pseudocount; ratio-of-totals and
 # mean-of-ratios are different numbers and only the first is meaningful.
 #
+# --derive-partition-bed adds the CROSS-cell-type classes as BEDs plus an
+# annotation_manifest.tsv, so they appear under 'Other annotations':
+#   RT_constitutive_late   late in every cell type
+#   RT_constitutive_early  early in every cell type
+#   RT_variable            late in some, early in others
+# A bin counts only where every cell type measured it (coverage differs, and
+# scoring a bin "late in all" on three of twelve would make the class largest
+# where the data are thinnest).  --rt-threshold opens a dead zone so bins
+# hovering at zero are not called variable on noise; with t > 0 the classes
+# stop being exhaustive and the leftover count is reported.
+#
+# Over 11 distinct cell types: 25.6% constitutive early, 50.6% variable, 23.8%
+# constitutive late.  These line up with the LAD partition almost perfectly --
+# constitutive-early is 82.7% ciLAD and 0% cLAD, constitutive-late is 74.0%
+# cLAD and 0.2% ciLAD, variable is 73.8% fLAD.
+#
 # Use signal_track_flags.txt with --signal-track.  Signed, so
 # bin_set_signal_summary needs --normalize zscore.  --derive-domain-bed writes
 # early/late BEDs at the sign cut for coverage-style tests.

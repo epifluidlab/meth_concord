@@ -143,6 +143,50 @@ def timing(early_paths, late_paths, grid_bp, chroms=None, min_total=1e-6):
     return out, int((~ok).sum())
 
 
+def rt_partition(frames, threshold=0.0):
+    """Cross-cell-type RT classes -> (frame, counts, n_incomplete).
+
+    Structurally the LAD partition with "is late" in place of "is a LAD":
+    constitutive-late is late everywhere, constitutive-early is late nowhere,
+    and variable is the rest.  Two differences matter.
+
+    A bin is classified only if EVERY cell type measured it.  Coverage is not
+    identical between cell types -- each drops its own centromeres and empty
+    bins -- so scoring a bin "late in all" when only three of twelve cell types
+    have data would let thin coverage masquerade as constitutivity, and the
+    class would be largest exactly where the data are weakest.
+
+    ``threshold`` opens a dead zone around zero.  At a bare sign cut a bin
+    sitting at -0.02 in one cell type and +0.02 in another is called variable
+    on noise, which inflates the variable class with bins that are really
+    mid-S everywhere.  With t > 0 a bin must clear +/-t to vote, so bins that
+    are ambiguous somewhere fall into NO class and the three stop being a
+    partition -- the count is returned so that is visible rather than implied.
+    """
+    keys, mats = None, []
+    for df in frames:
+        k = pd.MultiIndex.from_arrays([df.chrom, df.start])
+        ser = pd.Series(df.value.to_numpy(), index=k)
+        keys = ser.index if keys is None else keys.intersection(ser.index)
+        mats.append(ser)
+    n_all = len(set().union(*[set(m.index) for m in mats]))
+    v = np.vstack([m.loc[keys].to_numpy() for m in mats])
+
+    late, early = v < -threshold, v > threshold
+    con_late = late.all(axis=0)
+    con_early = early.all(axis=0)
+    variable = late.any(axis=0) & early.any(axis=0)
+
+    out = pd.DataFrame({"chrom": [k[0] for k in keys],
+                        "start": [k[1] for k in keys]})
+    out["class"] = np.where(
+        con_late, "RT_constitutive_late",
+        np.where(con_early, "RT_constitutive_early",
+                 np.where(variable, "RT_variable", "RT_unclassified")))
+    counts = out["class"].value_counts().to_dict()
+    return out, counts, n_all - len(keys)
+
+
 def write_bedgraph(df, path):
     df.to_csv(path, sep="\t", index=False, header=False,
               float_format="%.5f")
@@ -175,7 +219,21 @@ def main(argv=None) -> int:
                     help="Also write the binned early and late totals, for "
                          "checking the ratio against its inputs.")
     ap.add_argument("--derive-domain-bed", action="store_true",
-                    help="Also write early/late domain BEDs at the sign cut.")
+                    help="Also write per-cell-type early/late domain BEDs at "
+                         "the sign cut.")
+    ap.add_argument("--derive-partition-bed", action="store_true",
+                    help="Also write the CROSS-cell-type classes -- "
+                         "constitutive late, constitutive early, and variable "
+                         "-- plus an annotation_manifest.tsv, so they land in "
+                         "marker_bin_enrichment's 'Other annotations'.  A bin "
+                         "counts only where every cell type measured it.")
+    ap.add_argument("--rt-threshold", type=float, default=0.0,
+                    help="Dead zone for --derive-partition-bed: late is below "
+                         "-T, early above +T (0.0: a bare sign cut, where the "
+                         "three classes partition the measured bins).  Raise "
+                         "it so bins hovering at zero stop being called "
+                         "variable on noise; bins ambiguous in any cell type "
+                         "then fall into no class and are reported.")
     ap.add_argument("--list", action="store_true",
                     help="List what is available and exit without downloading.")
     args = ap.parse_args(argv)
@@ -205,7 +263,7 @@ def main(argv=None) -> int:
     (out / "raw").mkdir(parents=True, exist_ok=True)
     logger.info("%d cell types: %s", len(picked), ", ".join(picked))
 
-    tracks = {}
+    tracks, frames = {}, {}
     for label, fr in picked.items():
         paths = {}
         for frac in ("early", "late"):
@@ -217,6 +275,7 @@ def main(argv=None) -> int:
         dest = out / f"{label}_RT_{args.grid_bp // 1000}kb.bedGraph"
         write_bedgraph(df, dest)
         tracks[f"RT_{label}"] = dest
+        frames[label] = df
         logger.info("  %s: %d bins (%d dropped, one fraction empty), "
                     "log2(E/L) %+.2f .. %+.2f, %.0f%% early",
                     label, len(df), dropped, df.value.min(), df.value.max(),
@@ -242,6 +301,43 @@ def main(argv=None) -> int:
             ne = write_domains(df, out / f"{label}_early.bed", early=True)
             nl = write_domains(df, out / f"{label}_late.bed", early=False)
             logger.info("    domains: %d early / %d late", ne, nl)
+
+    if args.derive_partition_bed:
+        if len(frames) < 2:
+            raise SystemExit(
+                "--derive-partition-bed needs at least two cell types: with "
+                "one, every measured bin is trivially 'constitutive'.")
+        part, counts, incomplete = rt_partition(list(frames.values()),
+                                                args.rt_threshold)
+        part["end"] = part.start + args.grid_bp
+        manifest = {}
+        for cls in ("RT_constitutive_early", "RT_variable",
+                    "RT_constitutive_late"):
+            sel = part[part["class"] == cls]
+            path = out / f"{cls}.bed"
+            sel[["chrom", "start", "end"]].sort_values(
+                ["chrom", "start"]).to_csv(path, sep="\t", index=False,
+                                           header=False)
+            manifest[cls] = path
+        total = len(part)
+        logger.info("partition over %d cell types (%d bins classified, "
+                    "%d dropped for incomplete coverage):",
+                    len(frames), total, incomplete)
+        for cls, path in manifest.items():
+            n = int((part["class"] == cls).sum())
+            logger.info("  %-22s %6d bins (%4.1f%%)  -> %s",
+                        cls, n, 100 * n / max(total, 1), path.name)
+        unclassified = int((part["class"] == "RT_unclassified").sum())
+        if unclassified:
+            logger.info("  %-22s %6d bins (%4.1f%%)  ambiguous in at least "
+                        "one cell type at |log2(E/L)| <= %.2f; in no class",
+                        "(unclassified)", unclassified,
+                        100 * unclassified / max(total, 1), args.rt_threshold)
+        with open(out / "annotation_manifest.tsv", "w") as fh:
+            fh.write(f"# RT classes across {', '.join(sorted(frames))}\n")
+            for cls, path in manifest.items():
+                fh.write(f"{cls}\t{path.resolve()}\n")
+        logger.info("wrote %s", (out / "annotation_manifest.tsv").name)
 
     write_flags(tracks, out / "signal_track_flags.txt")
     logger.info("wrote %d tracks + signal_track_flags.txt to %s",
