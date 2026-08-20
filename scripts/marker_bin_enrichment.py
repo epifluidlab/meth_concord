@@ -1208,7 +1208,7 @@ def main(argv=None):
                          "for a starting point with the sources named: at a "
                          "250 kb bin the sets worth testing are DOMAIN-scale "
                          "(LADs, PMDs, compartments), since a peak-scale set "
-                         "covers ~0.1% of a bin and its coverage fraction "
+                         "covers ~0.1%% of a bin and its coverage fraction "
                          "mostly measures gene density.")
     ap.add_argument("--annotation", action="append", default=None,
                     metavar="LABEL=BED|URL",

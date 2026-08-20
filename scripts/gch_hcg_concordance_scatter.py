@@ -1096,7 +1096,7 @@ def main(argv=None) -> int:
                          "'heatmap' is the 3x3 table coloured by "
                          "log2(observed/expected) under independence — "
                          "colouring by the COUNT would show the margins, since "
-                         "with both marks far off 50% the co-closed x "
+                         "with both marks far off 50%% the co-closed x "
                          "co-methylated cell is the largest under no "
                          "relationship at all.  'flow' is the "
                          "stacked bars with ribbons.")
