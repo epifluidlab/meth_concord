@@ -745,6 +745,57 @@ def _signal_enrichment(bins, fg, tracks, block_bp=10_000_000, n_boot=200):
 
 # ------------------------------------------------------------- enrichment ----
 
+def _is_binary_coverage(cov, eps=1e-3) -> bool:
+    """Is this annotation all-or-nothing on this bin grid?
+
+    An annotation BUILT on the analysis grid -- the LAD partition, the
+    replication-timing classes, anything written per bin -- covers each bin
+    either fully or not at all, so its coverage takes exactly two values.  The
+    graded ones (PMDs, cytobands, a segmentation) land anywhere in between.
+    """
+    v = np.asarray(cov, float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return False
+    return bool(np.all((v <= eps) | (v >= 1.0 - eps)))
+
+
+def _fisher_row(label, cov, fg, min_frac=0.5):
+    """Fisher's exact on the 2x2 of (foreground, in the annotation).
+
+    A bin counts as IN when at least ``min_frac`` of it is covered.  For a set
+    defined on this grid -- the LAD partition, the RT classes -- coverage is 0
+    or 1 and any threshold in between gives the same table.  For a set with
+    its own coordinates (PMDs, HMDs) the bins that straddle a boundary go to
+    whichever side holds most of them, which is the usual call for domains
+    megabases wide against a 250 kb bin.
+
+    This is the classic enrichment question -- are foreground bins more often
+    in the annotation -- answered exactly, which matters when the foreground
+    is small, and with an odds ratio.  Running it for EVERY region annotation
+    rather than switching per annotation is deliberate: one panel comparing
+    LADs, PMDs and replication timing should not mix two tests and two effect
+    measures, because then no row can be read against its neighbour.
+    """
+    from scipy.stats import fisher_exact
+    hit = np.asarray(cov, float) >= min_frac
+    a = int(np.sum(fg & hit))
+    b = int(np.sum(fg & ~hit))
+    c = int(np.sum(~fg & hit))
+    d = int(np.sum(~fg & ~hit))
+    try:
+        orr, p = fisher_exact([[a, b], [c, d]])
+    except Exception:
+        orr, p = np.nan, np.nan
+    m_fg = a / max(a + b, 1)
+    m_bg = c / max(c + d, 1)
+    return {"annotation": label, "test": "fisher",
+            "mean_frac_fg": m_fg, "mean_frac_bg": m_bg,
+            "log2_fold_change": float(np.log2((m_fg + _EPS) / (m_bg + _EPS))),
+            "odds_ratio": float(orr), "n_fg_in": a, "n_fg_out": b,
+            "n_bg_in": c, "n_bg_out": d, "pvalue": float(p)}
+
+
 def _mwu_row(label, cov, fg):
     from scipy.stats import mannwhitneyu
     a, b = cov[fg], cov[~fg]
@@ -758,17 +809,50 @@ def _mwu_row(label, cov, fg):
                 a, b, alternative="two-sided").pvalue)  # it only errors when
         except ValueError:        # EVERY value (both groups) is identical.
             p = np.nan
-    return {"annotation": label, "mean_frac_fg": m_fg, "mean_frac_bg": m_bg,
+    return {"annotation": label, "test": "mannwhitney",
+            "mean_frac_fg": m_fg, "mean_frac_bg": m_bg,
             "log2_fold_change": lfc, "pvalue": p}
 
 
-def _region_enrichment(bins, fg, categories):
-    """MWU coverage enrichment (fg vs bg) for a dict {label: intervals_df}."""
+def _region_enrichment(bins, fg, categories, test="fisher", min_frac=0.5):
+    """Region enrichment (fg vs bg) for a dict {label: intervals_df}.
+
+    Fisher's exact for every annotation by default, on 'is this bin in the
+    set'.  These are all domain-scale sets asking one question, and they are
+    read side by side in a single panel; a per-annotation choice of test would
+    put an odds ratio next to a rank statistic and two different nulls in one
+    figure, which no reader can compare.
+
+    'mwu' keeps the graded version -- Mann-Whitney on the coverage fraction --
+    for a set where the partial bins are the point.  'auto' picks per
+    annotation, which is what the graded/binary split would suggest in
+    isolation; it is not the default for the reason above.  The test that ran
+    is recorded in the 'test' column either way.
+    """
     rows, covs = [], {}
     for label, iv in categories.items():
         cov = _coverage(bins, iv)
         covs[label] = cov
-        rows.append(_mwu_row(label, cov, fg))
+        use = test
+        if use == "auto":
+            use = "fisher" if _is_binary_coverage(cov) else "mwu"
+        if use == "fisher":
+            total = float(np.nansum(cov))
+            if total > 0 and not np.any(cov >= min_frac):
+                # Peak-scale set at a domain-scale bin.  It never fills half a
+                # bin, so every cell of the 2x2 on one side is zero and the
+                # row comes out p = 1 -- which reads as "no enrichment" when
+                # it means "this test cannot see this annotation here".
+                print(f"  NOTE {label}: covers at most "
+                      f"{100 * float(np.nanmax(cov)):.2g}% of any bin, never "
+                      f"the {100 * min_frac:.0f}% needed to count as IN, so "
+                      f"its row is empty rather than negative.  It is "
+                      f"peak-scale against a domain-scale bin: turn it into a "
+                      f"density track (bp or peaks per bin) and pass it with "
+                      f"--signal-track, or lower --region-overlap-frac.",
+                      file=sys.stderr)
+        rows.append(_fisher_row(label, cov, fg, min_frac) if use == "fisher"
+                    else _mwu_row(label, cov, fg))
     df = pd.DataFrame(rows)
     if not df.empty:
         df["fdr"] = _bh(df["pvalue"].values)
@@ -1025,7 +1109,9 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
     # (2) genomic features + gene overlap ----------------------------------
     fg_genes = bg_genes = None
     if genes is not None:
-        feat_df, _ = _region_enrichment(bins, fg, gene_features)
+        feat_df, _ = _region_enrichment(bins, fg, gene_features,
+                                        args.region_test,
+                                        args.region_overlap_frac)
         feat_df.to_csv(tsv("feature_enrichment"), sep="\t", index=False)
         pages.append(("region", ("Genomic features", feat_df)))
         bg_genes = _genes_over_bins(bins, genes)                 # universe
@@ -1046,18 +1132,23 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
             cats = {s: g for s, g in chromhmm.groupby("group")}
         else:                                    # per state, back-compat label
             cats = {f"state:{s}": g for s, g in chromhmm.groupby("name")}
-        hmm_df, _ = _region_enrichment(bins, fg, cats)
+        hmm_df, _ = _region_enrichment(bins, fg, cats,
+                                       args.region_test,
+                                       args.region_overlap_frac)
         hmm_df.to_csv(tsv("chromhmm_enrichment"), sep="\t", index=False)
         pages.append(("region", (
             f"Chromatin states (by {'group' if grouped else 'state'})", hmm_df)))
         if args.chromhmm_per_state and grouped:
             st = {f"state:{s}": g for s, g in chromhmm.groupby("name")}
-            _region_enrichment(bins, fg, st)[0].to_csv(
+            _region_enrichment(bins, fg, st, args.region_test,
+                               args.region_overlap_frac)[0].to_csv(
                 tsv("chromhmm_state_enrichment"), sep="\t", index=False)
 
     # (4) other annotations ------------------------------------------------
     if annotations:
-        ann_df, _ = _region_enrichment(bins, fg, annotations)
+        ann_df, _ = _region_enrichment(bins, fg, annotations,
+                                       args.region_test,
+                                       args.region_overlap_frac)
         ann_df.to_csv(tsv("annotation_enrichment"), sep="\t", index=False)
         pages.append(("region", ("Other annotations", ann_df)))
 
@@ -1235,6 +1326,23 @@ def main(argv=None):
     ap.add_argument("--chromhmm-per-state", action="store_true",
                     help="Also write the per-state (un-collapsed) enrichment "
                          "table alongside the per-group one.")
+    ap.add_argument("--region-test", choices=["fisher", "mwu", "auto"],
+                    default="fisher",
+                    help="Test for region enrichment.  'fisher' (default) is "
+                         "Fisher's exact on 'is this bin in the set', for "
+                         "EVERY annotation, so one panel of LADs, PMDs and "
+                         "replication timing carries one test and one effect "
+                         "measure.  'mwu' is Mann-Whitney on the coverage "
+                         "fraction, for when the partly-covered bins are the "
+                         "point.  'auto' picks per annotation.  Signal tracks "
+                         "(--signal-track) are continuous and always use "
+                         "Mann-Whitney; this flag does not touch them.")
+    ap.add_argument("--region-overlap-frac", type=float, default=0.5,
+                    help="A bin is IN an annotation when at least this "
+                         "fraction of it is covered (0.5).  Irrelevant for a "
+                         "set defined on the bin grid, where coverage is 0 or "
+                         "1; for PMDs and the like it decides the "
+                         "boundary-straddling bins, 23%% of them at 250 kb.")
     ap.add_argument("--annotation-manifest", action="append", default=None,
                     metavar="TSV",
                     help="A file of 'label<TAB>path_or_url' lines, one per "

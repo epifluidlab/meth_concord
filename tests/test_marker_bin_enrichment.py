@@ -778,3 +778,130 @@ def test_the_same_label_pointing_at_the_same_file_is_fine(tmp_path):
 def test_no_manifest_gives_an_empty_mapping():
     m = _mod()
     assert m._merge_manifests([]) == {}
+
+
+# ------------------------------------------------------------ region test ---
+
+def test_a_grid_aligned_annotation_is_recognised_as_all_or_nothing():
+    """A BED written per bin -- the LAD partition, the RT classes -- covers a
+    bin fully or not at all, so its coverage has exactly two values."""
+    m = _mod()
+    assert m._is_binary_coverage(np.array([0.0, 1.0, 1.0, 0.0]))
+    assert m._is_binary_coverage(np.array([0.0, 0.0]))
+    assert not m._is_binary_coverage(np.array([0.0, 0.4, 1.0]))
+    assert not m._is_binary_coverage(np.array([0.5]))
+
+
+def test_binary_coverage_ignores_nan_and_tolerates_rounding():
+    m = _mod()
+    assert m._is_binary_coverage(np.array([0.0, 1.0, np.nan]))
+    assert m._is_binary_coverage(np.array([1e-9, 1 - 1e-9]))
+    assert not m._is_binary_coverage(np.array([np.nan, np.nan]))
+
+
+def test_fisher_row_builds_the_right_two_by_two():
+    m = _mod()
+    #        covered  not
+    #  fg       3      1
+    #  bg       1      5
+    cov = np.array([1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    fg = np.array([True] * 4 + [False] * 6)
+    r = m._fisher_row("x", cov, fg)
+    assert (r["n_fg_in"], r["n_fg_out"]) == (3, 1)
+    assert (r["n_bg_in"], r["n_bg_out"]) == (1, 5)
+    assert r["odds_ratio"] == pytest.approx((3 * 5) / (1 * 1))
+    assert r["mean_frac_fg"] == pytest.approx(0.75)
+    assert r["test"] == "fisher"
+
+
+def test_fisher_is_exact_where_the_rank_test_only_approximates():
+    """The reason to switch: with a small foreground the exact p and the
+    normal-approximation rank p are different numbers."""
+    m = _mod()
+    cov = np.array([1.0] * 4 + [0.0] * 16)
+    fg = np.array([True] * 4 + [False] * 16)
+    fisher = m._fisher_row("x", cov, fg)["pvalue"]
+    mwu = m._mwu_row("x", cov, fg)["pvalue"]
+    assert fisher == pytest.approx(1 / 4845, rel=1e-6)   # 1 / C(20,4)
+    assert abs(fisher - mwu) > 1e-6, "the two tests should not coincide here"
+
+
+def test_every_region_annotation_gets_the_same_test_by_default():
+    """One panel of LADs, PMDs and replication timing must carry one test and
+    one effect measure, or no row can be read against its neighbour."""
+    m = _mod()
+    bins = _bins([("chr1", i * 100, (i + 1) * 100) for i in range(10)])
+    fg = np.array([True] * 4 + [False] * 6)
+    grid = pd.DataFrame({"chrom": ["chr1"] * 3,
+                         "start": [0, 100, 200], "end": [100, 200, 300]})
+    graded = pd.DataFrame({"chrom": ["chr1"] * 3,
+                           "start": [0, 140, 250], "end": [60, 200, 360]})
+    df, _ = m._region_enrichment(bins, fg, {"grid": grid, "graded": graded})
+    assert set(df["test"]) == {"fisher"}
+    assert df["odds_ratio"].notna().any()
+
+
+def test_auto_still_splits_by_annotation_when_asked():
+    m = _mod()
+    bins = _bins([("chr1", i * 100, (i + 1) * 100) for i in range(10)])
+    fg = np.array([True] * 4 + [False] * 6)
+    grid = pd.DataFrame({"chrom": ["chr1"] * 3,
+                         "start": [0, 100, 200], "end": [100, 200, 300]})
+    graded = pd.DataFrame({"chrom": ["chr1"] * 3,
+                           "start": [0, 140, 250], "end": [60, 200, 360]})
+    df, _ = m._region_enrichment(bins, fg, {"grid": grid, "graded": graded},
+                                 test="auto")
+    got = dict(zip(df["annotation"], df["test"]))
+    assert got["grid"] == "fisher" and got["graded"] == "mannwhitney"
+
+
+def test_a_straddling_bin_goes_to_the_side_holding_most_of_it():
+    """PMDs have their own coordinates, so 23% of 250 kb bins are partly
+    covered; the majority rule decides them, and the threshold is a flag."""
+    m = _mod()
+    bins = _bins([("chr1", 0, 100), ("chr1", 100, 200)])
+    fg = np.array([True, False])
+    ann = pd.DataFrame({"chrom": ["chr1", "chr1"],
+                        "start": [0, 100], "end": [70, 130]})   # 70% and 30%
+    r = m._fisher_row("x", m._coverage(bins, ann), fg, min_frac=0.5)
+    assert (r["n_fg_in"], r["n_bg_in"]) == (1, 0)
+    loose = m._fisher_row("x", m._coverage(bins, ann), fg, min_frac=0.2)
+    assert (loose["n_fg_in"], loose["n_bg_in"]) == (1, 1)
+
+
+def test_region_test_can_be_forced():
+    m = _mod()
+    bins = _bins([("chr1", i * 100, (i + 1) * 100) for i in range(10)])
+    fg = np.array([True] * 4 + [False] * 6)
+    grid = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [300]})
+    df, _ = m._region_enrichment(bins, fg, {"grid": grid}, test="mwu")
+    assert df["test"].iloc[0] == "mannwhitney"
+    df, _ = m._region_enrichment(bins, fg, {"grid": grid}, test="fisher")
+    assert df["test"].iloc[0] == "fisher"
+
+
+def test_a_peak_scale_annotation_is_flagged_not_silently_empty(capsys):
+    """CpG islands are ~1 kb and never fill half a 250 kb bin, so the 2x2 has
+    a zero column and the row reads p = 1 -- 'no enrichment' when it means
+    'this test cannot see this annotation at this bin size'."""
+    m = _mod()
+    bins = _bins([("chr1", i * 250000, (i + 1) * 250000) for i in range(8)])
+    fg = np.array([True] * 3 + [False] * 5)
+    peaks = pd.DataFrame({"chrom": ["chr1"] * 8,
+                          "start": [i * 250000 for i in range(8)],
+                          "end": [i * 250000 + 1000 for i in range(8)]})
+    df, _ = m._region_enrichment(bins, fg, {"CpG_island": peaks})
+    assert df["n_fg_in"].iloc[0] == 0 and df["n_bg_in"].iloc[0] == 0
+    err = capsys.readouterr().err
+    assert "peak-scale" in err and "CpG_island" in err
+    assert "--signal-track" in err
+
+
+def test_an_annotation_absent_from_the_bins_is_not_flagged(capsys):
+    """Zero coverage everywhere is a real absence, not a scale mismatch."""
+    m = _mod()
+    bins = _bins([("chr1", 0, 100), ("chr1", 100, 200)])
+    fg = np.array([True, False])
+    elsewhere = pd.DataFrame({"chrom": ["chr9"], "start": [0], "end": [100]})
+    m._region_enrichment(bins, fg, {"band:stalk": elsewhere})
+    assert "peak-scale" not in capsys.readouterr().err
