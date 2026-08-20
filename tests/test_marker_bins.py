@@ -1626,3 +1626,104 @@ def test_the_contrast_sees_batch_corrected_values(tmp_path):
         f"batch correction should not lose real bins "
         f"({corrected} vs {uncorrected})")
     assert corrected >= 30, f"only {corrected}/40 planted bins recovered"
+
+
+# ================================================== genome-wide offset =======
+
+def test_global_shift_report_spots_a_one_sided_contrast():
+    """Every bin moving the same way is an offset between the arms, not
+    thousands of local aberrations."""
+    m = _mod()
+    r = m.global_shift_report(np.full(1000, 1.0) + np.random.default_rng(0)
+                              .normal(0, 0.05, 1000))
+    assert r["frac_bins_same_direction"] > 0.99
+    assert r["median_diff"] == pytest.approx(1.0, abs=0.02)
+    assert r["median_over_mad"] > 10
+
+
+def test_global_shift_report_is_quiet_on_a_local_contrast():
+    m = _mod()
+    rng = np.random.default_rng(0)
+    d = rng.normal(0, 1, 1000)
+    d[:50] += 4.0                                  # a few genuinely aberrant
+    r = m.global_shift_report(d)
+    assert r["frac_bins_same_direction"] < 0.7
+    assert abs(r["median_diff"]) < 0.3
+
+
+def test_global_shift_report_ignores_nan():
+    m = _mod()
+    r = m.global_shift_report(np.array([1.0, 1.0, np.nan, 1.0]))
+    assert r["frac_bins_same_direction"] == pytest.approx(1.0)
+    assert m.global_shift_report(np.array([np.nan, np.nan])) == {}
+
+
+def test_center_cells_removes_a_per_cell_offset_not_the_shape():
+    m = _mod()
+    shape = np.array([0.0, 1.0, -1.0, 2.0])
+    X = np.vstack([shape + 10.0, shape - 5.0, shape])
+    got = m.center_cells(X)
+    # every row now has the same values up to its own median
+    for row in got:
+        np.testing.assert_allclose(row - row[0], shape - shape[0])
+    np.testing.assert_allclose(np.median(got, axis=1), 0.0, atol=1e-12)
+
+
+def test_center_cells_tolerates_nan():
+    m = _mod()
+    X = np.array([[1.0, 2.0, np.nan], [11.0, 12.0, 13.0]])
+    got = m.center_cells(X)
+    assert np.isnan(got[0, 2])
+    assert got[0, 0] == pytest.approx(1.0 - 1.5)
+
+
+def test_a_global_offset_makes_everything_significant_and_says_so(tmp_path):
+    """The failure this exists for: a per-cell offset in one arm makes every
+    bin differ, the BED comes back holding the genome, and an enrichment on it
+    is the genome against itself."""
+    rng = np.random.default_rng(11)
+    groups = [("tumor1", 30), ("tumor2", 30), ("mono", 28), ("lineA", 20)]
+    cells, types = [], []
+    for ct, k in groups:
+        cells += [f"{ct}_{i}" for i in range(k)]
+        types += [ct] * k
+    types = np.array(types)
+    n_bins = 400
+    X = rng.normal(0, 1, (len(cells), n_bins))
+    tum = np.char.startswith(types.astype(str), "tumor")
+    X[tum] += 1.5                                   # the global offset
+    X[np.ix_(tum, np.arange(30))] += 3.0            # 30 genuinely local bins
+
+    bins = [f"chr1:{i * 250000}" for i in range(n_bins)]
+    mat = tmp_path / "concordance_directional.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * len(cells),
+                  "cell_type": types,
+                  "sample": ["b1", "b2"] * (len(cells) // 2)}).to_csv(
+        stab, sep="\t", index=False)
+
+    def run(sub, extra):
+        out = tmp_path / sub
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+             "--samples", str(stab), "--cell-type-column", "cell_type",
+             "--batch-column", "sample", "--n-bins", "20",
+             "--n-permutations", "20", "--contrast", "t=tumor1,tumor2:mono",
+             "--output-dir", str(out), "--plot-format", "png"] + extra,
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        bed = pd.read_csv(out / "bin_scores_gch.contrast_t.bed", sep="\t")
+        local = int(((bed["start"] // 250000) < 30).sum())
+        return len(bed), local, r.stderr
+
+    n_all, local_all, err = run("plain", [])
+    assert n_all > 0.9 * n_bins, "the offset should light up nearly everything"
+    assert "genome-wide OFFSET" in err
+    assert "--contrast-center cell-median" in err
+
+    n_ctr, local_ctr, err2 = run("centred", ["--contrast-center",
+                                             "cell-median"])
+    assert n_ctr < 0.2 * n_bins, f"{n_ctr} bins still selected after centring"
+    assert local_ctr >= 25, f"only {local_ctr}/30 planted bins recovered"
+    assert "genome-wide OFFSET" not in err2

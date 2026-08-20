@@ -441,6 +441,58 @@ def mwu_min_pvalue(n1, n2):
     return min(1.0, 2.0 / comb(n1 + n2, n1))
 
 
+def global_shift_report(diff, sig=None):
+    """Is the contrast a genome-wide offset rather than local aberration?
+
+    A bin-specific result has differences scattered either side of zero, with
+    the significant ones in both tails.  If instead nearly every bin moves the
+    same way, the two arms differ by a constant across the whole genome -- and
+    at a few hundred cells per arm even a modest constant makes almost every
+    bin significant, so the BED comes back holding most of the genome and is
+    useless as a foreground: an enrichment of the genome against itself.
+
+    Such an offset can be real (one arm genuinely less coordinated) or
+    technical (different coverage, purity, or cell quality changing how D is
+    estimated).  This cannot tell which, so it reports rather than corrects.
+    """
+    d = np.asarray(diff, float)
+    d = d[np.isfinite(d)]
+    if d.size == 0:
+        return {}
+    med = float(np.median(d))
+    same = float(max(np.mean(d > 0), np.mean(d < 0)))
+    mad = float(np.median(np.abs(d - med))) or float("nan")
+    out = {"median_diff": med, "frac_bins_same_direction": same,
+           "median_abs_deviation": mad,
+           "median_over_mad": abs(med) / mad if mad == mad and mad else np.nan}
+    if sig is not None:
+        m = np.asarray(sig, bool)[np.isfinite(np.asarray(diff, float))]
+        if m.any():
+            out["frac_significant_up"] = float(np.mean(d[m] > 0))
+    return out
+
+
+def center_cells(X, mask=None):
+    """Subtract each cell's own median across bins.
+
+    Removes a per-CELL offset -- the mechanism behind a genome-wide arm
+    difference, since each cell carries its own overall level -- while leaving
+    the shape along the genome alone.  Gentler than the per-cell RANK used
+    before the UMAP, which redistributes every value; this only slides each
+    cell up or down.
+
+    It is still compositional in principle: a bin's centred value depends on
+    the other bins through the median.  That is harmless while genuine
+    aberrations are a small share of the genome (a few hundred bins cannot
+    move a median over tens of thousands) and wrong when they are not.  If
+    half the genome really differs, centring will subtract the finding.
+    """
+    X = np.asarray(X, float)
+    with np.errstate(invalid="ignore"):
+        med = np.nanmedian(X[:, mask] if mask is not None else X, axis=1)
+    return X - med[:, None]
+
+
 def contrast_stats(X, in_mask, min_cells, out_mask=None, test="mwu"):
     """Per-bin two-sample test of one group set against a reference arm.
 
@@ -1493,6 +1545,19 @@ def main():
                          "|t| whether or not any of them is significant, so it "
                          "always returns a set and never says the contrast is "
                          "empty.")
+    ap.add_argument("--contrast-center", choices=["none", "cell-median"],
+                    default="none",
+                    help="'cell-median' subtracts each cell's own median "
+                         "across bins before the contrast, removing the "
+                         "per-cell offset that makes two arms differ "
+                         "genome-wide.  Use it when the run warns that nearly "
+                         "every bin moves the same way: it changes the "
+                         "question from 'does this bin differ' -- which a "
+                         "global offset answers yes to everywhere -- to 'does "
+                         "this bin differ MORE than the genome does'.  It is "
+                         "compositional, so it is safe while real aberrations "
+                         "are a small share of the genome and will subtract "
+                         "the finding when they are not.")
     ap.add_argument("--contrast-test", choices=["mwu", "welch"], default="mwu",
                     help="Per-bin two-sample test for a contrast.  'mwu' "
                          "(default) is a two-sided Mann-Whitney U over cells: "
@@ -2028,10 +2093,33 @@ def main():
             # difference in D on this scale -- on the normalised one it is a
             # difference in per-cell rank, which is not what the volcano's
             # x-axis claims to show.
-            cs = contrast_stats(M_contrast.to_numpy(), in_mask,
-                                args.min_cells_per_group, out_mask,
-                                args.contrast_test)
+            Xc = M_contrast.to_numpy()
+            if args.contrast_center == "cell-median":
+                Xc = center_cells(Xc)
+            cs = contrast_stats(Xc, in_mask, args.min_cells_per_group,
+                                out_mask, args.contrast_test)
             q = _bh_fdr(cs["p"])
+            gs = global_shift_report(cs["diff"],
+                                     np.isfinite(q) & (q < args.contrast_fdr))
+            if gs and gs["frac_bins_same_direction"] > 0.9:
+                n_sig = int(np.sum(np.isfinite(q) & (q < args.contrast_fdr)))
+                n_tot = int(np.isfinite(cs["diff"]).sum())
+                print(f"  contrast {label!r}: WARNING "
+                      f"{gs['frac_bins_same_direction']:.0%} of bins move the "
+                      f"same way (median difference {gs['median_diff']:+.3g}, "
+                      f"{gs['median_over_mad']:.1f}x the spread between "
+                      f"bins), and {n_sig:,}/{n_tot:,} reach FDR<"
+                      f"{args.contrast_fdr}.  That is a genome-wide OFFSET "
+                      f"between the arms, not local aberration: the BED holds "
+                      f"most of the genome and cannot serve as a foreground, "
+                      f"since the enrichment would be the genome against "
+                      f"itself.  The offset may be real (one arm less "
+                      f"coordinated overall) or technical (coverage, purity, "
+                      f"cell quality changing how D is estimated) -- check "
+                      f"per-cell mean D against depth.  To ask instead which "
+                      f"bins depart from the genome-wide difference, rerun "
+                      f"with --contrast-center cell-median.",
+                      file=sys.stderr)
             if args.contrast_test == "mwu":
                 n_hi = int(np.nanmax(cs["n_in"])), int(np.nanmax(cs["n_out"]))
                 floor = mwu_min_pvalue(*n_hi)
@@ -2151,6 +2239,7 @@ def main():
                     float(np.mean(sel_cnv > cut)) if sel_cnv.size else np.nan)
                 cnv_info["delta_cut_used"] = float(cut)
             summary_contrast[label] = {
+                **{f"shift_{k}": v for k, v in gs.items()},
                 "groups_in": present, "n_cells_in": int(in_mask.sum()),
                 # The REFERENCE arm, not "everything else": with an explicit
                 # reference the two differ, and reporting the complement would
