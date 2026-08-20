@@ -425,13 +425,36 @@ def select_sign_bins(sg, key, rank_by, ascending, n_want):
             int(clean.size))
 
 
-def contrast_stats(X, in_mask, min_cells, out_mask=None):
-    """Welch two-sample t per bin for one group set against a reference arm.
+def mwu_min_pvalue(n1, n2):
+    """Smallest two-sided p a rank test can return for these arm sizes.
 
-    Welch rather than pooled: the two arms are a handful of samples of one
-    condition against a reference, so equal variances are not a safe
-    assumption.  Returns NaN for bins either arm cannot cover, which keeps them
-    out of the multiple-testing correction rather than in it at p = 1.
+    A rank test has only C(n1+n2, n1) distinct orderings, so its p-value has a
+    FLOOR.  At 3 against 3 that floor is 0.1 and no bin can ever be called,
+    however large the difference; at 8 against 8 it is 1.6e-4, which survives
+    BH across a handful of bins but not across thousands.  Worth checking
+    before a run rather than reading an all-empty table afterwards.
+    """
+    from math import comb
+    n1, n2 = int(n1), int(n2)
+    if n1 < 1 or n2 < 1:
+        return float("nan")
+    return min(1.0, 2.0 / comb(n1 + n2, n1))
+
+
+def contrast_stats(X, in_mask, min_cells, out_mask=None, test="mwu"):
+    """Per-bin two-sample test of one group set against a reference arm.
+
+    ``test='mwu'`` is a two-sided Mann-Whitney U on the cells: it makes no
+    normality assumption, which single-cell values do not honour, and one
+    outlying cell cannot carry a bin the way it can carry a t.  ``'welch'`` is
+    the Welch t -- unequal variances, since the two arms are a handful of
+    samples of one condition against a reference.
+
+    The reported difference is the difference of MEANS either way.  That is
+    the volcano's x-axis and the quantity in D units; the rank test supplies
+    the p-value, not the effect size.  Returns NaN for bins either arm cannot
+    cover, which keeps them out of the multiple-testing correction rather than
+    in it at p = 1.
 
     ``out_mask`` defaults to everything outside ``in_mask``.  Passing it
     explicitly names the reference instead, and cells in NEITHER arm are
@@ -442,6 +465,8 @@ def contrast_stats(X, in_mask, min_cells, out_mask=None):
     """
     from scipy.stats import t as _t
 
+    if test not in ("mwu", "welch"):
+        raise ValueError(f"test must be 'mwu' or 'welch', got {test!r}")
     X = np.asarray(X, float)
     if out_mask is None:
         out_mask = ~np.asarray(in_mask, bool)
@@ -470,6 +495,18 @@ def contrast_stats(X, in_mask, min_cells, out_mask=None):
         sp = np.sqrt(((n1 - 1) * v1 + (n2 - 1) * v2)
                      / np.maximum(n1 + n2 - 2, 1))
         d = diff / sp
+    if test == "mwu":
+        from scipy.stats import mannwhitneyu
+        with np.errstate(invalid="ignore"):
+            try:
+                p = mannwhitneyu(X[in_mask], X[out_mask], axis=0,
+                                 alternative="two-sided",
+                                 nan_policy="omit").pvalue
+            except ValueError:
+                # Raised when a bin is constant in BOTH arms together; there
+                # is no ordering to test, so it is unusable rather than p = 1.
+                p = np.full(X.shape[1], np.nan)
+        p = np.asarray(p, float)
     bad = (n1 < min_cells) | (n2 < min_cells) | ~np.isfinite(se) | (se <= 0)
     for k, v in (("diff", diff), ("t", tstat), ("p", p), ("d", d)):
         out[k] = np.where(bad, np.nan, v)
@@ -1456,6 +1493,15 @@ def main():
                          "|t| whether or not any of them is significant, so it "
                          "always returns a set and never says the contrast is "
                          "empty.")
+    ap.add_argument("--contrast-test", choices=["mwu", "welch"], default="mwu",
+                    help="Per-bin two-sample test for a contrast.  'mwu' "
+                         "(default) is a two-sided Mann-Whitney U over cells: "
+                         "no normality assumption, and one outlying cell "
+                         "cannot carry a bin.  'welch' is the Welch t.  Either "
+                         "way the volcano's x-axis is the difference of means, "
+                         "in D units.  A rank test has a p-value FLOOR set by "
+                         "the arm sizes -- 0.1 at 3 vs 3 -- and the run warns "
+                         "when that floor puts FDR out of reach.")
     ap.add_argument("--contrast-fdr", type=float, default=0.05,
                     help="BH-FDR cut for --contrast-select fdr (0.05).")
     ap.add_argument("--contrast-min-diff", type=float, default=0.0,
@@ -1690,8 +1736,17 @@ def main():
 
         # Optionally remove within-cell-type batch structure from the VALUES so
         # the batch strips (and the heatmap) look random.
+        #
+        # The contrast needs the same correction, on the RAW scale it runs on.
+        # _remove_batch centres each (cell type, batch) group to its cell-type
+        # mean, so it takes out within-cell-type batch variance while leaving
+        # the between-cell-type means alone -- which is exactly the split a
+        # tumour-vs-reference contrast wants: less nuisance spread in each arm,
+        # the difference between the arms untouched.
+        M_contrast = M_raw.reindex(index=M.index, columns=M.columns)
         if args.remove_batch == "within-celltype":
             M = _remove_batch(M, ct, batch_df)
+            M_contrast = _remove_batch(M_contrast, ct, batch_df)
 
         batch_specs = []
         for col in bcols:
@@ -1959,7 +2014,8 @@ def main():
             print(f"  contrast {label!r}: {int(in_mask.sum())} cells "
                   f"({'+'.join(present)}) {arm}, {int(out_mask.sum())} cells",
                   file=sys.stderr)
-            # On the RAW values, not the normalised ones.  Per-bin QN
+            # On the batch-corrected RAW values, not the normalised ones.
+            # Per-bin QN
             # followed by per-cell rank is COMPOSITIONAL: a real shift in one
             # block of bins pushes every other bin the other way in rank
             # space, so bins that are identical in every cell acquire a
@@ -1972,10 +2028,27 @@ def main():
             # difference in D on this scale -- on the normalised one it is a
             # difference in per-cell rank, which is not what the volcano's
             # x-axis claims to show.
-            Mc = M_raw.reindex(index=M.index, columns=M.columns).to_numpy()
-            cs = contrast_stats(Mc, in_mask, args.min_cells_per_group,
-                                out_mask)
+            cs = contrast_stats(M_contrast.to_numpy(), in_mask,
+                                args.min_cells_per_group, out_mask,
+                                args.contrast_test)
             q = _bh_fdr(cs["p"])
+            if args.contrast_test == "mwu":
+                n_hi = int(np.nanmax(cs["n_in"])), int(np.nanmax(cs["n_out"]))
+                floor = mwu_min_pvalue(*n_hi)
+                n_tested = int(np.isfinite(cs["p"]).sum())
+                # BH needs the most significant bin at or below q/m, so a
+                # floor above that means NOTHING can be called, whatever the
+                # data say.
+                need = args.contrast_fdr / max(n_tested, 1)
+                if np.isfinite(floor) and floor > need:
+                    print(f"  contrast {label!r}: WARNING a rank test on "
+                          f"{n_hi[0]} vs {n_hi[1]} cells cannot return a "
+                          f"p below {floor:.2g}, and BH over {n_tested:,} "
+                          f"bins needs {need:.2g} for even the top bin, so no "
+                          f"bin can reach FDR<{args.contrast_fdr}.  Use "
+                          f"--contrast-test welch, or accept that this "
+                          f"contrast has too few cells to call.",
+                          file=sys.stderr)
             # The copy-number check, before anything is ranked: a bin whose two
             # arms differ in copy number differs in coverage, and coverage is
             # upstream of every value in this matrix.
@@ -2011,7 +2084,10 @@ def main():
                               f"{args.cnv_max_delta} removed "
                               f"{int(drop.sum()):,} bins from the pool.",
                               file=sys.stderr)
-            rank = np.where(np.isfinite(cs["t"]), np.abs(cs["t"]), -np.inf)
+            # Rank on the chosen test's p, not on |t|: under mwu the t is not
+            # the statistic that produced the p-value.
+            rank = np.where(np.isfinite(cs["p"]),
+                            -np.log10(np.maximum(cs["p"], 1e-300)), -np.inf)
             mask = np.zeros(M.shape[1], bool)
             if args.contrast_select == "fdr":
                 # Significance, not a fixed count.  A rank cut returns N bins

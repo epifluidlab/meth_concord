@@ -1522,3 +1522,107 @@ def test_the_contrast_is_computed_on_raw_values_not_normalised_ones(tmp_path):
     assert n_constant <= 4, (
         f"{n_constant}/40 constant bins called significant -- the contrast is "
         f"seeing normalised values, where the split makes them differ")
+
+
+def test_mwu_min_pvalue_is_the_number_of_orderings():
+    """A rank test has C(n1+n2, n1) distinct orderings, so its p has a floor."""
+    m = _mod()
+    assert m.mwu_min_pvalue(3, 3) == pytest.approx(2 / 20)
+    assert m.mwu_min_pvalue(4, 4) == pytest.approx(2 / 70)
+    assert m.mwu_min_pvalue(16, 10) == pytest.approx(2 / 5311735)
+    assert m.mwu_min_pvalue(1, 1) == pytest.approx(1.0)     # clamped
+    assert np.isnan(m.mwu_min_pvalue(0, 5))
+
+
+def test_contrast_stats_mwu_matches_scipy():
+    m = _mod()
+    from scipy.stats import mannwhitneyu
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(20, 4))
+    in_mask = np.array([True] * 8 + [False] * 12)
+    got = m.contrast_stats(X, in_mask, 3, test="mwu")["p"]
+    want = mannwhitneyu(X[in_mask], X[~in_mask], axis=0,
+                        alternative="two-sided").pvalue
+    np.testing.assert_allclose(got, want)
+
+
+def test_the_difference_is_of_means_under_either_test():
+    """The rank test supplies the p-value, not the effect size: the volcano's
+    x-axis stays a difference in D units."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(20, 3))
+    in_mask = np.array([True] * 8 + [False] * 12)
+    a = m.contrast_stats(X, in_mask, 3, test="mwu")
+    b = m.contrast_stats(X, in_mask, 3, test="welch")
+    np.testing.assert_allclose(a["diff"], b["diff"])
+    assert not np.allclose(a["p"], b["p"])
+
+
+def test_mwu_is_not_carried_by_a_single_outlying_cell():
+    """One cell with an extreme value drags a t; it moves a rank test by one
+    rank.  Single-cell values have those cells."""
+    m = _mod()
+    base = np.array([[0.0], [0.1], [-0.1], [0.05], [-0.05], [0.0]])
+    arm = np.vstack([base, [[500.0]]])                  # 7th cell is wild
+    ref = base.copy()
+    X = np.vstack([arm, ref])
+    in_mask = np.array([True] * 7 + [False] * 6)
+    welch = m.contrast_stats(X, in_mask, 3, test="welch")["p"][0]
+    mwu = m.contrast_stats(X, in_mask, 3, test="mwu")["p"][0]
+    assert mwu > 0.3, "the rank test should not be moved by one cell"
+    assert mwu > welch
+
+
+def test_an_unknown_contrast_test_is_refused():
+    m = _mod()
+    with pytest.raises(ValueError, match="mwu.*welch"):
+        m.contrast_stats(np.zeros((4, 2)), np.array([1, 1, 0, 0], bool), 1,
+                         test="ttest")
+
+
+def test_the_contrast_sees_batch_corrected_values(tmp_path):
+    """Within-cell-type batch structure is nuisance spread inside each arm.
+    Left in, it inflates the standard error and buries real bins; _remove_batch
+    takes it out while leaving the between-cell-type means alone, so the
+    contrast it feeds is the same comparison with less noise.
+    """
+    rng = np.random.default_rng(4)
+    n_ct, n_per = 3, 20
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    batch = np.tile(["b1", "b2"], n // 2)
+    X = rng.normal(0, .25, (n, 200))
+    X[:, :40] += np.where((ct == 0)[:, None], 1.2, 0.0)        # the real split
+    # A big within-cell-type batch shift on every bin: pure nuisance.
+    X += np.where((batch == "b1")[:, None], 2.5, -2.5)
+
+    cells = [f"cell{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "concordance_directional.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": batch}).to_csv(stab, sep="\t", index=False)
+
+    def run(sub, extra):
+        out = tmp_path / sub
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+             "--samples", str(stab), "--cell-type-column", "cell_type",
+             "--batch-column", "sample", "--n-bins", "20",
+             "--n-permutations", "20", "--contrast", "arm=CT0",
+             "--output-dir", str(out), "--plot-format", "png"] + extra,
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        bed = pd.read_csv(out / "bin_scores_gch.contrast_arm.bed", sep="\t")
+        blk = bed["start"] // 250000 // 40
+        return int((blk == 0).sum())
+
+    uncorrected = run("plain", [])
+    corrected = run("fixed", ["--remove-batch", "within-celltype"])
+    assert corrected >= uncorrected, (
+        f"batch correction should not lose real bins "
+        f"({corrected} vs {uncorrected})")
+    assert corrected >= 30, f"only {corrected}/40 planted bins recovered"
