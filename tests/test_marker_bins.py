@@ -1727,3 +1727,108 @@ def test_a_global_offset_makes_everything_significant_and_says_so(tmp_path):
     assert n_ctr < 0.2 * n_bins, f"{n_ctr} bins still selected after centring"
     assert local_ctr >= 25, f"only {local_ctr}/30 planted bins recovered"
     assert "genome-wide OFFSET" not in err2
+
+
+# =========================================== precision-weighted contrast =====
+
+def test_dl_tau2_recovers_the_between_cell_variance():
+    """Each estimate carries its own sampling variance, so the spread between
+    cells has a known part and an unknown one; tau^2 is the unknown part."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n, tau = 800, 0.5
+    v = rng.uniform(0.01, 0.5, (n, 1))
+    x = rng.normal(0, tau, (n, 1)) + rng.normal(0, np.sqrt(v))
+    got = m._dl_tau2(x, v)[0]
+    assert got == pytest.approx(tau ** 2, rel=0.25)
+
+
+def test_dl_tau2_is_zero_when_the_spread_is_all_measurement_error():
+    m = _mod()
+    rng = np.random.default_rng(1)
+    v = np.full((500, 1), 0.2)
+    x = rng.normal(0, np.sqrt(0.2), (500, 1))
+    assert m._dl_tau2(x, v)[0] == pytest.approx(0.0, abs=0.05)
+
+
+def test_weighted_arm_is_inverse_variance():
+    m = _mod()
+    x = np.array([[1.0], [3.0]])
+    v = np.array([[1.0], [3.0]])           # the second is 3x noisier
+    mu, var = m._weighted_arm(x, v)
+    assert mu[0] == pytest.approx((1 / 1 * 1 + 1 / 3 * 3) / (1 + 1 / 3))
+    assert var[0] == pytest.approx(1 / (1 + 1 / 3))
+
+
+def test_weighting_stops_thin_cells_dominating_a_contrast():
+    """A handful of very noisy cells can carry an unweighted test; weighted by
+    their own variance they cannot."""
+    m = _mod()
+    rng = np.random.default_rng(2)
+    n_good, n_bad = 60, 12
+    # Both arms have the same true value.  The 'in' arm has extra thin cells
+    # whose estimates are wild.
+    v_in = np.concatenate([np.full(n_good, 0.01), np.full(n_bad, 4.0)])[:, None]
+    x_in = rng.normal(0.0, np.sqrt(v_in))
+    v_out = np.full((n_good, 1), 0.01)
+    x_out = rng.normal(0.0, np.sqrt(v_out))
+    X = np.vstack([x_in, x_out])
+    V = np.vstack([v_in, v_out])
+    in_mask = np.array([True] * (n_good + n_bad) + [False] * n_good)
+    out_mask = ~in_mask
+    w = m.weighted_contrast(X, V, in_mask, out_mask, 3, "precision")
+    assert abs(w["diff"][0]) < 0.05, "the thin cells should barely move it"
+
+
+def test_random_effects_is_more_conservative_than_fixed():
+    """Fixed effects assume every cell in an arm shares one true value; when
+    they do not, it is anticonservative."""
+    m = _mod()
+    rng = np.random.default_rng(3)
+    n = 80
+    v = np.full((2 * n, 1), 0.01)
+    x = np.vstack([rng.normal(0.4, 0.5, (n, 1)),      # real spread within arm
+                   rng.normal(0.0, 0.5, (n, 1))])
+    in_mask = np.array([True] * n + [False] * n)
+    fixed = m.weighted_contrast(x, v, in_mask, ~in_mask, 3, "precision")
+    re = m.weighted_contrast(x, v, in_mask, ~in_mask, 3, "random-effects")
+    assert re["p"][0] > fixed["p"][0]
+
+
+# ------------------------------------------------------- consistency --------
+
+def test_consistency_keeps_only_bins_moving_the_same_way_in_every_group():
+    """A bin significant on one tumour population alone is that population's
+    idiosyncrasy, not a shared signature; pooling hides which."""
+    m = _mod()
+    per = {"t1": {"diff": np.array([1.0, 1.0, -1.0]),
+                  "p": np.array([1e-9, 1e-9, 1e-9])},
+           "t2": {"diff": np.array([1.0, -1.0, -1.0]),
+                  "p": np.array([1e-9, 1e-9, 0.9])}}
+    mask, info = m.consistency_mask(per, 0.05)
+    assert list(mask) == [True, False, False]
+    assert info["n_significant_in_any"] == 3
+    assert info["n_consistent"] == 1
+
+
+def test_consistency_needs_significance_in_all_groups_not_just_agreement():
+    m = _mod()
+    per = {"a": {"diff": np.array([1.0]), "p": np.array([1e-9])},
+           "b": {"diff": np.array([1.0]), "p": np.array([0.5])}}
+    mask, _ = m.consistency_mask(per, 0.05)
+    assert list(mask) == [False]
+
+
+def test_consistency_on_no_groups_is_none():
+    m = _mod()
+    mask, info = m.consistency_mask({}, 0.05)
+    assert mask is None and info == {}
+
+
+def test_coverage_report_flags_a_lopsided_contrast():
+    m = _mod()
+    counts = np.vstack([np.full((10, 5), 12.0), np.full((10, 5), 60.0)])
+    in_mask = np.array([True] * 10 + [False] * 10)
+    r = m.coverage_report(counts, in_mask, ~in_mask)
+    assert r["median_pairs_in"] == 12 and r["median_pairs_out"] == 60
+    assert r["pairs_ratio"] == pytest.approx(0.2)

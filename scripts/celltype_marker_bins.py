@@ -441,6 +441,170 @@ def mwu_min_pvalue(n1, n2):
     return min(1.0, 2.0 / comb(n1 + n2, n1))
 
 
+def _dl_tau2(x, v, axis=0):
+    """DerSimonian-Laird between-unit variance, per bin.
+
+    Each (cell, bin) estimate carries its own sampling variance from the
+    pipeline, so the spread between cells has two parts: measurement error,
+    which is known, and real biological variation, which is not.  tau^2 is the
+    second.  Closed form, so it runs over tens of thousands of bins without
+    fitting anything iteratively.
+    """
+    w = 1.0 / v
+    sw = np.nansum(w, axis=axis)
+    m = np.nansum(w * x, axis=axis) / sw
+    q = np.nansum(w * (x - m) ** 2, axis=axis)
+    k = np.sum(np.isfinite(x) & np.isfinite(v), axis=axis)
+    denom = sw - np.nansum(w ** 2, axis=axis) / sw
+    with np.errstate(invalid="ignore", divide="ignore"):
+        tau2 = (q - (k - 1)) / denom
+    return np.where(np.isfinite(tau2) & (tau2 > 0), tau2, 0.0)
+
+
+def _weighted_arm(x, v, tau2=None):
+    """Inverse-variance pooled mean and its variance, per bin.
+
+    With tau2 this is the random-effects estimate: a cell with few read pairs
+    stops dominating on noise, and a cell with many stops dominating on
+    precision alone once real between-cell variation is accounted for.
+    """
+    vv = v if tau2 is None else v + tau2
+    w = 1.0 / vv
+    w = np.where(np.isfinite(w) & np.isfinite(x), w, np.nan)
+    sw = np.nansum(w, axis=0)
+    m = np.nansum(w * x, axis=0) / sw
+    return m, 1.0 / sw
+
+
+def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects"):
+    """Two-arm comparison weighting each cell by the precision of its estimate.
+
+    D is not measured, it is ESTIMATED from the read pairs in a (cell, bin),
+    and the pipeline records the variance of that estimate.  An unweighted
+    test treats a cell with five pairs in a bin as being worth as much as one
+    with five hundred.  That is wasteful when coverage merely varies, and
+    actively misleading when it varies BETWEEN THE ARMS -- a noisier estimate
+    is an attenuated one, so a coverage difference becomes a genome-wide
+    difference in D with no biology behind it.
+
+    'precision' is the fixed-effect form, which assumes every cell in an arm
+    shares one true value and is anticonservative when they do not.
+    'random-effects' adds the DerSimonian-Laird between-cell variance, so a
+    bin that genuinely varies within an arm is not called on the strength of
+    its coverage.  Returns the same keys as contrast_stats.
+    """
+    X = np.asarray(X, float)
+    V = np.asarray(V, float)
+    V = np.where(np.isfinite(V) & (V > 0), V, np.nan)
+    out = {}
+    means, varis = [], []
+    for tag, m in (("in", in_mask), ("out", out_mask)):
+        x, v = X[m], V[m]
+        n = np.sum(np.isfinite(x) & np.isfinite(v), axis=0)
+        tau2 = _dl_tau2(x, v) if mode == "random-effects" else None
+        mu, vr = _weighted_arm(x, v, tau2)
+        out[f"n_{tag}"] = n
+        out[f"mean_{tag}"] = mu
+        out[f"var_{tag}"] = vr
+        out[f"tau2_{tag}"] = tau2 if tau2 is not None else np.zeros_like(mu)
+        means.append(mu)
+        varis.append(vr)
+    diff = means[0] - means[1]
+    se = np.sqrt(varis[0] + varis[1])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = diff / se
+    from scipy.stats import norm
+    p = 2.0 * norm.sf(np.abs(z))
+    bad = ((out["n_in"] < min_cells) | (out["n_out"] < min_cells)
+           | ~np.isfinite(se) | (se <= 0))
+    out["diff"] = np.where(bad, np.nan, diff)
+    out["t"] = np.where(bad, np.nan, z)
+    out["p"] = np.where(bad, np.nan, p)
+    # Standardised on the between-cell SD, so it stays comparable with the
+    # unweighted Cohen's d rather than exploding as the pooled SE shrinks.
+    sd = np.sqrt(np.maximum(out["tau2_in"] + out["tau2_out"], 1e-300) / 2.0)
+    out["d"] = np.where(bad | (sd <= 0), np.nan, diff / sd)
+    return out
+
+
+def group_consistency(X, ct, groups, out_mask, min_cells, test, V=None,
+                      mode="random-effects"):
+    """Run the contrast once per group in the arm; return per-group diffs.
+
+    With two tumour populations pooled into one arm, a bin can reach
+    significance on one of them alone.  That is not a meningioma signature, it
+    is one population's idiosyncrasy, and pooling hides which.  Testing each
+    separately against the same reference and asking for agreement is a
+    REPRODUCIBILITY criterion -- weaker than a p-value in theory, and stronger
+    than one here, where the p-value's null (independent cells) is false.
+    """
+    per = {}
+    for g in groups:
+        m = (ct == g).to_numpy() if hasattr(ct, "to_numpy") else (ct == g)
+        if int(m.sum()) < min_cells:
+            continue
+        if V is not None:
+            cs = weighted_contrast(X, V, m, out_mask, min_cells, mode)
+        else:
+            cs = contrast_stats(X, m, min_cells, out_mask, test)
+        per[g] = cs
+    return per
+
+
+def consistency_mask(per_group, fdr_cut=0.05):
+    """Bins that move the SAME way in every group, significantly in each."""
+    if not per_group:
+        return None, {}
+    signs, sig = [], []
+    for g, cs in per_group.items():
+        q = _bh_fdr(cs["p"])
+        signs.append(np.sign(cs["diff"]))
+        sig.append(np.isfinite(q) & (q < fdr_cut))
+    signs = np.vstack(signs)
+    sig = np.vstack(sig)
+    same = np.all(signs == signs[0], axis=0) & np.all(signs != 0, axis=0)
+    everywhere = np.all(sig, axis=0)
+    mask = same & everywhere
+    return mask, {"n_consistent": int(mask.sum()),
+                  "n_significant_in_any": int(np.any(sig, axis=0).sum()),
+                  "n_significant_in_all": int(everywhere.sum()),
+                  "groups": list(per_group)}
+
+
+def coverage_report(counts, in_mask, out_mask):
+    """Per-arm read-pair coverage, the first thing to check on a global offset.
+
+    D is estimated from the pairs in a (cell, bin), so a coverage difference
+    between the arms attenuates one side's estimates more than the other and
+    shows up as a genome-wide difference in D with no biology under it.  If
+    the arms are matched here, a global offset is more likely to be real.
+    """
+    c = np.asarray(counts, float)
+    out = {}
+    for tag, m in (("in", in_mask), ("out", out_mask)):
+        v = c[m]
+        v = v[np.isfinite(v)]
+        out[f"median_pairs_{tag}"] = float(np.median(v)) if v.size else np.nan
+    a, b = out["median_pairs_in"], out["median_pairs_out"]
+    out["pairs_ratio"] = (a / b) if b else np.nan
+    return out
+
+
+def _companion(matrix_path, specs, name, filename, flag):
+    """The named companion parquet, or the one sitting beside the matrix."""
+    for spec in (specs or []):
+        if "=" not in spec:
+            sys.exit(f"{flag} must be NAME=PATH, got {spec!r}")
+        k, v = spec.split("=", 1)
+        if k.strip() == name:
+            pth = Path(v.strip())
+            if not pth.exists():
+                sys.exit(f"{flag} {name}: {pth} does not exist")
+            return pd.read_parquet(pth)
+    beside = Path(matrix_path).parent / filename
+    return pd.read_parquet(beside) if beside.exists() else None
+
+
 def global_shift_report(diff, sig=None):
     """Is the contrast a genome-wide offset rather than local aberration?
 
@@ -1545,6 +1709,42 @@ def main():
                          "|t| whether or not any of them is significant, so it "
                          "always returns a set and never says the contrast is "
                          "empty.")
+    ap.add_argument("--delta-var", action="append", default=None,
+                    metavar="NAME=PATH",
+                    help="concordance_delta_var.parquet for the matching "
+                         "--matrix NAME, giving the sampling variance of every "
+                         "(cell, bin) estimate.  Auto-discovered next to the "
+                         "matrix when not given.  Enables --contrast-weight.")
+    ap.add_argument("--pair-counts", action="append", default=None,
+                    metavar="NAME=PATH",
+                    help="pair_counts_per_bin.parquet for the matching "
+                         "--matrix NAME.  Auto-discovered.  Used only to "
+                         "report per-arm coverage, which is the first thing "
+                         "to check when a contrast shows a genome-wide "
+                         "offset.")
+    ap.add_argument("--contrast-weight",
+                    choices=["none", "precision", "random-effects"],
+                    default="none",
+                    help="Weight each cell by the precision of its D "
+                         "estimate.  D is estimated from the read pairs in a "
+                         "(cell, bin), so an unweighted test treats a cell "
+                         "with five pairs as worth one with five hundred -- "
+                         "wasteful when coverage varies, and misleading when "
+                         "it varies BETWEEN arms, since a noisier estimate is "
+                         "an attenuated one.  'random-effects' adds the "
+                         "DerSimonian-Laird between-cell variance and is the "
+                         "one to use; 'precision' is the fixed-effect form "
+                         "and is anticonservative when cells within an arm "
+                         "genuinely differ.  Needs --delta-var.")
+    ap.add_argument("--contrast-consistency", action="store_true",
+                    help="Also run the contrast SEPARATELY for each group in "
+                         "the arm and keep only bins that move the same way, "
+                         "significantly, in every one.  With two tumour "
+                         "populations pooled, a bin can otherwise reach "
+                         "significance on one of them alone.  This is a "
+                         "reproducibility criterion, and where cells are not "
+                         "independent replicates it is worth more than the "
+                         "p-value it replaces.")
     ap.add_argument("--contrast-center", choices=["none", "cell-median"],
                     default="none",
                     help="'cell-median' subtracts each cell's own median "
@@ -1808,6 +2008,18 @@ def main():
         # the between-cell-type means alone -- which is exactly the split a
         # tumour-vs-reference contrast wants: less nuisance spread in each arm,
         # the difference between the arms untouched.
+        # The sampling variance and the read-pair counts the pipeline wrote
+        # beside this matrix.  Auto-discovered so the common case needs no
+        # flag; a bad explicit path is an error rather than a silent skip.
+        V_df = _companion(path, args.delta_var, name,
+                          "concordance_delta_var.parquet", "--delta-var")
+        C_df = _companion(path, args.pair_counts, name,
+                          "pair_counts_per_bin.parquet", "--pair-counts")
+        if args.contrast_weight != "none" and V_df is None:
+            sys.exit(f"--contrast-weight {args.contrast_weight} needs the "
+                     f"per-estimate variance, and no "
+                     f"concordance_delta_var.parquet was found beside "
+                     f"{path!r}.  Pass it with --delta-var {name}=PATH.")
         M_contrast = M_raw.reindex(index=M.index, columns=M.columns)
         if args.remove_batch == "within-celltype":
             M = _remove_batch(M, ct, batch_df)
@@ -2096,8 +2308,33 @@ def main():
             Xc = M_contrast.to_numpy()
             if args.contrast_center == "cell-median":
                 Xc = center_cells(Xc)
-            cs = contrast_stats(Xc, in_mask, args.min_cells_per_group,
-                                out_mask, args.contrast_test)
+            Vc = (V_df.reindex(index=M.index, columns=M.columns).to_numpy()
+                  if V_df is not None else None)
+            if args.contrast_weight != "none":
+                cs = weighted_contrast(Xc, Vc, in_mask, out_mask,
+                                       args.min_cells_per_group,
+                                       args.contrast_weight)
+            else:
+                cs = contrast_stats(Xc, in_mask, args.min_cells_per_group,
+                                    out_mask, args.contrast_test)
+            if C_df is not None:
+                cov = coverage_report(
+                    C_df.reindex(index=M.index, columns=M.columns)
+                    .to_numpy(), in_mask, out_mask)
+                summary_cov = cov
+                if (np.isfinite(cov["pairs_ratio"])
+                        and not 0.67 < cov["pairs_ratio"] < 1.5):
+                    print(f"  contrast {label!r}: NOTE the arms differ in "
+                          f"coverage -- median {cov['median_pairs_in']:.0f} "
+                          f"vs {cov['median_pairs_out']:.0f} read pairs per "
+                          f"bin ({cov['pairs_ratio']:.2f}x).  D is estimated "
+                          f"from those pairs, so the thinner arm's estimates "
+                          f"are attenuated and a genome-wide difference can "
+                          f"follow from coverage alone.  --contrast-weight "
+                          f"random-effects weights each cell by the precision "
+                          f"of its own estimate.", file=sys.stderr)
+            else:
+                summary_cov = {}
             q = _bh_fdr(cs["p"])
             gs = global_shift_report(cs["diff"],
                                      np.isfinite(q) & (q < args.contrast_fdr))
@@ -2195,6 +2432,31 @@ def main():
                                                    or args.n_bins]
                 keep_rank = keep_rank[np.isfinite(rank[keep_rank])]
                 mask[keep_rank] = True
+            cons_info = {}
+            if args.contrast_consistency and len(present) > 1:
+                per_g = group_consistency(
+                    Xc, ct, present, out_mask, args.min_cells_per_group,
+                    args.contrast_test,
+                    Vc if args.contrast_weight != "none" else None,
+                    args.contrast_weight)
+                cmask, cons_info = consistency_mask(per_g, args.contrast_fdr)
+                if cmask is not None:
+                    for g, gcs in per_g.items():
+                        scores_df[f"contrast_{label}_diff_{g}"] = gcs["diff"]
+                        extra_cols.append(f"contrast_{label}_diff_{g}")
+                    before = int(mask.sum())
+                    mask = mask & cmask
+                    print(f"  contrast {label!r}: consistency across "
+                          f"{'+'.join(cons_info['groups'])} kept "
+                          f"{int(mask.sum()):,} of {before:,} bins "
+                          f"({cons_info['n_significant_in_any']:,} were "
+                          f"significant in at least one group, "
+                          f"{cons_info['n_consistent']:,} in all of them with "
+                          f"the same sign).", file=sys.stderr)
+            elif args.contrast_consistency:
+                print(f"  contrast {label!r}: --contrast-consistency needs "
+                      f"more than one group in the arm; {present} has one.",
+                      file=sys.stderr)
             # A contrast bin driven by batch is worthless in exactly the same
             # way a marker bin is, so it faces the same filter.
             clean = ~(np.isfinite(b_icc) & (b_icc > args.max_batch_icc))
@@ -2240,6 +2502,9 @@ def main():
                 cnv_info["delta_cut_used"] = float(cut)
             summary_contrast[label] = {
                 **{f"shift_{k}": v for k, v in gs.items()},
+                **{f"coverage_{k}": v for k, v in summary_cov.items()},
+                **{f"consistency_{k}": v for k, v in cons_info.items()},
+                "weight": args.contrast_weight, "test": args.contrast_test,
                 "groups_in": present, "n_cells_in": int(in_mask.sum()),
                 # The REFERENCE arm, not "everything else": with an explicit
                 # reference the two differ, and reporting the complement would
