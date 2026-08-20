@@ -472,8 +472,16 @@ def variance_from_counts(counts, X, in_mask, out_mask, eps=1e-12):
         k = np.sum(ok, axis=0)
         resid = np.nansum(w * (np.where(ok, x, np.nan) - mu) ** 2, axis=0)
         with np.errstate(invalid="ignore", divide="ignore"):
-            c = resid / np.maximum(k - 1, 1)
+            c = np.where(k > 1, resid / np.maximum(k - 1, 1), np.nan)
         c = np.where(np.isfinite(c) & (c > 0), c, np.nan)
+        # A bin whose arm has one usable cell -- or none that differ -- gives
+        # no residual to estimate c from.  Falling back to NaN would discard
+        # the BIN, not just the estimate, and at 250 kb in a sparse context
+        # that is most of the genome.  The median c over the bins that could
+        # be estimated is the honest stand-in: it says "as noisy as this arm
+        # usually is" rather than "unmeasurable".
+        pooled = np.nanmedian(c) if np.isfinite(c).any() else np.nan
+        c = np.where(np.isfinite(c), c, pooled)
         V[m] = c[None, :] / ni
     return V
 
@@ -561,6 +569,40 @@ def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects")
     # unweighted Cohen's d rather than exploding as the pooled SE shrinks.
     sd = np.sqrt(np.maximum(out["tau2_in"] + out["tau2_out"], 1e-300) / 2.0)
     out["d"] = np.where(bad | (sd <= 0), np.nan, diff / sd)
+    return out
+
+
+def dropout_report(X, in_mask, out_mask, min_cells, strata=None):
+    """Why bins are not testable, counted at each requirement in turn.
+
+    A contrast can look weak for two very different reasons -- the effect is
+    small, or most of the genome was never tested -- and the selected count
+    alone cannot tell them apart.  Stratifying multiplies the requirement:
+    each arm needs min_cells covered cells in EVERY stratum, so two arms and
+    two patients is four hurdles, and a sparse context clears far fewer of
+    them than a dense one.
+    """
+    X = np.asarray(X, float)
+    ok = np.isfinite(X)
+    out = {"n_bins": X.shape[1]}
+    ain = ok[np.asarray(in_mask, bool)].sum(axis=0)
+    aout = ok[np.asarray(out_mask, bool)].sum(axis=0)
+    out["n_testable_pooled"] = int(((ain >= min_cells)
+                                    & (aout >= min_cells)).sum())
+    out["median_cells_in"] = float(np.median(ain))
+    out["median_cells_out"] = float(np.median(aout))
+    if strata is not None:
+        strata = np.asarray(strata)
+        per_ok = []
+        for lev in [x for x in pd.unique(strata) if x == x]:
+            k = strata == lev
+            a = ok[np.asarray(in_mask, bool) & k].sum(axis=0)
+            b = ok[np.asarray(out_mask, bool) & k].sum(axis=0)
+            hit = (a >= min_cells) & (b >= min_cells)
+            per_ok.append(hit)
+            out[f"n_testable_{lev}"] = int(hit.sum())
+        if per_ok:
+            out["n_testable_all_strata"] = int(np.all(per_ok, axis=0).sum())
     return out
 
 
@@ -2453,15 +2495,39 @@ def main():
             if Vc is None and Cc is not None and args.contrast_weight != "none":
                 Vc = variance_from_counts(Cc, Xc, in_mask, out_mask)
             strat_per, cs = {}, None
+            _lev = None
             if args.contrast_stratify:
-                lev = batch_df_full.reindex(M.index)[args.contrast_stratify] \
-                    if args.contrast_stratify in batch_df_full.columns \
-                    else samples.set_index("cell_name")[
-                        args.contrast_stratify].reindex(M.index)
+                _lev = (batch_df_full.reindex(M.index)[args.contrast_stratify]
+                        if args.contrast_stratify in batch_df_full.columns
+                        else samples.set_index("cell_name")[
+                            args.contrast_stratify].reindex(M.index)).to_numpy()
+            dropout = dropout_report(Xc, in_mask, out_mask,
+                                     args.min_cells_per_group, _lev)
+            keep = dropout.get(
+                "n_testable_all_strata", dropout["n_testable_pooled"])
+            if keep < 0.5 * dropout["n_bins"]:
+                detail = ", ".join(
+                    f"{k[len('n_testable_'):]}: {v:,}"
+                    for k, v in dropout.items()
+                    if k.startswith("n_testable_")
+                    and k not in ("n_testable_pooled", "n_testable_all_strata"))
+                print(f"  contrast {label!r}: only {keep:,} of "
+                      f"{dropout['n_bins']:,} bins are testable at all "
+                      f"({dropout['n_testable_pooled']:,} without stratifying"
+                      + (f"; per stratum {detail}" if detail else "") + ").  "
+                      f"A bin needs {args.min_cells_per_group} covered cells "
+                      f"in EACH arm"
+                      + (" of EACH stratum" if _lev is not None else "")
+                      + f"; the median bin has {dropout['median_cells_in']:.0f} "
+                      f"in the arm and {dropout['median_cells_out']:.0f} in the "
+                      f"reference.  Most of the genome is UNTESTED rather than "
+                      f"unremarkable, so a small hit count here is reach, not "
+                      f"effect size.", file=sys.stderr)
+            if args.contrast_stratify:
                 use_v = (Vc if (args.contrast_weight != "none"
                                 and V_df is not None) else None)
                 cs, strat_per = stratified_contrast(
-                    Xc, lev.to_numpy(), in_mask, out_mask,
+                    Xc, _lev, in_mask, out_mask,
                     args.min_cells_per_group, args.contrast_test,
                     use_v, args.contrast_weight,
                     counts=(Cc if args.contrast_weight != "none" else None))
@@ -2683,6 +2749,7 @@ def main():
                 cnv_info["delta_cut_used"] = float(cut)
             summary_contrast[label] = {
                 **{f"shift_{k}": v for k, v in gs.items()},
+                **{f"dropout_{k}": v for k, v in dropout.items()},
                 **{f"coverage_{k}": v for k, v in summary_cov.items()},
                 **{f"consistency_{k}": v for k, v in cons_info.items()},
                 "weight": args.contrast_weight, "test": args.contrast_test,

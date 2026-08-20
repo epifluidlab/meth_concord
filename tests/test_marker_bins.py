@@ -1961,3 +1961,61 @@ def test_counts_variance_is_estimated_inside_each_stratum():
         "estimating the variance across strata should be the weaker of the "
         "two, since it carries the patient effect as noise")
     assert within["p"][0] < 0.01
+
+
+# --------------------------------------------------------- bin dropout ------
+
+def test_dropout_report_counts_testable_bins_per_stratum():
+    """A weak contrast has two very different causes -- small effect, or most
+    of the genome never tested -- and the hit count alone cannot separate
+    them."""
+    m = _mod()
+    X = np.full((12, 4), 1.0)
+    a = np.array([True] * 6 + [False] * 6)
+    pat = np.array(["p1"] * 3 + ["p2"] * 3 + ["p1"] * 3 + ["p2"] * 3)
+    X[:, 1] = np.nan                          # bin 1 unobserved everywhere
+    X[3:6, 2] = np.nan                        # bin 2: p2 has no 'in' cells
+    r = m.dropout_report(X, a, ~a, 3, pat)
+    assert r["n_bins"] == 4
+    assert r["n_testable_pooled"] == 3         # bins 0, 2, 3
+    assert r["n_testable_p2"] == 2             # bin 2 fails for p2
+    assert r["n_testable_all_strata"] == 2     # bins 0 and 3
+
+
+def test_dropout_report_without_strata_reports_only_the_pooled_count():
+    m = _mod()
+    X = np.ones((10, 2))
+    a = np.array([True] * 5 + [False] * 5)
+    r = m.dropout_report(X, a, ~a, 3)
+    assert r["n_testable_pooled"] == 2
+    assert "n_testable_all_strata" not in r
+
+
+def test_stratifying_can_only_lose_testable_bins_never_gain():
+    m = _mod()
+    rng = np.random.default_rng(0)
+    X = np.where(rng.random((40, 200)) < 0.5, rng.normal(size=(40, 200)),
+                 np.nan)
+    a = np.array([True] * 20 + [False] * 20)
+    pat = np.array(["p1", "p2"] * 20)
+    r = m.dropout_report(X, a, ~a, 3, pat)
+    assert r["n_testable_all_strata"] <= r["n_testable_pooled"]
+
+
+def test_a_degenerate_variance_estimate_does_not_discard_the_bin():
+    """One usable cell gives no residual to estimate the constant from.
+    Returning NaN would drop the BIN, and in a sparse context that is most of
+    the genome."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    X = rng.normal(0, 1, (6, 4))
+    n = np.full((6, 4), 30.0)
+    X[1:3, 1] = np.nan
+    n[1:3, 1] = np.nan                    # the 'in' arm keeps one cell here
+    a = np.array([True] * 3 + [False] * 3)
+    V = m.variance_from_counts(n, X, a, ~a)
+    assert np.isfinite(V[a]).any(axis=0).all(), "a bin lost its whole arm"
+    # and the stand-in is the arm's usual noise, not something invented
+    finite_elsewhere = V[a][:, [0, 2, 3]]
+    assert (np.nanmin(finite_elsewhere) <= np.nanmedian(V[a][:, 1])
+            <= np.nanmax(finite_elsewhere))
