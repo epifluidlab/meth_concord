@@ -2019,3 +2019,67 @@ def test_a_degenerate_variance_estimate_does_not_discard_the_bin():
     finite_elsewhere = V[a][:, [0, 2, 3]]
     assert (np.nanmin(finite_elsewhere) <= np.nanmedian(V[a][:, 1])
             <= np.nanmax(finite_elsewhere))
+
+
+# ------------------------------------------------ companion alignment -------
+
+def _companion_pair(tmp_path, cells, bins, comp_cells, comp_bins):
+    mat = pd.DataFrame(np.zeros((len(cells), len(bins))),
+                       index=cells, columns=bins)
+    comp = pd.DataFrame(np.ones((len(comp_cells), len(comp_bins))),
+                        index=comp_cells, columns=comp_bins)
+    comp.to_parquet(tmp_path / "concordance_delta_var.parquet")
+    return mat
+
+
+def test_a_stale_companion_is_refused_not_silently_reindexed(tmp_path):
+    """Reindexing a mismatched file succeeds and fills the gaps with NaN, so
+    every cell it does not cover loses its variance and drops out -- leaving a
+    handful of testable bins and nothing to say why."""
+    m = _mod()
+    cells = [f"c{i}" for i in range(100)]
+    bins = [f"chr1:{i}" for i in range(50)]
+    mat = _companion_pair(tmp_path, cells, bins, cells[:20], bins)
+    with pytest.raises(SystemExit, match="does not match the matrix"):
+        m._companion(str(tmp_path / "x.parquet"), None, "g",
+                     "concordance_delta_var.parquet", "--delta-var",
+                     matrix=mat)
+
+
+def test_a_companion_missing_bins_is_refused_too(tmp_path):
+    m = _mod()
+    cells = [f"c{i}" for i in range(50)]
+    bins = [f"chr1:{i}" for i in range(100)]
+    mat = _companion_pair(tmp_path, cells, bins, cells, bins[:30])
+    with pytest.raises(SystemExit, match="30% of its 100 bins|does not match"):
+        m._companion(str(tmp_path / "x.parquet"), None, "g",
+                     "concordance_delta_var.parquet", "--delta-var",
+                     matrix=mat)
+
+
+def test_a_companion_covering_the_matrix_is_accepted(tmp_path):
+    """A superset is fine -- the matrix may have been filtered since."""
+    m = _mod()
+    cells = [f"c{i}" for i in range(50)]
+    bins = [f"chr1:{i}" for i in range(30)]
+    mat = _companion_pair(tmp_path, cells, bins,
+                          cells + ["extra"], bins + ["chr9:1"])
+    got = m._companion(str(tmp_path / "x.parquet"), None, "g",
+                       "concordance_delta_var.parquet", "--delta-var",
+                       matrix=mat)
+    assert got is not None and got.shape[0] == 51
+
+
+def test_volcano_separates_fdr_passing_bins_that_were_dropped(tmp_path):
+    """A bin above the FDR line that a later filter removed must not be drawn
+    as 'n.s.' -- a point above the threshold in the not-significant class
+    reads as a broken plot, not as a second criterion."""
+    m = _mod()
+    diff = np.array([2.0, 1.5, 0.1])
+    fdr = np.array([0.001, 0.001, 0.9])
+    kept = np.array([True, False, False])         # bin 1 dropped by consistency
+    passed = np.array([True, True, False])
+    up, down = m.volcano_figure(diff, fdr, kept, tmp_path / "v.pdf", "t",
+                                0.05, passed_fdr=passed)
+    assert (up, down) == (1, 0)
+    assert (tmp_path / "v.pdf").stat().st_size > 0

@@ -739,7 +739,38 @@ def coverage_report(counts, in_mask, out_mask):
     return out
 
 
-def _companion(matrix_path, specs, name, filename, flag):
+def _check_companion(df, matrix, src, flag, min_overlap=0.95):
+    """A companion must cover the matrix it describes.
+
+    Reindexing a mismatched file onto the matrix succeeds and fills the gaps
+    with NaN, which is the worst possible outcome: every cell it does not
+    cover silently loses its variance, drops out of the contrast, and the run
+    reports a handful of testable bins with no indication that a stale file is
+    the reason.  A file from another run -- different cells, a different bin
+    size, a rerun with new filters -- looks identical to a correct one until
+    the results are inspected closely enough to notice they are impossible.
+    """
+    cells = len(matrix.index.intersection(df.index)) / max(len(matrix.index), 1)
+    bins = (len(matrix.columns.intersection(df.columns))
+            / max(len(matrix.columns), 1))
+    if cells < min_overlap or bins < min_overlap:
+        sys.exit(
+            f"{flag}: {src} does not match the matrix it is meant to "
+            f"describe.\n"
+            f"  it covers {cells:.0%} of the matrix's {len(matrix.index):,} "
+            f"cells and {bins:.0%} of its {len(matrix.columns):,} bins "
+            f"(the file itself is {df.shape[0]:,} x {df.shape[1]:,}).\n"
+            f"  every cell or bin it does not cover would lose its variance "
+            f"and drop out of the contrast, leaving a handful of testable "
+            f"bins and nothing to say why.\n"
+            f"  this is usually a file left from an earlier run with "
+            f"different cells, a different bin size, or different filters.  "
+            f"Re-run the concordance step, or point {flag} at the file that "
+            f"belongs to this matrix.")
+    return df
+
+
+def _companion(matrix_path, specs, name, filename, flag, matrix=None):
     """The named companion parquet, or the one sitting beside the matrix."""
     for spec in (specs or []):
         if "=" not in spec:
@@ -749,9 +780,15 @@ def _companion(matrix_path, specs, name, filename, flag):
             pth = Path(v.strip())
             if not pth.exists():
                 sys.exit(f"{flag} {name}: {pth} does not exist")
-            return pd.read_parquet(pth)
+            df = pd.read_parquet(pth)
+            return (_check_companion(df, matrix, str(pth), flag)
+                    if matrix is not None else df)
     beside = Path(matrix_path).parent / filename
-    return pd.read_parquet(beside) if beside.exists() else None
+    if not beside.exists():
+        return None
+    df = pd.read_parquet(beside)
+    return (_check_companion(df, matrix, str(beside), flag)
+            if matrix is not None else df)
 
 
 def global_shift_report(diff, sig=None):
@@ -878,7 +915,8 @@ def contrast_stats(X, in_mask, min_cells, out_mask=None, test="mwu"):
     return out
 
 
-def volcano_figure(diff, fdr, sig, path, title, fdr_cut, min_diff=0.0):
+def volcano_figure(diff, fdr, sig, path, title, fdr_cut, min_diff=0.0,
+                   passed_fdr=None):
     """Mean difference against -log10(FDR), significant bins coloured.
 
     The whole point of showing it rather than a ranked list: a volcano makes
@@ -899,10 +937,22 @@ def volcano_figure(diff, fdr, sig, path, title, fdr_cut, min_diff=0.0):
     y = -np.log10(q)
     m = np.asarray(sig, bool)[ok]
     up, down = m & (x > 0), m & (x < 0)
+    # A bin can clear the FDR line and still be dropped -- by the consistency
+    # filter, the batch filter or an effect-size floor.  Colouring it "n.s."
+    # would put a point above the threshold line in the not-significant class,
+    # which reads as a broken plot rather than as a second criterion.
+    dropped = np.zeros_like(m)
+    if passed_fdr is not None:
+        dropped = np.asarray(passed_fdr, bool)[ok] & ~m
+    rest = ~m & ~dropped
 
     fig, ax = plt.subplots(figsize=(5.2, 5.0))
-    ax.scatter(x[~m], y[~m], s=5, c="#C6CBD1", lw=0, alpha=0.55,
-               rasterized=True, label=f"n.s. ({int((~m).sum()):,})")
+    ax.scatter(x[rest], y[rest], s=5, c="#C6CBD1", lw=0, alpha=0.55,
+               rasterized=True, label=f"n.s. ({int(rest.sum()):,})")
+    if dropped.any():
+        ax.scatter(x[dropped], y[dropped], s=6, c="#F0C808", lw=0, alpha=0.8,
+                   rasterized=True,
+                   label=f"FDR only, not kept ({int(dropped.sum()):,})")
     ax.scatter(x[down], y[down], s=7, c="#2C6FAF", lw=0, rasterized=True,
                label=f"down ({int(down.sum()):,})")
     ax.scatter(x[up], y[up], s=7, c="#D1495B", lw=0, rasterized=True,
@@ -2175,9 +2225,11 @@ def main():
         # beside this matrix.  Auto-discovered so the common case needs no
         # flag; a bad explicit path is an error rather than a silent skip.
         V_df = _companion(path, args.delta_var, name,
-                          "concordance_delta_var.parquet", "--delta-var")
+                          "concordance_delta_var.parquet", "--delta-var",
+                          matrix=M)
         C_df = _companion(path, args.pair_counts, name,
-                          "pair_counts_per_bin.parquet", "--pair-counts")
+                          "pair_counts_per_bin.parquet", "--pair-counts",
+                          matrix=M)
         if args.contrast_weight != "none" and V_df is None and C_df is None:
             here = sorted(x.name for x in Path(path).parent.glob("*.parquet"))
             sys.exit(
@@ -2713,7 +2765,8 @@ def main():
                 n_up, n_dn = volcano_figure(
                     cs["diff"], q, mask, vpath,
                     f"{name}  {label} ({'+'.join(present)} {arm})",
-                    args.contrast_fdr, args.contrast_min_diff)
+                    args.contrast_fdr, args.contrast_min_diff,
+                    passed_fdr=np.isfinite(q) & (q < args.contrast_fdr))
                 print(f"  contrast {label!r}: {n_up:,} up / {n_dn:,} down "
                       f"-> {vpath.name}", file=sys.stderr)
             joint.setdefault(label, {})[name] = pd.DataFrame(
