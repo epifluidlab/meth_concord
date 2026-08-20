@@ -84,6 +84,27 @@
 # correlates with the 4DN LaminB1 DamID signal at r = -0.84, early being
 # lamina-distal.
 
+# --- repeat density, any UCSC build --------------------------------------
+# scripts/fetch_repeat_density.py turns the UCSC RepeatMasker table into
+# per-bin density tracks:
+#
+#   python scripts/fetch_repeat_density.py --output-dir repeats --main-chroms-only \
+#       --family L1 --family Alu --name L1HS --name AluY
+#
+# NOT as --annotation.  A single element is a few hundred bp, so no 250 kb bin
+# is ever half covered by one and a region test at majority overlap returns an
+# empty table.  What IS domain-scale is their density: pass
+# signal_track_flags.txt with --signal-track.
+#
+# Sanity check, and a check on the RT and LAD fetchers at the same time: in
+# HFFc6 the canonical compartment antagonism comes straight out --
+#   SINE/Alu  rho +0.60 vs log2(E/L), -0.59 vs LaminB1   (early, lamina-distal)
+#   LINE/L1   rho -0.38 vs log2(E/L), +0.45 vs LaminB1   (late, lamina-bound)
+#   DNA       rho +0.07 / +0.02                          (ancient, no preference)
+#
+# The young subfamilies are worth separating from their class: L1HS and AluY
+# are still mobile and do not sit where the ancient L1M/AluJ copies sit.
+
 # --- A/B compartments ----------------------------------------------------
 # From Hi-C in a relevant line (4DN).  Meningioma arises from arachnoid cap
 # cells, so a mesenchymal/fibroblast reference is nearer than a neuronal one.
