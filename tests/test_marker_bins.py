@@ -697,9 +697,21 @@ def test_end_to_end_stable_sign_and_contrast(tmp_path):
     assert (co_open["d_group_min"] > 0).all()
     assert (co_closed["d_group_max"] < 0).all()
     contrast = bed("contrast_tumour")
-    assert block(contrast).idxmax() == 4, "block 4 is the planted split"
     assert (contrast["contrast_tumour_fdr"] < 0.05).all()
-    assert (contrast["contrast_tumour_diff"] > 0).all(), "in-set is the high arm"
+    blk = contrast["start"] // 250000 // 20
+    planted = contrast[blk == 4]
+    assert len(planted) == 20, "the whole planted split should clear the FDR"
+    assert (planted["contrast_tumour_diff"] > 0).all(), "in-set is the high arm"
+    # The raw split is +2 against -2, and the difference is reported on that
+    # scale rather than on the normalised one.
+    assert planted["contrast_tumour_diff"].mean() == pytest.approx(4.0, abs=0.3)
+    # Blocks 1/2/3 are identical in every cell, so nothing there can really
+    # differ between the arms.  Before the contrast moved to the raw values,
+    # the compositional per-cell rank made all 60 of them significant.
+    assert int((blk.isin([1, 2, 3])).sum()) <= 6, contrast.groupby(blk).size()
+    # Block 0 genuinely varies by cell type, so it may contribute in EITHER
+    # direction; that is real signal, not an artefact.
+    assert block(contrast).idxmax() == 4, "block 4 is the planted split"
 
     s = json.loads((out / "marker_bins_summary.json").read_text())["matrices"]["gch"]
     assert s["n_always_co_open"] == 20 and s["n_always_co_closed"] == 20
@@ -1357,3 +1369,156 @@ def test_seg_and_headed_formats_both_read():
     df = m.read_segments(headed)
     assert list(df.columns) == ["sample", "chrom", "start", "end", "value"]
     assert df["chrom"].iloc[0] == "1", "chr prefix stripped for matching"
+
+
+# ============================================================ contrast arm ===
+
+def test_contrast_stats_uses_the_named_reference_only():
+    """A tumour-vs-monocyte contrast is not tumour-vs-everything.  Folding the
+    other cell types into the reference changes both the difference and which
+    bins clear the cut, silently."""
+    m = _mod()
+    X = np.zeros((9, 2))
+    X[0:3] = 5.0        # arm
+    X[3:6] = 1.0        # reference
+    X[6:9] = 100.0      # a third group that must not be in the reference
+    X += np.tile([[0.0], [0.1], [-0.1]], (3, 2))   # a little within-group spread
+    in_mask = np.array([True] * 3 + [False] * 6)
+    ref_mask = np.array([False] * 3 + [True] * 3 + [False] * 3)
+
+    named = m.contrast_stats(X, in_mask, 2, ref_mask)
+    everything = m.contrast_stats(X, in_mask, 2)
+    assert named["mean_out"][0] == pytest.approx(1.0, abs=0.05)
+    assert named["diff"][0] == pytest.approx(4.0, abs=0.1)
+    # Against "everything else" the reference mean is dragged up by the third
+    # group and the effect flips sign.
+    assert everything["diff"][0] < 0
+
+
+def test_contrast_stats_defaults_to_everything_else():
+    m = _mod()
+    X = np.array([[3.0], [3.1], [1.0], [1.1]])
+    in_mask = np.array([True, True, False, False])
+    a = m.contrast_stats(X, in_mask, 2)
+    b = m.contrast_stats(X, in_mask, 2, ~in_mask)
+    assert a["diff"][0] == pytest.approx(b["diff"][0])
+
+
+# ------------------------------------------------------- cross-modality ------
+
+def _ctx(diff, fdr, sig, keys=None):
+    keys = keys or [f"chr1:{i * 250000}" for i in range(len(diff))]
+    return pd.DataFrame({"diff": diff, "fdr": fdr, "sig": sig}, index=keys)
+
+
+def test_joint_table_labels_which_modality_a_bin_is_aberrant_in():
+    m = _mod()
+    per = {"gch": _ctx([1.0, 1.0, 0.0, 0.0], [0.01, 0.01, 0.9, 0.9],
+                       [True, True, False, False]),
+           "hcg": _ctx([1.0, 0.0, 1.0, 0.0], [0.01, 0.9, 0.01, 0.9],
+                       [True, False, True, False])}
+    tab, a, b = m.joint_contrast_table(per, "x")
+    assert list(tab["category"]) == ["both", "gch_only", "hcg_only", "neither"]
+
+
+def test_joint_table_drops_bins_one_context_never_measured():
+    """A bin GCH never saw is not evidence that the aberration is HCG-specific;
+    counting it would pad the modality-specific classes with missing data."""
+    m = _mod()
+    keys = ["chr1:0", "chr1:250000"]
+    per = {"gch": _ctx([1.0], [0.01], [True], keys=["chr1:0"]),
+           "hcg": _ctx([1.0, 2.0], [0.01, 0.01], [True, True], keys=keys)}
+    tab, _, _ = m.joint_contrast_table(per, "x")
+    assert list(tab.index) == ["chr1:0"]
+
+
+def test_joint_table_needs_exactly_two_contexts():
+    m = _mod()
+    with pytest.raises(ValueError, match="two contexts"):
+        m.joint_contrast_table({"gch": _ctx([1.0], [0.01], [True])}, "x")
+
+
+def test_concordance_counts_direction_only_over_shared_bins():
+    """Whether a bin moves the same way in a modality that did not move at all
+    is a coin flip, not a result."""
+    m = _mod()
+    per = {"gch": _ctx([1.0, 1.0, -1.0, 5.0], [0.01] * 3 + [0.9],
+                       [True, True, True, False]),
+           "hcg": _ctx([1.0, -1.0, -1.0, -5.0], [0.01] * 3 + [0.9],
+                       [True, True, True, False])}
+    tab, a, b = m.joint_contrast_table(per, "x")
+    st = m.joint_concordance(tab, a, b)
+    assert st["n_both"] == 3
+    assert st["n_both_same_direction"] == 2          # bins 0 and 2
+    assert st["frac_both_same_direction"] == pytest.approx(2 / 3)
+    assert st["n_gch_only"] == 0 and st["n_hcg_only"] == 0
+
+
+def test_concordance_with_nothing_shared_does_not_divide_by_zero():
+    m = _mod()
+    per = {"gch": _ctx([1.0], [0.01], [True]),
+           "hcg": _ctx([1.0], [0.9], [False])}
+    tab, a, b = m.joint_contrast_table(per, "x")
+    st = m.joint_concordance(tab, a, b)
+    assert st["n_both"] == 0
+    assert np.isnan(st["frac_both_same_direction"])
+
+
+def test_volcano_writes_a_figure_and_counts_both_directions(tmp_path):
+    m = _mod()
+    diff = np.array([2.0, -2.0, 0.1, np.nan])
+    fdr = np.array([0.001, 0.001, 0.9, 0.5])
+    sig = np.array([True, True, False, False])
+    up, down = m.volcano_figure(diff, fdr, sig, tmp_path / "v.pdf", "t", 0.05)
+    assert (up, down) == (1, 1)
+    assert (tmp_path / "v.pdf").stat().st_size > 0
+
+
+def test_volcano_survives_an_fdr_of_exactly_zero(tmp_path):
+    """-log10(0) is inf and would blow up the axis."""
+    m = _mod()
+    m.volcano_figure(np.array([2.0, 1.0]), np.array([0.0, 0.02]),
+                     np.array([True, True]), tmp_path / "v.pdf", "t", 0.05)
+    assert (tmp_path / "v.pdf").stat().st_size > 0
+
+
+def test_the_contrast_is_computed_on_raw_values_not_normalised_ones(tmp_path):
+    """Per-bin QN followed by per-cell rank is compositional: a real shift in
+    one block pushes every other bin the other way in rank space, so bins that
+    are IDENTICAL in every cell pick up a difference between the arms out of
+    nothing.  A ranked top-N hid it by taking only the strongest bins; an FDR
+    cut does not, and would fill the BED with normalisation artefacts.
+    """
+    rng = np.random.default_rng(3)
+    n_ct, n_per = 3, 20
+    ct = np.repeat(np.arange(n_ct), n_per)
+    n = len(ct)
+    # 40 bins that are constant in every cell, and 40 carrying a real split.
+    constant = np.tile(np.linspace(-1, 1, 40), (n, 1)) + rng.normal(0, .02, (n, 40))
+    split = np.where((ct < 1)[:, None], 2.0, -2.0) + rng.normal(0, .3, (n, 40))
+    X = np.hstack([constant, split])
+    cells = [f"cell{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "concordance_directional.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        stab, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "20",
+         "--contrast", "arm=CT0", "--output-dir", str(out),
+         "--plot-format", "png"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+    bed = pd.read_csv(out / "bin_scores_gch.contrast_arm.bed", sep="\t")
+    blk = bed["start"] // 250000 // 40
+    n_constant, n_split = int((blk == 0).sum()), int((blk == 1).sum())
+    assert n_split >= 35, "the real split should be recovered"
+    assert n_constant <= 4, (
+        f"{n_constant}/40 constant bins called significant -- the contrast is "
+        f"seeing normalised values, where the split makes them differ")

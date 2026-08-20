@@ -138,7 +138,6 @@ def _batch_icc(X, cell_type_ids, batch_ids, n_batch, icc_fn, min_cells, min_g):
     return np.where(wsum > 0, acc / np.maximum(wsum, 1), np.nan)
 
 
-
 def _nonselected_separation(M, labels, n_svd, skip_top, seed, n_perm):
     """Do the NON-selected bins still separate cell types?  (silhouette + perm)
 
@@ -426,19 +425,28 @@ def select_sign_bins(sg, key, rank_by, ascending, n_want):
             int(clean.size))
 
 
-def contrast_stats(X, in_mask, min_cells):
-    """Welch two-sample t per bin for one group set against all the others.
+def contrast_stats(X, in_mask, min_cells, out_mask=None):
+    """Welch two-sample t per bin for one group set against a reference arm.
 
     Welch rather than pooled: the two arms are a handful of samples of one
-    condition against everything else, so equal variances are not a safe
+    condition against a reference, so equal variances are not a safe
     assumption.  Returns NaN for bins either arm cannot cover, which keeps them
     out of the multiple-testing correction rather than in it at p = 1.
+
+    ``out_mask`` defaults to everything outside ``in_mask``.  Passing it
+    explicitly names the reference instead, and cells in NEITHER arm are
+    dropped rather than folded into the reference -- a tumour-vs-monocyte
+    contrast is not a tumour-vs-everything contrast with a different label, and
+    silently widening the reference would change both the effect size and which
+    bins clear the threshold.
     """
     from scipy.stats import t as _t
 
     X = np.asarray(X, float)
+    if out_mask is None:
+        out_mask = ~np.asarray(in_mask, bool)
     out = {}
-    for tag, m in (("in", in_mask), ("out", ~in_mask)):
+    for tag, m in (("in", in_mask), ("out", out_mask)):
         rows = X[m]
         n = np.isfinite(rows).sum(axis=0)
         with np.errstate(invalid="ignore"):
@@ -466,6 +474,186 @@ def contrast_stats(X, in_mask, min_cells):
     for k, v in (("diff", diff), ("t", tstat), ("p", p), ("d", d)):
         out[k] = np.where(bad, np.nan, v)
     return out
+
+
+def volcano_figure(diff, fdr, sig, path, title, fdr_cut, min_diff=0.0):
+    """Mean difference against -log10(FDR), significant bins coloured.
+
+    The whole point of showing it rather than a ranked list: a volcano makes
+    the two ways a bin can be uninteresting visible at once -- significant but
+    tiny, and large but noisy -- which a top-N table hides by construction,
+    since it reports its N either way.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ok = np.isfinite(diff) & np.isfinite(fdr)
+    x = np.asarray(diff, float)[ok]
+    # FDR of exactly 0 would be an infinite y; floor at the smallest non-zero.
+    q = np.asarray(fdr, float)[ok]
+    nz = q[q > 0]
+    q = np.maximum(q, nz.min() if nz.size else 1e-300)
+    y = -np.log10(q)
+    m = np.asarray(sig, bool)[ok]
+    up, down = m & (x > 0), m & (x < 0)
+
+    fig, ax = plt.subplots(figsize=(5.2, 5.0))
+    ax.scatter(x[~m], y[~m], s=5, c="#C6CBD1", lw=0, alpha=0.55,
+               rasterized=True, label=f"n.s. ({int((~m).sum()):,})")
+    ax.scatter(x[down], y[down], s=7, c="#2C6FAF", lw=0, rasterized=True,
+               label=f"down ({int(down.sum()):,})")
+    ax.scatter(x[up], y[up], s=7, c="#D1495B", lw=0, rasterized=True,
+               label=f"up ({int(up.sum()):,})")
+    if np.isfinite(fdr_cut) and 0 < fdr_cut < 1:
+        ax.axhline(-np.log10(fdr_cut), color="#6B7280", lw=0.9, ls="--")
+    if min_diff > 0:
+        for v in (-min_diff, min_diff):
+            ax.axvline(v, color="#6B7280", lw=0.9, ls=":")
+    ax.axvline(0.0, color="#9AA0A6", lw=0.8, zorder=0)
+    ax.set_xlabel("mean difference (contrast - reference)")
+    ax.set_ylabel("-log10(FDR)")
+    ax.set_title(title, fontsize=10)
+    ax.legend(frameon=False, fontsize=8, loc="upper left")
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    return int(up.sum()), int(down.sum())
+
+
+def joint_contrast_table(per_context, label):
+    """Align two contexts' contrast results on their shared bins.
+
+    Returns a frame indexed by bin key with diff/fdr/sig per context and a
+    ``category`` naming which modality the bin is aberrant in.  Bins missing
+    from either context are dropped: a bin GCH never measured is not evidence
+    that the aberration is HCG-specific, and letting it in would inflate the
+    modality-specific classes with what is really missing data.
+    """
+    names = list(per_context)
+    if len(names) != 2:
+        raise ValueError(f"need exactly two contexts, got {names}")
+    a, b = names
+    fa, fb = per_context[a], per_context[b]
+    keys = fa.index.intersection(fb.index)
+    out = pd.DataFrame(index=keys)
+    for nm, fr in ((a, fa), (b, fb)):
+        out[f"{nm}_diff"] = fr.loc[keys, "diff"].to_numpy()
+        out[f"{nm}_fdr"] = fr.loc[keys, "fdr"].to_numpy()
+        out[f"{nm}_sig"] = fr.loc[keys, "sig"].to_numpy()
+    sa, sb = out[f"{a}_sig"].to_numpy(), out[f"{b}_sig"].to_numpy()
+    out["category"] = np.where(
+        sa & sb, "both",
+        np.where(sa, f"{a}_only",
+                 np.where(sb, f"{b}_only", "neither")))
+    return out, a, b
+
+
+def joint_concordance(tab, a, b):
+    """Counts and sign agreement over the bins significant in both.
+
+    Sign agreement is only meaningful there.  Asking whether a bin moves the
+    same way in both modalities when one of them did not move at all is a
+    coin flip dressed as a result.
+    """
+    both = tab[tab["category"] == "both"]
+    da, db = both[f"{a}_diff"].to_numpy(), both[f"{b}_diff"].to_numpy()
+    same = int(np.sum(np.sign(da) == np.sign(db)))
+    n = int(len(both))
+    stats = {"n_shared_bins": int(len(tab)),
+             "n_both": n,
+             f"n_{a}_only": int((tab["category"] == f"{a}_only").sum()),
+             f"n_{b}_only": int((tab["category"] == f"{b}_only").sum()),
+             "n_both_same_direction": same,
+             "frac_both_same_direction": (same / n) if n else float("nan")}
+    if n > 2:
+        from scipy.stats import binomtest, pearsonr, spearmanr
+        stats["pearson_r_diff"] = float(pearsonr(da, db)[0])
+        stats["spearman_rho_diff"] = float(spearmanr(da, db)[0])
+        # Against the null that direction is independent between modalities.
+        stats["p_same_direction"] = float(
+            binomtest(same, n, 0.5, alternative="two-sided").pvalue)
+    return stats
+
+
+def joint_figure(tab, a, b, stats, mats, cell_types, path, label):
+    """One PDF: the two mean differences against each other, then a clustered
+    heatmap per modality over the union of significant bins.
+
+    The heatmaps share one bin order -- clustered once, on the two differences
+    together -- so a row is the same bin in both panels.  Clustering each
+    panel separately would put a different bin on each row and make the two
+    impossible to read against each other, which is the only question here.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from scipy.cluster.hierarchy import leaves_list, linkage
+
+    colour = {"both": "#7B3294", f"{a}_only": "#D1495B",
+              f"{b}_only": "#2C6FAF", "neither": "#DADDE1"}
+    with PdfPages(path) as pdf:
+        # (1) scatter of the two effects
+        fig, ax = plt.subplots(figsize=(5.4, 5.2))
+        for cat in ("neither", f"{a}_only", f"{b}_only", "both"):
+            sub = tab[tab["category"] == cat]
+            if not len(sub):
+                continue
+            ax.scatter(sub[f"{a}_diff"], sub[f"{b}_diff"], s=9 if cat != "neither" else 4,
+                       c=colour[cat], lw=0, alpha=0.75 if cat != "neither" else 0.4,
+                       rasterized=True, label=f"{cat} ({len(sub):,})")
+        ax.axhline(0, color="#9AA0A6", lw=0.8, zorder=0)
+        ax.axvline(0, color="#9AA0A6", lw=0.8, zorder=0)
+        ax.set_xlabel(f"{a} mean difference (contrast - reference)")
+        ax.set_ylabel(f"{b} mean difference (contrast - reference)")
+        sub = stats.get("frac_both_same_direction")
+        note = (f"{stats['n_both']:,} significant in both, "
+                f"{sub:.0%} same direction" if stats["n_both"] else
+                "no bin significant in both")
+        ax.set_title(f"{label}: {note}", fontsize=10)
+        ax.legend(frameon=False, fontsize=8, loc="best")
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # (2) clustered heatmaps over the union, one bin order for both
+        sel = tab[tab["category"] != "neither"]
+        if not len(sel):
+            return
+        keys = list(sel.index)
+        eff = np.column_stack([sel[f"{a}_diff"].to_numpy(),
+                               sel[f"{b}_diff"].to_numpy()])
+        eff = np.nan_to_num(eff)
+        order = (leaves_list(linkage(eff, method="average"))
+                 if len(keys) > 2 else np.arange(len(keys)))
+        keys = [keys[i] for i in order]
+
+        fig, axes = plt.subplots(1, len(mats), figsize=(6.0 * len(mats), 7.2),
+                                 squeeze=False)
+        for ax, (nm, mat) in zip(axes[0], mats.items()):
+            cols = [k for k in keys if k in mat.columns]
+            sub = mat.loc[:, cols]
+            ct = pd.Series(cell_types).reindex(sub.index)
+            cell_order = np.argsort(ct.to_numpy().astype(str), kind="stable")
+            v = sub.to_numpy()[cell_order].T
+            lim = np.nanpercentile(np.abs(v), 98) if np.isfinite(v).any() else 1
+            im = ax.imshow(v, aspect="auto", cmap="RdBu_r",
+                           vmin=-lim, vmax=lim, interpolation="nearest")
+            ax.set_title(f"{nm}  ({len(cols):,} bins)", fontsize=10)
+            ax.set_xlabel("cells (grouped by cell type)")
+            ax.set_ylabel("bins (shared order, clustered on both effects)")
+            ax.set_yticks([])
+            ax.set_xticks([])
+            fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+        fig.suptitle(f"{label}: union of significant bins", fontsize=11)
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
 
 
 def read_segments(path, sample_col=None):
@@ -669,7 +857,6 @@ def _bins_to_bed(bins, bin_size, chrom_sizes=None):
     return rows
 
 
-
 # Distinct diverging colour schemes so GCH-GCH and HCG-HCG never look alike.
 _CMAPS = {"gch": "RdBu_r", "hcg": "PuOr_r"}
 _CMAP_FALLBACK = ["RdBu_r", "PuOr_r", "BrBG_r", "PiYG_r"]
@@ -719,7 +906,6 @@ def _remove_batch(M, ct_labels, batch_df):
         grp = (ctk + "|" + batch_df[col].loc[cells].astype(str)).to_numpy()
         df = df - df.groupby(grp).transform("mean") + ct_mean
     return df
-
 
 
 def _row_linkage(Z):
@@ -1258,7 +1444,35 @@ def main():
                          "the clearly CN-different regions while keeping the "
                          "copy-neutral genome.")
     ap.add_argument("--n-contrast-bins", type=int, default=0,
-                    help="Bins per contrast BED (0 = same as --n-bins).")
+                    help="Bins per contrast BED with --contrast-select top-n "
+                         "(0 = same as --n-bins).  Ignored under the default "
+                         "fdr rule, which has no fixed count.")
+    ap.add_argument("--contrast-select", choices=["fdr", "top-n"],
+                    default="fdr",
+                    help="How a contrast BED is filled.  'fdr' (default) keeps "
+                         "every bin below --contrast-fdr, which is what the "
+                         "volcano colours and can legitimately come back "
+                         "empty.  'top-n' keeps the --n-contrast-bins largest "
+                         "|t| whether or not any of them is significant, so it "
+                         "always returns a set and never says the contrast is "
+                         "empty.")
+    ap.add_argument("--contrast-fdr", type=float, default=0.05,
+                    help="BH-FDR cut for --contrast-select fdr (0.05).")
+    ap.add_argument("--contrast-min-diff", type=float, default=0.0,
+                    help="Also require |mean difference| at least this large. "
+                         "0 disables.  With many cells a tiny shift reaches "
+                         "significance, and this is where 'significant' is "
+                         "separated from 'big enough to care about'.")
+    ap.add_argument("--volcano", action="store_true",
+                    help="Draw a volcano per contrast per context: mean "
+                         "difference against -log10(FDR), significant bins "
+                         "coloured by direction.")
+    ap.add_argument("--contrast-joint", action="store_true",
+                    help="After every context, compare the contrast ACROSS "
+                         "them: the union of significant bins, a scatter of "
+                         "the two mean differences, and a clustered heatmap "
+                         "of each modality over those bins -- which shows "
+                         "whether a bin is aberrant in both or in only one.")
     ap.add_argument("--max-batch-icc", type=float, default=0.1,
                     help="Drop a candidate bin whose within-cell-type between-"
                          "batch ICC exceeds this — it is sample-driven.")
@@ -1365,13 +1579,27 @@ def main():
     contrasts = []
     for spec in (args.contrast or []):
         if "=" not in spec:
-            sys.exit(f"--contrast must be LABEL=GROUP[,GROUP...], got {spec!r}")
+            sys.exit(f"--contrast must be LABEL=GROUP[,GROUP...][:REF[,REF]], "
+                     f"got {spec!r}")
         lab, groups = spec.split("=", 1)
-        lab = lab.strip().replace("/", "_").replace(" ", "_")
+        lab = lab.strip()
+        # "in:ref" names the reference arm; without it the reference is every
+        # other cell, which is a different question with a different answer.
+        ref = None
+        if ":" in groups:
+            groups, ref_s = groups.split(":", 1)
+            ref = [g.strip() for g in ref_s.split(",") if g.strip()]
+            if not ref:
+                sys.exit(f"--contrast {spec!r}: ':' given but no reference "
+                         f"group follows it")
         want = [g.strip() for g in groups.split(",") if g.strip()]
         if not lab or not want:
-            sys.exit(f"--contrast needs a label and at least one group: {spec!r}")
-        contrasts.append((lab, want))
+            sys.exit(f"--contrast needs a label and at least one group: "
+                     f"{spec!r}")
+        overlap = set(want) & set(ref or [])
+        if overlap:
+            sys.exit(f"--contrast {spec!r}: {sorted(overlap)} is on both sides")
+        contrasts.append((lab, want, ref))
 
     seg = cell_to_sample = None
     if args.cnv_seg:
@@ -1403,6 +1631,9 @@ def main():
     out_dir = ensure_dir(Path(args.output_dir))
     summary = {}
 
+    # {contrast label: {context: frame(diff, fdr, sig) indexed by bin key}}
+    joint = {}
+    joint_mats = {}
     for mi, spec in enumerate(args.matrix):
         if "=" not in spec:
             sys.exit(f"--matrix must be NAME=PATH, got {spec!r}")
@@ -1693,18 +1924,57 @@ def main():
 
         # (4) Group-set contrasts: these groups against every other.
         summary_contrast = {}
-        for label, want in contrasts:
+        for label, want, ref_groups in contrasts:
             present = [g for g in want if g in set(ct_u)]
             missing = [g for g in want if g not in set(ct_u)]
             if missing:
                 print(f"  contrast {label!r}: no cells for {missing} "
                       f"(available: {ct_u})", file=sys.stderr)
-            if not present or len(present) == len(ct_u):
-                print(f"  contrast {label!r}: needs at least one group in the "
-                      f"set and one outside — skipped", file=sys.stderr)
+            if not present:
+                print(f"  contrast {label!r}: no group present — skipped",
+                      file=sys.stderr)
                 continue
             in_mask = ct.isin(present).to_numpy()
-            cs = contrast_stats(Msel, in_mask, args.min_cells_per_group)
+            if ref_groups:
+                ref_present = [g for g in ref_groups if g in set(ct_u)]
+                ref_missing = [g for g in ref_groups if g not in set(ct_u)]
+                if ref_missing:
+                    print(f"  contrast {label!r}: no cells for reference "
+                          f"{ref_missing} (available: {ct_u})",
+                          file=sys.stderr)
+                if not ref_present:
+                    print(f"  contrast {label!r}: no reference cells — "
+                          f"skipped", file=sys.stderr)
+                    continue
+                out_mask = ct.isin(ref_present).to_numpy()
+                arm = f"vs {'+'.join(ref_present)}"
+            else:
+                if len(present) == len(ct_u):
+                    print(f"  contrast {label!r}: every group is in the set, "
+                          f"so nothing is left to compare against — skipped",
+                          file=sys.stderr)
+                    continue
+                out_mask = ~in_mask
+                arm = "vs all other cell types"
+            print(f"  contrast {label!r}: {int(in_mask.sum())} cells "
+                  f"({'+'.join(present)}) {arm}, {int(out_mask.sum())} cells",
+                  file=sys.stderr)
+            # On the RAW values, not the normalised ones.  Per-bin QN
+            # followed by per-cell rank is COMPOSITIONAL: a real shift in one
+            # block of bins pushes every other bin the other way in rank
+            # space, so bins that are identical in every cell acquire a
+            # difference between the arms out of nothing.  On a fixture whose
+            # blocks 2 and 3 are constant across all cells, the normalised
+            # matrix calls 25% and 20% of them significant at p<0.01 against
+            # 5% and 0% raw.  A ranked top-N hid this by taking only the
+            # strongest bins; an FDR cut does not, and would fill the BED with
+            # normalisation artefacts.  The mean difference is also only a
+            # difference in D on this scale -- on the normalised one it is a
+            # difference in per-cell rank, which is not what the volcano's
+            # x-axis claims to show.
+            Mc = M_raw.reindex(index=M.index, columns=M.columns).to_numpy()
+            cs = contrast_stats(Mc, in_mask, args.min_cells_per_group,
+                                out_mask)
             q = _bh_fdr(cs["p"])
             # The copy-number check, before anything is ranked: a bin whose two
             # arms differ in copy number differs in coverage, and coverage is
@@ -1712,7 +1982,7 @@ def main():
             cnv = cnv_info = None
             if seg is not None:
                 cells_in = list(M.index[in_mask])
-                cells_out = list(M.index[~in_mask])
+                cells_out = list(M.index[out_mask])
                 cnv, _samples, (n_in, n_out) = cnv_group_delta(
                     M.columns, seg, cell_to_sample, cells_in, cells_out)
                 if cnv is None:
@@ -1742,15 +2012,41 @@ def main():
                               f"{int(drop.sum()):,} bins from the pool.",
                               file=sys.stderr)
             rank = np.where(np.isfinite(cs["t"]), np.abs(cs["t"]), -np.inf)
-            keep_rank = np.argsort(rank)[::-1][: args.n_contrast_bins
-                                               or args.n_bins]
-            keep_rank = keep_rank[np.isfinite(rank[keep_rank])]
+            mask = np.zeros(M.shape[1], bool)
+            if args.contrast_select == "fdr":
+                # Significance, not a fixed count.  A rank cut returns N bins
+                # whether or not anything differs, so "the top 500" reads as a
+                # finding even when the contrast is empty; an FDR cut can
+                # return nothing, which is the honest answer in that case.
+                sig = (np.isfinite(q) & (q < args.contrast_fdr)
+                       & np.isfinite(cs["diff"]))
+                if args.contrast_min_diff > 0:
+                    sig &= np.abs(cs["diff"]) >= args.contrast_min_diff
+                if args.cnv_max_delta > 0 and cnv is not None:
+                    sig &= ~(np.isfinite(cnv)
+                             & (np.abs(cnv) > args.cnv_max_delta))
+                mask = sig
+            else:
+                keep_rank = np.argsort(rank)[::-1][: args.n_contrast_bins
+                                                   or args.n_bins]
+                keep_rank = keep_rank[np.isfinite(rank[keep_rank])]
+                mask[keep_rank] = True
             # A contrast bin driven by batch is worthless in exactly the same
             # way a marker bin is, so it faces the same filter.
             clean = ~(np.isfinite(b_icc) & (b_icc > args.max_batch_icc))
-            mask = np.zeros(M.shape[1], bool)
-            mask[keep_rank] = True
             pre = f"contrast_{label}"
+            if args.volcano:
+                vpath = out_dir / f"volcano_{name}_{label}.pdf"
+                n_up, n_dn = volcano_figure(
+                    cs["diff"], q, mask, vpath,
+                    f"{name}  {label} ({'+'.join(present)} {arm})",
+                    args.contrast_fdr, args.contrast_min_diff)
+                print(f"  contrast {label!r}: {n_up:,} up / {n_dn:,} down "
+                      f"-> {vpath.name}", file=sys.stderr)
+            joint.setdefault(label, {})[name] = pd.DataFrame(
+                {"diff": cs["diff"], "fdr": q, "sig": mask},
+                index=pd.Index(M.columns, name="bin"))
+            joint_mats[name] = M
             scores_df[f"{pre}_diff"] = cs["diff"]
             scores_df[f"{pre}_cohens_d"] = cs["d"]
             scores_df[f"{pre}_pvalue"] = cs["p"]
@@ -1780,7 +2076,11 @@ def main():
                 cnv_info["delta_cut_used"] = float(cut)
             summary_contrast[label] = {
                 "groups_in": present, "n_cells_in": int(in_mask.sum()),
-                "n_cells_out": int((~in_mask).sum()),
+                # The REFERENCE arm, not "everything else": with an explicit
+                # reference the two differ, and reporting the complement would
+                # describe a comparison that was never run.
+                "groups_out": ref_present if ref_groups else "rest",
+                "n_cells_out": int(out_mask.sum()),
                 "n_selected": int(mask.sum()),
                 "n_fdr_0.05": int(np.nansum(q < 0.05)),
                 "n_selected_batch_clean": int(np.sum(mask & clean)),
@@ -1879,7 +2179,9 @@ def main():
                       f"{summary_sign[f'n_{key}_total']} qualifying "
                       f"-> bin_scores_{name}.{key}.bed")
         for lab, s in summary_contrast.items():
-            print(f"  contrast {lab} ({'+'.join(s['groups_in'])}, "
+            ref = s.get("groups_out", "rest")
+            ref = "+".join(ref) if isinstance(ref, list) else ref
+            print(f"  contrast {lab} ({'+'.join(s['groups_in'])} vs {ref}, "
                   f"{s['n_cells_in']} vs {s['n_cells_out']} cells): "
                   f"{s['n_selected']} bins written, "
                   f"{s['n_fdr_0.05']} at FDR<0.05, "
@@ -1896,6 +2198,39 @@ def main():
 
     if not summary:
         sys.exit("no matrix produced output.")
+
+    # (5) The contrast ACROSS contexts: is a bin aberrant in both modalities,
+    # or in only one?  Needs both, so it waits until every matrix is done.
+    if args.contrast_joint:
+        for label, per_ctx in joint.items():
+            if len(per_ctx) != 2:
+                print(f"  contrast-joint {label!r}: needs exactly two "
+                      f"contexts, have {sorted(per_ctx)} — skipped",
+                      file=sys.stderr)
+                continue
+            tab, a, b = joint_contrast_table(per_ctx, label)
+            stats = joint_concordance(tab, a, b)
+            tab.to_csv(out_dir / f"contrast_joint_{label}.tsv", sep="\t")
+            sel = tab[tab["category"] != "neither"]
+            bed = out_dir / f"contrast_joint_{label}.bed"
+            coords = _bins_to_bed(sel.index, infer_bin_size(sel.index),
+                                  chrom_sizes)
+            jb = pd.DataFrame(coords, columns=["chrom", "start", "end"])
+            for c in (f"{a}_diff", f"{a}_fdr", f"{b}_diff", f"{b}_fdr",
+                      "category"):
+                jb[c] = sel[c].to_numpy()
+            jb.sort_values(["chrom", "start"]).to_csv(
+                bed, sep="\t", index=False, na_rep="NA")
+            joint_figure(tab, a, b, stats,
+                         {k: joint_mats[k] for k in (a, b)},
+                         ct_of, out_dir / f"contrast_joint_{label}.pdf",
+                         label)
+            summary.setdefault("contrast_joint", {})[label] = stats
+            print(f"  contrast-joint {label!r}: {stats['n_both']:,} in both, "
+                  f"{stats[f'n_{a}_only']:,} {a} only, "
+                  f"{stats[f'n_{b}_only']:,} {b} only; "
+                  f"{stats['frac_both_same_direction']:.0%} of the shared ones "
+                  f"move the same way -> {bed.name}", file=sys.stderr)
     with open(out_dir / "marker_bins_summary.json", "w") as fh:
         json.dump({"matrices": summary, "n_bins": args.n_bins,
                    "max_batch_icc": args.max_batch_icc,
