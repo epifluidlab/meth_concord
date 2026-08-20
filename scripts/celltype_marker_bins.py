@@ -441,6 +441,43 @@ def mwu_min_pvalue(n1, n2):
     return min(1.0, 2.0 / comb(n1 + n2, n1))
 
 
+def variance_from_counts(counts, X, in_mask, out_mask, eps=1e-12):
+    """Approximate per-estimate variance from read-pair counts.
+
+    Delta is a difference of two proportions estimated from the pairs in a
+    (cell, bin), so its sampling variance falls as 1/n -- exact in form, with
+    only the constant unknown, since that constant involves the underlying
+    proportions.  The constant is recovered per bin and per arm by moments:
+    with v_i = c/n_i, the weighted residual sum Sum n_i (x_i - m)^2 has
+    expectation (k-1)c, so c is that sum over (k-1).
+
+    Anything the counts do not explain -- real between-cell variation -- lands
+    in c and inflates every variance in that arm equally.  That makes this
+    CONSERVATIVE rather than anticonservative, which is the right way to be
+    wrong when the exact variances are missing.
+
+    Use concordance_delta_var.parquet when the pipeline wrote one; this is the
+    fallback, not the equal.
+    """
+    n = np.asarray(counts, float)
+    n = np.where(np.isfinite(n) & (n > 0), n, np.nan)
+    X = np.asarray(X, float)
+    V = np.full(X.shape, np.nan)
+    for m in (np.asarray(in_mask, bool), np.asarray(out_mask, bool)):
+        x, ni = X[m], n[m]
+        ok = np.isfinite(x) & np.isfinite(ni)
+        w = np.where(ok, ni, np.nan)
+        sw = np.nansum(w, axis=0)
+        mu = np.nansum(w * np.where(ok, x, 0.0), axis=0) / np.maximum(sw, eps)
+        k = np.sum(ok, axis=0)
+        resid = np.nansum(w * (np.where(ok, x, np.nan) - mu) ** 2, axis=0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            c = resid / np.maximum(k - 1, 1)
+        c = np.where(np.isfinite(c) & (c > 0), c, np.nan)
+        V[m] = c[None, :] / ni
+    return V
+
+
 def _dl_tau2(x, v, axis=0):
     """DerSimonian-Laird between-unit variance, per bin.
 
@@ -528,7 +565,8 @@ def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects")
 
 
 def stratified_contrast(X, strata, in_mask, out_mask, min_cells, test,
-                        V=None, mode="random-effects", min_strata=2):
+                        V=None, mode="random-effects", min_strata=2,
+                        counts=None):
     """Run the contrast WITHIN each stratum, then combine across them.
 
     The right treatment for a blocking factor that is biological rather than
@@ -559,8 +597,16 @@ def stratified_contrast(X, strata, in_mask, out_mask, min_cells, test,
         a, b = in_mask & keep, out_mask & keep
         if int(a.sum()) < min_cells or int(b.sum()) < min_cells:
             continue
-        if V is not None:
-            cs = weighted_contrast(X, V, a, b, min_cells, mode)
+        # The variance approximated from counts must be estimated INSIDE the
+        # stratum.  Estimated over the whole arm it absorbs the between-strata
+        # difference -- the patient effect -- into the noise constant, and
+        # then inflates every within-patient comparison by it, which is
+        # exactly the variation stratifying was meant to remove.
+        Vs = V
+        if V is None and counts is not None:
+            Vs = variance_from_counts(counts, X, a, b)
+        if Vs is not None:
+            cs = weighted_contrast(X, Vs, a, b, min_cells, mode)
         else:
             cs = contrast_stats(X, a, min_cells, b, test)
         per[str(lev)] = cs
@@ -2090,11 +2136,25 @@ def main():
                           "concordance_delta_var.parquet", "--delta-var")
         C_df = _companion(path, args.pair_counts, name,
                           "pair_counts_per_bin.parquet", "--pair-counts")
+        if args.contrast_weight != "none" and V_df is None and C_df is None:
+            here = sorted(x.name for x in Path(path).parent.glob("*.parquet"))
+            sys.exit(
+                f"--contrast-weight {args.contrast_weight} needs the "
+                f"precision of each (cell, bin) estimate, and neither "
+                f"concordance_delta_var.parquet nor pair_counts_per_bin"
+                f".parquet is beside {path!r}.\n"
+                f"  that directory holds: {', '.join(here) or '(no parquet)'}\n"
+                f"  pass either --delta-var {name}=PATH (exact variances) or "
+                f"--pair-counts {name}=PATH (read-pair counts, from which the "
+                f"variance is approximated as c/n).  pair_counts_per_bin"
+                f".parquet is written into the same 05_concordance directory "
+                f"by the concordance step.")
         if args.contrast_weight != "none" and V_df is None:
-            sys.exit(f"--contrast-weight {args.contrast_weight} needs the "
-                     f"per-estimate variance, and no "
-                     f"concordance_delta_var.parquet was found beside "
-                     f"{path!r}.  Pass it with --delta-var {name}=PATH.")
+            print(f"  {name}: no concordance_delta_var.parquet; approximating "
+                  f"the per-estimate variance as c/n from "
+                  f"pair_counts_per_bin.parquet, with c recovered per bin by "
+                  f"moments.  Real between-cell spread lands in c, so this "
+                  f"errs conservative.", file=sys.stderr)
         M_contrast = M_raw.reindex(index=M.index, columns=M.columns)
         if args.remove_batch == "within-celltype":
             M = _remove_batch(M, ct, batch_df)
@@ -2383,19 +2443,28 @@ def main():
             Xc = M_contrast.to_numpy()
             if args.contrast_center == "cell-median":
                 Xc = center_cells(Xc)
-            Vc = (V_df.reindex(index=M.index, columns=M.columns).to_numpy()
-                  if V_df is not None else None)
+            Vc = Cc = None
+            if V_df is not None:
+                Vc = V_df.reindex(index=M.index,
+                                  columns=M.columns).to_numpy()
+            if C_df is not None:
+                Cc = C_df.reindex(index=M.index,
+                                  columns=M.columns).to_numpy()
+            if Vc is None and Cc is not None and args.contrast_weight != "none":
+                Vc = variance_from_counts(Cc, Xc, in_mask, out_mask)
             strat_per, cs = {}, None
             if args.contrast_stratify:
                 lev = batch_df_full.reindex(M.index)[args.contrast_stratify] \
                     if args.contrast_stratify in batch_df_full.columns \
                     else samples.set_index("cell_name")[
                         args.contrast_stratify].reindex(M.index)
+                use_v = (Vc if (args.contrast_weight != "none"
+                                and V_df is not None) else None)
                 cs, strat_per = stratified_contrast(
                     Xc, lev.to_numpy(), in_mask, out_mask,
                     args.min_cells_per_group, args.contrast_test,
-                    Vc if args.contrast_weight != "none" else None,
-                    args.contrast_weight)
+                    use_v, args.contrast_weight,
+                    counts=(Cc if args.contrast_weight != "none" else None))
                 if cs is None:
                     print(f"  contrast {label!r}: --contrast-stratify "
                           f"{args.contrast_stratify!r} left fewer than two "

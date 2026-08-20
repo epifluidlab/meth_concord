@@ -1895,3 +1895,69 @@ def test_stratified_combination_is_not_a_consistency_test():
     assert comb["p"][0] < 0.01, "the combined test passes the p1-only bin"
     mask, info = m.consistency_mask(per, 0.05)
     assert list(mask) == [False, True], "consistency rejects it"
+
+
+# ----------------------------------------- variance approximated from n -----
+
+def test_variance_from_counts_scales_as_one_over_n():
+    """Delta is a difference of proportions, so its sampling variance falls as
+    1/n; only the constant is unknown."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n_cells, n_bins = 200, 3
+    counts = np.tile(np.array([10.0, 40.0, 160.0]), (n_cells, 1))
+    X = rng.normal(0, np.sqrt(0.8 / counts))
+    a = np.array([True] * 100 + [False] * 100)
+    V = m.variance_from_counts(counts, X, a, ~a)
+    ratios = np.nanmedian(V, axis=0)
+    assert ratios[0] / ratios[1] == pytest.approx(4.0, rel=0.05)
+    assert ratios[1] / ratios[2] == pytest.approx(4.0, rel=0.05)
+
+
+def test_variance_from_counts_recovers_the_constant():
+    m = _mod()
+    rng = np.random.default_rng(1)
+    counts = np.full((400, 1), 25.0)
+    X = rng.normal(0, np.sqrt(0.5 / 25.0), (400, 1))
+    a = np.array([True] * 200 + [False] * 200)
+    V = m.variance_from_counts(counts, X, a, ~a)
+    assert np.nanmedian(V) == pytest.approx(0.5 / 25.0, rel=0.2)
+
+
+def test_variance_from_counts_absorbs_extra_spread_conservatively():
+    """Between-cell variation the counts do not explain lands in the constant,
+    which inflates the variances rather than understating them."""
+    m = _mod()
+    rng = np.random.default_rng(2)
+    counts = np.full((400, 1), 25.0)
+    tight = rng.normal(0, np.sqrt(0.5 / 25.0), (400, 1))
+    loose = tight + rng.normal(0, 0.5, (400, 1))
+    a = np.array([True] * 200 + [False] * 200)
+    v_tight = np.nanmedian(m.variance_from_counts(counts, tight, a, ~a))
+    v_loose = np.nanmedian(m.variance_from_counts(counts, loose, a, ~a))
+    assert v_loose > 5 * v_tight
+
+
+def test_counts_variance_is_estimated_inside_each_stratum():
+    """Estimated over the whole arm it swallows the between-stratum
+    difference -- the patient effect -- and then inflates every within-patient
+    comparison by the very variation stratifying removed."""
+    m = _mod()
+    rng = np.random.default_rng(3)
+    n = 60
+    ct = np.array(["in"] * n + ["out"] * n)
+    pat = np.array([f"p{(i % 2) + 1}" for i in range(2 * n)])
+    counts = np.full((2 * n, 2), 30.0)
+    X = rng.normal(0, np.sqrt(0.4 / 30.0), (2 * n, 2))
+    X += np.where((pat == "p1")[:, None], 5.0, -5.0)     # huge patient effect
+    X[ct == "in", 0] += 0.25                             # a real, small effect
+    a, b = ct == "in", ct == "out"
+
+    within, _ = m.stratified_contrast(X, pat, a, b, 5, "welch", counts=counts)
+    # the same variance estimated once over the whole arm, for comparison
+    V_pooled = m.variance_from_counts(counts, X, a, b)
+    across, _ = m.stratified_contrast(X, pat, a, b, 5, "welch", V=V_pooled)
+    assert within["p"][0] < across["p"][0], (
+        "estimating the variance across strata should be the weaker of the "
+        "two, since it carries the patient effect as noise")
+    assert within["p"][0] < 0.01
