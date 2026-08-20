@@ -25,12 +25,27 @@
 # will not stop a run.
 
 # --- lamina-associated domains, hg38 ------------------------------------
-# UCSC carries the LaminB1 table for hg19 only, so hg38 LADs must come from a
-# published set.  Supplementary data of:
-#   https://pmc.ncbi.nlm.nih.gov/articles/PMC9869549/
-# Download the LAD coordinates, then point this line at the local file (or lift
-# the hg19 UCSC table over with liftOver).
-# LAD	/path/to/hg38_LADs.bed
+# UCSC carries the LaminB1 table for hg19 only.  For hg38, scripts/
+# fetch_4dn_damid.py pulls the 4DN LaminB1 DamID-seq bigWigs (250 kb, dam-only
+# normalised, replicate mean) for 7 cell types and writes both forms:
+#
+#   python scripts/fetch_4dn_damid.py --output-dir lad_hg38 --derive-lad-bed
+#
+#   signal_track_flags.txt  the bigWigs as --signal-track (PREFERRED: the score
+#                           is log2(Dam-LaminB1/Dam), so >0 is lamina-proximal
+#                           and a threshold throws that gradient away).  Use
+#                           --normalize zscore, not log2-median -- it is signed.
+#   annotation_manifest.tsv cLAD / fLAD / ciLAD as BEDs, for when a discrete
+#                           partition is wanted.  cLAD shrinks as cell types
+#                           are added, so these are not comparable across runs
+#                           with different --cell-type lists.
+#
+# NOT LADs: the same 4DN collection has nucleolar-targeting DamID (NADs).  They
+# overlap LADs substantially but are a different compartment; the fetcher keeps
+# LaminB1-Dam only.
+#
+# None of the 7 cell types is meningeal.  cLAD is the cross-cell-type invariant
+# part and travels; per-cell-type tracks do not.
 
 # --- A/B compartments ----------------------------------------------------
 # From Hi-C in a relevant line (4DN).  Meningioma arises from arachnoid cap

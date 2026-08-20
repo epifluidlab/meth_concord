@@ -38,6 +38,13 @@ batch-combat = [
 batch-harmony = [
     "harmonypy>=0.0.9",
 ]
+# Optional bigWig reading/writing.  Only required for --signal-track /
+# --derive-lad-bed (scripts/marker_bin_enrichment.py, bin_set_signal_summary.py,
+# fetch_4dn_damid.py) and bigWig output from scripts/concordance_bigwig.py;
+# every one of those falls back to a bedGraph or a clear message without it.
+bigwig = [
+    "pyBigWig>=0.3.18",
+]
 # Convenience: both batch backends at once.
 batch = [
     "combat>=0.3.3",
