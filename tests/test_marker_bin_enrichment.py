@@ -9,6 +9,7 @@ signal and degrade gracefully when no annotations are given.
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 from pathlib import Path
 
@@ -678,3 +679,59 @@ def test_a_malformed_manifest_line_names_its_line_number(tmp_path):
     p.write_text("LAD\t/ok.bed\nbroken-line\n")
     with pytest.raises(SystemExit, match=":2:"):
         m._read_annotation_manifest(str(p))
+
+
+# --------------------------------------------------------------- cache key ---
+
+def test_the_cache_does_not_confuse_two_assemblies(tmp_path, monkeypatch):
+    """UCSC serves cytoBand.txt.gz under every assembly at the same basename.
+    Keyed by basename, an mm10 run's cytobands get handed to a later hg38 run
+    in the same --cache-dir: mouse chr1-19 match human chr1-19 by name, so the
+    wrong coordinates flow through to every band:* row with no error."""
+    mbe = _mod()
+    ucsc = "https://hgdownload.soe.ucsc.edu/goldenPath"
+    served = {f"{ucsc}/mm10/database/cytoBand.txt.gz": b"MOUSE",
+              f"{ucsc}/hg38/database/cytoBand.txt.gz": b"HUMAN"}
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, **kw: _Resp(served[req.full_url]))
+
+    mouse = mbe._fetch(f"{ucsc}/mm10/database/cytoBand.txt.gz", tmp_path)
+    human = mbe._fetch(f"{ucsc}/hg38/database/cytoBand.txt.gz", tmp_path)
+
+    assert mouse != human, "one cache slot for two assemblies"
+    assert mouse.read_bytes() == b"MOUSE"
+    assert human.read_bytes() == b"HUMAN", "hg38 was served the mm10 file"
+
+
+def test_a_second_fetch_of_the_same_url_is_cached(tmp_path, monkeypatch):
+    mbe = _mod()
+    url = "https://example.org/a/thing.bed.gz"
+    calls = []
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    import urllib.request
+
+    def fake(req, **kw):
+        calls.append(req.full_url)
+        return _Resp(b"payload")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    first = mbe._fetch(url, tmp_path)
+    second = mbe._fetch(url, tmp_path)
+    assert first == second
+    assert len(calls) == 1, "the cache did not hit on an identical url"

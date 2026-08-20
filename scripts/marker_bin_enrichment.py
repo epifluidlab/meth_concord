@@ -444,9 +444,17 @@ def _is_url(s) -> bool:
 
 def _fetch(url, cache_dir):
     """Download ``url`` into ``cache_dir`` (skipped if already cached); return
-    the local path.  Enrichr query URLs are named by their libraryName."""
+    the local path.  Enrichr query URLs are named by their libraryName.
+
+    The cache name carries a hash of the FULL url, not just its basename.  UCSC
+    serves cytoBand.txt.gz and cpgIslandExt.txt.gz at the same basename under
+    every assembly, so a basename-keyed cache hands an mm10 run's cytobands to
+    a later hg38 run in the same --cache-dir, silently and with no error --
+    mouse chr1-19 match human chr1-19 by name and simply carry wrong
+    coordinates.  Hashing the url keeps both assemblies side by side."""
     from urllib.parse import urlparse, parse_qs
     from urllib.request import urlopen, Request
+    import hashlib
     import shutil
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -455,10 +463,17 @@ def _fetch(url, cache_dir):
         fname = q["libraryName"][0] + ".gmt"
     else:
         fname = Path(urlparse(url).path).name or "download"
-    dest = cache_dir / fname
+    key = hashlib.sha1(url.encode()).hexdigest()[:8]
+    dest = cache_dir / f"{key}_{fname}"
     if dest.exists() and dest.stat().st_size > 0:
         print(f"  cached: {fname}", file=sys.stderr)
         return dest
+    # A file left by a pre-hash release cannot be trusted: its name does not
+    # record which assembly it came from.  Re-download rather than guess.
+    legacy = cache_dir / fname
+    if legacy.exists():
+        print(f"  re-downloading {fname} (cached under the old name, which "
+              f"did not record the source assembly)", file=sys.stderr)
     print(f"  downloading {fname} ...", file=sys.stderr)
     tmp = dest.with_name(dest.name + ".part")
     req = Request(url, headers={"User-Agent": "marker_bin_enrichment"})
