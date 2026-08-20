@@ -239,6 +239,25 @@ def _read_annotation_manifest(path) -> dict:
     return out
 
 
+def _merge_manifests(paths) -> dict:
+    """Every --annotation-manifest, merged into one {label: path_or_url}.
+
+    The flag repeats, so LADs and replication timing can come from separate
+    files.  A label appearing in two manifests is an error: silently keeping
+    one would drop a whole annotation from the report, and its absence is not
+    visible in the output -- nothing says "this was meant to be here".
+    """
+    out, source = {}, {}
+    for path in paths:
+        for label, value in _read_annotation_manifest(path).items():
+            if label in out and out[label] != value:
+                sys.exit(f"annotation {label!r} is defined in both "
+                         f"{source[label]} and {path}, pointing at different "
+                         f"files.  Rename one, or drop the duplicate line.")
+            out[label], source[label] = value, path
+    return out
+
+
 def _read_chrom_sizes(path) -> dict:
     """{contig (chr-stripped): length} from a chrom.sizes / .fai (first 2 cols)."""
     sizes = {}
@@ -1216,10 +1235,14 @@ def main(argv=None):
     ap.add_argument("--chromhmm-per-state", action="store_true",
                     help="Also write the per-state (un-collapsed) enrichment "
                          "table alongside the per-group one.")
-    ap.add_argument("--annotation-manifest", default=None, metavar="TSV",
+    ap.add_argument("--annotation-manifest", action="append", default=None,
+                    metavar="TSV",
                     help="A file of 'label<TAB>path_or_url' lines, one per "
                          "annotation, as an alternative to many --annotation "
-                         "flags.  See resources/annotations_human_domains.tsv "
+                         "flags.  REPEATABLE -- pass one per source (LADs, "
+                         "replication timing, ...) and they are merged; a "
+                         "label defined in two of them is an error rather "
+                         "than one quietly winning.  See resources/annotations_human_domains.tsv "
                          "for a starting point with the sources named: at a "
                          "250 kb bin the sets worth testing are DOMAIN-scale "
                          "(LADs, PMDs, compartments), since a peak-scale set "
@@ -1335,8 +1358,7 @@ def main(argv=None):
         rv = _resolve(v, cache, f"annotation {k}")
         if rv is not None:
             annotations[k] = _read_bed(rv)
-    manifest = (_read_annotation_manifest(args.annotation_manifest)
-                if args.annotation_manifest else {})
+    manifest = _merge_manifests(args.annotation_manifest or [])
     for k, v in manifest.items():
         if k not in annotations:
             rv = _resolve(v, cache, f"annotation {k} (manifest)")

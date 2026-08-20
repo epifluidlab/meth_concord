@@ -735,3 +735,46 @@ def test_a_second_fetch_of_the_same_url_is_cached(tmp_path, monkeypatch):
     second = mbe._fetch(url, tmp_path)
     assert first == second
     assert len(calls) == 1, "the cache did not hit on an identical url"
+
+
+# ------------------------------------------------------- manifest merging ---
+
+def _manifest(path, rows):
+    Path(path).write_text("".join(f"{k}\t{v}\n" for k, v in rows))
+    return str(path)
+
+
+def test_several_annotation_manifests_are_merged(tmp_path):
+    """--annotation-manifest repeats, so LADs and replication timing can come
+    from separate files.  As a single-valued option argparse kept only the
+    last, and the first source vanished from the report with nothing to say
+    it had been asked for."""
+    m = _mod()
+    a = _manifest(tmp_path / "lad.tsv", [("cLAD", "/a/c.bed"),
+                                         ("fLAD", "/a/f.bed")])
+    b = _manifest(tmp_path / "rt.tsv", [("RT_variable", "/b/v.bed")])
+    got = m._merge_manifests([a, b])
+    assert got == {"cLAD": "/a/c.bed", "fLAD": "/a/f.bed",
+                   "RT_variable": "/b/v.bed"}
+
+
+def test_a_label_in_two_manifests_is_an_error(tmp_path):
+    """Keeping one silently would drop an annotation from the report, and its
+    absence is invisible -- nothing says it was meant to be there."""
+    m = _mod()
+    a = _manifest(tmp_path / "one.tsv", [("cLAD", "/a/c.bed")])
+    b = _manifest(tmp_path / "two.tsv", [("cLAD", "/b/other.bed")])
+    with pytest.raises(SystemExit, match="defined in both"):
+        m._merge_manifests([a, b])
+
+
+def test_the_same_label_pointing_at_the_same_file_is_fine(tmp_path):
+    """Passing one manifest twice is harmless, not a conflict."""
+    m = _mod()
+    a = _manifest(tmp_path / "one.tsv", [("cLAD", "/a/c.bed")])
+    assert m._merge_manifests([a, a]) == {"cLAD": "/a/c.bed"}
+
+
+def test_no_manifest_gives_an_empty_mapping():
+    m = _mod()
+    assert m._merge_manifests([]) == {}
