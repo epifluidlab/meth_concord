@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib.util
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -361,6 +363,213 @@ def profile_figure(results, path, title, near, step, ylabel):
     return path
 
 
+def _marker_mod():
+    """celltype_marker_bins, for its batch correction."""
+    q = Path(__file__).resolve().parent / "celltype_marker_bins.py"
+    spec = importlib.util.spec_from_file_location("_cmb", q)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_cmb"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def signal_profile(M, ct, groups, dist, flank, step, conf=0.95):
+    """Mean D per cell type against distance from a boundary.
+
+    A different question from the density profile, and a cleaner one: it does
+    not depend on which bins were SELECTED, so it cannot inherit the size or
+    the biases of a contrast.  The reference cell types on the same axis are
+    the control -- if every cell type dips inside the domain, that is the
+    domain; if only the tumour ones do, that is the finding.
+
+    The interval is across CELLS, not across (cell, bin) pairs.  Bins within
+    a domain are heavily correlated, so pooling them as independent
+    observations would give a band far too tight to mean anything; cells are
+    the closest thing to a replicate here.
+
+    The inside half of the axis is bounded by the domains, not by --flank:
+    distance is to the NEAREST edge, so a domain of width W contributes
+    nothing beyond W/2 inward and the curve simply stops there.  A short
+    inside arm means narrow domains, not missing data.
+    """
+    from scipy.stats import t as _t
+
+    edges, centres = offset_edges(flank, step)
+    which = np.digitize(dist, edges) - 1
+    valid = np.isfinite(dist) & (which >= 0) & (which < centres.size)
+    out = {}
+    for g in groups:
+        cells = ct.index[ct == g]
+        rows = M.loc[M.index.intersection(cells)]
+        if not len(rows):
+            continue
+        v = rows.to_numpy(float)
+        mean = np.full(centres.size, np.nan)
+        lo = np.full(centres.size, np.nan)
+        hi = np.full(centres.size, np.nan)
+        n_bin = np.zeros(centres.size, int)
+        for i in range(centres.size):
+            cols = valid & (which == i)
+            n_bin[i] = int(cols.sum())
+            if not cols.any():
+                continue
+            with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                per_cell = np.nanmean(v[:, cols], axis=1)
+            per_cell = per_cell[np.isfinite(per_cell)]
+            if per_cell.size == 0:
+                continue
+            mean[i] = per_cell.mean()
+            if per_cell.size > 1:
+                se = per_cell.std(ddof=1) / np.sqrt(per_cell.size)
+                half = _t.ppf(0.5 + conf / 2.0, per_cell.size - 1) * se
+                lo[i], hi[i] = mean[i] - half, mean[i] + half
+        out[g] = {"offset": centres, "mean": mean, "lo": lo, "hi": hi,
+                  "n_bins": n_bin, "n_cells": int(len(rows))}
+    return out
+
+
+def signal_figure(results, path, title, ylabel, ct_colors=None, conf=0.95):
+    """One panel per boundary, one line and band per cell type."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    names = list(results)
+    fig, axes = plt.subplots(1, len(names), figsize=(4.8 * len(names), 4.0),
+                             squeeze=False, sharey=True)
+    pal = dict(ct_colors or {})
+    fallback = plt.get_cmap("tab10")
+    order = list(dict.fromkeys(
+        g for b in results.values() for g in b))
+    for i, g in enumerate(order):
+        pal.setdefault(g, fallback(i % 10))
+    for ax, bname in zip(axes[0], names):
+        for g, r in results[bname].items():
+            ok = np.isfinite(r["mean"])
+            ax.plot(r["offset"][ok] / 1e6, r["mean"][ok], color=pal[g],
+                    lw=1.8, zorder=3,
+                    label=f"{g} (n={r['n_cells']})")
+            band = np.isfinite(r["lo"]) & np.isfinite(r["hi"])
+            ax.fill_between(r["offset"][band] / 1e6, r["lo"][band],
+                            r["hi"][band], color=pal[g], alpha=0.15, lw=0)
+        ax.axvline(0, color="#374151", lw=1.0, ls="--", zorder=1)
+        ax.set_title(bname, fontsize=10)
+        ax.set_xlabel("distance from boundary (Mb)\n"
+                      "<- outside      inside ->", fontsize=8)
+        ax.grid(axis="y", color="#EEF0F2", lw=0.7)
+        ax.set_axisbelow(True)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+    axes[0][0].set_ylabel(ylabel, fontsize=9)
+    axes[0][-1].legend(frameon=False, fontsize=8, loc="upper left",
+                       bbox_to_anchor=(1.02, 1.0))
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _signal_mode(args):
+    """Mean D per cell type around each boundary."""
+    name, mpath = (args.matrix.split("=", 1) if "=" in args.matrix
+                   else ("gch", args.matrix))
+    M = pd.read_parquet(mpath)
+    samples = pd.read_csv(args.samples, sep="\t")
+    if args.cell_type_column not in samples.columns:
+        sys.exit(f"--cell-type-column {args.cell_type_column!r} not in "
+                 f"--samples ({list(samples.columns)})")
+    ct = samples.set_index("cell_name")[args.cell_type_column].astype(str)
+    ct = ct.reindex(M.index).dropna()
+    M = M.loc[ct.index]
+
+    if args.remove_batch == "within-celltype":
+        if not args.batch_column:
+            sys.exit("--remove-batch needs --batch-column")
+        cols = [c.strip() for c in args.batch_column.split(",") if c.strip()]
+        missing = [c for c in cols if c not in samples.columns]
+        if missing:
+            sys.exit(f"--batch-column {missing} not in --samples")
+        bdf = samples.set_index("cell_name")[cols].astype(str).reindex(M.index)
+        M = _marker_mod()._remove_batch(M, ct, bdf)
+        print(f"  batch-corrected within cell type on {'+'.join(cols)}",
+              file=sys.stderr)
+
+    groups = ([g.strip() for g in args.groups.split(",") if g.strip()]
+              if args.groups else sorted(set(ct)))
+    missing = [g for g in groups if g not in set(ct)]
+    if missing:
+        sys.exit(f"not in --samples {args.cell_type_column!r}: {missing}\n"
+                 f"  have: {sorted(set(ct))}")
+
+    bins = pd.DataFrame({
+        "chrom": [str(c).rsplit(":", 1)[0] for c in M.columns],
+        "start": [int(str(c).rsplit(":", 1)[1]) for c in M.columns]})
+    widths = np.diff(np.sort(bins.start.unique()))
+    step_bp = int(np.median(widths)) if widths.size else 250_000
+    bins["end"] = bins.start + step_bp
+
+    ct_colors = {}
+    if args.color_column and args.color_column in samples.columns:
+        for g, c in zip(samples[args.cell_type_column].astype(str),
+                        samples[args.color_column].astype(str)):
+            if c and c.lower() not in ("nan", "none", ""):
+                ct_colors.setdefault(g, c)
+
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    results, rows = {}, []
+    for bname, bspec in _named(args.boundary, "--boundary").items():
+        bpath, _, bclass = bspec.partition("::")
+        dom_all = read_bed(bpath, merge=True, keep_class=bclass or None)
+        dom = (dom_all if args.keep_crowded
+               else isolated_boundaries(dom_all, args.flank,
+                                        args.min_domain_width))
+        if not len(dom):
+            print(f"  {bname}: no domain has {args.flank / 1e6:g} Mb of clear "
+                  f"space on both sides -- lower --flank or pass "
+                  f"--keep-crowded", file=sys.stderr)
+            continue
+        dist = signed_distance(bins, dom)
+        prof = signal_profile(M, ct, groups, dist, args.flank, args.step,
+                              args.conf)
+        results[bname] = prof
+        print(f"  {bname}: {len(dom):,} of {len(dom_all):,} domains, "
+              f"{int(np.isfinite(dist).sum()):,} bins placed")
+        for g, r in prof.items():
+            inside = np.isfinite(r["mean"]) & (r["offset"] > 0)
+            outside = np.isfinite(r["mean"]) & (r["offset"] < 0)
+            din = float(np.nanmean(r["mean"][inside])) if inside.any() else np.nan
+            dout = float(np.nanmean(r["mean"][outside])) if outside.any() else np.nan
+            rows.append({"boundary": bname, "group": g, "mean_inside": din,
+                         "mean_outside": dout, "difference": din - dout,
+                         "n_cells": r["n_cells"]})
+            print(f"    {g:>16}: inside {din:+.4f}  outside {dout:+.4f}  "
+                  f"difference {din - dout:+.4f}")
+        pd.DataFrame([
+            {"boundary": bname, "group": g, "offset": o, "mean": mu,
+             "lo": lo, "hi": hi, "n_bins": nb}
+            for g, r in prof.items()
+            for o, mu, lo, hi, nb in zip(r["offset"], r["mean"], r["lo"],
+                                         r["hi"], r["n_bins"])]).to_csv(
+            out / f"signal_profile_{name}.tsv", sep="\t", index=False,
+            mode="a" if (out / f"signal_profile_{name}.tsv").exists() else "w",
+            header=not (out / f"signal_profile_{name}.tsv").exists())
+    if not results:
+        sys.exit("no boundary produced a profile")
+    pd.DataFrame(rows).to_csv(out / f"signal_summary_{name}.tsv", sep="\t",
+                              index=False)
+    fig = signal_figure(results, out / f"signal_profile_{name}.pdf",
+                        f"{name}: mean D around domain boundaries "
+                        f"(+/-{args.flank / 1e6:g} Mb)",
+                        f"mean D per cell type\n({args.conf:.0%} CI over cells)",
+                        ct_colors=ct_colors, conf=args.conf)
+    print(f"  -> {Path(fig).name}, signal_summary_{name}.tsv, "
+          f"signal_profile_{name}.tsv")
+    return 0
+
+
 def _named(specs, flag):
     out = {}
     for spec in specs or []:
@@ -391,7 +600,7 @@ def main(argv=None) -> int:
                          "figure makes; without it a set is tested against "
                          "the rest of the universe, a different and blunter "
                          "question.")
-    ap.add_argument("--bed", action="append", required=True,
+    ap.add_argument("--bed", action="append", default=None,
                     metavar="LABEL=BED",
                     help="A bin set to profile.  Repeatable.  Each gets a "
                          "size-matched random control drawn from the universe "
@@ -409,6 +618,37 @@ def main(argv=None) -> int:
                          "domain set.  Such a file is refused without a class "
                          "rather than merged into one interval per "
                          "chromosome.")
+    ap.add_argument("--matrix", default=None, metavar="NAME=PATH",
+                    help="cells x bins concordance parquet.  Given this, the "
+                         "figure becomes the mean D per CELL TYPE against "
+                         "distance from the boundary, instead of the density "
+                         "of a selected bin set.  It answers the question "
+                         "without depending on which bins were selected, so "
+                         "it cannot inherit the size or the biases of a "
+                         "contrast, and the reference cell types on the same "
+                         "axis are the control.  The inside half of the axis "
+                         "is bounded by domain width, not by --flank: "
+                         "distance is to the nearest edge, so a domain of "
+                         "width W reaches only W/2 inward.")
+    ap.add_argument("--samples", default=None,
+                    help="Sample sheet, with --matrix.")
+    ap.add_argument("--cell-type-column", default="cell_type")
+    ap.add_argument("--color-column", default=None)
+    ap.add_argument("--groups", default=None,
+                    help="Comma-separated cell types to draw, in order "
+                         "(default: all, alphabetical).")
+    ap.add_argument("--batch-column", default=None,
+                    help="Comma-separated batch columns.  With "
+                         "--remove-batch these are centred out within cell "
+                         "type before profiling.")
+    ap.add_argument("--remove-batch", choices=["none", "within-celltype"],
+                    default="none",
+                    help="Centre each (cell type, batch) group on its "
+                         "cell-type mean before profiling, as "
+                         "celltype_marker_bins does.  It removes batch "
+                         "structure WITHIN a cell type and leaves the "
+                         "differences BETWEEN cell types, which is what this "
+                         "figure compares.")
     ap.add_argument("--density", choices=["set-fraction", "occupancy"],
                     default="set-fraction",
                     help="'set-fraction' (default): of the SET's bins, the "
@@ -454,9 +694,18 @@ def main(argv=None) -> int:
                          "(500 kb).  --flank sets what the figure spans; "
                          "--near sets where the summary statistic draws its "
                          "line inside that span.")
+    ap.add_argument("--conf", type=float, default=0.95,
+                    help="Confidence level for the band across cells (0.95).")
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args(argv)
 
+    if not args.matrix and not args.bed:
+        sys.exit("give --bed (density of a bin set) or --matrix with "
+                 "--samples (mean signal per cell type)")
+    if args.matrix and not args.samples:
+        sys.exit("--matrix needs --samples for the cell types")
+    if args.matrix:
+        return _signal_mode(args)
     sets = _named(args.bed, "--bed")
     if args.universe:
         print("  NOTE --universe is ignored: the profile is per boundary, "

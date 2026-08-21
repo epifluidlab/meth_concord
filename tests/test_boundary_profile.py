@@ -325,3 +325,76 @@ def test_a_chromosome_with_one_domain_has_no_neighbour_to_exclude():
     dom = pd.DataFrame({"chrom": ["chr1", "chr2"], "start": [0, 0],
                         "end": [200_000_000, 150_000_000]})
     assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 2
+
+
+# --------------------------------------------------------- signal mode ----
+
+def _matrix(groups, n_bins=12, step=250_000, seed=0):
+    rng = np.random.default_rng(seed)
+    cells, types = [], []
+    for g, k in groups:
+        cells += [f"{g}_{i}" for i in range(k)]
+        types += [g] * k
+    cols = [f"chr1:{i * step}" for i in range(n_bins)]
+    M = pd.DataFrame(rng.normal(0.5, 0.01, (len(cells), n_bins)),
+                     index=cells, columns=cols)
+    return M, pd.Series(types, index=cells)
+
+
+def test_the_signal_profile_separates_cell_types():
+    """The reference types on the same axis ARE the control: if every type
+    dips inside the domain that is the domain, and if only one does that is
+    the finding."""
+    m = _mod()
+    M, ct = _matrix([("tum", 6), ("ref", 6)])
+    dist = np.array([-1e6, -0.5e6, 0.5e6, 1e6] * 3)[:12]
+    M.loc[ct.index[ct == "tum"], M.columns[dist > 0]] -= 0.30
+    got = m.signal_profile(M, ct, ["tum", "ref"], dist,
+                           flank=2_000_000, step=1_000_000)
+    centres = m.offset_edges(2_000_000, 1_000_000)[1]
+    inside = centres > 0
+    assert got["tum"]["mean"][inside].mean() == pytest.approx(0.20, abs=0.02)
+    assert got["ref"]["mean"][inside].mean() == pytest.approx(0.50, abs=0.02)
+
+
+def test_the_band_is_across_cells_not_across_bins():
+    """Bins inside a domain are heavily correlated; pooling them as
+    independent observations gives a band far too tight to mean anything."""
+    m = _mod()
+    M, ct = _matrix([("g", 4)], n_bins=40)
+    dist = np.linspace(-1e6, 1e6, 40)
+    got = m.signal_profile(M, ct, ["g"], dist, flank=2_000_000,
+                           step=2_000_000)
+    half = got["g"]["hi"][0] - got["g"]["mean"][0]
+    # four cells: the interval reflects those four, not the bins.  Offset bin
+    # 0 spans [-2 Mb, 0), so it holds only the negative-distance columns.
+    per_cell = M.loc[:, M.columns[dist < 0]].mean(axis=1).to_numpy()
+    from scipy.stats import t as _t
+    want = _t.ppf(0.975, 3) * per_cell.std(ddof=1) / np.sqrt(4)
+    assert half == pytest.approx(want, rel=0.05)
+
+
+def test_a_group_with_one_cell_gets_no_interval():
+    m = _mod()
+    M, ct = _matrix([("solo", 1), ("pair", 2)])
+    dist = np.zeros(12)
+    got = m.signal_profile(M, ct, ["solo", "pair"], dist, flank=1e6, step=1e6)
+    assert np.isfinite(got["solo"]["mean"]).any()
+    assert np.isnan(got["solo"]["lo"]).all(), "one cell cannot carry a band"
+    assert np.isfinite(got["pair"]["lo"]).any()
+
+
+def test_bins_outside_the_flank_are_not_counted():
+    m = _mod()
+    M, ct = _matrix([("g", 3)])
+    dist = np.concatenate([np.full(6, 0.5e6), np.full(6, 9e6)])
+    got = m.signal_profile(M, ct, ["g"], dist, flank=1_000_000, step=1e6)
+    assert got["g"]["n_bins"].sum() == 6
+
+
+def test_a_group_absent_from_the_matrix_is_skipped():
+    m = _mod()
+    M, ct = _matrix([("a", 3)])
+    got = m.signal_profile(M, ct, ["a", "absent"], np.zeros(12),
+                           flank=1e6, step=1e6)
+    assert list(got) == ["a"]
