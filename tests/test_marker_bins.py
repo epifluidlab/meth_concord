@@ -2083,3 +2083,127 @@ def test_volcano_separates_fdr_passing_bins_that_were_dropped(tmp_path):
                                 0.05, passed_fdr=passed)
     assert (up, down) == (1, 0)
     assert (tmp_path / "v.pdf").stat().st_size > 0
+
+
+# ------------------------------------------------------- shared grid --------
+
+def _mat(cells, bins, fill=1.0):
+    return pd.DataFrame(np.full((len(cells), len(bins)), fill),
+                        index=cells, columns=bins)
+
+
+def test_shared_grid_keeps_only_cells_and_bins_present_in_both():
+    """Position i must be the same cell and row j the same bin in both panels,
+    or a reader comparing the two positions is comparing nothing."""
+    m = _mod()
+    a = _mat(["c1", "c2", "c3"], ["b1", "b2", "b3"])
+    b = _mat(["c2", "c3", "c4"], ["b2", "b3", "b4"])
+    (cells, cols), dropped = m.shared_grid({"a": a, "b": b},
+                                           ["b1", "b2", "b3", "b4"])
+    assert list(cells) == ["c2", "c3"]
+    assert cols == ["b2", "b3"]
+    assert dropped["bins_dropped"] == 2
+    assert dropped["cells_dropped"] == 2          # c1 and c4
+
+
+def test_shared_grid_drops_a_bin_measured_in_only_one_modality():
+    """Present is not measured: an all-NaN column would draw as a blank
+    stripe, which reads as 'no signal' when the truth is 'not measured'."""
+    m = _mod()
+    a = _mat(["c1", "c2"], ["b1", "b2"])
+    b = _mat(["c1", "c2"], ["b1", "b2"])
+    b.loc[:, "b2"] = np.nan
+    (cells, cols), dropped = m.shared_grid({"a": a, "b": b}, ["b1", "b2"])
+    assert cols == ["b1"]
+    assert dropped["bins_dropped"] == 1
+
+
+def test_shared_grid_drops_a_cell_measured_in_only_one_modality():
+    m = _mod()
+    a = _mat(["c1", "c2", "c3"], ["b1", "b2"])
+    b = _mat(["c1", "c2", "c3"], ["b1", "b2"])
+    b.loc["c2", :] = np.nan
+    (cells, cols), dropped = m.shared_grid({"a": a, "b": b}, ["b1", "b2"])
+    assert list(cells) == ["c1", "c3"]
+    assert dropped["cells_dropped"] == 1
+
+
+def test_shared_grid_returns_none_when_nothing_is_shared():
+    m = _mod()
+    a = _mat(["c1"], ["b1"])
+    b = _mat(["c2"], ["b2"])
+    grid, dropped = m.shared_grid({"a": a, "b": b}, ["b1", "b2"])
+    assert grid is None
+    assert dropped["bins_dropped"] == 2
+
+
+def test_shared_grid_preserves_the_requested_bin_order():
+    """The order comes from the clustering, and both panels must follow it."""
+    m = _mod()
+    a = _mat(["c1"], ["b1", "b2", "b3"])
+    b = _mat(["c1"], ["b1", "b2", "b3"])
+    (_, cols), _ = m.shared_grid({"a": a, "b": b}, ["b3", "b1", "b2"])
+    assert cols == ["b3", "b1", "b2"]
+
+
+def test_joint_figure_draws_both_panels_on_one_grid(tmp_path):
+    m = _mod()
+    cells = [f"c{i}" for i in range(12)]
+    bins = [f"chr1:{i}" for i in range(6)]
+    rng = np.random.default_rng(0)
+    a = pd.DataFrame(rng.normal(size=(12, 6)), index=cells, columns=bins)
+    b = pd.DataFrame(rng.normal(size=(9, 4)), index=cells[:9],
+                     columns=bins[:4])
+    tab = pd.DataFrame(
+        {"a_diff": [1.0] * 4, "b_diff": [1.0] * 4,
+         "a_fdr": [0.01] * 4, "b_fdr": [0.01] * 4,
+         "a_sig": [True] * 4, "b_sig": [True] * 4,
+         "category": ["both"] * 4}, index=bins[:4])
+    ct = pd.Series(["x"] * 12, index=cells)
+    m.joint_figure(tab, "a", "b", {"n_both": 4, "frac_both_same_direction": 1.0},
+                   {"a": a, "b": b}, ct, tmp_path / "j.pdf", "lab")
+    assert (tmp_path / "j.pdf").stat().st_size > 0
+
+
+def test_joint_figure_uses_the_supplied_cell_type_colours(tmp_path):
+    """Columns are cells in cell-type order, and that order is invisible
+    without a key: which block is the tumour and which the reference is the
+    first thing the figure has to answer."""
+    m = _mod()
+    cells = [f"c{i}" for i in range(12)]
+    bins = [f"chr1:{i}" for i in range(6)]
+    rng = np.random.default_rng(0)
+    a = pd.DataFrame(rng.normal(size=(12, 6)), index=cells, columns=bins)
+    b = pd.DataFrame(rng.normal(size=(12, 6)), index=cells, columns=bins)
+    tab = pd.DataFrame(
+        {"a_diff": [1.0] * 4, "b_diff": [1.0] * 4,
+         "a_fdr": [0.01] * 4, "b_fdr": [0.01] * 4,
+         "a_sig": [True] * 4, "b_sig": [True] * 4,
+         "category": ["both"] * 4}, index=bins[:4])
+    ct = pd.Series(["tumour"] * 6 + ["mono"] * 6, index=cells)
+    out = tmp_path / "j.pdf"
+    m.joint_figure(tab, "a", "b",
+                   {"n_both": 4, "frac_both_same_direction": 1.0},
+                   {"a": a, "b": b}, ct, out, "lab",
+                   ct_colors={"tumour": "#D1495B", "mono": "#1F6F8B"})
+    assert out.stat().st_size > 0
+
+
+def test_joint_figure_invents_colours_when_none_are_given(tmp_path):
+    """--color-column is optional; the key still has to exist."""
+    m = _mod()
+    cells = [f"c{i}" for i in range(8)]
+    bins = [f"chr1:{i}" for i in range(4)]
+    rng = np.random.default_rng(1)
+    a = pd.DataFrame(rng.normal(size=(8, 4)), index=cells, columns=bins)
+    tab = pd.DataFrame(
+        {"a_diff": [1.0] * 2, "b_diff": [1.0] * 2,
+         "a_fdr": [0.01] * 2, "b_fdr": [0.01] * 2,
+         "a_sig": [True] * 2, "b_sig": [True] * 2,
+         "category": ["both"] * 2}, index=bins[:2])
+    ct = pd.Series(["x"] * 4 + ["y"] * 4, index=cells)
+    out = tmp_path / "j.pdf"
+    m.joint_figure(tab, "a", "b",
+                   {"n_both": 2, "frac_both_same_direction": 1.0},
+                   {"a": a, "b": a.copy()}, ct, out, "lab", ct_colors=None)
+    assert out.stat().st_size > 0

@@ -1030,14 +1030,59 @@ def joint_concordance(tab, a, b):
     return stats
 
 
-def joint_figure(tab, a, b, stats, mats, cell_types, path, label):
+def shared_grid(mats, keys):
+    """Cells and bins measured in EVERY modality -> ((cells, bins), dropped).
+
+    The two panels only mean anything side by side if position i is the same
+    cell and row j the same bin in both.  A cell present in one matrix and
+    absent from the other, or covered in one and all-NaN in the other, cannot
+    be compared and is removed from both rather than drawn as a blank stripe
+    in one -- a blank column reads as "no signal here", which is a claim,
+    where the truth is "not measured here".
+    """
+    names = list(mats)
+    cells = None
+    for nm in names:
+        idx = mats[nm].index
+        cells = idx if cells is None else cells.intersection(idx)
+    cols = [k for k in keys
+            if all(k in mats[nm].columns for nm in names)]
+    if cells is None or not len(cells) or not cols:
+        return None, {"bins_dropped": len(keys), "cells_dropped": 0}
+
+    # Present is not the same as measured: require real values on both sides.
+    ok_cols, ok_cells = [], np.ones(len(cells), bool)
+    for k in cols:
+        if all(np.isfinite(mats[nm].loc[cells, k].to_numpy()).any()
+               for nm in names):
+            ok_cols.append(k)
+    if not ok_cols:
+        return None, {"bins_dropped": len(keys), "cells_dropped": 0}
+    for nm in names:
+        block = mats[nm].loc[cells, ok_cols].to_numpy()
+        ok_cells &= np.isfinite(block).any(axis=1)
+    if not ok_cells.any():
+        return None, {"bins_dropped": len(keys), "cells_dropped": len(cells)}
+    kept = cells[ok_cells]
+    n_union = len(set().union(*[set(mats[nm].index) for nm in names]))
+    return (kept, ok_cols), {"bins_dropped": len(keys) - len(ok_cols),
+                             "cells_dropped": n_union - len(kept)}
+
+
+def joint_figure(tab, a, b, stats, mats, cell_types, path, label,
+                 ct_colors=None):
     """One PDF: the two mean differences against each other, then a clustered
     heatmap per modality over the union of significant bins.
 
-    The heatmaps share one bin order -- clustered once, on the two differences
-    together -- so a row is the same bin in both panels.  Clustering each
-    panel separately would put a different bin on each row and make the two
-    impossible to read against each other, which is the only question here.
+    The heatmaps are drawn on ONE grid: the cells and bins measured in BOTH
+    modalities, in one order, clustered once on the two differences together.
+    Anything else makes the panels uncomparable in a way that is invisible --
+    letting each panel keep its own bins puts a different bin on each row, and
+    letting each keep its own cells puts a different cell in each column, so
+    a reader comparing the two positions is comparing nothing.  The count that
+    survives is in the title, because a small shared grid is itself the
+    result: it says the two modalities were measured on different parts of the
+    genome, not that they disagree.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1085,25 +1130,77 @@ def joint_figure(tab, a, b, stats, mats, cell_types, path, label):
                  if len(keys) > 2 else np.arange(len(keys)))
         keys = [keys[i] for i in order]
 
-        fig, axes = plt.subplots(1, len(mats), figsize=(6.0 * len(mats), 7.2),
-                                 squeeze=False)
-        for ax, (nm, mat) in zip(axes[0], mats.items()):
-            cols = [k for k in keys if k in mat.columns]
-            sub = mat.loc[:, cols]
-            ct = pd.Series(cell_types).reindex(sub.index)
-            cell_order = np.argsort(ct.to_numpy().astype(str), kind="stable")
-            v = sub.to_numpy()[cell_order].T
+        grid, dropped = shared_grid(mats, keys)
+        _ = ct_colors
+        if grid is None:
+            fig, ax = plt.subplots(figsize=(6, 3))
+            ax.text(0.5, 0.5, f"no bin is measured in both {a} and {b}\n"
+                              f"across a shared set of cells",
+                    ha="center", va="center", fontsize=11)
+            ax.axis("off")
+            pdf.savefig(fig)
+            plt.close(fig)
+            return
+        cells, cols = grid
+        ct = pd.Series(cell_types).reindex(cells).astype(str)
+        cell_order = np.argsort(ct.to_numpy(), kind="stable")
+        ct_sorted = ct.to_numpy()[cell_order]
+        # Columns are cells in cell-type order, but that order is invisible
+        # without a key: which block of columns is the tumour and which the
+        # reference is the first thing this figure has to answer.
+        levels = list(dict.fromkeys(ct_sorted))
+        palette = dict(ct_colors or {})
+        missing = [lv for lv in levels if lv not in palette]
+        if missing:
+            fallback = plt.get_cmap("tab10")
+            for i, lv in enumerate(missing):
+                palette[lv] = fallback(i % 10)
+        strip = np.array([[matplotlib.colors.to_rgb(palette[c])
+                           for c in ct_sorted]])
+
+        # The colourbar gets its OWN gridspec column rather than being carved
+        # out of the heatmap axis.  Carved out, the heatmap narrows while the
+        # strip above it does not, and the key stops sitting over the columns
+        # it labels -- which is worse than no key at all.
+        n = len(mats)
+        fig = plt.figure(figsize=(6.0 * n, 7.6))
+        gs = fig.add_gridspec(2, 3 * n, height_ratios=[1, 26], hspace=0.03,
+                              width_ratios=[16, 1, 3] * n, wspace=0.05)
+        axes = [[fig.add_subplot(gs[1, 3 * i]) for i in range(n)]]
+        cbars = [fig.add_subplot(gs[1, 3 * i + 1]) for i in range(n)]
+        for i in range(n):
+            sax = fig.add_subplot(gs[0, 3 * i])
+            sax.imshow(strip, aspect="auto", interpolation="nearest")
+            sax.set_xticks([])
+            sax.set_yticks([])
+            sax.set_frame_on(False)
+        for ax, cax, (nm, mat) in zip(axes[0], cbars, mats.items()):
+            v = mat.reindex(index=cells, columns=cols).to_numpy()[
+                cell_order].T
             lim = np.nanpercentile(np.abs(v), 98) if np.isfinite(v).any() else 1
             im = ax.imshow(v, aspect="auto", cmap="RdBu_r",
                            vmin=-lim, vmax=lim, interpolation="nearest")
-            ax.set_title(f"{nm}  ({len(cols):,} bins)", fontsize=10)
-            ax.set_xlabel("cells (grouped by cell type)")
-            ax.set_ylabel("bins (shared order, clustered on both effects)")
+            ax.set_title(nm, fontsize=10)
+            ax.set_xlabel(f"{len(cells):,} cells measured in both "
+                          f"(grouped by cell type)")
+            ax.set_ylabel(f"{len(cols):,} bins measured in both "
+                          f"(shared order)")
             ax.set_yticks([])
             ax.set_xticks([])
-            fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-        fig.suptitle(f"{label}: union of significant bins", fontsize=11)
-        fig.tight_layout()
+            fig.colorbar(im, cax=cax)
+            cax.tick_params(labelsize=7)
+        handles = [plt.Rectangle((0, 0), 1, 1,
+                                 facecolor=palette[lv], edgecolor="#374151",
+                                 label=f"{lv} ({int(np.sum(ct_sorted == lv))})")
+                   for lv in levels]
+        fig.legend(handles=handles, loc="lower center", ncol=min(len(levels), 6),
+                   frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.01))
+        note = (f"; {dropped['bins_dropped']:,} bins and "
+                f"{dropped['cells_dropped']:,} cells dropped for lacking one "
+                f"modality" if (dropped["bins_dropped"]
+                                or dropped["cells_dropped"]) else "")
+        fig.suptitle(f"{label}: significant bins on the shared grid{note}",
+                     fontsize=11)
         pdf.savefig(fig)
         plt.close(fig)
 
@@ -2955,7 +3052,7 @@ def main():
             joint_figure(tab, a, b, stats,
                          {k: joint_mats[k] for k in (a, b)},
                          ct_of, out_dir / f"contrast_joint_{label}.pdf",
-                         label)
+                         label, ct_colors=ct_colors)
             summary.setdefault("contrast_joint", {})[label] = stats
             print(f"  contrast-joint {label!r}: {stats['n_both']:,} in both, "
                   f"{stats[f'n_{a}_only']:,} {a} only, "
