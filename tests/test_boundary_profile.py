@@ -98,179 +98,118 @@ def test_a_contig_without_domains_gets_nan():
     assert np.isnan(d[2:]).all()
 
 
-# ------------------------------------------------------------- profile ----
+# ----------------------------------------------------------- occupancy ----
 
-def test_the_profile_is_the_sets_own_frequency_over_offsets():
-    """Not the share of bins at an offset that belong to the set: that
-    saturates at 1 wherever the set covers everything nearby, so a large set
-    draws a line along the top and its shape reports set size, not position.
-    A frequency sums to one for any set, putting sets of different sizes on
-    one axis."""
+def _iv(rows):
+    return pd.DataFrame(rows, columns=["chrom", "start", "end"])
+
+
+def test_occupancy_asks_whether_the_set_is_there_per_boundary():
+    """One row per boundary edge, 1 where a bin of the set overlaps that
+    offset window.  This is the denominator that makes a random set flat."""
     m = _mod()
-    dist = np.array([-300.0, -100.0, 100.0, 300.0, 100.0, 300.0])
-    in_set = np.array([True, True, False, True, False, False])
-    n, freq = m.profile(dist, in_set, flank=400, step=200)
-    assert list(n) == [1, 1, 0, 1]
-    assert freq.sum() == pytest.approx(1.0)
-    np.testing.assert_allclose(freq, [1 / 3, 1 / 3, 0.0, 1 / 3])
+    dom = _iv([("chr1", 1_000_000, 3_000_000)])
+    # a single set bin sitting just inside the left edge
+    bed = _iv([("chr1", 1_000_000, 1_250_000)])
+    occ, centres = m.occupancy(dom, bed, flank=1_000_000, step=250_000)
+    assert occ.shape == (2, 8)          # two edges, eight offsets
+    left = occ[0]
+    assert left[centres == 125_000][0]  # just inside the left edge
+    assert not left[centres == -875_000][0]
 
 
-def test_a_frequency_never_exceeds_one_or_goes_negative():
-    """The old share could reach 1, and its normal-approximation band went
-    below zero -- a proportion drawn outside [0, 1]."""
+def test_offsets_are_oriented_so_positive_is_inside():
+    """For a right edge that means walking left; without the flip the two
+    edges cancel."""
     m = _mod()
+    dom = _iv([("chr1", 1_000_000, 3_000_000)])
+    bed = _iv([("chr1", 2_750_000, 3_000_000)])   # just inside the RIGHT edge
+    occ, centres = m.occupancy(dom, bed, flank=1_000_000, step=250_000)
+    right = occ[1]
+    assert right[centres == 125_000][0], "inside should be positive"
+    assert not right[centres == -125_000][0]
+
+
+def test_a_uniformly_placed_set_is_flat():
+    """The whole point.  Histogramming a set's own bins by distance peaks at
+    the boundary for ANY set, because the positions available at each
+    distance are not uniform; occupancy per boundary does not."""
+    m = _mod()
+    step = 250_000
+    dom = _iv([("chr1", i * 20_000_000, i * 20_000_000 + 4_000_000)
+               for i in range(1, 9)])
     rng = np.random.default_rng(0)
-    dist = rng.uniform(-5e6, 5e6, 2000)
-    in_set = rng.random(2000) < 0.6
-    _, freq = m.profile(dist, in_set, flank=5_000_000, step=250_000)
-    assert np.nanmin(freq) >= 0.0
-    assert np.nanmax(freq) <= 1.0
-    assert freq.sum() == pytest.approx(1.0)
+    starts = np.sort(rng.choice(np.arange(0, 200_000_000, step),
+                                size=400, replace=False))
+    bed = _iv([("chr1", int(s), int(s) + step) for s in starts])
+    occ, centres = m.occupancy(dom, bed, flank=5_000_000, step=step)
+    dens, n = m.profile_from_occupancy(occ)
+    assert n == 16
+    # flat: the centre is no higher than the rest, within sampling noise
+    near = dens[np.abs(centres) < 1_000_000].mean()
+    far = dens[np.abs(centres) >= 3_000_000].mean()
+    assert abs(near - far) < 0.12, f"near {near:.3f} vs far {far:.3f}"
 
 
-def test_an_empty_set_gives_nan_not_a_divide_by_zero():
+def test_a_boundary_hugging_set_is_not_flat():
     m = _mod()
-    n, freq = m.profile(np.array([1.0, 2.0]), np.array([False, False]),
-                        flank=400, step=200)
-    assert n.sum() == 0
-    assert np.isnan(freq).all()
+    step = 250_000
+    # 12 Mb wide, so a domain's own far edge falls OUTSIDE the 5 Mb window
+    # and the test measures boundary-hugging rather than domain width.
+    dom = _iv([("chr1", i * 30_000_000, i * 30_000_000 + 12_000_000)
+               for i in range(1, 7)])
+    rows = []
+    for i in range(1, 7):
+        for edge in (i * 30_000_000, i * 30_000_000 + 12_000_000):
+            # one bin each side of the edge, so both nearest offsets are hit
+            rows.append(("chr1", edge - step, edge))
+            rows.append(("chr1", edge, edge + step))
+    occ, centres = m.occupancy(dom, _iv(rows), flank=5_000_000, step=step)
+    dens, _ = m.profile_from_occupancy(occ)
+    assert dens[np.abs(centres) < 300_000].mean() > 0.9
+    assert dens[np.abs(centres) > 3_000_000].mean() < 0.1
 
 
-def test_the_random_control_is_size_matched_and_flat():
-    """Any set inherits the shape of where the universe sits relative to the
-    boundaries; without that drawn beside it, the universe's geometry reads
-    as the set's biology."""
+def test_profile_from_empty_occupancy_is_nan():
     m = _mod()
-    rng = np.random.default_rng(1)
-    dist = rng.uniform(-5e6, 5e6, 4000)
-    ctrl = m.random_profile(dist, np.ones(4000, bool), n_draw=400, n_rep=60,
-                            flank=5_000_000, step=1_000_000)
-    assert ctrl.sum() == pytest.approx(1.0)
-    # ten offset bins over a uniform distance -> a tenth each
-    assert np.allclose(ctrl, 0.1, atol=0.02)
+    dens, n = m.profile_from_occupancy(np.zeros((0, 8), bool))
+    assert n == 0 and np.isnan(dens).all()
 
 
-def test_the_random_control_follows_a_lopsided_universe():
-    """The null is where the universe's bins are, not a flat line."""
+def test_occupancy_ignores_a_chromosome_the_set_never_touches():
     m = _mod()
-    dist = np.concatenate([np.full(900, -400.0), np.full(100, 400.0)])
-    ctrl = m.random_profile(dist, np.ones(1000, bool), n_draw=200, n_rep=80,
-                            flank=600, step=600)
-    assert ctrl[0] == pytest.approx(0.9, abs=0.04)
-
-
-# ------------------------------------------------------------- isolation ---
-
-def test_only_boundaries_with_a_clear_window_are_kept():
-    """A domain narrower than twice the flank puts its far edge inside its
-    near edge's window, so bins deep inside one boundary are just outside the
-    next and the two cancel."""
-    m = _mod()
-    dom = pd.DataFrame({"chrom": ["chr1"] * 3,
-                        "start": [0, 3_000_000, 30_000_000],
-                        "end": [1_000_000, 4_000_000, 40_000_000]})
-    got = m.isolated_boundaries(dom, flank=5_000_000)
-    assert list(got.start) == [30_000_000]
-
-
-def test_a_wide_domain_with_a_close_neighbour_is_dropped():
-    m = _mod()
-    dom = pd.DataFrame({"chrom": ["chr1"] * 2,
-                        "start": [0, 11_000_000],
-                        "end": [10_000_000, 21_000_000]})
-    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 0
-
-
-def test_a_lone_wide_domain_survives():
-    m = _mod()
-    dom = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [20_000_000]})
-    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 1
+    dom = _iv([("chr9", 1_000_000, 3_000_000)])
+    bed = _iv([("chr1", 1_000_000, 1_250_000)])
+    occ, _ = m.occupancy(dom, bed, flank=1_000_000, step=250_000)
+    assert occ.shape[0] == 2 and not occ.any()
 
 
 # ---------------------------------------------------------------- test ----
 
-def test_edge_test_builds_the_two_by_two_on_proximity():
-    """Near means |distance| < near on EITHER side: a boundary effect is
-    about proximity to the edge, not which side of it a bin sits on."""
+def test_the_occupancy_test_compares_near_offsets_with_far_ones():
     m = _mod()
-    dist = np.array([-50.0, 50.0, -500.0, 500.0, -500.0, 500.0])
-    in_set = np.array([True, True, False, False, True, False])
-    st = m.edge_test(dist, in_set, np.ones(6, bool), near=100)
-    assert (st["n_near_in_set"], st["n_near_out"]) == (2, 0)
-    assert (st["n_far_in_set"], st["n_far_out"]) == (1, 3)
+    centres = np.array([-750_000.0, -250_000.0, 250_000.0, 750_000.0])
+    occ = np.array([[False, True, True, False],
+                    [False, True, True, False],
+                    [True, True, True, True]])
+    st = m.occupancy_test(occ, centres, near=500_000)
+    assert (st["n_occupied_near"], st["n_empty_near"]) == (6, 0)
+    assert (st["n_occupied_far"], st["n_empty_far"]) == (2, 4)
     assert st["frac_near"] == pytest.approx(1.0)
-    assert st["frac_far"] == pytest.approx(0.25)
+    assert st["odds_ratio"] > 1
 
 
-def test_a_uniform_set_gives_an_odds_ratio_near_one():
+def test_a_flat_set_gives_an_odds_ratio_near_one():
     m = _mod()
-    rng = np.random.default_rng(0)
-    dist = rng.uniform(-5e6, 5e6, 4000)
-    in_set = rng.random(4000) < 0.2
-    st = m.edge_test(dist, in_set, np.ones(4000, bool), near=1e6)
+    rng = np.random.default_rng(1)
+    centres = np.linspace(-5e6, 5e6, 40)
+    occ = rng.random((200, 40)) < 0.2
+    st = m.occupancy_test(occ, centres, near=5e5)
     assert 0.7 < st["odds_ratio"] < 1.4
-    assert st["pvalue"] > 0.01
+    assert st["pvalue"] > 0.05
 
 
-# ------------------------------------------------- isolation vs width ------
-
-def test_a_narrow_domain_far_from_its_neighbours_is_kept():
-    """The point is keeping a NEIGHBOUR out of the window.  A domain's own
-    far edge is a different matter: a narrow isolated domain shows as a bump
-    of its own width, which is readable rather than confounding."""
+def test_the_occupancy_test_on_nothing_returns_nothing():
     m = _mod()
-    dom = pd.DataFrame({"chrom": ["chr1"] * 2,
-                        "start": [0, 20_000_000],
-                        "end": [1_000_000, 21_000_000]})
-    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 2
-
-
-def test_min_domain_width_restores_the_stricter_reading():
-    m = _mod()
-    dom = pd.DataFrame({"chrom": ["chr1"] * 2,
-                        "start": [0, 20_000_000],
-                        "end": [1_000_000, 21_000_000]})
-    got = m.isolated_boundaries(dom, flank=5_000_000,
-                                min_width=5_000_000)
-    assert len(got) == 0
-
-
-def test_a_close_neighbour_still_disqualifies_both():
-    m = _mod()
-    dom = pd.DataFrame({"chrom": ["chr1"] * 2,
-                        "start": [0, 2_000_000],
-                        "end": [1_000_000, 3_000_000]})
-    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 0
-
-
-# --------------------------------------------------------- two-set test ---
-
-def test_the_two_set_test_compares_query_with_control():
-    """The claim the figure makes is that the query concentrates at
-    boundaries MORE than its control -- not that it differs from everything
-    it is not."""
-    m = _mod()
-    q = np.concatenate([np.full(30, 100.0), np.full(70, 5e6)])
-    c = np.concatenate([np.full(10, 100.0), np.full(90, 5e6)])
-    st = m.two_set_test(q, c, near=500_000)
-    assert (st["n_near_in_set"], st["n_far_in_set"]) == (30, 70)
-    assert (st["n_near_control"], st["n_far_control"]) == (10, 90)
-    assert st["frac_near"] == pytest.approx(0.30)
-    assert st["frac_near_control"] == pytest.approx(0.10)
-    assert st["odds_ratio"] > 1 and st["pvalue"] < 0.01
-
-
-def test_two_identical_sets_give_an_odds_ratio_of_one():
-    m = _mod()
-    x = np.concatenate([np.full(20, 100.0), np.full(80, 5e6)])
-    st = m.two_set_test(x, x.copy(), near=500_000)
-    assert st["odds_ratio"] == pytest.approx(1.0)
-    assert st["pvalue"] > 0.5
-
-
-def test_the_two_set_test_ignores_nan_distances():
-    m = _mod()
-    q = np.array([100.0, np.nan, 5e6])
-    c = np.array([5e6, 5e6])
-    st = m.two_set_test(q, c, near=500_000)
-    assert st["n_near_in_set"] + st["n_far_in_set"] == 2
+    assert m.occupancy_test(np.zeros((0, 4), bool),
+                            np.zeros(4), near=1.0) == {}

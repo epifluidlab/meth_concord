@@ -139,105 +139,90 @@ def offset_edges(flank, step):
     return edges, (edges[:-1] + edges[1:]) / 2.0
 
 
-def profile(dist, in_set, flank, step):
-    """Where the SET's own bins sit, as a frequency over offsets.
+def _interval_index(bed):
+    """{chrom: (starts, ends)} sorted, for fast overlap queries."""
+    idx = {}
+    for c, g in bed.groupby("chrom", sort=False):
+        g = g.sort_values("start")
+        idx[str(c)] = (g.start.to_numpy(np.int64), g.end.to_numpy(np.int64))
+    return idx
 
-    The share of bins at an offset that belong to the set is a different
-    quantity and a misleading one here: it saturates at 1 wherever the set
-    happens to cover everything nearby, so a large set draws a line along the
-    top of the panel and its shape says more about set size than position.
-    The frequency -- what fraction of the set's bins fall at each offset --
-    sums to one for any set, so sets of different sizes are on one axis and
-    the curve is a distribution.
 
-    Returns (counts, frequency); the counts matter because the tails rest on
-    few bins.
+def _occupied(idx, chrom, lo, hi):
+    """Does any interval of the set overlap [lo, hi)?  Vectorised over windows."""
+    got = idx.get(str(chrom))
+    if got is None:
+        return np.zeros(np.shape(lo), bool)
+    starts, ends = got
+    lo = np.asarray(lo, np.int64)
+    hi = np.asarray(hi, np.int64)
+    # Intervals are sorted and non-overlapping, so the last one starting
+    # before hi is the only candidate that can reach past lo.
+    j = np.searchsorted(starts, hi, side="left")
+    ok = j > 0
+    out = np.zeros(lo.shape, bool)
+    out[ok] = ends[np.maximum(j[ok] - 1, 0)] > lo[ok]
+    return out
+
+
+def occupancy(boundaries, bed, flank, step):
+    """Per-boundary occupancy of the set at each offset -> (n_bnd, n_offset).
+
+    THE denominator question.  Histogramming the set's own bins by distance
+    to a boundary looks like a profile and is not one: the positions
+    AVAILABLE at each distance are not uniform -- domains have finite width
+    and uneven spacing -- so any set drawn from the genome inherits that shape
+    and peaks at the boundary.  A random control then peaks too, which is the
+    tell that the curve is geometry rather than enrichment.
+
+    Here each boundary contributes one row: at every offset the entry is 1 if
+    a bin of the set overlaps that window and 0 if not.  Averaging down the
+    rows gives the share of boundaries occupied at that offset, which for a
+    randomly placed set is its genome-wide coverage at every offset -- flat,
+    as it should be.
+
+    Offsets are oriented so positive is INSIDE the domain, which for a right
+    edge means walking left.
     """
     edges, centres = offset_edges(flank, step)
-    ok = np.isfinite(dist) & np.asarray(in_set, bool)
-    counts, _ = np.histogram(np.asarray(dist, float)[ok], bins=edges)
-    total = counts.sum()
-    freq = counts / total if total else np.full(counts.shape, np.nan)
-    return counts.astype(int), freq
+    idx = _interval_index(bed)
+    rows = []
+    for _, d in boundaries.iterrows():
+        for pos, sign in ((int(d["start"]), +1), (int(d["end"]), -1)):
+            lo = pos + sign * edges[:-1]
+            hi = pos + sign * edges[1:]
+            lo, hi = np.minimum(lo, hi), np.maximum(lo, hi)
+            rows.append(_occupied(idx, d["chrom"], lo, hi))
+    if not rows:
+        return np.zeros((0, centres.size), bool), centres
+    return np.vstack(rows), centres
 
 
-def random_profile(dist, universe_mask, n_draw, n_rep, flank, step, seed=0):
-    """The same frequency for random bin sets of the SAME SIZE.
-
-    A size-matched random draw is the null the eye needs: any set inherits the
-    shape of where the universe's bins sit relative to the boundaries -- which
-    is not uniform, because domains have a length distribution -- and without
-    that shape drawn beside it, the universe's geometry gets read as the set's
-    biology.  Averaged over repeats so the control is the expectation rather
-    than one arbitrary draw.
-    """
-    rng = np.random.default_rng(seed)
-    pool = np.flatnonzero(np.isfinite(dist) & universe_mask)
-    if pool.size == 0 or n_draw <= 0:
-        _, centres = offset_edges(flank, step)
-        return np.full(centres.shape, np.nan)
-    n_draw = min(n_draw, pool.size)
-    acc = None
-    for _ in range(n_rep):
-        pick = rng.choice(pool, size=n_draw, replace=False)
-        m = np.zeros(dist.shape, bool)
-        m[pick] = True
-        _, freq = profile(dist, m, flank, step)
-        acc = freq if acc is None else acc + freq
-    return acc / n_rep
+def profile_from_occupancy(occ):
+    """Share of boundaries occupied at each offset, and the boundary count."""
+    if occ.shape[0] == 0:
+        return np.full(occ.shape[1], np.nan), 0
+    return occ.mean(axis=0), int(occ.shape[0])
 
 
-def two_set_test(dist_a, dist_b, near):
-    """Fisher on (near the boundary) x (which set), for two bin sets.
-
-    The right test when a matched control is supplied: it asks directly
-    whether the query concentrates at boundaries MORE than the control does,
-    which is the claim the figure makes.  Testing a set against the rest of
-    the universe answers a different question -- whether the set differs from
-    everything it was not -- and a matched control is a sharper comparator
-    than "everything else".
-    """
+def occupancy_test(occ, centres, near):
+    """Occupied share near the boundary against far from it, per set."""
     from scipy.stats import fisher_exact
 
-    da = np.asarray(dist_a, float)
-    db = np.asarray(dist_b, float)
-    da, db = da[np.isfinite(da)], db[np.isfinite(db)]
-    a = int(np.sum(np.abs(da) < near))
-    b = int(da.size - a)
-    c = int(np.sum(np.abs(db) < near))
-    d = int(db.size - c)
+    if occ.shape[0] == 0:
+        return {}
+    close = np.abs(centres) < near
+    far = ~close
+    a = int(occ[:, close].sum())
+    b = int(occ[:, close].size - a)
+    c = int(occ[:, far].sum())
+    d = int(occ[:, far].size - c)
     try:
         orr, p = fisher_exact([[a, b], [c, d]])
     except Exception:
         orr, p = np.nan, np.nan
-    return {"n_near_in_set": a, "n_far_in_set": b,
-            "n_near_control": c, "n_far_control": d,
-            "frac_near": a / max(a + b, 1),
-            "frac_near_control": c / max(c + d, 1),
-            "odds_ratio": float(orr), "pvalue": float(p)}
-
-
-def edge_test(dist, in_set, universe_mask, near):
-    """Fisher on (near the boundary) x (in the set), against the far bins.
-
-    Used when a universe is given and no control set is: it compares the set
-    with everything it is not, within the universe.
-    """
-    from scipy.stats import fisher_exact
-
-    ok = np.isfinite(dist) & universe_mask
-    close = ok & (np.abs(dist) < near)
-    far = ok & (np.abs(dist) >= near)
-    a = int(np.sum(close & in_set))
-    b = int(np.sum(close & ~in_set))
-    c = int(np.sum(far & in_set))
-    d = int(np.sum(far & ~in_set))
-    try:
-        orr, p = fisher_exact([[a, b], [c, d]])
-    except Exception:
-        orr, p = np.nan, np.nan
-    return {"n_near_in_set": a, "n_near_out": b, "n_far_in_set": c,
-            "n_far_out": d,
+    return {"n_occupied_near": a, "n_empty_near": b,
+            "n_occupied_far": c, "n_empty_far": d,
             "frac_near": a / max(a + b, 1), "frac_far": c / max(c + d, 1),
             "odds_ratio": float(orr), "pvalue": float(p)}
 
@@ -279,7 +264,8 @@ def profile_figure(results, path, title, near, step):
             ax.spines[sp].set_visible(False)
         ax.grid(axis="y", color="#EEF0F2", lw=0.7)
         ax.set_axisbelow(True)
-    axes[0][0].set_ylabel("fraction of the set's bins", fontsize=9)
+    axes[0][0].set_ylabel("share of boundaries with a bin\n"
+                          "of the set at this offset", fontsize=9)
     axes[0][-1].legend(frameon=False, fontsize=8, loc="upper left",
                        bbox_to_anchor=(1.02, 1.0))
     fig.suptitle(title, fontsize=11)
@@ -305,12 +291,12 @@ def main(argv=None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--universe", default=None, metavar="BED",
-                    help="Every bin that could have been selected -- "
-                         "normally bin_scores_<ctx>.all.bed.  Needed only to "
-                         "DRAW a random control and to test a set against "
-                         "everything it is not.  Omit it when you supply your "
-                         "own matched control with --control: the profile "
-                         "itself is computed from each set's own bins.")
+                    help="Accepted and ignored.  The profile is per "
+                         "BOUNDARY -- at each offset it asks whether a bin of "
+                         "the set is there -- so it needs no universe, and a "
+                         "randomly placed control comes out flat without one. "
+                         "Supply the control as another --bed and name it "
+                         "with --control.")
     ap.add_argument("--control", default=None, metavar="LABEL",
                     help="Which --bed is the control.  The comparison then "
                          "becomes query-vs-control, which is the claim the "
@@ -337,11 +323,8 @@ def main(argv=None) -> int:
                     help="Offset bin for the profile (250 kb).  Below the "
                          "bin size it only splits single bins across "
                          "neighbouring offsets.")
-    ap.add_argument("--n-random", type=int, default=200, metavar="N",
-                    help="Random size-matched draws averaged into the control "
-                         "(200).  One draw is an arbitrary sample; the mean "
-                         "over many is the expectation a set of that size "
-                         "would show if it ignored the boundaries.")
+    ap.add_argument("--n-random", type=int, default=0, metavar="N",
+                    help=argparse.SUPPRESS)
     ap.add_argument("--min-domain-width", type=int, default=0, metavar="BP",
                     help="Also require each domain to be at least this wide "
                          "(0: no requirement).  Off by default because a "
@@ -367,8 +350,10 @@ def main(argv=None) -> int:
 
     sets = _named(args.bed, "--bed")
     if args.universe:
-        uni = read_bed(args.universe)
-    else:
+        print("  NOTE --universe is ignored: the profile is per boundary, "
+              "not per bin of a universe.  Give the control as another --bed "
+              "and name it with --control.", file=sys.stderr)
+    if True:
         # No universe: the profile only needs each set's own bins, so the
         # working grid is their union.  Every automatic control and the
         # against-everything-else test are unavailable and are skipped rather
@@ -390,24 +375,14 @@ def main(argv=None) -> int:
     # its biology, and a real set that behaves like the random one is a
     # stronger statement than random alone.
 
-    key = uni.chrom.astype(str) + ":" + uni.start.astype(str)
-    membership = {}
-    for name, path in sets.items():
-        b = read_bed(path)
-        k = set(b.chrom.astype(str) + ":" + b.start.astype(str))
-        membership[name] = key.isin(k).to_numpy()
-        where = "universe bins" if args.universe else "bins in the union"
-        print(f"  {name}: {int(membership[name].sum()):,} of "
-              f"{len(uni):,} {where}")
-        if not membership[name].any():
-            sys.exit(f"--bed {name}: not one of its bins matches the "
-                     f"{'universe' if args.universe else 'other sets'}.  They "
-                     f"must share a bin grid -- the subset BEDs written "
-                     f"beside bin_scores_<ctx>.all.bed do.")
+    bed_of = {name: read_bed(path) for name, path in sets.items()}
+    for name, b in bed_of.items():
+        print(f"  {name}: {len(b):,} intervals")
+        if not len(b):
+            sys.exit(f"--bed {name}: no intervals")
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    universe_mask = np.ones(len(uni), bool)
 
     results, rows = {}, []
     for bname, bpath in bounds.items():
@@ -424,50 +399,27 @@ def main(argv=None) -> int:
                     "every edge and accept that neighbouring domains fall "
                     "inside the window.", file=sys.stderr)
             continue
-        dist = signed_distance(uni, dom)
-        n_ok = int(np.isfinite(dist).sum())
-        print(f"  {bname}: {len(dom):,} of {len(dom_all):,} domains isolated "
-              f"at +/-{args.flank / 1e6:g} Mb, {n_ok:,} bins placed")
-        _, centres = offset_edges(args.flank, args.step)
+
         block = {"sets": {}}
-        for sname, in_set in membership.items():
-            n_at, freq = profile(dist, in_set, args.flank, args.step)
-            block["sets"][sname] = {"offset": centres, "density": freq,
-                                    "n": n_at}
-            if args.universe and args.n_random > 0 and not args.control:
-                ctrl = random_profile(dist, universe_mask, int(in_set.sum()),
-                                      args.n_random, args.flank, args.step)
-                block["sets"][f"{sname} (random, n matched)"] = {
-                    "offset": centres, "density": ctrl,
-                    "n": np.zeros(centres.shape, int), "control": True}
-            if args.control:
-                if sname == args.control:
-                    continue
-                st = two_set_test(dist[in_set],
-                                  dist[membership[args.control]], args.near)
-                st.update({"boundary": bname, "set": sname,
-                           "control": args.control})
+        n_edges = None
+        for sname, bed in bed_of.items():
+            occ, centres = occupancy(dom, bed, args.flank, args.step)
+            dens, n_bnd = profile_from_occupancy(occ)
+            n_edges = n_bnd
+            block["sets"][sname] = {
+                "offset": centres, "density": dens,
+                "n": np.full(centres.shape, n_bnd, int),
+                "control": sname == args.control}
+            st = occupancy_test(occ, centres, args.near)
+            if st:
+                st.update({"boundary": bname, "set": sname})
                 rows.append(st)
-                print(f"    {sname:>16}: {st['frac_near']:.3f} within "
-                      f"{args.near / 1e6:g} Mb vs {st['frac_near_control']:.3f}"
-                      f" for {args.control}, OR {st['odds_ratio']:.2f}, "
+                print(f"    {sname:>16}: {st['frac_near']:.3f} occupied "
+                      f"within {args.near / 1e6:g} Mb vs {st['frac_far']:.3f} "
+                      f"beyond, OR {st['odds_ratio']:.2f}, "
                       f"p {st['pvalue']:.2g}")
-                continue
-            if not args.universe:
-                continue
-            st = edge_test(dist, in_set, universe_mask, args.near)
-            share = (st["n_near_in_set"] + st["n_near_out"]) / max(
-                st["n_near_in_set"] + st["n_near_out"]
-                + st["n_far_in_set"] + st["n_far_out"], 1)
-            st.update({"boundary": bname, "set": sname})
-            rows.append(st)
-            st["frac_of_genome_near"] = float(share)
-            note = ("   (near covers most of the universe -- lower --near)"
-                    if share > 0.4 else "")
-            print(f"    {sname:>16}: {st['frac_near']:.3f} within "
-                  f"{args.near / 1e6:g} Mb vs {st['frac_far']:.3f} beyond, "
-                  f"OR {st['odds_ratio']:.2f}, p {st['pvalue']:.2g}"
-                  f"   [near = {share:.0%} of bins]{note}")
+        print(f"  {bname}: {len(dom):,} of {len(dom_all):,} domains isolated "
+              f"at +/-{args.flank / 1e6:g} Mb, {n_edges or 0} edges profiled")
         results[bname] = block
 
     if rows:
