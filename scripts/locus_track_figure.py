@@ -83,6 +83,86 @@ def separation_score(means, low, high):
     return worst_high - worst_low
 
 
+def all_runs(bins, score, min_bins=2, require=None, min_gap=0.0, fdr=None):
+    """Every qualifying run, with the statistics needed to rank them.
+
+    Enumerated once rather than found-and-masked repeatedly: the runs are
+    disjoint by construction -- a run ends where a bin fails -- so there is
+    nothing to mask, and having them all at once means the ranking is a sort
+    over a table the caller can print, not an order emerging from the search.
+    """
+    d = bins.copy()
+    d["score"] = np.asarray(score, float)
+    d["fdr"] = (np.asarray(fdr, float) if fdr is not None
+                else np.full(len(d), np.nan))
+    ok = np.isfinite(d["score"]) & (d["score"] > max(min_gap, 0.0))
+    if require is not None:
+        ok &= np.asarray(require, bool)
+    d["ok"] = ok
+    d = d.sort_values(["chrom", "start"]).reset_index(drop=True)
+
+    runs, cur = [], None
+    for _, r in d.iterrows():
+        contiguous = (cur is not None and r["chrom"] == cur["chrom"]
+                      and r["start"] == cur["end"])
+        if r["ok"] and contiguous:
+            cur["end"] = r["end"]
+            cur["gaps"].append(r["score"])
+            cur["fdrs"].append(r["fdr"])
+        elif r["ok"]:
+            if cur is not None:
+                runs.append(cur)
+            cur = {"chrom": r["chrom"], "start": r["start"], "end": r["end"],
+                   "gaps": [r["score"]], "fdrs": [r["fdr"]]}
+        else:
+            if cur is not None:
+                runs.append(cur)
+            cur = None
+    if cur is not None:
+        runs.append(cur)
+
+    out = []
+    for r in runs:
+        g = np.asarray(r["gaps"], float)
+        q = np.asarray(r["fdrs"], float)
+        if g.size < min_bins:
+            continue
+        with np.errstate(divide="ignore", invalid="ignore"):
+            evidence = (float(np.nanmedian(-np.log10(np.maximum(q, 1e-300))))
+                        if np.isfinite(q).any() else np.nan)
+        out.append({"chrom": r["chrom"], "start": r["start"], "end": r["end"],
+                    "n": int(g.size), "total": float(g.sum()),
+                    "mean_gap": float(g.mean()), "min_gap": float(g.min()),
+                    "median_fdr": (float(np.nanmedian(q))
+                                   if np.isfinite(q).any() else np.nan),
+                    "evidence": evidence})
+    return out
+
+
+def rank_runs(runs, how="gap-mean"):
+    """Sort runs, strongest first, by the chosen definition of strongest.
+
+    'gap-mean' is how different the locus IS, independent of how wide it is,
+    which is what "the most different locus" means.  'gap-total' sums instead,
+    so a broad domain of modest bins outranks a narrow one of strong bins --
+    the right choice when the figure is about a domain rather than a peak, and
+    the wrong one when it is asked to put the biggest differences first.
+    'combined' multiplies the mean gap by the evidence behind it, so a large
+    difference resting on a weak FDR does not outrank a slightly smaller one
+    that is solid.
+    """
+    keys = {
+        "gap-mean": lambda r: (r["mean_gap"], r["n"]),
+        "gap-total": lambda r: (r["total"], r["n"]),
+        "combined": lambda r: (r["mean_gap"] * (r["evidence"]
+                                                if r["evidence"] == r["evidence"]
+                                                else 1.0), r["n"]),
+    }
+    if how not in keys:
+        raise ValueError(f"unknown ranking {how!r}; have {sorted(keys)}")
+    return sorted(runs, key=keys[how], reverse=True)
+
+
 def best_run(bins, score, min_bins=2, require=None, min_gap=0.0):
     """Longest-then-strongest run of adjacent bins with a positive score.
 
@@ -709,7 +789,20 @@ def main(argv=None) -> int:
     ap.add_argument("--step", type=int, default=10_000)
     ap.add_argument("--window", type=int, default=250_000)
     ap.add_argument("--top", type=int, default=1,
-                    help="Draw this many runs, best first.")
+                    help="Draw this many runs, strongest first.")
+    ap.add_argument("--rank", choices=["gap-mean", "gap-total", "combined"],
+                    default="gap-mean",
+                    help="What 'strongest' means.  'gap-mean' (default) is "
+                         "how different the locus IS, independent of how wide "
+                         "it is -- the ranking that puts the most different "
+                         "loci first.  'gap-total' sums over the run instead, "
+                         "so a broad domain of modest bins outranks a narrow "
+                         "one of strong bins; right when the figure is about "
+                         "a domain, wrong when it is asked for the biggest "
+                         "differences.  'combined' multiplies the mean gap by "
+                         "the median -log10(FDR), so a large difference "
+                         "resting on weak evidence does not outrank a "
+                         "slightly smaller one that is solid.")
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args(argv)
 
@@ -742,7 +835,7 @@ def main(argv=None) -> int:
     means = group_means(M, ct, low + high)
     score = separation_score(means, low, high).reindex(M.columns).to_numpy()
 
-    require = fdr_by_bin = None
+    require = fdr_by_bin = q_by_bin = None
     if args.scores:
         sc = pd.read_csv(args.scores, sep="\t")
         cands = [c for c in sc.columns
@@ -772,6 +865,7 @@ def main(argv=None) -> int:
         q = sig.reindex(M.columns).to_numpy(float)
         require = np.isfinite(q) & (q < args.fdr)
         fdr_by_bin = pd.Series(require, index=M.columns)
+        q_by_bin = q
         print(f"  {int(np.nansum(require)):,} bins at {col} < {args.fdr}")
 
     out = Path(args.output_dir)
@@ -827,17 +921,22 @@ def main(argv=None) -> int:
         regions.append({"chrom": chrom, "start": int(a), "end": int(b),
                         "n": 0, "total": np.nan})
     else:
-        pool_score, pool_req = score.copy(), (require.copy()
-                                              if require is not None else None)
-        for _ in range(args.top):
-            run = best_run(bins, pool_score, args.min_run_bins, pool_req,
-                           args.min_gap)
-            if run is None:
-                break
-            regions.append(run)
-            inside = ((bins.chrom == run["chrom"]) & (bins.start >= run["start"])
-                      & (bins.start < run["end"])).to_numpy()
-            pool_score[inside] = np.nan
+        found = all_runs(bins, score, args.min_run_bins, require,
+                         args.min_gap, fdr=q_by_bin)
+        regions = rank_runs(found, args.rank)[: args.top]
+        if found:
+            print(f"  {len(found):,} qualifying runs; showing the top "
+                  f"{len(regions)} by {args.rank}")
+            print("    "
+                  + f"{'locus':<32}{'bins':>5}{'mean gap':>11}"
+                  + f"{'min gap':>10}{'median FDR':>13}")
+            for r in regions:
+                q = ("-" if r["median_fdr"] != r["median_fdr"]
+                     else f"{r['median_fdr']:.2g}")
+                loc = f"{r['chrom']}:{r['start']:,}-{r['end']:,}"
+                print("    "
+                      + f"{loc:<32}{r['n']:>5d}{r['mean_gap']:>11.3g}"
+                      + f"{r['min_gap']:>10.3g}{q:>13}")
         if not regions:
             sys.exit(
                 "no run of adjacent bins has every --low group below every "
@@ -883,7 +982,7 @@ def main(argv=None) -> int:
         sub = M[cols]
         stem = f"locus_{name}_{i}_{run['chrom']}_{run['start']}"
         dest = out / f"{stem}.pdf"
-        gap = run["total"] / max(run["n"], 1)
+        gap = run.get("mean_gap", run["total"] / max(run["n"], 1))
         head = (f"{name}  {run['chrom']}:{run['start']:,}-{run['end']:,}  "
                 f"({run['n']} bins, {len(sub):,} cells, mean gap {gap:.3g} "
                 f"in D between {'+'.join(low)} and {'+'.join(high)})")

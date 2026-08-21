@@ -284,3 +284,70 @@ def test_significant_spans_closes_a_run_at_the_end():
 def test_no_significant_bins_gives_no_spans():
     m = _mod()
     assert m.significant_spans([0, 100], [False, False], 100) == []
+
+
+# --------------------------------------------------------- ranking ---------
+
+def test_all_runs_reports_the_statistics_needed_to_rank():
+    m = _mod()
+    b = _bins(8)
+    score = np.array([-1, 0.5, 0.5, 0.5, -1, 0.2, 0.2, -1])
+    fdr = np.array([1, 1e-4, 1e-4, 1e-2, 1, 1e-9, 1e-9, 1], float)
+    runs = m.all_runs(b, score, min_bins=2, fdr=fdr)
+    assert len(runs) == 2
+    a, c = runs
+    assert (a["n"], a["mean_gap"], a["total"]) == (3, pytest.approx(0.5),
+                                                   pytest.approx(1.5))
+    assert a["median_fdr"] == pytest.approx(1e-4)
+    assert c["n"] == 2 and c["mean_gap"] == pytest.approx(0.2)
+
+
+def test_gap_mean_puts_the_most_different_locus_first():
+    """Narrow and strong beats wide and modest -- which is what "the most
+    different locus" means, and what summing over the run gets backwards."""
+    m = _mod()
+    runs = [{"chrom": "chr1", "start": 0, "end": 1, "n": 14, "total": 2.0,
+             "mean_gap": 0.143, "min_gap": 0.13, "median_fdr": 1e-12,
+             "evidence": 12.0},
+            {"chrom": "chr1", "start": 9, "end": 10, "n": 3, "total": 1.6,
+             "mean_gap": 0.538, "min_gap": 0.53, "median_fdr": 0.04,
+             "evidence": 1.4}]
+    assert m.rank_runs(runs, "gap-mean")[0]["n"] == 3
+    assert m.rank_runs(runs, "gap-total")[0]["n"] == 14
+
+
+def test_combined_lets_evidence_outweigh_a_slightly_larger_gap():
+    m = _mod()
+    runs = [{"n": 14, "total": 2.0, "mean_gap": 0.143, "evidence": 12.0},
+            {"n": 3, "total": 1.6, "mean_gap": 0.538, "evidence": 1.4}]
+    #  0.143*12 = 1.72  vs  0.538*1.4 = 0.75
+    assert m.rank_runs(runs, "combined")[0]["n"] == 14
+
+
+def test_combined_falls_back_when_no_fdr_is_available():
+    m = _mod()
+    runs = [{"n": 2, "mean_gap": 0.4, "total": 0.8, "evidence": float("nan")},
+            {"n": 2, "mean_gap": 0.9, "total": 1.8, "evidence": float("nan")}]
+    assert m.rank_runs(runs, "combined")[0]["mean_gap"] == pytest.approx(0.9)
+
+
+def test_an_unknown_ranking_is_refused():
+    m = _mod()
+    with pytest.raises(ValueError, match="unknown ranking"):
+        m.rank_runs([], "whatever")
+
+
+def test_all_runs_honours_min_gap_and_min_bins():
+    m = _mod()
+    b = _bins(8)
+    score = np.array([0.01, 0.01, 0.01, -1, 0.9, 0.9, -1, -1])
+    assert len(m.all_runs(b, score, min_bins=2)) == 2
+    assert len(m.all_runs(b, score, min_bins=2, min_gap=0.1)) == 1
+    assert len(m.all_runs(b, score, min_bins=4, min_gap=0.1)) == 0
+
+
+def test_all_runs_does_not_join_across_a_chromosome():
+    m = _mod()
+    b = pd.concat([_bins(3, "chr1"), _bins(3, "chr2")], ignore_index=True)
+    runs = m.all_runs(b, np.ones(6), min_bins=2)
+    assert len(runs) == 2 and {r["chrom"] for r in runs} == {"chr1", "chr2"}

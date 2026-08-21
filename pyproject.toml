@@ -29,6 +29,10 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "pybind11>=2.10",
+    # The suite is dominated by end-to-end tests that each launch a
+    # subprocess, so it parallelises almost linearly: `pytest -n auto` runs
+    # in about a quarter of the wall-clock on a normal machine.
+    "pytest-xdist>=3.0",
 ]
 # Optional batch-correction backends.  Only required if you set
 # --batch-correction combat (combat) or --batch-correction harmony.
