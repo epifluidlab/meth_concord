@@ -38,7 +38,29 @@ import numpy as np
 import pandas as pd
 
 
-def read_bed(path, merge=False):
+def _class_column(path, skip):
+    """Index of a categorical column past the first three, or None.
+
+    A BED whose extra column repeats a handful of labels over thousands of
+    rows is a partition of the genome, not a set of domains: the Zhou PMD
+    file tiles every chromosome in 100 kb blocks marked PMD / HMD / NA.  Read
+    as three columns and merged, it collapses to one interval per chromosome
+    -- and a boundary profile against it measures chromosome ENDS, silently.
+    """
+    head = pd.read_csv(path, sep="\t", header=None, skiprows=skip, nrows=5000,
+                       comment="#", compression="infer", dtype=str)
+    for col in range(3, head.shape[1]):
+        vals = head[col].dropna()
+        if not len(vals):
+            continue
+        uniq = vals.unique()
+        numeric = pd.to_numeric(vals, errors="coerce").notna().mean()
+        if numeric < 0.5 and 1 < len(uniq) <= 12:
+            return col, sorted(uniq)
+    return None, None
+
+
+def read_bed(path, merge=False, keep_class=None):
     """chrom/start/end, header tolerated; merged only when asked.
 
     Merging is right for a DOMAIN file, where touching intervals are one
@@ -51,10 +73,30 @@ def read_bed(path, merge=False):
     head = pd.read_csv(p, sep="\t", nrows=1, header=None, compression="infer",
                        dtype=str)
     skip = 1 if str(head.iloc[0, 1]).lower() in ("start", "chromstart") else 0
+    col, labels = _class_column(p, skip)
+    if col is not None and keep_class is None:
+        raise SystemExit(
+            f"{p} has a class column (column {col + 1}) holding "
+            f"{', '.join(labels)}.\n"
+            f"  It partitions the genome rather than listing domains: read as "
+            f"three columns and merged it becomes one interval per "
+            f"chromosome, and a boundary profile against that measures "
+            f"chromosome ends.\n"
+            f"  Name the class you want:  --boundary \"LABEL={p}::CLASS\"  "
+            f"e.g. ::{labels[0]}")
+    use = [0, 1, 2] if col is None else [0, 1, 2, col]
+    names = (["chrom", "start", "end"] if col is None
+             else ["chrom", "start", "end", "_class"])
     df = pd.read_csv(p, sep="\t", header=None, skiprows=skip, comment="#",
-                     compression="infer", usecols=[0, 1, 2],
-                     names=["chrom", "start", "end"],
+                     compression="infer", usecols=use, names=names,
                      dtype={0: str, 1: np.int64, 2: np.int64})
+    if col is not None:
+        want = str(keep_class)
+        hit = df["_class"].astype(str) == want
+        if not hit.any():
+            raise SystemExit(f"{p}: no row has class {want!r} "
+                             f"(have: {', '.join(labels)})")
+        df = df[hit].drop(columns=["_class"])
     df = df.sort_values(["chrom", "start"]).reset_index(drop=True)
     if not merge:
         return df
@@ -325,8 +367,10 @@ def _named(specs, flag):
         if "=" not in spec:
             sys.exit(f"{flag} must be LABEL=PATH, got {spec!r}")
         k, v = spec.split("=", 1)
-        hits = sorted(glob.glob(v.strip())) or [v.strip()]
-        out[k.strip()] = hits[0]
+        raw = v.strip()
+        base, sep, cls = raw.partition("::")
+        hits = sorted(glob.glob(base)) or [base]
+        out[k.strip()] = hits[0] + sep + cls
     return out
 
 
@@ -355,9 +399,16 @@ def main(argv=None) -> int:
                          "set is still worth it, since random bins share the "
                          "universe's geometry but not its biology.")
     ap.add_argument("--boundary", action="append", required=True,
-                    metavar="LABEL=BED",
+                    metavar="LABEL=BED[::CLASS]",
                     help="A domain BED whose interval EDGES are the "
-                         "boundaries.  Repeatable, one panel each.")
+                         "boundaries.  Repeatable, one panel each.  Append "
+                         "::CLASS for a file that PARTITIONS the genome with "
+                         "a class column rather than listing domains -- the "
+                         "Zhou PMD file tiles every chromosome as PMD / HMD / "
+                         "NA, so \"PMD=...bed.gz::PMD\" is what makes it a "
+                         "domain set.  Such a file is refused without a class "
+                         "rather than merged into one interval per "
+                         "chromosome.")
     ap.add_argument("--density", choices=["set-fraction", "occupancy"],
                     default="set-fraction",
                     help="'set-fraction' (default): of the SET's bins, the "
@@ -465,8 +516,9 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     results, rows = {}, []
-    for bname, bpath in bounds.items():
-        dom_all = read_bed(bpath, merge=True)
+    for bname, bspec in bounds.items():
+        bpath, _, bclass = bspec.partition("::")
+        dom_all = read_bed(bpath, merge=True, keep_class=bclass or None)
         dom = (dom_all if args.keep_crowded
                else isolated_boundaries(dom_all, args.flank,
                                         args.min_domain_width))
@@ -507,8 +559,23 @@ def main(argv=None) -> int:
                   "occupancy either way, since that is the one a randomly "
                   "placed set does not pass by construction)",
                   file=sys.stderr)
+        gaps = []
+        for _, g in dom_all.groupby("chrom", sort=False):
+            g = g.sort_values("start")
+            if len(g) > 1:
+                gaps.append(g.start.to_numpy()[1:] - g.end.to_numpy()[:-1])
+        gaps = np.concatenate(gaps) if gaps else np.array([])
+        alone = int(sum(len(g) == 1 for _, g in dom_all.groupby("chrom")))
+        w = (dom_all.end - dom_all.start).to_numpy()
+        detail = (f"median width {np.median(w) / 1e6:.2f} Mb, median gap "
+                  f"{np.median(gaps) / 1e6:.2f} Mb"
+                  if gaps.size else "one domain per contig")
+        if alone:
+            detail += (f"; {alone} contig(s) hold a single domain, which has "
+                       f"no neighbour and is always isolated")
         print(f"  {bname}: {len(dom):,} of {len(dom_all):,} domains isolated "
-              f"at +/-{args.flank / 1e6:g} Mb, {n_edges or 0} edges profiled")
+              f"at +/-{args.flank / 1e6:g} Mb, {n_edges or 0} edges profiled "
+              f"({detail})")
         results[bname] = block
 
     if rows:

@@ -263,3 +263,65 @@ def test_an_empty_set_fraction_is_nan():
     bed = _iv([("chr9", 0, 100)])
     freq, counts = m.set_fraction_profile(bed, dom, flank=100, step=50)
     assert counts.sum() == 0 and np.isnan(freq).all()
+
+
+# ------------------------------------------------ class-partitioned BEDs ---
+
+def _classed(path, rows):
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False, header=False)
+    return str(path)
+
+
+def test_a_genome_partitioning_bed_is_refused_without_a_class(tmp_path):
+    """The Zhou PMD file tiles every chromosome as PMD / HMD / NA.  Read as
+    three columns and merged it becomes ONE interval per chromosome, and a
+    boundary profile against that measures chromosome ends -- silently."""
+    m = _mod()
+    rows = [("chr1", i * 100_000, (i + 1) * 100_000, 0.5,
+             "PMD" if i % 2 else "HMD", "x") for i in range(200)]
+    p = _classed(tmp_path / "pmd.bed", rows)
+    with pytest.raises(SystemExit, match="class column"):
+        m.read_bed(p, merge=True)
+
+
+def test_naming_the_class_selects_only_those_rows(tmp_path):
+    m = _mod()
+    rows = [("chr1", i * 100_000, (i + 1) * 100_000, 0.5,
+             "PMD" if i % 2 else "HMD", "x") for i in range(200)]
+    p = _classed(tmp_path / "pmd.bed", rows)
+    got = m.read_bed(p, keep_class="PMD")
+    assert len(got) == 100
+    assert (got.start % 200_000 == 100_000).all()
+
+
+def test_an_absent_class_is_an_error_not_an_empty_result(tmp_path):
+    m = _mod()
+    rows = [("chr1", 0, 100, 0.5, "PMD", "x"), ("chr1", 100, 200, 0.5,
+                                                "HMD", "x")]
+    p = _classed(tmp_path / "pmd.bed", rows)
+    with pytest.raises(SystemExit, match="no row has class"):
+        m.read_bed(p, keep_class="NOPE")
+
+
+def test_a_plain_three_column_bed_needs_no_class(tmp_path):
+    m = _mod()
+    p = _bed(tmp_path / "d.bed", [("chr1", 0, 100), ("chr1", 500, 600)])
+    assert len(m.read_bed(p)) == 2
+
+
+def test_a_numeric_fourth_column_is_not_mistaken_for_a_class(tmp_path):
+    """A BED6 with a score must still read as plain intervals."""
+    m = _mod()
+    rows = [("chr1", i * 100, (i + 1) * 100, i * 0.37, ".", "+")
+            for i in range(50)]
+    p = _classed(tmp_path / "scored.bed", rows)
+    assert len(m.read_bed(p)) == 50
+
+
+def test_a_chromosome_with_one_domain_has_no_neighbour_to_exclude():
+    """Which is why a file merged to one block per chromosome reports every
+    domain as isolated -- the tell that it was not a domain file."""
+    m = _mod()
+    dom = pd.DataFrame({"chrom": ["chr1", "chr2"], "start": [0, 0],
+                        "end": [200_000_000, 150_000_000]})
+    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 2
