@@ -83,7 +83,7 @@ def separation_score(means, low, high):
     return worst_high - worst_low
 
 
-def best_run(bins, score, min_bins=2, require=None):
+def best_run(bins, score, min_bins=2, require=None, min_gap=0.0):
     """Longest-then-strongest run of adjacent bins with a positive score.
 
     Adjacent in GENOMIC order on one chromosome, so a run cannot jump a gap or
@@ -91,7 +91,7 @@ def best_run(bins, score, min_bins=2, require=None):
     """
     d = bins.copy()
     d["score"] = np.asarray(score, float)
-    ok = np.isfinite(d["score"]) & (d["score"] > 0)
+    ok = np.isfinite(d["score"]) & (d["score"] > max(min_gap, 0.0))
     if require is not None:
         ok &= np.asarray(require, bool)
     d["ok"] = ok
@@ -447,6 +447,16 @@ def main(argv=None) -> int:
                          "edges of the domain are visible rather than cropped "
                          "to the claim (6).")
     ap.add_argument("--min-run-bins", type=int, default=2)
+    ap.add_argument("--min-gap", type=float, default=0.0, metavar="D",
+                    help="Require this much separation, in D units, in EVERY "
+                         "bin of the run.  The ordering alone is a weak "
+                         "condition: a bin where the arms differ by 0.0001 "
+                         "satisfies 'every low below every high' and is "
+                         "indistinguishable from noise, so asking for the top "
+                         "N without this returns real loci first and "
+                         "arbitrary ones after.  A tenth of the spread of the "
+                         "per-bin separation is a reasonable place to start; "
+                         "the run prints that number.")
     ap.add_argument("--step", type=int, default=10_000)
     ap.add_argument("--window", type=int, default=250_000)
     ap.add_argument("--top", type=int, default=1,
@@ -570,7 +580,8 @@ def main(argv=None) -> int:
         pool_score, pool_req = score.copy(), (require.copy()
                                               if require is not None else None)
         for _ in range(args.top):
-            run = best_run(bins, pool_score, args.min_run_bins, pool_req)
+            run = best_run(bins, pool_score, args.min_run_bins, pool_req,
+                           args.min_gap)
             if run is None:
                 break
             regions.append(run)
@@ -585,12 +596,32 @@ def main(argv=None) -> int:
                 + ".  Loosen --fdr, lower --min-run-bins, or check that the "
                   "group names are the ones you meant.")
 
+    # What "a real gap" looks like on this data, so --min-gap is a number the
+    # user can choose rather than guess.
+    pos = score[np.isfinite(score) & (score > 0)]
+    if pos.size:
+        print(f"  separation where positive: median {np.median(pos):.3g}, "
+              f"90th pct {np.percentile(pos, 90):.3g} in D "
+              f"(--min-gap is currently {args.min_gap:g})")
+
     order = low + high + [g for g in sorted(set(ct)) if g not in low + high]
     for i, run in enumerate(regions, 1):
         pad = args.flank_bins * step_bp
         lo, hi = max(run["start"] - pad, 0), run["end"] + pad
-        win = pd.DataFrame({"chrom": run["chrom"],
-                            "start": np.arange(lo, hi, step_bp)})
+        # The tracks must be sampled on the bins the MATRIX has, not on every
+        # bin the window spans.  A matrix that lost bins to a coverage filter
+        # is the normal case, and sampling the wider grid gives the tracks
+        # more points than the heatmap has columns -- which used to crash on
+        # the first locus with a gap, after the earlier ones had already been
+        # written and looked fine.
+        have = set(M.columns)
+        starts_here = [x for x in np.arange(lo, hi, step_bp)
+                       if f"{run['chrom']}:{x}" in have]
+        if not starts_here:
+            print(f"  {run['chrom']}:{run['start']:,}: no bin of the matrix "
+                  f"falls in the padded window -- skipped", file=sys.stderr)
+            continue
+        win = pd.DataFrame({"chrom": run["chrom"], "start": starts_here})
         win["end"] = win.start + step_bp
         tracks = {}
         for label, path in tracks_spec.items():
@@ -598,8 +629,7 @@ def main(argv=None) -> int:
         heat = {g: {lab: mbe._signal_bin_means(win, pth)
                     for lab, pth in mem.items()}
                 for g, mem in heat_spec.items()}
-        cols = [f"{run['chrom']}:{s}" for s in win.start
-                if f"{run['chrom']}:{s}" in set(M.columns)]
+        cols = [f"{run['chrom']}:{x}" for x in starts_here]
         sub = M[cols]
         dest = out / f"locus_{name}_{i}_{run['chrom']}_{run['start']}.pdf"
         gap = run["total"] / max(run["n"], 1)
@@ -612,8 +642,11 @@ def main(argv=None) -> int:
             bin_bp=step_bp, highlight=(run["start"], run["end"]),
             heat_groups=heat, cytoband=cyto, vmin=args.vmin, vmax=args.vmax,
             cmap=args.cmap)
+        flag = ""
+        if pos.size and gap < 0.1 * np.median(pos):
+            flag = "   <- gap is a tenth of the typical one; likely noise"
         print(f"  {run['chrom']}:{run['start']:,}-{run['end']:,}  "
-              f"{run['n']} bins, mean gap {gap:.3g} -> {dest.name}")
+              f"{run['n']} bins, mean gap {gap:.3g} -> {dest.name}{flag}")
     return 0
 
 

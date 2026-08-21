@@ -186,3 +186,29 @@ def test_limits_never_collapse_to_a_point():
     m = _mod()
     lo, hi = m.robust_limits(np.full(100, 0.5))
     assert hi > lo
+
+
+def test_min_gap_rejects_a_run_that_only_just_qualifies():
+    """The ordering alone is weak: arms differing by 0.0001 satisfy 'every low
+    below every high' and are indistinguishable from noise.  Ranking is by
+    total gap, so a real locus still comes first -- the trivial runs are what
+    fill positions 2..N when the top N are asked for, and --min-gap is what
+    keeps them out."""
+    m = _mod()
+    b = _bins(8)
+    score = np.array([0.0001, 0.0001, 0.0001, -1, 0.9, 0.9, -1, -1])
+    strong = m.best_run(b, score, min_bins=2)
+    assert (strong["start"], strong["n"]) == (4 * 250_000, 2)
+
+    # With the real locus taken, the trivial run is what the next request
+    # returns -- unless a floor excludes it.
+    rest = score.copy()
+    rest[4:6] = np.nan
+    assert m.best_run(b, rest, min_bins=2)["n"] == 3
+    assert m.best_run(b, rest, min_bins=2, min_gap=0.01) is None
+
+
+def test_min_gap_can_reject_everything():
+    m = _mod()
+    b = _bins(5)
+    assert m.best_run(b, np.full(5, 0.01), min_bins=2, min_gap=0.5) is None
