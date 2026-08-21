@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""A genome-browser panel for one locus: every cell, then the annotation tracks.
+
+Picks the region where a contrast separates the arms most cleanly and draws it
+the way a browser would -- single cells as heatmap rows grouped by cell type,
+then the continuous tracks (replication timing, lamina association) and the
+genes underneath, all on one x axis.
+
+    python scripts/locus_track_figure.py \\
+        --matrix gch=.../concordance_directional.parquet \\
+        --scores out/marker_bins/bin_scores_gch.all.bed \\
+        --samples samples.tsv --cell-type-column group \\
+        --low tumor1,tumor2 --high GM12878,IMR-90,monocyte \\
+        --signal-track "RT early=rt/HFFc6_early_250kb.bedGraph" \\
+        --signal-track "RT late=rt/HFFc6_late_250kb.bedGraph" \\
+        --signal-track "LaminB1=lad/HFFc6_LMNB1_250kb.bw" \\
+        --gene-annotation gencode.v44.annotation.gtf.gz \\
+        --output-dir out/locus
+
+REGION CHOICE.  A bin scores on the GAP between the arms -- the highest of the
+"low" group means subtracted from the lowest of the "high" group means -- so a
+bin only scores when EVERY low group sits below EVERY high one.  A mean
+difference would let one tumour population carry a bin the other does not
+share, which is the thing this figure would be read as ruling out.  Runs of
+adjacent qualifying bins are ranked by total gap, and the winner is drawn with
+--flank-bins of context on each side so the edges of the domain are visible
+rather than cropped to the claim.
+
+SMOOTHING IS INTERPOLATION, NOT RESOLUTION.  D is stored per 250 kb bin, so a
+250 kb window stepped every 10 kb is a rolling mean over overlapping bins: it
+makes the track continuous instead of blocky and it moves no boundary it was
+not already given.  Real 10 kb detail would mean recomputing concordance from
+the read pairs at that step.  The axis label says which one this is.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+def _enrich():
+    """The sibling enrichment script, for its readers."""
+    p = Path(__file__).resolve().parent / "marker_bin_enrichment.py"
+    spec = importlib.util.spec_from_file_location("_mbe", p)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["_mbe"] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def group_means(M, ct, groups):
+    """{group: per-bin mean over its cells}, on the raw scale."""
+    out = {}
+    for g in groups:
+        rows = M.loc[ct.index[ct == g]] if len(ct.index[ct == g]) else None
+        if rows is None or not len(rows):
+            continue
+        out[g] = rows.mean(axis=0, skipna=True)
+    return out
+
+
+def separation_score(means, low, high):
+    """Lowest high-group mean minus highest low-group mean, per bin.
+
+    Positive only where EVERY low group sits below EVERY high one, which is
+    what "consistently down in both tumours and up in the rest" means.  An
+    average of the two sides would score a bin one tumour drives alone.
+    """
+    lo = [means[g] for g in low if g in means]
+    hi = [means[g] for g in high if g in means]
+    if not lo or not hi:
+        raise SystemExit(
+            f"need at least one group on each side; have low={list(lo)} "
+            f"high={list(hi)} out of {sorted(means)}")
+    worst_low = pd.concat(lo, axis=1).max(axis=1)
+    worst_high = pd.concat(hi, axis=1).min(axis=1)
+    return worst_high - worst_low
+
+
+def best_run(bins, score, min_bins=2, require=None):
+    """Longest-then-strongest run of adjacent bins with a positive score.
+
+    Adjacent in GENOMIC order on one chromosome, so a run cannot jump a gap or
+    a centromere and be reported as one domain.
+    """
+    d = bins.copy()
+    d["score"] = np.asarray(score, float)
+    ok = np.isfinite(d["score"]) & (d["score"] > 0)
+    if require is not None:
+        ok &= np.asarray(require, bool)
+    d["ok"] = ok
+    d = d.sort_values(["chrom", "start"]).reset_index(drop=True)
+    runs, cur = [], None
+    for i, r in d.iterrows():
+        contiguous = (cur is not None and r["chrom"] == cur["chrom"]
+                      and r["start"] == cur["end"])
+        if r["ok"] and contiguous:
+            cur["end"], cur["n"] = r["end"], cur["n"] + 1
+            cur["total"] += r["score"]
+        elif r["ok"]:
+            if cur is not None:
+                runs.append(cur)
+            cur = {"chrom": r["chrom"], "start": r["start"], "end": r["end"],
+                   "n": 1, "total": r["score"]}
+        else:
+            if cur is not None:
+                runs.append(cur)
+            cur = None
+    if cur is not None:
+        runs.append(cur)
+    runs = [r for r in runs if r["n"] >= min_bins]
+    if not runs:
+        return None
+    return max(runs, key=lambda r: (r["total"], r["n"]))
+
+
+def smooth(values, starts, step, window):
+    """Rolling mean of binned values onto a finer grid -> (positions, values).
+
+    Interpolation between bins that already exist, which is a display choice.
+    It cannot sharpen a boundary the 250 kb binning already blurred.
+    """
+    starts = np.asarray(starts, float)
+    v = np.asarray(values, float)
+    lo, hi = starts.min(), starts.max() + window
+    grid = np.arange(lo, hi + step, step, dtype=float)
+    out = np.full(grid.shape, np.nan)
+    for i, g in enumerate(grid):
+        m = (starts + window > g) & (starts < g + window)
+        if m.any() and np.isfinite(v[m]).any():
+            out[i] = np.nanmean(v[m])
+    return grid, out
+
+
+def _gene_rows(genes, chrom, lo, hi, max_rows=4):
+    """Genes overlapping the window, packed into non-overlapping rows.
+
+    Packed rather than stacked one-per-row: a gene-dense locus would otherwise
+    need a panel taller than the heatmap, and the point of the track is where
+    the genes are, not how many rows they need.
+    """
+    g = genes[(genes.chrom.astype(str) == str(chrom))
+              & (genes.end > lo) & (genes.start < hi)].copy()
+    if not len(g):
+        return g.assign(row=[])
+    g = g.sort_values("start").reset_index(drop=True)
+    ends = []
+    rows = []
+    span = max(hi - lo, 1)
+    for _, r in g.iterrows():
+        # Reserve label width so a name does not collide with the next gene.
+        need = r["start"] - 0.06 * span
+        for i, e in enumerate(ends):
+            if e <= need:
+                rows.append(i)
+                ends[i] = r["end"]
+                break
+        else:
+            rows.append(len(ends))
+            ends.append(r["end"])
+    g["row"] = np.minimum(rows, max_rows - 1)
+    return g
+
+
+def locus_figure(M, ct, order, region, tracks, genes, path, title,
+                 ct_colors=None, step=10_000, window=250_000, bin_bp=250_000,
+                 highlight=None):
+    """Cells over the locus, then the tracks, then the genes -- one x axis."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    chrom, lo, hi = region
+    cols = [c for c in M.columns
+            if str(c).rsplit(":", 1)[0] == str(chrom)
+            and lo <= int(str(c).rsplit(":", 1)[1]) < hi]
+    if not cols:
+        raise SystemExit(f"no bins of {M.shape[1]} fall in "
+                         f"{chrom}:{lo:,}-{hi:,}")
+    starts = np.array([int(str(c).rsplit(":", 1)[1]) for c in cols], float)
+    keep = ct.index.intersection(M.index)
+    ct = ct.loc[keep]
+    cells = [c for g in order for c in ct.index[ct == g]]
+    sub = M.loc[cells, cols]
+
+    # Every cell smoothed onto the same fine grid, so the heatmap and the
+    # tracks below it share one coordinate system.
+    grid, _ = smooth(sub.iloc[0].to_numpy(), starts, step, window)
+    img = np.vstack([smooth(sub.loc[c].to_numpy(), starts, step, window)[1]
+                     for c in cells])
+
+    n_track = len(tracks)
+    heights = [len(cells) * 0.055 + 1.2] + [0.62] * n_track + [0.9]
+    fig, axes = plt.subplots(
+        len(heights), 1, figsize=(11.5, sum(heights) + 1.0), sharex=True,
+        gridspec_kw={"height_ratios": heights, "hspace": 0.12})
+    ax0 = axes[0]
+
+    lim = np.nanpercentile(np.abs(img), 99) if np.isfinite(img).any() else 1.0
+    extent = [grid[0], grid[-1], len(cells), 0]
+    im = ax0.imshow(img, aspect="auto", cmap="RdYlBu_r", vmin=-lim, vmax=lim,
+                    extent=extent, interpolation="nearest")
+    ax0.set_yticks([])
+    ax0.set_title(title, fontsize=11)
+    cb = fig.colorbar(im, ax=ax0, fraction=0.012, pad=0.005)
+    cb.set_label("concordance D", fontsize=8)
+    cb.ax.tick_params(labelsize=7)
+
+    # Cell-type blocks down the left edge, and a rule between them, so a band
+    # in the heatmap can be attributed without counting rows.
+    pal = dict(ct_colors or {})
+    fallback = plt.get_cmap("tab10")
+    for i, g in enumerate(order):
+        pal.setdefault(g, fallback(i % 10))
+    # Blocks OUTSIDE the axes, in axes coordinates, so they never cover the
+    # first column of data and the names have room to sit beside them.
+    span = grid[-1] - grid[0]
+    y = 0
+    for g in order:
+        n = int((ct == g).sum())
+        if not n:
+            continue
+        ax0.add_patch(plt.Rectangle(
+            (grid[0] - 0.022 * span, y), 0.014 * span, n,
+            facecolor=pal[g], edgecolor="none", clip_on=False))
+        ax0.text(grid[0] - 0.030 * span, y + n / 2, f"{g}\n(n={n})",
+                 ha="right", va="center", fontsize=8, color=pal[g],
+                 linespacing=1.25)
+        y += n
+        if y < len(cells):
+            ax0.axhline(y, color="white", lw=1.2)
+
+    for ax, (label, values) in zip(axes[1:1 + n_track], tracks.items()):
+        tg, tv = smooth(values, starts, step, window)
+        ok = np.isfinite(tv)
+        ax.fill_between(tg[ok], 0, tv[ok], color="#4B5563", lw=0)
+        ax.axhline(0, color="#9AA0A6", lw=0.6)
+        ax.set_ylabel(label, fontsize=8, rotation=0, ha="right", va="center")
+        ax.tick_params(labelsize=7)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+
+    axg = axes[-1]
+    gr = _gene_rows(genes, chrom, grid[0], grid[-1]) if genes is not None \
+        else pd.DataFrame()
+    for _, r in gr.iterrows():
+        axg.add_patch(plt.Rectangle((r["start"], -r["row"] - 0.32),
+                                    max(r["end"] - r["start"], 1), 0.3,
+                                    facecolor="#2C6FAF", edgecolor="none"))
+        axg.text((r["start"] + r["end"]) / 2, -r["row"] - 0.42,
+                 str(r.get("name", "")), fontsize=6, ha="center", va="top")
+    axg.set_ylim(-4.2, 0.1)
+    axg.set_yticks([])
+    axg.set_ylabel("genes", fontsize=8, rotation=0, ha="right", va="center")
+    for sp in ("top", "right", "left"):
+        axg.spines[sp].set_visible(False)
+
+    if highlight is not None:
+        for ax in axes:
+            ax.axvspan(highlight[0], highlight[1], color="#F0C808",
+                       alpha=0.13, lw=0, zorder=0)
+    axg.set_xlim(grid[0], grid[-1])
+    axg.set_xlabel(
+        f"{chrom}  (Mb)   -- {window // 1000} kb window every "
+        f"{step // 1000} kb: interpolation between {bin_bp // 1000} kb bins, "
+        f"not {step // 1000} kb resolution", fontsize=8)
+    axg.xaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, _: f"{v / 1e6:.2f}"))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _named(specs, flag):
+    out = {}
+    for spec in specs or []:
+        if "=" not in spec:
+            sys.exit(f"{flag} must be LABEL=PATH, got {spec!r}")
+        k, v = spec.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--matrix", required=True, metavar="NAME=PATH",
+                    help="cells x bins concordance parquet (the RAW one: the "
+                         "figure shows D, and per-bin normalisation destroys "
+                         "its scale).")
+    ap.add_argument("--samples", required=True)
+    ap.add_argument("--cell-type-column", default="cell_type")
+    ap.add_argument("--color-column", default=None,
+                    help="Column giving each cell type's colour, as in "
+                         "celltype_marker_bins.py, so the blocks match your "
+                         "other figures.")
+    ap.add_argument("--low", required=True,
+                    help="Comma-separated groups expected LOW (e.g. "
+                         "tumor1,tumor2).  Every one must sit below every "
+                         "--high group for a bin to score.")
+    ap.add_argument("--high", required=True,
+                    help="Comma-separated groups expected HIGH.")
+    ap.add_argument("--scores", default=None, metavar="BED",
+                    help="bin_scores_<ctx>.all.bed, to require significance "
+                         "as well as separation.  Without it the region is "
+                         "chosen on the group means alone.")
+    ap.add_argument("--fdr-column", default=None,
+                    help="Column in --scores to threshold (default: the "
+                         "first contrast_*_fdr found).")
+    ap.add_argument("--fdr", type=float, default=0.05)
+    ap.add_argument("--signal-track", action="append", default=None,
+                    metavar="LABEL=PATH",
+                    help="bigWig or bedGraph drawn under the heatmap "
+                         "(RT early, RT late, LaminB1, ...).  Repeatable.")
+    ap.add_argument("--gene-annotation", default=None, metavar="GTF|BED")
+    ap.add_argument("--region", default=None, metavar="chr:start-end",
+                    help="Draw this locus instead of searching for one.")
+    ap.add_argument("--flank-bins", type=int, default=6,
+                    help="Bins of context each side of the chosen run, so the "
+                         "edges of the domain are visible rather than cropped "
+                         "to the claim (6).")
+    ap.add_argument("--min-run-bins", type=int, default=2)
+    ap.add_argument("--step", type=int, default=10_000)
+    ap.add_argument("--window", type=int, default=250_000)
+    ap.add_argument("--top", type=int, default=1,
+                    help="Draw this many runs, best first.")
+    ap.add_argument("--output-dir", required=True)
+    args = ap.parse_args(argv)
+
+    mbe = _enrich()
+    name, mpath = (args.matrix.split("=", 1) if "=" in args.matrix
+                   else ("gch", args.matrix))
+    M = pd.read_parquet(mpath)
+    samples = pd.read_csv(args.samples, sep="\t")
+    if args.cell_type_column not in samples.columns:
+        sys.exit(f"--cell-type-column {args.cell_type_column!r} not in "
+                 f"--samples ({list(samples.columns)})")
+    ct = samples.set_index("cell_name")[args.cell_type_column].astype(str)
+    ct = ct.reindex(M.index).dropna()
+    M = M.loc[ct.index]
+
+    low = [g.strip() for g in args.low.split(",") if g.strip()]
+    high = [g.strip() for g in args.high.split(",") if g.strip()]
+    missing = [g for g in low + high if g not in set(ct)]
+    if missing:
+        sys.exit(f"not in --samples {args.cell_type_column!r}: {missing}\n"
+                 f"  have: {sorted(set(ct))}")
+
+    bins = pd.DataFrame({
+        "chrom": [str(c).rsplit(":", 1)[0] for c in M.columns],
+        "start": [int(str(c).rsplit(":", 1)[1]) for c in M.columns]})
+    step_bp = int(np.median(np.diff(np.sort(bins.start.unique())))) or 250_000
+    bins["end"] = bins.start + step_bp
+    bins["bin"] = list(M.columns)
+
+    means = group_means(M, ct, low + high)
+    score = separation_score(means, low, high).reindex(M.columns).to_numpy()
+
+    require = None
+    if args.scores:
+        sc = pd.read_csv(args.scores, sep="\t")
+        col = args.fdr_column or next(
+            (c for c in sc.columns
+             if c.startswith("contrast_") and c.endswith("_fdr")), None)
+        if col is None:
+            sys.exit(f"--scores {args.scores}: no contrast_*_fdr column "
+                     f"({list(sc.columns)}); pass --fdr-column")
+        key = sc["chrom"].astype(str) + ":" + sc["start"].astype(str)
+        sig = pd.Series(sc[col].to_numpy(), index=key.to_numpy())
+        q = sig.reindex(M.columns).to_numpy(float)
+        require = np.isfinite(q) & (q < args.fdr)
+        print(f"  {int(np.nansum(require)):,} bins at {col} < {args.fdr}")
+
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    tracks_spec = _named(args.signal_track, "--signal-track")
+    genes = (mbe._read_genes(args.gene_annotation)
+             if args.gene_annotation else None)
+    ct_colors = {}
+    if args.color_column and args.color_column in samples.columns:
+        for g, c in zip(samples[args.cell_type_column].astype(str),
+                        samples[args.color_column].astype(str)):
+            if c and c.lower() not in ("nan", "none", ""):
+                ct_colors.setdefault(g, c)
+
+    regions = []
+    if args.region:
+        chrom, rng = args.region.split(":")
+        a, b = rng.replace(",", "").split("-")
+        regions.append({"chrom": chrom, "start": int(a), "end": int(b),
+                        "n": 0, "total": np.nan})
+    else:
+        pool_score, pool_req = score.copy(), (require.copy()
+                                              if require is not None else None)
+        for _ in range(args.top):
+            run = best_run(bins, pool_score, args.min_run_bins, pool_req)
+            if run is None:
+                break
+            regions.append(run)
+            inside = ((bins.chrom == run["chrom"]) & (bins.start >= run["start"])
+                      & (bins.start < run["end"])).to_numpy()
+            pool_score[inside] = np.nan
+        if not regions:
+            sys.exit(
+                "no run of adjacent bins has every --low group below every "
+                "--high group"
+                + (f" at FDR<{args.fdr}" if require is not None else "")
+                + ".  Loosen --fdr, lower --min-run-bins, or check that the "
+                  "group names are the ones you meant.")
+
+    order = low + high + [g for g in sorted(set(ct)) if g not in low + high]
+    for i, run in enumerate(regions, 1):
+        pad = args.flank_bins * step_bp
+        lo, hi = max(run["start"] - pad, 0), run["end"] + pad
+        win = pd.DataFrame({"chrom": run["chrom"],
+                            "start": np.arange(lo, hi, step_bp)})
+        win["end"] = win.start + step_bp
+        tracks = {}
+        for label, path in tracks_spec.items():
+            tracks[label] = mbe._signal_bin_means(win, path)
+        cols = [f"{run['chrom']}:{s}" for s in win.start
+                if f"{run['chrom']}:{s}" in set(M.columns)]
+        sub = M[cols]
+        dest = out / f"locus_{name}_{i}_{run['chrom']}_{run['start']}.pdf"
+        gap = run["total"] / max(run["n"], 1)
+        locus_figure(
+            sub, ct, order, (run["chrom"], lo, hi), tracks, genes, dest,
+            f"{name}  {run['chrom']}:{run['start']:,}-{run['end']:,}  "
+            f"({run['n']} bins, {len(M):,} cells, mean gap {gap:.3g} in D "
+            f"between {'+'.join(low)} and {'+'.join(high)})",
+            ct_colors=ct_colors, step=args.step, window=args.window,
+            bin_bp=step_bp, highlight=(run["start"], run["end"]))
+        print(f"  {run['chrom']}:{run['start']:,}-{run['end']:,}  "
+              f"{run['n']} bins, mean gap {gap:.3g} -> {dest.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
