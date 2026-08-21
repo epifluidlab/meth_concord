@@ -73,6 +73,35 @@ def read_bed(path, merge=False):
     return pd.DataFrame(out, columns=["chrom", "start", "end"])
 
 
+def isolated_boundaries(domains, flank):
+    """Domain edges with no OTHER edge within +/- flank -> a filtered frame.
+
+    Without this the profile is a mixture.  A domain narrower than 2*flank
+    puts its far edge inside its near edge's window, so bins counted as "deep
+    inside" one boundary are "just outside" the next, and the two signals
+    cancel to a flat line no matter what is really there.  It is why a wide
+    flank over megabase domains produces noise rather than a shape.
+
+    An edge survives only if the domain it belongs to is at least flank long
+    AND the gap to the neighbouring domain is at least flank, so its whole
+    window belongs to it alone.
+    """
+    keep = []
+    for chrom, g in domains.groupby("chrom", sort=False):
+        g = g.sort_values("start").reset_index(drop=True)
+        widths = (g.end - g.start).to_numpy(float)
+        gap_before = np.full(len(g), np.inf)
+        gap_after = np.full(len(g), np.inf)
+        if len(g) > 1:
+            gap_before[1:] = g.start.to_numpy()[1:] - g.end.to_numpy()[:-1]
+            gap_after[:-1] = g.start.to_numpy()[1:] - g.end.to_numpy()[:-1]
+        ok = ((widths >= flank) & (gap_before >= flank) & (gap_after >= flank))
+        keep.append(g[ok])
+    out = (pd.concat(keep, ignore_index=True) if keep
+           else domains.iloc[:0].copy())
+    return out
+
+
 def signed_distance(bins, domains):
     """Signed distance from each bin's centre to the nearest domain edge.
 
@@ -103,25 +132,57 @@ def signed_distance(bins, domains):
     return out
 
 
-def profile(dist, in_set, universe_mask, flank, step):
-    """Share of universe bins at each offset that belong to the set.
-
-    Returns offset centres, the density, and the count behind it -- the count
-    matters because the tails of a profile rest on few bins and a density
-    there swings on one of them.
-    """
+def offset_edges(flank, step):
     edges = np.arange(-flank, flank + step, step, dtype=float)
-    centres = (edges[:-1] + edges[1:]) / 2.0
-    dens = np.full(centres.shape, np.nan)
-    n_at = np.zeros(centres.shape, dtype=int)
-    ok = np.isfinite(dist) & universe_mask
-    for i, (a, b) in enumerate(zip(edges[:-1], edges[1:])):
-        m = ok & (dist >= a) & (dist < b)
-        n = int(m.sum())
-        n_at[i] = n
-        if n:
-            dens[i] = float(np.mean(in_set[m]))
-    return centres, dens, n_at
+    return edges, (edges[:-1] + edges[1:]) / 2.0
+
+
+def profile(dist, in_set, flank, step):
+    """Where the SET's own bins sit, as a frequency over offsets.
+
+    The share of bins at an offset that belong to the set is a different
+    quantity and a misleading one here: it saturates at 1 wherever the set
+    happens to cover everything nearby, so a large set draws a line along the
+    top of the panel and its shape says more about set size than position.
+    The frequency -- what fraction of the set's bins fall at each offset --
+    sums to one for any set, so sets of different sizes are on one axis and
+    the curve is a distribution.
+
+    Returns (counts, frequency); the counts matter because the tails rest on
+    few bins.
+    """
+    edges, centres = offset_edges(flank, step)
+    ok = np.isfinite(dist) & np.asarray(in_set, bool)
+    counts, _ = np.histogram(np.asarray(dist, float)[ok], bins=edges)
+    total = counts.sum()
+    freq = counts / total if total else np.full(counts.shape, np.nan)
+    return counts.astype(int), freq
+
+
+def random_profile(dist, universe_mask, n_draw, n_rep, flank, step, seed=0):
+    """The same frequency for random bin sets of the SAME SIZE.
+
+    A size-matched random draw is the null the eye needs: any set inherits the
+    shape of where the universe's bins sit relative to the boundaries -- which
+    is not uniform, because domains have a length distribution -- and without
+    that shape drawn beside it, the universe's geometry gets read as the set's
+    biology.  Averaged over repeats so the control is the expectation rather
+    than one arbitrary draw.
+    """
+    rng = np.random.default_rng(seed)
+    pool = np.flatnonzero(np.isfinite(dist) & universe_mask)
+    if pool.size == 0 or n_draw <= 0:
+        _, centres = offset_edges(flank, step)
+        return np.full(centres.shape, np.nan)
+    n_draw = min(n_draw, pool.size)
+    acc = None
+    for _ in range(n_rep):
+        pick = rng.choice(pool, size=n_draw, replace=False)
+        m = np.zeros(dist.shape, bool)
+        m[pick] = True
+        _, freq = profile(dist, m, flank, step)
+        acc = freq if acc is None else acc + freq
+    return acc / n_rep
 
 
 def edge_test(dist, in_set, universe_mask, near):
@@ -164,18 +225,20 @@ def profile_figure(results, path, title, near, step):
     palette = ["#D1495B", "#1F6F8B", "#3E8E7E", "#B07C4F"]
     for ax, bname in zip(axes[0], names):
         block = results[bname]
-        for i, (sname, r) in enumerate(block["sets"].items()):
-            x, y, n = r["offset"], r["density"], r["n"]
-            good = np.isfinite(y) & (n > 0)
-            # Binomial standard error on the share, so the tails show their
-            # own uncertainty instead of looking as firm as the centre.
-            se = np.sqrt(np.clip(y, 0, 1) * (1 - np.clip(y, 0, 1))
-                         / np.maximum(n, 1))
-            ax.plot(x[good] / 1e6, y[good], color=palette[i % len(palette)],
-                    lw=1.8, label=sname, zorder=3)
-            ax.fill_between(x[good] / 1e6, (y - 1.96 * se)[good],
-                            (y + 1.96 * se)[good],
-                            color=palette[i % len(palette)], alpha=0.16, lw=0)
+        colour_of, k = {}, 0
+        for sname, r in block["sets"].items():
+            base = sname.split(" (random")[0]
+            if base not in colour_of:
+                colour_of[base] = palette[k % len(palette)]
+                k += 1
+            x, y = r["offset"], r["density"]
+            good = np.isfinite(y)
+            is_ctrl = bool(r.get("control"))
+            ax.plot(x[good] / 1e6, y[good], color=colour_of[base],
+                    lw=1.2 if is_ctrl else 1.9,
+                    ls="--" if is_ctrl else "-",
+                    alpha=0.75 if is_ctrl else 1.0,
+                    label=sname, zorder=2 if is_ctrl else 3)
         ax.axvline(0, color="#374151", lw=1.0, ls="--", zorder=1)
         ax.axvspan(-near / 1e6, near / 1e6, color="#F0C808", alpha=0.10, lw=0,
                    zorder=0)
@@ -186,7 +249,7 @@ def profile_figure(results, path, title, near, step):
             ax.spines[sp].set_visible(False)
         ax.grid(axis="y", color="#EEF0F2", lw=0.7)
         ax.set_axisbelow(True)
-    axes[0][0].set_ylabel("share of bins in the set", fontsize=9)
+    axes[0][0].set_ylabel("fraction of the set's bins", fontsize=9)
     axes[0][-1].legend(frameon=False, fontsize=8, loc="upper left",
                        bbox_to_anchor=(1.02, 1.0))
     fig.suptitle(title, fontsize=11)
@@ -218,10 +281,11 @@ def main(argv=None) -> int:
                          "effect does not become a profile.")
     ap.add_argument("--bed", action="append", required=True,
                     metavar="LABEL=BED",
-                    help="A bin set to profile.  Repeatable; give the query "
-                         "AND a control (the stable bins), since a profile "
-                         "with no control cannot separate enrichment at the "
-                         "boundary from any set being non-uniform.")
+                    help="A bin set to profile.  Repeatable.  Each gets a "
+                         "size-matched random control drawn from the universe "
+                         "automatically; adding the stable bins as a second "
+                         "set is still worth it, since random bins share the "
+                         "universe's geometry but not its biology.")
     ap.add_argument("--boundary", action="append", required=True,
                     metavar="LABEL=BED",
                     help="A domain BED whose interval EDGES are the "
@@ -235,6 +299,18 @@ def main(argv=None) -> int:
                     help="Offset bin for the profile (250 kb).  Below the "
                          "bin size it only splits single bins across "
                          "neighbouring offsets.")
+    ap.add_argument("--n-random", type=int, default=200, metavar="N",
+                    help="Random size-matched draws averaged into the control "
+                         "(200).  One draw is an arbitrary sample; the mean "
+                         "over many is the expectation a set of that size "
+                         "would show if it ignored the boundaries.")
+    ap.add_argument("--keep-crowded", action="store_true",
+                    help="Profile every domain edge, including those whose "
+                         "window contains another domain.  Off by default: a "
+                         "domain narrower than twice the flank puts its far "
+                         "edge inside its near edge's window, so bins deep "
+                         "inside one boundary are just outside the next and "
+                         "the two cancel to a flat line.")
     ap.add_argument("--near", type=int, default=500_000,
                     help="|distance| under this counts as AT the boundary for "
                          "the Fisher test (500 kb).  Domains are megabases "
@@ -247,11 +323,11 @@ def main(argv=None) -> int:
     uni = read_bed(args.universe)
     sets = _named(args.bed, "--bed")
     bounds = _named(args.boundary, "--boundary")
-    if len(sets) < 2:
-        print("  NOTE only one --bed given.  Without a control set a profile "
-              "cannot distinguish enrichment at the boundary from the set "
-              "being non-uniform for any other reason; the stable bins are "
-              "the natural control.", file=sys.stderr)
+    # Every set gets a size-matched random control automatically, so one
+    # --bed is a complete analysis.  A second real set (the stable bins) is
+    # still worth giving: random bins share the universe's geometry but not
+    # its biology, and a real set that behaves like the random one is a
+    # stronger statement than random alone.
 
     key = uni.chrom.astype(str) + ":" + uni.start.astype(str)
     membership = {}
@@ -272,15 +348,32 @@ def main(argv=None) -> int:
 
     results, rows = {}, []
     for bname, bpath in bounds.items():
-        dom = read_bed(bpath, merge=True)
+        dom_all = read_bed(bpath, merge=True)
+        dom = (dom_all if args.keep_crowded
+               else isolated_boundaries(dom_all, args.flank))
+        if not len(dom):
+            print(f"  {bname}: no domain is {args.flank / 1e6:g} Mb wide with "
+                  f"{args.flank / 1e6:g} Mb of clear space either side, so no "
+                  f"boundary has a window of its own.  Lower --flank, or pass "
+                  f"--keep-crowded to profile every edge and accept that "
+                  f"neighbouring domains fall inside the window.",
+                  file=sys.stderr)
+            continue
         dist = signed_distance(uni, dom)
         n_ok = int(np.isfinite(dist).sum())
-        print(f"  {bname}: {len(dom):,} domains, {n_ok:,} bins placed")
+        print(f"  {bname}: {len(dom):,} of {len(dom_all):,} domains isolated "
+              f"at +/-{args.flank / 1e6:g} Mb, {n_ok:,} bins placed")
+        _, centres = offset_edges(args.flank, args.step)
         block = {"sets": {}}
         for sname, in_set in membership.items():
-            x, dens, n_at = profile(dist, in_set, universe_mask, args.flank,
-                                    args.step)
-            block["sets"][sname] = {"offset": x, "density": dens, "n": n_at}
+            n_at, freq = profile(dist, in_set, args.flank, args.step)
+            block["sets"][sname] = {"offset": centres, "density": freq,
+                                    "n": n_at}
+            ctrl = random_profile(dist, universe_mask, int(in_set.sum()),
+                                  args.n_random, args.flank, args.step)
+            block["sets"][f"{sname} (random, n matched)"] = {
+                "offset": centres, "density": ctrl,
+                "n": np.zeros(centres.shape, int), "control": True}
             st = edge_test(dist, in_set, universe_mask, args.near)
             share = (st["n_near_in_set"] + st["n_near_out"]) / max(
                 st["n_near_in_set"] + st["n_near_out"]

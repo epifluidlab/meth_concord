@@ -100,27 +100,91 @@ def test_a_contig_without_domains_gets_nan():
 
 # ------------------------------------------------------------- profile ----
 
-def test_the_profile_is_a_share_of_the_universe_not_a_count():
-    """Counting would draw the distribution of domain lengths, which appears
-    identically in every set and reads as biology."""
+def test_the_profile_is_the_sets_own_frequency_over_offsets():
+    """Not the share of bins at an offset that belong to the set: that
+    saturates at 1 wherever the set covers everything nearby, so a large set
+    draws a line along the top and its shape reports set size, not position.
+    A frequency sums to one for any set, putting sets of different sizes on
+    one axis."""
     m = _mod()
     dist = np.array([-300.0, -100.0, 100.0, 300.0, 100.0, 300.0])
     in_set = np.array([True, True, False, True, False, False])
-    uni = np.ones(6, bool)
-    x, dens, n = m.profile(dist, in_set, uni, flank=400, step=200)
-    assert list(x) == [-300.0, -100.0, 100.0, 300.0]
-    assert dens[1] == pytest.approx(1.0)      # one bin, in the set
-    assert dens[2] == pytest.approx(0.0)      # two bins, neither in the set
-    assert dens[3] == pytest.approx(0.5)      # two bins, one in the set
-    assert list(n) == [1, 1, 2, 2]
+    n, freq = m.profile(dist, in_set, flank=400, step=200)
+    assert list(n) == [1, 1, 0, 1]
+    assert freq.sum() == pytest.approx(1.0)
+    np.testing.assert_allclose(freq, [1 / 3, 1 / 3, 0.0, 1 / 3])
 
 
-def test_offsets_with_no_bins_are_nan_not_zero():
-    """Zero would draw a gap as a real absence of the set."""
+def test_a_frequency_never_exceeds_one_or_goes_negative():
+    """The old share could reach 1, and its normal-approximation band went
+    below zero -- a proportion drawn outside [0, 1]."""
     m = _mod()
-    dist = np.array([100.0])
-    x, dens, n = m.profile(dist, np.array([True]), np.ones(1, bool), 400, 200)
-    assert n[0] == 0 and np.isnan(dens[0])
+    rng = np.random.default_rng(0)
+    dist = rng.uniform(-5e6, 5e6, 2000)
+    in_set = rng.random(2000) < 0.6
+    _, freq = m.profile(dist, in_set, flank=5_000_000, step=250_000)
+    assert np.nanmin(freq) >= 0.0
+    assert np.nanmax(freq) <= 1.0
+    assert freq.sum() == pytest.approx(1.0)
+
+
+def test_an_empty_set_gives_nan_not_a_divide_by_zero():
+    m = _mod()
+    n, freq = m.profile(np.array([1.0, 2.0]), np.array([False, False]),
+                        flank=400, step=200)
+    assert n.sum() == 0
+    assert np.isnan(freq).all()
+
+
+def test_the_random_control_is_size_matched_and_flat():
+    """Any set inherits the shape of where the universe sits relative to the
+    boundaries; without that drawn beside it, the universe's geometry reads
+    as the set's biology."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    dist = rng.uniform(-5e6, 5e6, 4000)
+    ctrl = m.random_profile(dist, np.ones(4000, bool), n_draw=400, n_rep=60,
+                            flank=5_000_000, step=1_000_000)
+    assert ctrl.sum() == pytest.approx(1.0)
+    # ten offset bins over a uniform distance -> a tenth each
+    assert np.allclose(ctrl, 0.1, atol=0.02)
+
+
+def test_the_random_control_follows_a_lopsided_universe():
+    """The null is where the universe's bins are, not a flat line."""
+    m = _mod()
+    dist = np.concatenate([np.full(900, -400.0), np.full(100, 400.0)])
+    ctrl = m.random_profile(dist, np.ones(1000, bool), n_draw=200, n_rep=80,
+                            flank=600, step=600)
+    assert ctrl[0] == pytest.approx(0.9, abs=0.04)
+
+
+# ------------------------------------------------------------- isolation ---
+
+def test_only_boundaries_with_a_clear_window_are_kept():
+    """A domain narrower than twice the flank puts its far edge inside its
+    near edge's window, so bins deep inside one boundary are just outside the
+    next and the two cancel."""
+    m = _mod()
+    dom = pd.DataFrame({"chrom": ["chr1"] * 3,
+                        "start": [0, 3_000_000, 30_000_000],
+                        "end": [1_000_000, 4_000_000, 40_000_000]})
+    got = m.isolated_boundaries(dom, flank=5_000_000)
+    assert list(got.start) == [30_000_000]
+
+
+def test_a_wide_domain_with_a_close_neighbour_is_dropped():
+    m = _mod()
+    dom = pd.DataFrame({"chrom": ["chr1"] * 2,
+                        "start": [0, 11_000_000],
+                        "end": [10_000_000, 21_000_000]})
+    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 0
+
+
+def test_a_lone_wide_domain_survives():
+    m = _mod()
+    dom = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [20_000_000]})
+    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 1
 
 
 # ---------------------------------------------------------------- test ----
