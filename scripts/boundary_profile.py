@@ -315,10 +315,10 @@ def main(argv=None) -> int:
                     help="A domain BED whose interval EDGES are the "
                          "boundaries.  Repeatable, one panel each.")
     ap.add_argument("--flank", type=int, default=5_000_000,
-                    help="Half-width of the profile (5 Mb).  At a 250 kb bin "
-                         "this is 20 bins each way; a flank of tens of Mb "
-                         "spans whole chromosome arms and is flat by "
-                         "construction.")
+                    help="Half-width of the FIGURE (5 Mb): the x axis runs "
+                         "from -flank to +flank.  At a 250 kb bin that is 20 "
+                         "bins each way; a flank of tens of Mb spans whole "
+                         "chromosome arms and is flat by construction.")
     ap.add_argument("--step", type=int, default=250_000,
                     help="Offset bin for the profile (250 kb).  Below the "
                          "bin size it only splits single bins across "
@@ -340,11 +340,12 @@ def main(argv=None) -> int:
                          "inside one boundary are just outside the next and "
                          "the two cancel to a flat line.")
     ap.add_argument("--near", type=int, default=500_000,
-                    help="|distance| under this counts as AT the boundary for "
-                         "the Fisher test (500 kb).  Domains are megabases "
-                         "wide, so a generous 'near' takes in much of the "
-                         "genome and the near-vs-far contrast stops meaning "
-                         "much; the run reports what share it captured.")
+                    help="ONLY for the Fisher test in the table, never for "
+                         "the plot: offsets with |distance| < this count as "
+                         "AT the boundary and the rest as away from it "
+                         "(500 kb).  --flank sets what the figure spans; "
+                         "--near sets where the summary statistic draws its "
+                         "line inside that span.")
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args(argv)
 
@@ -380,6 +381,21 @@ def main(argv=None) -> int:
         print(f"  {name}: {len(b):,} intervals")
         if not len(b):
             sys.exit(f"--bed {name}: no intervals")
+    # A set covering most of the genome pins the curve near its own coverage
+    # at every offset: each offset window is about one bin, so the share of
+    # boundaries occupied IS the coverage fraction, and a set at 60% can rise
+    # at most 0.4 anywhere.  That is a property of the set, not of the
+    # boundaries, and no profile recovers structure from it.
+    span = sum((b.end - b.start).sum() for b in bed_of.values())
+    for name, b in bed_of.items():
+        frac = float((b.end - b.start).sum()) / max(span, 1)
+        if len(bed_of) > 1 and frac > 0.45 and len(b) > 1000:
+            print(f"  NOTE {name} is large.  The share of boundaries occupied "
+                  f"equals the set's genome coverage at every offset, so a "
+                  f"set covering much of the genome sits flat near that value "
+                  f"with little room to rise.  A profile is informative when "
+                  f"the set is a small minority of bins.", file=sys.stderr)
+            break
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)

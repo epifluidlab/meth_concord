@@ -134,3 +134,35 @@ def test_write_bed_emits_three_columns_and_counts(tmp_path):
     got = pd.read_csv(tmp_path / "x.bed", sep="\t", header=None)
     assert got.shape == (2, 3)
     assert list(got[1]) == [0, 500000]
+
+
+def test_the_lad_beds_hold_domains_not_the_bins_they_are_made_of(tmp_path):
+    """A file called cLAD.bed should contain cLADs.  Written per bin, every
+    consumer has to know to merge -- bedtools, IGV and anything counting
+    domains take each row at face value, and a boundary analysis then sees a
+    boundary at every bin edge inside a domain."""
+    m = _mod()
+    bins = pd.DataFrame({"chrom": ["chr1"] * 6,
+                         "start": np.arange(6) * 250_000,
+                         "end": (np.arange(6) + 1) * 250_000})
+    mask = np.array([True, True, True, False, True, False])
+    n = m.write_bed(bins, mask, tmp_path / "x.bed")
+    assert n == 4, "the reported count is still bins"
+    got = pd.read_csv(tmp_path / "x.bed", sep="\t", header=None,
+                      names=["chrom", "start", "end"])
+    assert len(got) == 2, "three contiguous bins are one domain"
+    assert list(got.start) == [0, 1_000_000]
+    assert list(got.end) == [750_000, 1_250_000]
+
+
+def test_merge_bins_does_not_join_across_chromosomes():
+    m = _mod()
+    f = pd.DataFrame({"chrom": ["chr1", "chr2"], "start": [250_000, 0],
+                      "end": [500_000, 250_000]})
+    assert len(m.merge_bins(f)) == 2
+
+
+def test_merge_bins_on_an_empty_frame_is_empty():
+    m = _mod()
+    empty = pd.DataFrame(columns=["chrom", "start", "end"])
+    assert len(m.merge_bins(empty)) == 0

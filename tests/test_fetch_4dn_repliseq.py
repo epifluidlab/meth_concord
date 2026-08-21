@@ -321,3 +321,16 @@ def test_the_consensus_sign_splits_early_from_late():
     cons = m.consensus_timing(frames)
     early = cons.value > 0
     assert list(early) == [True, True, False, False]
+
+
+def test_the_consensus_beds_hold_domains(tmp_path):
+    """Same reason as the LAD files: RT_consensus_early.bed should hold the
+    early domains, not the 250 kb pieces of them."""
+    m = _mod()
+    f = pd.DataFrame({"chrom": ["chr1"] * 5,
+                      "start": [0, 250_000, 500_000, 1_000_000, 1_250_000],
+                      "end": [250_000, 500_000, 750_000, 1_250_000,
+                              1_500_000]})
+    got = m.merge_bins(f)
+    assert len(got) == 2
+    assert list(got.end) == [750_000, 1_500_000]

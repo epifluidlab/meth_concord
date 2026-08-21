@@ -143,6 +143,33 @@ def timing(early_paths, late_paths, grid_bp, chroms=None, min_total=1e-6):
     return out, int((~ok).sum())
 
 
+def merge_bins(frame):
+    """Contiguous bins -> the domains they compose.
+
+    These BEDs are built by selecting bins, so without this a file called
+    cLAD.bed holds the 250 kb pieces of a cLAD rather than the cLAD.  Every
+    consumer then has to know to merge -- bedtools, IGV and a reader counting
+    "how many domains" all take each row at face value, and a boundary
+    analysis sees a boundary at every bin edge inside a domain.
+    """
+    if not len(frame):
+        return frame
+    out = []
+    for chrom, g in frame.groupby("chrom", sort=False):
+        g = g.sort_values("start")
+        cur = None
+        for s, e in zip(g.start.to_numpy(), g.end.to_numpy()):
+            if cur is not None and s <= cur[1]:
+                cur[1] = max(cur[1], e)
+            else:
+                if cur is not None:
+                    out.append((chrom, *cur))
+                cur = [s, e]
+        if cur is not None:
+            out.append((chrom, *cur))
+    return pd.DataFrame(out, columns=["chrom", "start", "end"])
+
+
 def consensus_timing(frames):
     """Mean log2(early/late) across cell types, on their shared bins.
 
@@ -343,9 +370,9 @@ def main(argv=None) -> int:
                     "RT_constitutive_late"):
             sel = part[part["class"] == cls]
             path = out / f"{cls}.bed"
-            sel[["chrom", "start", "end"]].sort_values(
-                ["chrom", "start"]).to_csv(path, sep="\t", index=False,
-                                           header=False)
+            merge_bins(sel[["chrom", "start", "end"]].sort_values(
+                ["chrom", "start"])).to_csv(path, sep="\t", index=False,
+                                            header=False)
             manifest[cls] = path
         total = len(part)
         logger.info("partition over %d cell types (%d bins classified, "
@@ -371,11 +398,11 @@ def main(argv=None) -> int:
             for cls, sel in (("RT_consensus_early", cons.value > 0),
                              ("RT_consensus_late", cons.value < 0)):
                 pth = out / f"{cls}.bed"
-                cons.loc[sel, ["chrom", "start", "end"]].to_csv(
-                    pth, sep="\t", index=False, header=False)
+                dom = merge_bins(cons.loc[sel, ["chrom", "start", "end"]])
+                dom.to_csv(pth, sep="\t", index=False, header=False)
                 manifest[cls] = pth
-                logger.info("  %-22s %6d bins (%4.1f%%)  -> %s", cls,
-                            int(sel.sum()),
+                logger.info("  %-22s %6d bins in %d domains (%4.1f%%)  -> %s",
+                            cls, int(sel.sum()), len(dom),
                             100 * float(sel.mean()), pth.name)
             logger.info("  consensus track -> %s.  The EDGES of "
                         "RT_consensus_early.bed are the early/late boundary "

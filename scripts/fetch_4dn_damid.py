@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _4dn import cell_name, download, search  # noqa: E402
@@ -133,9 +134,38 @@ def lad_partition(calls):
     return constitutive, union & ~constitutive, hits == 0
 
 
+def merge_bins(frame):
+    """Contiguous bins -> the domains they compose.
+
+    These BEDs are built by selecting bins, so without this a file called
+    cLAD.bed holds the 250 kb pieces of a cLAD rather than the cLAD.  Every
+    consumer then has to know to merge -- bedtools, IGV and a reader counting
+    "how many domains" all take each row at face value, and a boundary
+    analysis sees a boundary at every bin edge inside a domain.
+    """
+    if not len(frame):
+        return frame
+    out = []
+    for chrom, g in frame.groupby("chrom", sort=False):
+        g = g.sort_values("start")
+        cur = None
+        for s, e in zip(g.start.to_numpy(), g.end.to_numpy()):
+            if cur is not None and s <= cur[1]:
+                cur[1] = max(cur[1], e)
+            else:
+                if cur is not None:
+                    out.append((chrom, *cur))
+                cur = [s, e]
+        if cur is not None:
+            out.append((chrom, *cur))
+    return pd.DataFrame(out, columns=["chrom", "start", "end"])
+
+
 def write_bed(bins, mask, path):
-    bins.loc[np.asarray(mask, bool), ["chrom", "start", "end"]].to_csv(
-        path, sep="\t", index=False, header=False)
+    """Selected bins, merged into the domains they compose."""
+    sel = bins.loc[np.asarray(mask, bool), ["chrom", "start", "end"]]
+    dom = merge_bins(sel.sort_values(["chrom", "start"]))
+    dom.to_csv(path, sep="\t", index=False, header=False)
     return int(np.sum(mask))
 
 
