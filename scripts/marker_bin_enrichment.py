@@ -834,7 +834,10 @@ def _dotplot(df, x, size, color, labels, path, title, xlabel,
     d = d.sort_values(color).head(top).sort_values(x, ascending=ascending)
     y = np.arange(len(d))
     area = d[size].to_numpy(float)
-    area = 40 + 260 * ((area - area.min()) / (area.ptp() or 1))
+    # np.ptp, not ndarray.ptp: the method was removed in NumPy 2.0, and this
+    # module is otherwise version-agnostic.
+    span = float(np.ptp(area)) if area.size else 0.0
+    area = 40 + 260 * ((area - area.min()) / (span or 1.0))
 
     fig, ax = plt.subplots(figsize=(8.6, max(3.0, 0.34 * len(d) + 1.8)))
     sc = ax.scatter(d[x], y, s=area, c=d[color], cmap="plasma_r",
