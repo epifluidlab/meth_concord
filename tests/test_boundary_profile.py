@@ -210,3 +210,67 @@ def test_a_uniform_set_gives_an_odds_ratio_near_one():
     st = m.edge_test(dist, in_set, np.ones(4000, bool), near=1e6)
     assert 0.7 < st["odds_ratio"] < 1.4
     assert st["pvalue"] > 0.01
+
+
+# ------------------------------------------------- isolation vs width ------
+
+def test_a_narrow_domain_far_from_its_neighbours_is_kept():
+    """The point is keeping a NEIGHBOUR out of the window.  A domain's own
+    far edge is a different matter: a narrow isolated domain shows as a bump
+    of its own width, which is readable rather than confounding."""
+    m = _mod()
+    dom = pd.DataFrame({"chrom": ["chr1"] * 2,
+                        "start": [0, 20_000_000],
+                        "end": [1_000_000, 21_000_000]})
+    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 2
+
+
+def test_min_domain_width_restores_the_stricter_reading():
+    m = _mod()
+    dom = pd.DataFrame({"chrom": ["chr1"] * 2,
+                        "start": [0, 20_000_000],
+                        "end": [1_000_000, 21_000_000]})
+    got = m.isolated_boundaries(dom, flank=5_000_000,
+                                min_width=5_000_000)
+    assert len(got) == 0
+
+
+def test_a_close_neighbour_still_disqualifies_both():
+    m = _mod()
+    dom = pd.DataFrame({"chrom": ["chr1"] * 2,
+                        "start": [0, 2_000_000],
+                        "end": [1_000_000, 3_000_000]})
+    assert len(m.isolated_boundaries(dom, flank=5_000_000)) == 0
+
+
+# --------------------------------------------------------- two-set test ---
+
+def test_the_two_set_test_compares_query_with_control():
+    """The claim the figure makes is that the query concentrates at
+    boundaries MORE than its control -- not that it differs from everything
+    it is not."""
+    m = _mod()
+    q = np.concatenate([np.full(30, 100.0), np.full(70, 5e6)])
+    c = np.concatenate([np.full(10, 100.0), np.full(90, 5e6)])
+    st = m.two_set_test(q, c, near=500_000)
+    assert (st["n_near_in_set"], st["n_far_in_set"]) == (30, 70)
+    assert (st["n_near_control"], st["n_far_control"]) == (10, 90)
+    assert st["frac_near"] == pytest.approx(0.30)
+    assert st["frac_near_control"] == pytest.approx(0.10)
+    assert st["odds_ratio"] > 1 and st["pvalue"] < 0.01
+
+
+def test_two_identical_sets_give_an_odds_ratio_of_one():
+    m = _mod()
+    x = np.concatenate([np.full(20, 100.0), np.full(80, 5e6)])
+    st = m.two_set_test(x, x.copy(), near=500_000)
+    assert st["odds_ratio"] == pytest.approx(1.0)
+    assert st["pvalue"] > 0.5
+
+
+def test_the_two_set_test_ignores_nan_distances():
+    m = _mod()
+    q = np.array([100.0, np.nan, 5e6])
+    c = np.array([5e6, 5e6])
+    st = m.two_set_test(q, c, near=500_000)
+    assert st["n_near_in_set"] + st["n_far_in_set"] == 2

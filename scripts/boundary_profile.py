@@ -73,33 +73,35 @@ def read_bed(path, merge=False):
     return pd.DataFrame(out, columns=["chrom", "start", "end"])
 
 
-def isolated_boundaries(domains, flank):
-    """Domain edges with no OTHER edge within +/- flank -> a filtered frame.
+def isolated_boundaries(domains, flank, min_width=0):
+    """Domains with no OTHER domain within +/- flank -> a filtered frame.
 
-    Without this the profile is a mixture.  A domain narrower than 2*flank
-    puts its far edge inside its near edge's window, so bins counted as "deep
-    inside" one boundary are "just outside" the next, and the two signals
-    cancel to a flat line no matter what is really there.  It is why a wide
-    flank over megabase domains produces noise rather than a shape.
+    The point is to keep a NEIGHBOUR out of the window.  Two domains 1 Mb
+    apart profiled with a 5 Mb flank put each other's edges inside each
+    other's windows, so a bin deep inside one is just outside the next and
+    the two signals cancel to a flat line whatever is really there.
 
-    An edge survives only if the domain it belongs to is at least flank long
-    AND the gap to the neighbouring domain is at least flank, so its whole
-    window belongs to it alone.
+    A domain's OWN far edge is a different matter and is not excluded by
+    default.  A narrow isolated domain is a real object -- it simply appears
+    in the profile as a bump of its own width, which is readable rather than
+    confounding.  --min-domain-width brings back the stricter reading, where
+    every window is one edge against open ground.
     """
     keep = []
-    for chrom, g in domains.groupby("chrom", sort=False):
+    for _, g in domains.groupby("chrom", sort=False):
         g = g.sort_values("start").reset_index(drop=True)
-        widths = (g.end - g.start).to_numpy(float)
         gap_before = np.full(len(g), np.inf)
         gap_after = np.full(len(g), np.inf)
         if len(g) > 1:
-            gap_before[1:] = g.start.to_numpy()[1:] - g.end.to_numpy()[:-1]
-            gap_after[:-1] = g.start.to_numpy()[1:] - g.end.to_numpy()[:-1]
-        ok = ((widths >= flank) & (gap_before >= flank) & (gap_after >= flank))
+            gaps = g.start.to_numpy(float)[1:] - g.end.to_numpy(float)[:-1]
+            gap_before[1:] = gaps
+            gap_after[:-1] = gaps
+        ok = (gap_before >= flank) & (gap_after >= flank)
+        if min_width:
+            ok &= (g.end - g.start).to_numpy(float) >= min_width
         keep.append(g[ok])
-    out = (pd.concat(keep, ignore_index=True) if keep
-           else domains.iloc[:0].copy())
-    return out
+    return (pd.concat(keep, ignore_index=True) if keep
+            else domains.iloc[:0].copy())
 
 
 def signed_distance(bins, domains):
@@ -185,13 +187,41 @@ def random_profile(dist, universe_mask, n_draw, n_rep, flank, step, seed=0):
     return acc / n_rep
 
 
+def two_set_test(dist_a, dist_b, near):
+    """Fisher on (near the boundary) x (which set), for two bin sets.
+
+    The right test when a matched control is supplied: it asks directly
+    whether the query concentrates at boundaries MORE than the control does,
+    which is the claim the figure makes.  Testing a set against the rest of
+    the universe answers a different question -- whether the set differs from
+    everything it was not -- and a matched control is a sharper comparator
+    than "everything else".
+    """
+    from scipy.stats import fisher_exact
+
+    da = np.asarray(dist_a, float)
+    db = np.asarray(dist_b, float)
+    da, db = da[np.isfinite(da)], db[np.isfinite(db)]
+    a = int(np.sum(np.abs(da) < near))
+    b = int(da.size - a)
+    c = int(np.sum(np.abs(db) < near))
+    d = int(db.size - c)
+    try:
+        orr, p = fisher_exact([[a, b], [c, d]])
+    except Exception:
+        orr, p = np.nan, np.nan
+    return {"n_near_in_set": a, "n_far_in_set": b,
+            "n_near_control": c, "n_far_control": d,
+            "frac_near": a / max(a + b, 1),
+            "frac_near_control": c / max(c + d, 1),
+            "odds_ratio": float(orr), "pvalue": float(p)}
+
+
 def edge_test(dist, in_set, universe_mask, near):
     """Fisher on (near the boundary) x (in the set), against the far bins.
 
-    The profile shows a shape; this says whether the shape is bigger than
-    counting noise.  Near means |distance| < near, on either side, because a
-    boundary effect is about proximity to the edge rather than which side of
-    it a bin sits on.
+    Used when a universe is given and no control set is: it compares the set
+    with everything it is not, within the universe.
     """
     from scipy.stats import fisher_exact
 
@@ -274,11 +304,19 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--universe", required=True, metavar="BED",
-                    help="Every bin that could have been selected -- normally "
-                         "bin_scores_<ctx>.all.bed.  The density at each "
-                         "offset is a share of THIS, so a domain-length "
-                         "effect does not become a profile.")
+    ap.add_argument("--universe", default=None, metavar="BED",
+                    help="Every bin that could have been selected -- "
+                         "normally bin_scores_<ctx>.all.bed.  Needed only to "
+                         "DRAW a random control and to test a set against "
+                         "everything it is not.  Omit it when you supply your "
+                         "own matched control with --control: the profile "
+                         "itself is computed from each set's own bins.")
+    ap.add_argument("--control", default=None, metavar="LABEL",
+                    help="Which --bed is the control.  The comparison then "
+                         "becomes query-vs-control, which is the claim the "
+                         "figure makes; without it a set is tested against "
+                         "the rest of the universe, a different and blunter "
+                         "question.")
     ap.add_argument("--bed", action="append", required=True,
                     metavar="LABEL=BED",
                     help="A bin set to profile.  Repeatable.  Each gets a "
@@ -304,6 +342,13 @@ def main(argv=None) -> int:
                          "(200).  One draw is an arbitrary sample; the mean "
                          "over many is the expectation a set of that size "
                          "would show if it ignored the boundaries.")
+    ap.add_argument("--min-domain-width", type=int, default=0, metavar="BP",
+                    help="Also require each domain to be at least this wide "
+                         "(0: no requirement).  Off by default because a "
+                         "narrow ISOLATED domain is a real object -- it shows "
+                         "as a bump of its own width, which is readable.  Set "
+                         "it to --flank when every window must be one edge "
+                         "against open ground.")
     ap.add_argument("--keep-crowded", action="store_true",
                     help="Profile every domain edge, including those whose "
                          "window contains another domain.  Off by default: a "
@@ -320,8 +365,24 @@ def main(argv=None) -> int:
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args(argv)
 
-    uni = read_bed(args.universe)
     sets = _named(args.bed, "--bed")
+    if args.universe:
+        uni = read_bed(args.universe)
+    else:
+        # No universe: the profile only needs each set's own bins, so the
+        # working grid is their union.  Every automatic control and the
+        # against-everything-else test are unavailable and are skipped rather
+        # than faked from a grid that is not a universe.
+        uni = (pd.concat([read_bed(v) for v in sets.values()],
+                         ignore_index=True)
+               .drop_duplicates(subset=["chrom", "start"])
+               .sort_values(["chrom", "start"]).reset_index(drop=True))
+        print(f"  no --universe: profiling on the union of the given sets "
+              f"({len(uni):,} bins).  No random control is drawn and no "
+              f"test against the rest of the genome is run.", file=sys.stderr)
+    if args.control and args.control not in sets:
+        sys.exit(f"--control {args.control!r} is not one of the --bed labels "
+                 f"({sorted(sets)})")
     bounds = _named(args.boundary, "--boundary")
     # Every set gets a size-matched random control automatically, so one
     # --bed is a complete analysis.  A second real set (the stable bins) is
@@ -335,12 +396,14 @@ def main(argv=None) -> int:
         b = read_bed(path)
         k = set(b.chrom.astype(str) + ":" + b.start.astype(str))
         membership[name] = key.isin(k).to_numpy()
+        where = "universe bins" if args.universe else "bins in the union"
         print(f"  {name}: {int(membership[name].sum()):,} of "
-              f"{len(uni):,} universe bins")
+              f"{len(uni):,} {where}")
         if not membership[name].any():
-            sys.exit(f"--bed {name}: no bin matches the universe.  Both must "
-                     f"be on the same grid -- the subset BEDs written beside "
-                     f"bin_scores_<ctx>.all.bed are.")
+            sys.exit(f"--bed {name}: not one of its bins matches the "
+                     f"{'universe' if args.universe else 'other sets'}.  They "
+                     f"must share a bin grid -- the subset BEDs written "
+                     f"beside bin_scores_<ctx>.all.bed do.")
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -350,14 +413,16 @@ def main(argv=None) -> int:
     for bname, bpath in bounds.items():
         dom_all = read_bed(bpath, merge=True)
         dom = (dom_all if args.keep_crowded
-               else isolated_boundaries(dom_all, args.flank))
+               else isolated_boundaries(dom_all, args.flank,
+                                        args.min_domain_width))
         if not len(dom):
-            print(f"  {bname}: no domain is {args.flank / 1e6:g} Mb wide with "
-                  f"{args.flank / 1e6:g} Mb of clear space either side, so no "
-                  f"boundary has a window of its own.  Lower --flank, or pass "
-                  f"--keep-crowded to profile every edge and accept that "
-                  f"neighbouring domains fall inside the window.",
-                  file=sys.stderr)
+            print(f"  {bname}: no domain has {args.flank / 1e6:g} Mb of "
+                  f"clear space on both sides"
+                  + (f" and is {args.min_domain_width / 1e6:g} Mb wide"
+                     if args.min_domain_width else "")
+                  + ".  Lower --flank, or pass --keep-crowded to profile "
+                    "every edge and accept that neighbouring domains fall "
+                    "inside the window.", file=sys.stderr)
             continue
         dist = signed_distance(uni, dom)
         n_ok = int(np.isfinite(dist).sum())
@@ -369,11 +434,27 @@ def main(argv=None) -> int:
             n_at, freq = profile(dist, in_set, args.flank, args.step)
             block["sets"][sname] = {"offset": centres, "density": freq,
                                     "n": n_at}
-            ctrl = random_profile(dist, universe_mask, int(in_set.sum()),
-                                  args.n_random, args.flank, args.step)
-            block["sets"][f"{sname} (random, n matched)"] = {
-                "offset": centres, "density": ctrl,
-                "n": np.zeros(centres.shape, int), "control": True}
+            if args.universe and args.n_random > 0 and not args.control:
+                ctrl = random_profile(dist, universe_mask, int(in_set.sum()),
+                                      args.n_random, args.flank, args.step)
+                block["sets"][f"{sname} (random, n matched)"] = {
+                    "offset": centres, "density": ctrl,
+                    "n": np.zeros(centres.shape, int), "control": True}
+            if args.control:
+                if sname == args.control:
+                    continue
+                st = two_set_test(dist[in_set],
+                                  dist[membership[args.control]], args.near)
+                st.update({"boundary": bname, "set": sname,
+                           "control": args.control})
+                rows.append(st)
+                print(f"    {sname:>16}: {st['frac_near']:.3f} within "
+                      f"{args.near / 1e6:g} Mb vs {st['frac_near_control']:.3f}"
+                      f" for {args.control}, OR {st['odds_ratio']:.2f}, "
+                      f"p {st['pvalue']:.2g}")
+                continue
+            if not args.universe:
+                continue
             st = edge_test(dist, in_set, universe_mask, args.near)
             share = (st["n_near_in_set"] + st["n_near_out"]) / max(
                 st["n_near_in_set"] + st["n_near_out"]
@@ -389,11 +470,11 @@ def main(argv=None) -> int:
                   f"   [near = {share:.0%} of bins]{note}")
         results[bname] = block
 
-    tab = pd.DataFrame(rows)[
-        ["boundary", "set", "n_near_in_set", "n_near_out", "n_far_in_set",
-         "n_far_out", "frac_near", "frac_far", "frac_of_genome_near",
-         "odds_ratio", "pvalue"]]
-    tab.to_csv(out / "boundary_enrichment.tsv", sep="\t", index=False)
+    if rows:
+        tab = pd.DataFrame(rows)
+        lead = [c for c in ("boundary", "set", "control") if c in tab.columns]
+        tab = tab[lead + [c for c in tab.columns if c not in lead]]
+        tab.to_csv(out / "boundary_enrichment.tsv", sep="\t", index=False)
 
     long = []
     for bname, block in results.items():
