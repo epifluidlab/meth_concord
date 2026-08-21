@@ -997,3 +997,59 @@ def test_chromatin_states_use_mann_whitney_by_default():
     assert fisher["n_fg_in"].iloc[0] == 0, "majority overlap sees nothing"
     assert np.isfinite(mwu["mean_frac_fg"].iloc[0])
     assert mwu["mean_frac_fg"].iloc[0] > 0
+
+
+# ------------------------------------------------------- audit: coverage ---
+
+def test_coverage_is_the_same_whether_the_annotation_is_merged():
+    """The domain BEDs were written per 250 kb bin and are now merged.
+    Coverage measures the union either way, so no enrichment number changes
+    -- worth pinning, since the alternative would have invalidated results
+    already computed."""
+    m = _mod()
+    bins = _bins([("chr1", i * 250_000, (i + 1) * 250_000) for i in range(8)])
+    per_bin = _bins([("chr1", 0, 250_000), ("chr1", 250_000, 500_000),
+                     ("chr1", 500_000, 750_000)])
+    merged = _bins([("chr1", 0, 750_000)])
+    np.testing.assert_allclose(m._coverage(bins, per_bin),
+                               m._coverage(bins, merged))
+
+
+def test_overlapping_annotation_intervals_do_not_double_count():
+    m = _mod()
+    bins = _bins([("chr1", 0, 250_000)])
+    overlap = _bins([("chr1", 0, 200_000), ("chr1", 100_000, 250_000)])
+    assert m._coverage(bins, overlap)[0] == pytest.approx(1.0)
+
+
+def test_coverage_is_bounded_and_zero_off_contig():
+    m = _mod()
+    bins = _bins([("chr1", 0, 100), ("chr9", 0, 100)])
+    ann = _bins([("chr1", 0, 100)])
+    got = m._coverage(bins, ann)
+    assert got[0] == pytest.approx(1.0) and got[1] == pytest.approx(0.0)
+    assert (got >= 0).all() and (got <= 1).all()
+
+
+def test_a_partitioning_annotation_is_flagged(tmp_path, capsys):
+    """Read whole, a file that tiles the genome IS the genome: its coverage
+    is 1 in every bin, so the enrichment row looks measured and says
+    nothing."""
+    m = _mod()
+    p = tmp_path / "pmd.bed"
+    pd.DataFrame([("chr1", i * 100_000, (i + 1) * 100_000, 0.5,
+                   "PMD" if i % 2 else "HMD", "x") for i in range(200)]
+                 ).to_csv(p, sep="\t", index=False, header=False)
+    m._warn_if_partition(str(p), None)
+    err = capsys.readouterr().err
+    assert "class column" in err and "PMD" in err
+
+
+def test_a_scored_bed6_is_not_flagged(tmp_path, capsys):
+    m = _mod()
+    p = tmp_path / "scored.bed"
+    pd.DataFrame([("chr1", i * 100, (i + 1) * 100, i * 0.37, ".", "+")
+                  for i in range(50)]).to_csv(p, sep="\t", index=False,
+                                              header=False)
+    m._warn_if_partition(str(p), None)
+    assert "class column" not in capsys.readouterr().err

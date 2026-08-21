@@ -178,6 +178,40 @@ def _split_with_background(fg_path: str, bg_path: str, name: str):
     return bins, fg, f"--background-bed ({len(fg_df):,} fg / {len(bg_df):,} bg)"
 
 
+def _warn_if_partition(path, df):
+    """A BED whose extra column repeats a few labels partitions the genome.
+
+    The Zhou PMD file tiles every chromosome in 100 kb blocks marked
+    PMD / HMD / NA.  Read whole it covers every bin, so an annotation named
+    "PMD" is really "the genome" and its coverage enrichment comes out at 1
+    against a background of 1 -- a row that looks measured and says nothing.
+    --genome routes that file through the class-splitting reader; a manifest
+    entry or --annotation pointing straight at it does not, so it is worth
+    saying out loud.
+    """
+    try:
+        head = pd.read_csv(path, sep="\t", header=None, nrows=2000,
+                           comment="#", compression="infer", dtype=str)
+    except Exception:
+        return
+    for col in range(3, head.shape[1]):
+        vals = head[col].dropna()
+        if not len(vals):
+            continue
+        uniq = vals.unique()
+        numeric = pd.to_numeric(vals, errors="coerce").notna().mean()
+        if numeric < 0.5 and 1 < len(uniq) <= 12:
+            print(f"  NOTE {path} has a class column (column {col + 1}: "
+                  f"{', '.join(sorted(uniq)[:6])}) and is being read WHOLE, "
+                  f"so the annotation is the union of every class -- for a "
+                  f"file that partitions the genome that is the genome "
+                  f"itself, and its enrichment will sit at 1.  Split it by "
+                  f"class first, or use --genome, which routes the known "
+                  f"partitioned files through a class-aware reader.",
+                  file=sys.stderr)
+            return
+
+
 def _read_bed(path: str, want_name=False):
     """A plain (headerless) BED: chrom, start, end[, name/state]."""
     df = pd.read_csv(path, sep="\t", header=None, comment="#",
@@ -1611,12 +1645,14 @@ def main(argv=None):
     for k, v in _parse_pairs(args.annotation, "annotation").items():
         rv = _resolve(v, cache, f"annotation {k}")
         if rv is not None:
+            _warn_if_partition(rv, None)
             annotations[k] = _read_bed(rv)
     manifest = _merge_manifests(args.annotation_manifest or [])
     for k, v in manifest.items():
         if k not in annotations:
             rv = _resolve(v, cache, f"annotation {k} (manifest)")
             if rv is not None:
+                _warn_if_partition(rv, None)
                 annotations[k] = _read_bed(rv)
     for k, v in preset.get("annotations", {}).items():
         spec = v if isinstance(v, dict) else {"url": v}
