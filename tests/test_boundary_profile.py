@@ -213,3 +213,53 @@ def test_the_occupancy_test_on_nothing_returns_nothing():
     m = _mod()
     assert m.occupancy_test(np.zeros((0, 4), bool),
                             np.zeros(4), near=1.0) == {}
+
+
+# ------------------------------------------------------ set-fraction ------
+
+def test_set_fraction_sums_to_one_across_the_axis():
+    """The old view: of the SET's bins, the fraction at each offset.  It keeps
+    its range however large the set is, which is why it stays readable when
+    occupancy would saturate."""
+    m = _mod()
+    dom = _iv([("chr1", 1_000_000, 3_000_000)])
+    bed = _iv([("chr1", s, s + 250_000)
+               for s in range(0, 4_000_000, 250_000)])
+    freq, counts = m.set_fraction_profile(bed, dom, flank=1_000_000,
+                                          step=250_000)
+    assert np.nansum(freq) == pytest.approx(1.0)
+    assert counts.sum() > 0
+
+
+def test_set_fraction_peaks_for_a_boundary_hugging_set():
+    m = _mod()
+    dom = _iv([("chr1", 10_000_000, 20_000_000)])
+    bed = _iv([("chr1", 9_750_000, 10_000_000),
+               ("chr1", 10_000_000, 10_250_000)])
+    freq, _ = m.set_fraction_profile(bed, dom, flank=2_000_000, step=250_000)
+    centres = m.offset_edges(2_000_000, 250_000)[1]
+    assert freq[np.abs(centres) < 300_000].sum() == pytest.approx(1.0)
+
+
+def test_set_fraction_peaks_for_a_UNIFORM_set_too():
+    """The cost of this view, and the reason a control is not optional in it:
+    the positions available at each distance are not uniform, so a set that
+    ignores the boundaries entirely still peaks at one."""
+    m = _mod()
+    step = 250_000
+    dom = _iv([("chr1", 10_000_000, 14_000_000)])
+    bed = _iv([("chr1", s, s + step)
+               for s in range(0, 24_000_000, step)])
+    freq, _ = m.set_fraction_profile(bed, dom, flank=5_000_000, step=step)
+    centres = m.offset_edges(5_000_000, step)[1]
+    near = freq[np.abs(centres) < 500_000].mean()
+    far = freq[np.abs(centres) > 3_000_000].mean()
+    assert near > far, "a uniform set peaks at the boundary in this view"
+
+
+def test_an_empty_set_fraction_is_nan():
+    m = _mod()
+    dom = _iv([("chr1", 0, 100)])
+    bed = _iv([("chr9", 0, 100)])
+    freq, counts = m.set_fraction_profile(bed, dom, flank=100, step=50)
+    assert counts.sum() == 0 and np.isnan(freq).all()

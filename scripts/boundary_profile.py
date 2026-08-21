@@ -165,6 +165,51 @@ def _occupied(idx, chrom, lo, hi):
     return out
 
 
+def signed_distance_to_boundaries(bed, boundaries):
+    """Signed distance from each interval's centre to the nearest domain edge,
+    positive inside, oriented per edge."""
+    centre = ((bed.start + bed.end) / 2.0).to_numpy(float)
+    chrom = bed.chrom.astype(str).to_numpy()
+    out = np.full(len(bed), np.nan)
+    for c, g in boundaries.groupby("chrom", sort=False):
+        m = chrom == str(c)
+        if not m.any():
+            continue
+        starts = g.start.to_numpy(float)
+        ends = g.end.to_numpy(float)
+        edges = np.sort(np.concatenate([starts, ends]))
+        x = centre[m]
+        idx = np.clip(np.searchsorted(edges, x), 1, len(edges) - 1)
+        d = np.minimum(np.abs(x - edges[idx - 1]), np.abs(x - edges[idx]))
+        j = np.clip(np.searchsorted(starts, x, side="right") - 1, 0, None)
+        inside = (x >= starts[j]) & (x < ends[j])
+        out[m] = np.where(inside, d, -d)
+    return out
+
+
+def set_fraction_profile(bed, boundaries, flank, step):
+    """Fraction of the SET's own bins sitting at each offset.
+
+    Sums to one across the axis, so sets of different sizes share it and the
+    curve keeps its dynamic range however large the set is -- which is why it
+    is easier to read than occupancy for a set covering much of the genome.
+
+    The cost, and it is not small: the positions AVAILABLE at each distance
+    are not uniform -- domains have finite width and uneven spacing -- so
+    every set inherits that shape, and a randomly placed control peaks at the
+    boundary exactly as the query does.  Nothing here is enrichment until the
+    query is compared with a control drawn the same way, so the control is
+    not optional in this mode; it is the axis the reading is made against.
+    """
+    edges, centres = offset_edges(flank, step)
+    dist = signed_distance_to_boundaries(bed, boundaries)
+    ok = np.isfinite(dist)
+    counts, _ = np.histogram(dist[ok], bins=edges)
+    total = counts.sum()
+    freq = counts / total if total else np.full(counts.shape, np.nan)
+    return freq, counts.astype(int)
+
+
 def occupancy(boundaries, bed, flank, step):
     """Per-boundary occupancy of the set at each offset -> (n_bnd, n_offset).
 
@@ -227,7 +272,7 @@ def occupancy_test(occ, centres, near):
             "odds_ratio": float(orr), "pvalue": float(p)}
 
 
-def profile_figure(results, path, title, near, step):
+def profile_figure(results, path, title, near, step, ylabel):
     """One panel per boundary; the sets overlaid so the control is beside the
     query rather than on another page."""
     import matplotlib
@@ -264,8 +309,7 @@ def profile_figure(results, path, title, near, step):
             ax.spines[sp].set_visible(False)
         ax.grid(axis="y", color="#EEF0F2", lw=0.7)
         ax.set_axisbelow(True)
-    axes[0][0].set_ylabel("share of boundaries with a bin\n"
-                          "of the set at this offset", fontsize=9)
+    axes[0][0].set_ylabel(ylabel, fontsize=9)
     axes[0][-1].legend(frameon=False, fontsize=8, loc="upper left",
                        bbox_to_anchor=(1.02, 1.0))
     fig.suptitle(title, fontsize=11)
@@ -314,6 +358,19 @@ def main(argv=None) -> int:
                     metavar="LABEL=BED",
                     help="A domain BED whose interval EDGES are the "
                          "boundaries.  Repeatable, one panel each.")
+    ap.add_argument("--density", choices=["set-fraction", "occupancy"],
+                    default="set-fraction",
+                    help="'set-fraction' (default): of the SET's bins, the "
+                         "fraction at each offset -- sums to one, so the "
+                         "curve keeps its range however large the set is.  "
+                         "But the positions available at each distance are "
+                         "not uniform, so EVERY set peaks at the boundary and "
+                         "only the gap to a matched control means anything.  "
+                         "'occupancy': of the BOUNDARIES, the share with a "
+                         "set bin at that offset -- a randomly placed set is "
+                         "flat, but the value equals the set's genome "
+                         "coverage, so a set covering much of the genome "
+                         "sits near that with little room to move.")
     ap.add_argument("--flank", type=int, default=5_000_000,
                     help="Half-width of the FIGURE (5 Mb): the x axis runs "
                          "from -flank to +flank.  At a 250 kb bin that is 20 "
@@ -366,6 +423,13 @@ def main(argv=None) -> int:
         print(f"  no --universe: profiling on the union of the given sets "
               f"({len(uni):,} bins).  No random control is drawn and no "
               f"test against the rest of the genome is run.", file=sys.stderr)
+    if args.density == "set-fraction" and not args.control:
+        print("  NOTE --density set-fraction gives every set a peak at the "
+              "boundary, because the positions available at each distance are "
+              "not uniform.  Without --control naming a matched control there "
+              "is nothing to read that peak against.  --density occupancy is "
+              "flat for a randomly placed set and needs no control to be "
+              "interpretable.", file=sys.stderr)
     if args.control and args.control not in sets:
         sys.exit(f"--control {args.control!r} is not one of the --bed labels "
                  f"({sorted(sets)})")
@@ -420,11 +484,15 @@ def main(argv=None) -> int:
         n_edges = None
         for sname, bed in bed_of.items():
             occ, centres = occupancy(dom, bed, args.flank, args.step)
-            dens, n_bnd = profile_from_occupancy(occ)
-            n_edges = n_bnd
+            n_edges = int(occ.shape[0])
+            if args.density == "occupancy":
+                dens, _ = profile_from_occupancy(occ)
+                n_at = np.full(centres.shape, n_edges, int)
+            else:
+                dens, n_at = set_fraction_profile(bed, dom, args.flank,
+                                                  args.step)
             block["sets"][sname] = {
-                "offset": centres, "density": dens,
-                "n": np.full(centres.shape, n_bnd, int),
+                "offset": centres, "density": dens, "n": n_at,
                 "control": sname == args.control}
             st = occupancy_test(occ, centres, args.near)
             if st:
@@ -434,6 +502,11 @@ def main(argv=None) -> int:
                       f"within {args.near / 1e6:g} Mb vs {st['frac_far']:.3f} "
                       f"beyond, OR {st['odds_ratio']:.2f}, "
                       f"p {st['pvalue']:.2g}")
+        if args.density == "set-fraction":
+            print("    (the figure is set-fraction; the test above is "
+                  "occupancy either way, since that is the one a randomly "
+                  "placed set does not pass by construction)",
+                  file=sys.stderr)
         print(f"  {bname}: {len(dom):,} of {len(dom_all):,} domains isolated "
               f"at +/-{args.flank / 1e6:g} Mb, {n_edges or 0} edges profiled")
         results[bname] = block
@@ -454,9 +527,13 @@ def main(argv=None) -> int:
     pd.concat(long, ignore_index=True).to_csv(
         out / "boundary_profile.tsv", sep="\t", index=False)
 
+    ylabel = ("fraction of the set's bins\nat this offset"
+              if args.density == "set-fraction"
+              else "share of boundaries with a bin\nof the set at this offset")
     fig = profile_figure(results, out / "boundary_profile.pdf",
                          f"bin density around domain boundaries "
-                         f"(+/-{args.flank / 1e6:g} Mb)", args.near, args.step)
+                         f"(+/-{args.flank / 1e6:g} Mb)", args.near,
+                         args.step, ylabel)
     print(f"  -> {Path(fig).name}, boundary_enrichment.tsv, "
           f"boundary_profile.tsv")
     return 0
