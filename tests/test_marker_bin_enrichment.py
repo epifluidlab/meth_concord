@@ -905,3 +905,95 @@ def test_an_annotation_absent_from_the_bins_is_not_flagged(capsys):
     elsewhere = pd.DataFrame({"chrom": ["chr9"], "start": [0], "end": [100]})
     m._region_enrichment(bins, fg, {"band:stalk": elsewhere})
     assert "peak-scale" not in capsys.readouterr().err
+
+
+# ------------------------------------------------- publication figures ------
+
+def _ann_table():
+    return pd.DataFrame({
+        "annotation": ["cLAD", "ciLAD", "band:gpos25", "CpG_island", "PMD"],
+        "test": ["fisher"] * 5,
+        "n_fg_in": [0, 80, 44, 0, 29], "n_fg_out": [120, 40, 76, 120, 91],
+        "n_bg_in": [152, 226, 25, 0, 266],
+        "n_bg_out": [528, 454, 655, 680, 414],
+        "odds_ratio": [0.0, 4.02, 15.2, np.nan, 0.50],
+        "fdr": [1e-12, 4e-11, 1e-21, 1.0, 3e-3]})
+
+
+def test_the_annotation_figure_drops_bands_and_cpg_islands(tmp_path):
+    """A Giemsa band is a stain, not a functional annotation; a CpG island is
+    ~1 kb so its Fisher row is empty rather than negative.  Neither belongs
+    beside LADs and replication timing in a figure about domains."""
+    m = _mod()
+    out = tmp_path / "a.pdf"
+    assert m._annotation_dotplot(_ann_table(), out, "gch") is not None
+    assert out.stat().st_size > 0
+
+
+def test_a_zero_odds_ratio_still_appears_in_the_figure(tmp_path):
+    """An annotation the foreground never enters has odds ratio 0 and log
+    -inf -- and it is the STRONGEST depletion in the table, so dropping it as
+    unplottable removes the biggest result from the figure."""
+    m = _mod()
+    d = _ann_table()
+    kept = d[~d["annotation"].str.contains(r"^band:|^CpG_island$", regex=True)]
+    a = kept["n_fg_in"] + 0.5
+    b = kept["n_fg_out"] + 0.5
+    c = kept["n_bg_in"] + 0.5
+    e = kept["n_bg_out"] + 0.5
+    lor = np.log2((a * e) / (b * c))
+    assert np.isfinite(lor).all()
+    assert lor.iloc[0] < -5, "cLAD should be the most extreme point"
+    out = tmp_path / "a.pdf"
+    m._annotation_dotplot(d, out, "gch")
+    assert out.stat().st_size > 0
+
+
+def test_the_annotation_figure_keeps_everything_when_asked(tmp_path):
+    m = _mod()
+    out = tmp_path / "a.pdf"
+    assert m._annotation_dotplot(_ann_table(), out, "gch", exclude="") \
+        is not None
+
+
+def test_a_table_without_the_two_by_two_counts_makes_no_figure(tmp_path):
+    """Only Fisher rows carry the counts the Haldane correction needs."""
+    m = _mod()
+    d = pd.DataFrame({"annotation": ["x"], "test": ["mannwhitney"],
+                      "fdr": [0.01]})
+    assert m._annotation_dotplot(d, tmp_path / "a.pdf", "gch") is None
+
+
+def test_geneset_dotplot_puts_the_gene_ratio_on_the_axis(tmp_path):
+    m = _mod()
+    ora = pd.DataFrame({"term": [f"path{i}" for i in range(6)],
+                        "n_overlap": [15, 12, 9, 8, 6, 6],
+                        "fdr": [0.001, 0.004, 0.01, 0.02, 0.03, 0.04]})
+    out = tmp_path / "k.pdf"
+    assert m._geneset_dotplot(ora, out, "hcg", "KEGG", 90) is not None
+    assert out.stat().st_size > 0
+
+
+def test_geneset_dotplot_on_an_empty_table_returns_none(tmp_path):
+    m = _mod()
+    empty = pd.DataFrame(columns=["term", "n_overlap", "fdr"])
+    assert m._geneset_dotplot(empty, tmp_path / "k.pdf", "h", "KEGG", 10) \
+        is None
+
+
+def test_chromatin_states_use_mann_whitney_by_default():
+    """A full-stack segment has a MEDIAN length of 200 bp -- 0.08% of a 250 kb
+    bin -- so a majority-overlap Fisher test returns an empty table for every
+    state, and the graded coverage is all there is to test."""
+    m = _mod()
+    bins = _bins([("chr1", i * 250000, (i + 1) * 250000) for i in range(10)])
+    fg = np.array([True] * 4 + [False] * 6)
+    # 200 bp segments scattered through each bin: real coverage, never 50%.
+    rows = [("chr1", i * 250000 + j * 1000, i * 250000 + j * 1000 + 200)
+            for i in range(10) for j in range(50)]
+    tiny = pd.DataFrame(rows, columns=["chrom", "start", "end"])
+    fisher, _ = m._region_enrichment(bins, fg, {"state": tiny}, test="fisher")
+    mwu, _ = m._region_enrichment(bins, fg, {"state": tiny}, test="mwu")
+    assert fisher["n_fg_in"].iloc[0] == 0, "majority overlap sees nothing"
+    assert np.isfinite(mwu["mean_frac_fg"].iloc[0])
+    assert mwu["mean_frac_fg"].iloc[0] > 0

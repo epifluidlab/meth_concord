@@ -814,6 +814,118 @@ def _mwu_row(label, cov, fg):
             "log2_fold_change": lfc, "pvalue": p}
 
 
+def _dotplot(df, x, size, color, labels, path, title, xlabel,
+             size_label="Count", color_label="FDR", vline=None, top=20,
+             ascending=False):
+    """A dot plot: position is the effect, area the count, colour the FDR.
+
+    One panel carrying all three is what makes an enrichment readable at a
+    glance -- a bar of fold change alone hides that it rests on four genes,
+    and a table of p-values hides which effects are large.  Area, not radius,
+    scales with the count, because area is what the eye compares.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    d = df.dropna(subset=[x, color]).copy()
+    if not len(d):
+        return None
+    d = d.sort_values(color).head(top).sort_values(x, ascending=ascending)
+    y = np.arange(len(d))
+    area = d[size].to_numpy(float)
+    area = 40 + 260 * ((area - area.min()) / (area.ptp() or 1))
+
+    fig, ax = plt.subplots(figsize=(8.6, max(3.0, 0.34 * len(d) + 1.8)))
+    sc = ax.scatter(d[x], y, s=area, c=d[color], cmap="plasma_r",
+                    edgecolor="#2A2E35", linewidth=0.5, zorder=3)
+    if vline is not None:
+        ax.axvline(vline, color="#9AA0A6", lw=1.0, ls="--", zorder=0)
+    ax.set_yticks(y)
+    ax.set_yticklabels([str(v) for v in d[labels]], fontsize=9)
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_title(title, fontsize=11)
+    ax.grid(axis="y", color="#E5E7EB", lw=0.7, zorder=0)
+    ax.set_axisbelow(True)
+    for sp in ("top", "right", "left"):
+        ax.spines[sp].set_visible(False)
+    ax.tick_params(axis="y", length=0)
+    cb = fig.colorbar(sc, ax=ax, fraction=0.035, pad=0.02, aspect=28)
+    cb.set_label(color_label, fontsize=9)
+    cb.ax.tick_params(labelsize=8)
+    cb.outline.set_linewidth(0.5)
+
+    # A size key, since area carries a number the axes cannot show.
+    lo, hi = int(np.nanmin(d[size])), int(np.nanmax(d[size]))
+    ticks = sorted({lo, (lo + hi) // 2, hi})
+    handles = [plt.scatter([], [], s=40 + 260 * ((t - lo) / ((hi - lo) or 1)),
+                           c="#B0B5BC", edgecolor="#2A2E35", linewidth=0.5,
+                           label=str(t)) for t in ticks]
+    # Below the colourbar rather than beside it: the two keys otherwise share
+    # the same strip of figure and overlap once the bars grow.
+    ax.legend(handles=handles, title=size_label, loc="lower left",
+              bbox_to_anchor=(1.14, 0.0), frameon=False, fontsize=8,
+              title_fontsize=9, labelspacing=1.3, borderpad=0.8,
+              handletextpad=1.2)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _annotation_dotplot(df, path, name, exclude=r"^band:|^CpG_island$"):
+    """Publication panel for the region annotations, Fisher rows only.
+
+    Giemsa bands and CpG islands are dropped by default and for opposite
+    reasons: a band is a stain, not a functional annotation, and it is the
+    coarsest thing in the table; a CpG island is ~1 kb and never fills a bin,
+    so its row is empty rather than negative.  Neither belongs beside LADs,
+    PMDs and replication timing in a figure about domain organisation.
+    """
+    d = df[df.get("test", "fisher") == "fisher"].copy()
+    if exclude:
+        d = d[~d["annotation"].astype(str).str.contains(exclude, regex=True)]
+    need = {"n_fg_in", "n_fg_out", "n_bg_in", "n_bg_out"}
+    if not need <= set(d.columns) or not len(d):
+        return None
+    # Haldane-Anscombe: half a count in every cell of the 2x2.  An annotation
+    # the foreground never enters has an odds ratio of exactly 0, whose log is
+    # -inf -- and that is the STRONGEST depletion in the table, so dropping it
+    # for being unplottable removes the biggest result from the figure while
+    # leaving it in the TSV.  The correction keeps it finite and it stays the
+    # most extreme point, which is the honest place for it.
+    a = d["n_fg_in"].to_numpy(float) + 0.5
+    b = d["n_fg_out"].to_numpy(float) + 0.5
+    c = d["n_bg_in"].to_numpy(float) + 0.5
+    e = d["n_bg_out"].to_numpy(float) + 0.5
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d["log2_odds_ratio"] = np.log2((a * e) / (b * c))
+    d = d[np.isfinite(d["log2_odds_ratio"])]
+    if not len(d):
+        return None
+    return _dotplot(d, "log2_odds_ratio", "n_fg_in", "fdr", "annotation",
+                    path, f"{name}: domain-scale enrichment (Fisher's exact)",
+                    "log2 odds ratio (Haldane-corrected)",
+                    size_label="bins in set", color_label="FDR", vline=0.0)
+
+
+def _geneset_dotplot(df, path, name, label, n_fg_genes):
+    """Publication panel for a gene-set database, in the usual dot-plot form.
+
+    x is the gene ratio -- the share of the foreground's genes in the term --
+    because that is the quantity a reader can hold against the term's own
+    size; area is the overlap count and colour the adjusted p.
+    """
+    d = df.copy()
+    if not len(d) or "n_overlap" not in d:
+        return None
+    denom = float(n_fg_genes) or 1.0
+    d["GeneRatio"] = d["n_overlap"].to_numpy(float) / denom
+    return _dotplot(d, "GeneRatio", "n_overlap", "fdr", "term", path,
+                    f"{name}: {label}", "GeneRatio", size_label="Count",
+                    color_label="p.adjust", ascending=True)
+
+
 def _region_enrichment(bins, fg, categories, test="fisher", min_frac=0.5):
     """Region enrichment (fg vs bg) for a dict {label: intervals_df}.
 
@@ -1133,14 +1245,14 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
         else:                                    # per state, back-compat label
             cats = {f"state:{s}": g for s, g in chromhmm.groupby("name")}
         hmm_df, _ = _region_enrichment(bins, fg, cats,
-                                       args.region_test,
+                                       args.chromhmm_test,
                                        args.region_overlap_frac)
         hmm_df.to_csv(tsv("chromhmm_enrichment"), sep="\t", index=False)
         pages.append(("region", (
             f"Chromatin states (by {'group' if grouped else 'state'})", hmm_df)))
         if args.chromhmm_per_state and grouped:
             st = {f"state:{s}": g for s, g in chromhmm.groupby("name")}
-            _region_enrichment(bins, fg, st, args.region_test,
+            _region_enrichment(bins, fg, st, args.chromhmm_test,
                                args.region_overlap_frac)[0].to_csv(
                 tsv("chromhmm_state_enrichment"), sep="\t", index=False)
 
@@ -1151,6 +1263,10 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
                                        args.region_overlap_frac)
         ann_df.to_csv(tsv("annotation_enrichment"), sep="\t", index=False)
         pages.append(("region", ("Other annotations", ann_df)))
+        got = _annotation_dotplot(ann_df, out_dir / f"{name}_annotation_dot"
+                                  f"plot.pdf", name, args.figure_exclude)
+        if got is not None:
+            print(f"  figure -> {got.name}")
 
     # (4b) continuous signal tracks (replication timing, ...) --------------
     if signal_tracks:
@@ -1180,6 +1296,12 @@ def _run_context(name, bed_path, args, genes, gene_features, chromhmm,
             print(f"  {label}: {n_sig} terms at FDR<0.05 -> "
                   f"{tsv(label + '_enrichment').name}")
             pages.append(("ora", (f"{label} (top {args.max_terms})", ora)))
+            got = _geneset_dotplot(
+                ora[ora["fdr"] < args.figure_fdr] if not ora.empty else ora,
+                out_dir / f"{name}_{label}_dotplot.pdf", name, label,
+                len(fg_genes))
+            if got is not None:
+                print(f"  figure -> {got.name}")
     elif gene_sets:
         print("  gene sets given but no --gene-annotation -> skipping GO/KEGG.",
               file=sys.stderr)
@@ -1337,6 +1459,27 @@ def main(argv=None):
                          "point.  'auto' picks per annotation.  Signal tracks "
                          "(--signal-track) are continuous and always use "
                          "Mann-Whitney; this flag does not touch them.")
+    ap.add_argument("--figure-fdr", type=float, default=0.05,
+                    help="FDR cut for the gene-set dot plot (0.05).  The TSV "
+                         "keeps every term regardless.")
+    ap.add_argument("--figure-exclude", default=r"^band:|^CpG_island$",
+                    metavar="REGEX",
+                    help="Annotations kept out of the publication dot plot "
+                         "(the TSV keeps everything).  Default drops the "
+                         "Giemsa bands and CpG islands: a band is a stain "
+                         "rather than a functional annotation, and a CpG "
+                         "island is ~1 kb so its Fisher row is empty rather "
+                         "than negative.  Pass an empty string to keep all.")
+    ap.add_argument("--chromhmm-test", choices=["mwu", "fisher", "auto"],
+                    default="mwu",
+                    help="Test for the chromatin-state enrichment, separately "
+                         "from --region-test.  Mann-Whitney on the coverage "
+                         "fraction by default, because a full-stack segment "
+                         "has a MEDIAN length of 200 bp -- 0.08%% of a 250 kb "
+                         "bin -- and even a whole state group rarely covers "
+                         "20%% of one, so a majority-overlap Fisher test "
+                         "returns an empty table for every state.  The graded "
+                         "coverage is the only thing there is to test here.")
     ap.add_argument("--region-overlap-frac", type=float, default=0.5,
                     help="A bin is IN an annotation when at least this "
                          "fraction of it is covered (0.5).  Irrelevant for a "
