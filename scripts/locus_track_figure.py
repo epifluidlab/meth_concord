@@ -138,6 +138,61 @@ def smooth(values, starts, step, window):
     return grid, out
 
 
+def group_mean_ci(sub, ct, groups, conf=0.95):
+    """Per group: the per-bin mean and its confidence interval over cells.
+
+    Student t rather than 1.96 sigma: with a dozen cells covering a bin the
+    normal interval is visibly too narrow, and the whole point of drawing the
+    band is to show when two groups are not actually resolved.  n is counted
+    per BIN, not per group, because coverage differs bin to bin and a band
+    drawn on the group's total cell count would be too tight exactly where the
+    data is thinnest.
+    """
+    import warnings
+
+    from scipy.stats import t as _t
+
+    out = {}
+    for g in groups:
+        cells = ct.index[ct == g]
+        rows = sub.loc[sub.index.intersection(cells)]
+        if not len(rows):
+            continue
+        v = rows.to_numpy(float)
+        n = np.sum(np.isfinite(v), axis=0)
+        with np.errstate(invalid="ignore", divide="ignore"), \
+                warnings.catch_warnings():
+            # A bin covered by one cell has no spread to estimate, and NaN is
+            # the right answer there -- but it is the common case in a sparse
+            # context, so the warning would bury the run's real output.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            mean = np.nanmean(v, axis=0)
+            sd = np.nanstd(v, axis=0, ddof=1)
+            se = sd / np.sqrt(np.maximum(n, 1))
+            crit = _t.ppf(0.5 + conf / 2.0, np.maximum(n - 1, 1))
+            half = crit * se
+        half = np.where(n > 1, half, np.nan)
+        out[g] = {"mean": np.where(n > 0, mean, np.nan),
+                  "lo": mean - half, "hi": mean + half, "n": n}
+    return out
+
+
+def significant_spans(starts, sig, width):
+    """Contiguous [start, end) runs where sig is True, for axvspan shading."""
+    spans, run = [], None
+    for x, ok in zip(np.asarray(starts, float), np.asarray(sig, bool)):
+        if ok and run is None:
+            run = [x, x + width]
+        elif ok:
+            run[1] = x + width
+        elif run is not None:
+            spans.append(tuple(run))
+            run = None
+    if run is not None:
+        spans.append(tuple(run))
+    return spans
+
+
 def robust_limits(values, vmin=None, vmax=None, lo_pct=1.0, hi_pct=99.0):
     """Colour limits from the data actually present.
 
@@ -377,6 +432,186 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
     return path
 
 
+def locus_mean_figure(M, ct, order, region, tracks, genes, path, title,
+                      ct_colors=None, step=10_000, window=250_000,
+                      bin_bp=250_000, highlight=None, heat_groups=None,
+                      cytoband=None, sig_starts=None, sig_mask=None,
+                      conf=0.95):
+    """Ideogram, genes, then a mean +/- CI curve per cell type, then the
+    track heatmaps.
+
+    The per-cell heatmap shows every observation and hides whether the groups
+    are actually resolved; a band shows the second and not the first.  They
+    answer different questions, so this is a separate layout rather than an
+    option on the other one.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    chrom, lo, hi = region
+    cols = list(M.columns)
+    starts = np.array([int(str(c).rsplit(":", 1)[1]) for c in cols], float)
+    heat_groups = heat_groups or {}
+
+    heights = ([0.42] if cytoband is not None else []) \
+        + [0.55, 2.9] \
+        + [max(0.30 * len(v) + 0.30, 0.7) for v in heat_groups.values()] \
+        + [0.62] * len(tracks)
+    fig = plt.figure(figsize=(11.5, sum(heights) + 1.2))
+    gs = fig.add_gridspec(len(heights), 1, height_ratios=heights, hspace=0.18)
+    idx = 0
+    axi = None
+    if cytoband is not None:
+        axi = fig.add_subplot(gs[0])
+        idx = 1
+    axg = fig.add_subplot(gs[idx])
+    axm = fig.add_subplot(gs[idx + 1], sharex=axg)
+    rest = [fig.add_subplot(gs[i], sharex=axg)
+            for i in range(idx + 2, len(heights))]
+
+    grid = smooth(np.zeros(len(cols)), starts, step, window)[0]
+
+    # (1) ideogram
+    if axi is not None:
+        cb_ = cytoband[cytoband.chrom.astype(str) == str(chrom)]
+        clen = float(cb_.end.max()) if len(cb_) else float(grid[-1])
+        stain = {"gneg": "#FFFFFF", "gpos25": "#C8C8C8", "gpos50": "#969696",
+                 "gpos75": "#646464", "gpos100": "#1E1E1E",
+                 "acen": "#B03030", "gvar": "#8FA5C8", "stalk": "#5F8FBF"}
+        for _, r in cb_.iterrows():
+            axi.add_patch(plt.Rectangle(
+                (r["start"], 0.16), max(r["end"] - r["start"], 1), 0.34,
+                facecolor=stain.get(str(r.get("stain", "gneg")), "#C8C8C8"),
+                edgecolor="#4B5563", linewidth=0.25))
+        axi.add_patch(plt.Rectangle((grid[0], 0.06),
+                                    max(grid[-1] - grid[0], clen * 0.004),
+                                    0.54, fill=False, edgecolor="#D1495B",
+                                    linewidth=1.4))
+        axi.set_xlim(0, clen)
+        axi.set_ylim(0, 0.7)
+        axi.set_yticks([])
+        axi.set_ylabel(chrom, fontsize=8, rotation=0, ha="right", va="center")
+        axi.tick_params(labelsize=7)
+        axi.xaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v / 1e6:.0f}"))
+        for sp in axi.spines.values():
+            sp.set_visible(False)
+        axi.set_title(title, fontsize=11)
+    else:
+        axg.set_title(title, fontsize=11)
+
+    # (2) genes
+    gr = _gene_rows(genes, chrom, grid[0], grid[-1], max_rows=3) \
+        if genes is not None else pd.DataFrame()
+    for _, r in gr.iterrows():
+        axg.add_patch(plt.Rectangle((r["start"], -r["row"] * 0.32 - 0.28),
+                                    max(r["end"] - r["start"], 1), 0.24,
+                                    facecolor="#2C6FAF", edgecolor="none",
+                                    alpha=0.85))
+    axg.set_ylim(-1.05, 0.05)
+    axg.set_yticks([])
+    axg.set_ylabel(f"genes (n={len(gr)})", fontsize=8, rotation=0,
+                   ha="right", va="center")
+    for sp in ("top", "right", "left"):
+        axg.spines[sp].set_visible(False)
+
+    # (3) mean +/- CI per cell type
+    pal = dict(ct_colors or {})
+    fallback = plt.get_cmap("tab10")
+    for i, g in enumerate(order):
+        pal.setdefault(g, fallback(i % 10))
+    stats = group_mean_ci(M, ct, order, conf)
+    for g in order:
+        if g not in stats:
+            continue
+        gm, glo, ghi = (smooth(stats[g][k], starts, step, window)[1]
+                        for k in ("mean", "lo", "hi"))
+        ok = np.isfinite(gm)
+        axm.plot(grid[ok], gm[ok], color=pal[g], lw=1.7, zorder=3,
+                 label=f"{g} (n={int(np.nanmax(stats[g]['n']))})")
+        band = np.isfinite(glo) & np.isfinite(ghi)
+        axm.fill_between(grid[band], glo[band], ghi[band], color=pal[g],
+                         alpha=0.18, lw=0, zorder=2)
+    sig_bar = []
+    if sig_mask is not None and sig_starts is not None:
+        sig_bar = significant_spans(sig_starts, sig_mask, bin_bp)
+    # A rule along the bottom, not a wash over the panel: shading the full
+    # height of the significant span buries the curves it is annotating, and
+    # the span is usually the whole interesting part of the figure.
+    if sig_bar:
+        y0, y1 = axm.get_ylim()
+        pad = 0.04 * (y1 - y0)
+        axm.set_ylim(y0 - pad * 1.6, y1)
+        for j, (a, b) in enumerate(sig_bar):
+            axm.add_patch(plt.Rectangle(
+                (a, y0 - pad * 1.35), b - a, pad * 0.7, facecolor="#D1495B",
+                edgecolor="none", zorder=4,
+                label="FDR significant" if j == 0 else None))
+    axm.set_ylabel(f"concordance D\n(mean, {conf:.0%} CI)", fontsize=9)
+    # Outside the axes: the interesting curve is usually the low one, and a
+    # legend placed anywhere inside lands on it.
+    axm.legend(frameon=False, fontsize=7.5, loc="upper left",
+               bbox_to_anchor=(1.005, 1.0), handlelength=1.4)
+    axm.grid(axis="y", color="#EEF0F2", lw=0.7)
+    axm.set_axisbelow(True)
+    for sp in ("top", "right"):
+        axm.spines[sp].set_visible(False)
+
+    # (4) the track heatmaps, then any line tracks
+    k = 0
+    for gname, members in heat_groups.items():
+        ax = rest[k]
+        k += 1
+        block = np.vstack([smooth(v, starts, step, window)[1]
+                           for v in members.values()])
+        glo2, ghi2 = robust_limits(block)
+        gim = ax.imshow(block, aspect="auto", cmap="RdYlBu_r",
+                        vmin=glo2, vmax=ghi2,
+                        extent=[grid[0], grid[-1], len(members), 0],
+                        interpolation="nearest")
+        ax.set_yticks(np.arange(len(members)) + 0.5)
+        ax.set_yticklabels(list(members), fontsize=7)
+        ax.tick_params(axis="y", length=0)
+        ax.set_ylabel(gname, fontsize=9, rotation=0, ha="right", va="center",
+                      labelpad=42)
+        cbb = fig.colorbar(gim, ax=ax, fraction=0.012, pad=0.005)
+        cbb.ax.tick_params(labelsize=6)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+    for ax, (label, values) in zip(rest[k:], tracks.items()):
+        tg, tv = smooth(values, starts, step, window)
+        good = np.isfinite(tv)
+        ax.fill_between(tg[good], 0, tv[good], color="#4B5563", lw=0)
+        ax.axhline(0, color="#9AA0A6", lw=0.6)
+        ax.set_ylabel(label, fontsize=8, rotation=0, ha="right", va="center")
+        ax.tick_params(labelsize=7)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+
+    shared = [axg, axm] + rest
+    if highlight is not None:
+        for ax in shared:
+            ax.axvspan(highlight[0], highlight[1], color="#F0C808",
+                       alpha=0.13, lw=0, zorder=0)
+    for ax in shared[:-1]:
+        ax.tick_params(axis="x", labelbottom=False, length=0)
+    last = shared[-1]
+    last.set_xlim(grid[0], grid[-1])
+    last.xaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, _: f"{v / 1e6:.2f}"))
+    last.set_xlabel(f"{chrom} (Mb)", fontsize=9, labelpad=1)
+    last.tick_params(axis="x", labelsize=8, pad=1)
+    fig.text(0.5, 0.005,
+             f"{window // 1000} kb window every {step // 1000} kb: "
+             f"interpolation between {bin_bp // 1000} kb bins, not "
+             f"{step // 1000} kb resolution",
+             ha="center", fontsize=7.5, color="#4B5563")
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def _named(specs, flag):
     out = {}
     for spec in specs or []:
@@ -440,6 +675,20 @@ def main(argv=None) -> int:
                          "when D sits in a narrow positive band and paints "
                          "every cell alike.")
     ap.add_argument("--cmap", default="RdYlBu_r")
+    ap.add_argument("--style", choices=["cells", "mean", "both"],
+                    default="cells",
+                    help="'cells' draws every cell as a heatmap row.  'mean' "
+                         "draws a mean and confidence band per cell type, "
+                         "with the ideogram and genes on TOP and the track "
+                         "heatmaps below -- the heatmap shows every "
+                         "observation and hides whether the groups are "
+                         "resolved; the band shows the second and not the "
+                         "first.  'both' writes the two.")
+    ap.add_argument("--conf", type=float, default=0.95,
+                    help="Confidence level for the band (0.95).  Student t "
+                         "on the cells covering each BIN, so it widens where "
+                         "coverage thins instead of borrowing the group's "
+                         "total cell count.")
     ap.add_argument("--region", default=None, metavar="chr:start-end",
                     help="Draw this locus instead of searching for one.")
     ap.add_argument("--flank-bins", type=int, default=6,
@@ -493,7 +742,7 @@ def main(argv=None) -> int:
     means = group_means(M, ct, low + high)
     score = separation_score(means, low, high).reindex(M.columns).to_numpy()
 
-    require = None
+    require = fdr_by_bin = None
     if args.scores:
         sc = pd.read_csv(args.scores, sep="\t")
         cands = [c for c in sc.columns
@@ -522,6 +771,7 @@ def main(argv=None) -> int:
         sig = pd.Series(sc[col].to_numpy(), index=key.to_numpy())
         q = sig.reindex(M.columns).to_numpy(float)
         require = np.isfinite(q) & (q < args.fdr)
+        fdr_by_bin = pd.Series(require, index=M.columns)
         print(f"  {int(np.nansum(require)):,} bins at {col} < {args.fdr}")
 
     out = Path(args.output_dir)
@@ -631,13 +881,30 @@ def main(argv=None) -> int:
                 for g, mem in heat_spec.items()}
         cols = [f"{run['chrom']}:{x}" for x in starts_here]
         sub = M[cols]
-        dest = out / f"locus_{name}_{i}_{run['chrom']}_{run['start']}.pdf"
+        stem = f"locus_{name}_{i}_{run['chrom']}_{run['start']}"
+        dest = out / f"{stem}.pdf"
         gap = run["total"] / max(run["n"], 1)
+        head = (f"{name}  {run['chrom']}:{run['start']:,}-{run['end']:,}  "
+                f"({run['n']} bins, {len(sub):,} cells, mean gap {gap:.3g} "
+                f"in D between {'+'.join(low)} and {'+'.join(high)})")
+        if args.style in ("mean", "both"):
+            sig = (fdr_by_bin.reindex(cols).to_numpy(bool)
+                   if fdr_by_bin is not None else None)
+            locus_mean_figure(
+                sub, ct, order, (run["chrom"], lo, hi), tracks, genes,
+                out / (f"{stem}_mean.pdf" if args.style == "both"
+                       else f"{stem}.pdf"), head,
+                ct_colors=ct_colors, step=args.step, window=args.window,
+                bin_bp=step_bp, highlight=(run["start"], run["end"]),
+                heat_groups=heat, cytoband=cyto,
+                sig_starts=[int(str(c).rsplit(":", 1)[1]) for c in cols],
+                sig_mask=sig, conf=args.conf)
+        if args.style == "mean":
+            print(f"  {run['chrom']}:{run['start']:,}-{run['end']:,}  "
+                  f"{run['n']} bins, mean gap {gap:.3g} -> {stem}.pdf")
+            continue
         locus_figure(
-            sub, ct, order, (run["chrom"], lo, hi), tracks, genes, dest,
-            f"{name}  {run['chrom']}:{run['start']:,}-{run['end']:,}  "
-            f"({run['n']} bins, {len(M):,} cells, mean gap {gap:.3g} in D "
-            f"between {'+'.join(low)} and {'+'.join(high)})",
+            sub, ct, order, (run["chrom"], lo, hi), tracks, genes, dest, head,
             ct_colors=ct_colors, step=args.step, window=args.window,
             bin_bp=step_bp, highlight=(run["start"], run["end"]),
             heat_groups=heat, cytoband=cyto, vmin=args.vmin, vmax=args.vmax,

@@ -212,3 +212,75 @@ def test_min_gap_can_reject_everything():
     m = _mod()
     b = _bins(5)
     assert m.best_run(b, np.full(5, 0.01), min_bins=2, min_gap=0.5) is None
+
+
+# ------------------------------------------------------- mean and band -----
+
+def _sub(vals_by_group, n_bins=3):
+    cells, rows, ct = [], [], []
+    for g, vals in vals_by_group.items():
+        for i, v in enumerate(vals):
+            cells.append(f"{g}_{i}")
+            rows.append(np.full(n_bins, float(v)))
+            ct.append(g)
+    M = pd.DataFrame(rows, index=cells,
+                     columns=[f"chr1:{i * 250_000}" for i in range(n_bins)])
+    return M, pd.Series(ct, index=cells)
+
+
+def test_group_mean_ci_gives_the_mean_and_a_band_around_it():
+    m = _mod()
+    M, ct = _sub({"a": [0.4, 0.5, 0.6], "b": [0.9, 1.0, 1.1]})
+    got = m.group_mean_ci(M, ct, ["a", "b"])
+    assert got["a"]["mean"][0] == pytest.approx(0.5)
+    assert got["b"]["mean"][0] == pytest.approx(1.0)
+    assert got["a"]["lo"][0] < 0.5 < got["a"]["hi"][0]
+
+
+def test_the_band_uses_t_not_a_normal_approximation():
+    """With a dozen cells the normal interval is visibly too narrow, and the
+    band exists to show when two groups are NOT resolved."""
+    m = _mod()
+    M, ct = _sub({"a": [0.0, 1.0, 2.0]})
+    got = m.group_mean_ci(M, ct, ["a"])
+    half = got["a"]["hi"][0] - got["a"]["mean"][0]
+    se = 1.0 / np.sqrt(3)                        # sd = 1 with ddof=1
+    assert half > 1.96 * se, "t is wider than the normal at n=3"
+    assert half == pytest.approx(4.302653 * se, rel=1e-4)   # t(0.975, df=2)
+
+
+def test_the_band_widens_where_coverage_thins():
+    """n is counted per BIN: a band drawn on the group's total cell count
+    would be too tight exactly where the data is thinnest."""
+    m = _mod()
+    M, ct = _sub({"a": [0.2, 0.4, 0.6, 0.8]}, n_bins=2)
+    M.iloc[1:, 1] = np.nan                       # bin 1 keeps one cell
+    got = m.group_mean_ci(M, ct, ["a"])
+    assert got["a"]["n"][0] == 4 and got["a"]["n"][1] == 1
+    assert np.isfinite(got["a"]["hi"][0])
+    assert np.isnan(got["a"]["hi"][1]), "one cell cannot carry an interval"
+
+
+def test_a_group_with_no_cells_is_skipped():
+    m = _mod()
+    M, ct = _sub({"a": [1.0, 2.0]})
+    assert list(m.group_mean_ci(M, ct, ["a", "absent"])) == ["a"]
+
+
+def test_significant_spans_merges_adjacent_bins():
+    m = _mod()
+    starts = np.arange(6) * 250_000
+    sig = np.array([False, True, True, False, True, False])
+    got = m.significant_spans(starts, sig, 250_000)
+    assert got == [(250_000.0, 750_000.0), (1_000_000.0, 1_250_000.0)]
+
+
+def test_significant_spans_closes_a_run_at_the_end():
+    m = _mod()
+    got = m.significant_spans([0, 100], [False, True], 100)
+    assert got == [(100.0, 200.0)]
+
+
+def test_no_significant_bins_gives_no_spans():
+    m = _mod()
+    assert m.significant_spans([0, 100], [False, False], 100) == []
