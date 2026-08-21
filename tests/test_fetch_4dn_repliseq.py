@@ -281,3 +281,43 @@ def test_partition_is_the_lad_partition_with_late_in_place_of_lad():
     assert list(con) == [c == "RT_constitutive_late" for c in part["class"]]
     assert list(var) == [c == "RT_variable" for c in part["class"]]
     assert list(never) == [c == "RT_constitutive_early" for c in part["class"]]
+
+
+# --------------------------------------------------------- consensus -------
+
+def test_consensus_is_the_mean_across_cell_types():
+    """A boundary from one cell type is that cell type's boundary, and half
+    the genome changes timing between them."""
+    m = _mod()
+    a = _frame([1.0, -1.0, 0.5])
+    b = _frame([1.0, -1.0, -1.5])
+    got = m.consensus_timing([a, b])
+    np.testing.assert_allclose(got.value.to_numpy(), [1.0, -1.0, -0.5])
+
+
+def test_consensus_uses_only_bins_every_cell_type_measured():
+    """A mean over whichever cell types happen to cover a bin is strongest
+    where the data is thinnest."""
+    m = _mod()
+    a = _frame([1.0, 1.0, 1.0])
+    b = _frame([1.0, 1.0])                       # third bin never measured
+    got = m.consensus_timing([a, b])
+    assert len(got) == 2
+
+
+def test_consensus_returns_none_when_nothing_is_shared():
+    m = _mod()
+    a = _frame([1.0])
+    b = _frame([1.0])
+    b["start"] = b["start"] + 7                  # a different grid entirely
+    assert m.consensus_timing([a, b]) is None
+
+
+def test_the_consensus_sign_splits_early_from_late():
+    """The edges of the positive set are the transition the cell types agree
+    on -- which is what a boundary profile should be measured against."""
+    m = _mod()
+    frames = [_frame([2.0, 2.0, -2.0, -2.0]), _frame([1.0, 3.0, -1.0, -3.0])]
+    cons = m.consensus_timing(frames)
+    early = cons.value > 0
+    assert list(early) == [True, True, False, False]

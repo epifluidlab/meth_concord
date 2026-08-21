@@ -143,6 +143,34 @@ def timing(early_paths, late_paths, grid_bp, chroms=None, min_total=1e-6):
     return out, int((~ok).sum())
 
 
+def consensus_timing(frames):
+    """Mean log2(early/late) across cell types, on their shared bins.
+
+    A boundary taken from one cell type is that cell type's boundary, and
+    replication timing moves between them -- half the genome is variable.
+    Averaging first and cutting the mean at zero gives the transition the cell
+    types agree on, which is the one worth profiling a bin set against.
+
+    Restricted to bins every cell type measured, for the same reason the
+    partition is: a mean over whichever cell types happen to cover a bin makes
+    the consensus strongest where the data is thinnest.
+    """
+    keys = None
+    series = []
+    for df in frames:
+        k = pd.MultiIndex.from_arrays([df.chrom, df.start])
+        ser = pd.Series(df.value.to_numpy(), index=k)
+        keys = ser.index if keys is None else keys.intersection(ser.index)
+        series.append(ser)
+    if keys is None or not len(keys):
+        return None
+    mat = np.vstack([s.loc[keys].to_numpy() for s in series])
+    out = pd.DataFrame({"chrom": [k[0] for k in keys],
+                        "start": [k[1] for k in keys],
+                        "value": mat.mean(axis=0)})
+    return out.sort_values(["chrom", "start"]).reset_index(drop=True)
+
+
 def rt_partition(frames, threshold=0.0):
     """Cross-cell-type RT classes -> (frame, counts, n_incomplete).
 
@@ -333,6 +361,27 @@ def main(argv=None) -> int:
                         "one cell type at |log2(E/L)| <= %.2f; in no class",
                         "(unclassified)", unclassified,
                         100 * unclassified / max(total, 1), args.rt_threshold)
+        # The consensus early/late transition: what every cell type agrees
+        # on, and the boundary file to profile a bin set against.
+        cons = consensus_timing(list(frames.values()))
+        if cons is not None:
+            cons["end"] = cons.start + args.grid_bp
+            cpath = out / f"RT_consensus_{args.grid_bp // 1000}kb.bedGraph"
+            write_bedgraph(cons[["chrom", "start", "end", "value"]], cpath)
+            for cls, sel in (("RT_consensus_early", cons.value > 0),
+                             ("RT_consensus_late", cons.value < 0)):
+                pth = out / f"{cls}.bed"
+                cons.loc[sel, ["chrom", "start", "end"]].to_csv(
+                    pth, sep="\t", index=False, header=False)
+                manifest[cls] = pth
+                logger.info("  %-22s %6d bins (%4.1f%%)  -> %s", cls,
+                            int(sel.sum()),
+                            100 * float(sel.mean()), pth.name)
+            logger.info("  consensus track -> %s.  The EDGES of "
+                        "RT_consensus_early.bed are the early/late boundary "
+                        "the cell types agree on; pass that file to "
+                        "boundary_profile.py --boundary.", cpath.name)
+
         with open(out / "annotation_manifest.tsv", "w") as fh:
             fh.write(f"# RT classes across {', '.join(sorted(frames))}\n")
             for cls, path in manifest.items():

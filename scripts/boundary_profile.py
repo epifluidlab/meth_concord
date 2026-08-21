@@ -235,9 +235,12 @@ def main(argv=None) -> int:
                     help="Offset bin for the profile (250 kb).  Below the "
                          "bin size it only splits single bins across "
                          "neighbouring offsets.")
-    ap.add_argument("--near", type=int, default=1_000_000,
+    ap.add_argument("--near", type=int, default=500_000,
                     help="|distance| under this counts as AT the boundary for "
-                         "the Fisher test (1 Mb).")
+                         "the Fisher test (500 kb).  Domains are megabases "
+                         "wide, so a generous 'near' takes in much of the "
+                         "genome and the near-vs-far contrast stops meaning "
+                         "much; the run reports what share it captured.")
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args(argv)
 
@@ -279,16 +282,24 @@ def main(argv=None) -> int:
                                     args.step)
             block["sets"][sname] = {"offset": x, "density": dens, "n": n_at}
             st = edge_test(dist, in_set, universe_mask, args.near)
+            share = (st["n_near_in_set"] + st["n_near_out"]) / max(
+                st["n_near_in_set"] + st["n_near_out"]
+                + st["n_far_in_set"] + st["n_far_out"], 1)
             st.update({"boundary": bname, "set": sname})
             rows.append(st)
+            st["frac_of_genome_near"] = float(share)
+            note = ("   (near covers most of the universe -- lower --near)"
+                    if share > 0.4 else "")
             print(f"    {sname:>16}: {st['frac_near']:.3f} within "
                   f"{args.near / 1e6:g} Mb vs {st['frac_far']:.3f} beyond, "
-                  f"OR {st['odds_ratio']:.2f}, p {st['pvalue']:.2g}")
+                  f"OR {st['odds_ratio']:.2f}, p {st['pvalue']:.2g}"
+                  f"   [near = {share:.0%} of bins]{note}")
         results[bname] = block
 
     tab = pd.DataFrame(rows)[
         ["boundary", "set", "n_near_in_set", "n_near_out", "n_far_in_set",
-         "n_far_out", "frac_near", "frac_far", "odds_ratio", "pvalue"]]
+         "n_far_out", "frac_near", "frac_far", "frac_of_genome_near",
+         "odds_ratio", "pvalue"]]
     tab.to_csv(out / "boundary_enrichment.tsv", sep="\t", index=False)
 
     long = []
