@@ -200,19 +200,31 @@ def best_run(bins, score, min_bins=2, require=None, min_gap=0.0):
     return max(runs, key=lambda r: (r["total"], r["n"]))
 
 
-def smooth(values, starts, step, window):
+def smooth(values, starts, step, window, bin_bp=None):
     """Rolling mean of binned values onto a finer grid -> (positions, values).
 
-    Interpolation between bins that already exist, which is a display choice.
-    It cannot sharpen a boundary the 250 kb binning already blurred.
+    ``window`` is the FULL width of a centred window, and a bin counts when
+    its own extent overlaps it.  The earlier version used ``window`` as the
+    bin's extent too, which made the window symmetric about the grid point
+    and so twice as wide as the number requested -- a "250 kb window" that
+    actually reached 250 kb each way.
+
+    Note what this can and cannot do.  It is interpolation between bins that
+    already exist: it makes a track continuous instead of blocky and cannot
+    sharpen a boundary the binning already blurred.  A window equal to the bin
+    size averages one or two bins and is very nearly a no-op, which is why a
+    visible effect needs a window several times the bin width.
     """
     starts = np.asarray(starts, float)
     v = np.asarray(values, float)
-    lo, hi = starts.min(), starts.max() + window
+    width = float(bin_bp) if bin_bp else (float(np.min(np.diff(np.sort(
+        np.unique(starts))))) if starts.size > 1 else float(window))
+    half = float(window) / 2.0
+    lo, hi = starts.min(), starts.max() + width
     grid = np.arange(lo, hi + step, step, dtype=float)
     out = np.full(grid.shape, np.nan)
     for i, g in enumerate(grid):
-        m = (starts + window > g) & (starts < g + window)
+        m = (starts + width > g - half) & (starts < g + half)
         if m.any() and np.isfinite(v[m]).any():
             out[i] = np.nanmean(v[m])
     return grid, out
@@ -351,8 +363,8 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
 
     # Every cell smoothed onto the same fine grid, so the heatmap and the
     # tracks below it share one coordinate system.
-    grid, _ = smooth(sub.iloc[0].to_numpy(), starts, step, window)
-    img = np.vstack([smooth(sub.loc[c].to_numpy(), starts, step, window)[1]
+    grid, _ = smooth(sub.iloc[0].to_numpy(), starts, step, window, bin_bp)
+    img = np.vstack([smooth(sub.loc[c].to_numpy(), starts, step, window, bin_bp)[1]
                      for c in cells])
 
     heat_groups = heat_groups or {}
@@ -415,7 +427,7 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
         nxt += 1
         rows, labels = [], []
         for lab, vals in members.items():
-            rows.append(smooth(vals, starts, step, window)[1])
+            rows.append(smooth(vals, starts, step, window, bin_bp)[1])
             labels.append(lab)
         block = np.vstack(rows)
         glo, ghi = robust_limits(block)
@@ -434,7 +446,7 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
             sp.set_visible(False)
 
     for ax, (label, values) in zip(axes[nxt:nxt + n_track], tracks.items()):
-        tg, tv = smooth(values, starts, step, window)
+        tg, tv = smooth(values, starts, step, window, bin_bp)
         ok = np.isfinite(tv)
         ax.fill_between(tg[ok], 0, tv[ok], color="#4B5563", lw=0)
         ax.axhline(0, color="#9AA0A6", lw=0.6)
@@ -550,7 +562,7 @@ def locus_mean_figure(M, ct, order, region, tracks, genes, path, title,
     rest = [fig.add_subplot(gs[i], sharex=axg)
             for i in range(idx + 2, len(heights))]
 
-    grid = smooth(np.zeros(len(cols)), starts, step, window)[0]
+    grid = smooth(np.zeros(len(cols)), starts, step, window, bin_bp)[0]
 
     # (1) ideogram
     if axi is not None:
@@ -605,7 +617,7 @@ def locus_mean_figure(M, ct, order, region, tracks, genes, path, title,
     for g in order:
         if g not in stats:
             continue
-        gm, glo, ghi = (smooth(stats[g][k], starts, step, window)[1]
+        gm, glo, ghi = (smooth(stats[g][k], starts, step, window, bin_bp)[1]
                         for k in ("mean", "lo", "hi"))
         ok = np.isfinite(gm)
         axm.plot(grid[ok], gm[ok], color=pal[g], lw=1.7, zorder=3,
@@ -643,7 +655,7 @@ def locus_mean_figure(M, ct, order, region, tracks, genes, path, title,
     for gname, members in heat_groups.items():
         ax = rest[k]
         k += 1
-        block = np.vstack([smooth(v, starts, step, window)[1]
+        block = np.vstack([smooth(v, starts, step, window, bin_bp)[1]
                            for v in members.values()])
         glo2, ghi2 = robust_limits(block)
         gim = ax.imshow(block, aspect="auto", cmap="RdYlBu_r",
@@ -660,7 +672,7 @@ def locus_mean_figure(M, ct, order, region, tracks, genes, path, title,
         for sp in ax.spines.values():
             sp.set_visible(False)
     for ax, (label, values) in zip(rest[k:], tracks.items()):
-        tg, tv = smooth(values, starts, step, window)
+        tg, tv = smooth(values, starts, step, window, bin_bp)
         good = np.isfinite(tv)
         ax.fill_between(tg[good], 0, tv[good], color="#4B5563", lw=0)
         ax.axhline(0, color="#9AA0A6", lw=0.6)
@@ -787,7 +799,13 @@ def main(argv=None) -> int:
                          "per-bin separation is a reasonable place to start; "
                          "the run prints that number.")
     ap.add_argument("--step", type=int, default=10_000)
-    ap.add_argument("--window", type=int, default=250_000)
+    ap.add_argument("--window", type=int, default=750_000,
+                    help="Full width of the centred smoothing window "
+                         "(750 kb).  It must be several times the BIN size to "
+                         "do anything: a window equal to the bin averages one "
+                         "or two bins, which is a staircase with soft edges "
+                         "rather than a curve.  The run says so when the "
+                         "window is too narrow to matter.")
     ap.add_argument("--top", type=int, default=1,
                     help="Draw this many runs, strongest first.")
     ap.add_argument("--rank", choices=["gap-mean", "gap-total", "combined"],
@@ -831,6 +849,13 @@ def main(argv=None) -> int:
     step_bp = int(np.median(np.diff(np.sort(bins.start.unique())))) or 250_000
     bins["end"] = bins.start + step_bp
     bins["bin"] = list(M.columns)
+
+    if args.window <= step_bp:
+        print(f"  NOTE --window {args.window:,} is not larger than the "
+              f"{step_bp:,} bp bin, so each point averages one or two bins "
+              f"and the track is effectively unsmoothed.  A window several "
+              f"times the bin ({3 * step_bp:,} or more) is what produces a "
+              f"curve; it cannot add resolution either way.", file=sys.stderr)
 
     means = group_means(M, ct, low + high)
     score = separation_score(means, low, high).reindex(M.columns).to_numpy()

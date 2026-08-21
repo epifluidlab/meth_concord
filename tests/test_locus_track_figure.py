@@ -108,13 +108,16 @@ def test_smoothing_is_a_rolling_mean_over_the_existing_bins():
     m = _mod()
     starts = np.arange(4) * 250_000
     vals = np.array([0.0, 1.0, 1.0, 0.0])
-    grid, out = m.smooth(vals, starts, 10_000, 250_000)
+    grid, out = m.smooth(vals, starts, 10_000, 250_000, bin_bp=250_000)
     assert grid[1] - grid[0] == 10_000
     assert np.nanmax(out) <= 1.0 + 1e-9
     assert np.nanmin(out) >= 0.0 - 1e-9
-    # the middle of the block averages only the two 1.0 bins
-    mid = out[np.argmin(np.abs(grid - 375_000))]
-    assert mid == pytest.approx(1.0)
+    # Centred on the join between the two 1.0 bins, a 250 kb window sees only
+    # those two.  A point 130 kb earlier straddles the 0.0 bin below and
+    # correctly reads the average -- the window is 250 kb WIDE, not 250 kb
+    # each way.
+    assert out[np.argmin(np.abs(grid - 500_000))] == pytest.approx(1.0)
+    assert out[np.argmin(np.abs(grid - 370_000))] == pytest.approx(0.5)
 
 
 def test_smoothing_ignores_nan_bins():
@@ -351,3 +354,48 @@ def test_all_runs_does_not_join_across_a_chromosome():
     b = pd.concat([_bins(3, "chr1"), _bins(3, "chr2")], ignore_index=True)
     runs = m.all_runs(b, np.ones(6), min_bins=2)
     assert len(runs) == 2 and {r["chrom"] for r in runs} == {"chr1", "chr2"}
+
+
+def test_the_window_is_its_stated_width_not_twice_it():
+    """--window is the FULL width of a centred window.  Treating it as the
+    bin's extent too made the window reach that far EACH WAY, so a '250 kb
+    window' smoothed over 500 kb."""
+    m = _mod()
+    starts = np.arange(9) * 250_000
+    vals = np.array([0.6] * 4 + [0.0] * 5)
+    for win in (250_000, 500_000, 1_000_000):
+        _, out = m.smooth(vals, starts, 10_000, win, bin_bp=250_000)
+        ramp = np.sum((out > 0.02) & (out < 0.58)) * 10_000
+        assert abs(ramp - win) <= 20_000, f"{win}: ramp came out {ramp}"
+
+
+def test_a_window_equal_to_the_bin_barely_smooths():
+    """Which is why a 250 kb window over 250 kb bins looks unsmoothed: each
+    point averages one or two bins."""
+    m = _mod()
+    starts = np.arange(10) * 250_000
+    vals = np.array([0.6] * 5 + [0.0] * 5)
+    _, narrow = m.smooth(vals, starts, 10_000, 250_000, bin_bp=250_000)
+    _, wide = m.smooth(vals, starts, 10_000, 1_000_000, bin_bp=250_000)
+    assert len(np.unique(np.round(narrow, 4))) <= 4
+    assert len(np.unique(np.round(wide, 4))) >= 8
+
+
+def test_the_bin_width_is_inferred_when_not_given():
+    m = _mod()
+    starts = np.arange(6) * 100_000
+    vals = np.arange(6, dtype=float)
+    a = m.smooth(vals, starts, 10_000, 300_000)[1]
+    b = m.smooth(vals, starts, 10_000, 300_000, bin_bp=100_000)[1]
+    np.testing.assert_allclose(a, b, equal_nan=True)
+
+
+def test_smoothing_preserves_the_plateau_values():
+    """It interpolates between bins; it must not move a level that is flat
+    across the window."""
+    m = _mod()
+    starts = np.arange(12) * 250_000
+    vals = np.full(12, 0.42)
+    _, out = m.smooth(vals, starts, 10_000, 1_000_000, bin_bp=250_000)
+    ok = np.isfinite(out)
+    np.testing.assert_allclose(out[ok], 0.42)
