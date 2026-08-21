@@ -144,3 +144,45 @@ def test_genes_off_the_window_are_dropped():
     g = pd.DataFrame({"chrom": ["chr1", "chr2"], "start": [0, 0],
                       "end": [100, 100], "name": ["a", "b"]})
     assert list(m._gene_rows(g, "chr1", 0, 1000)["name"]) == ["a"]
+
+
+# ------------------------------------------------------- colour limits -----
+
+def test_limits_follow_the_data_when_it_does_not_straddle_zero():
+    """D over one locus often sits in a narrow positive band; a forced
+    -|max|..+|max| scale then spends half the range on values that do not
+    exist and paints every cell alike."""
+    m = _mod()
+    v = np.random.default_rng(0).normal(0.55, 0.05, 5000)
+    lo, hi = m.robust_limits(v)
+    assert lo > 0.3, f"lower limit {lo} should track the data, not zero"
+    assert hi < 0.8
+    assert hi - lo < 0.5
+
+
+def test_limits_stay_symmetric_when_the_data_spans_both_signs():
+    """There zero is a meaningful midpoint and the diverging map should have
+    its neutral colour on it."""
+    m = _mod()
+    v = np.concatenate([np.full(500, -0.8), np.full(500, 0.4)])
+    lo, hi = m.robust_limits(v)
+    assert lo == pytest.approx(-hi)
+
+
+def test_explicit_limits_win():
+    m = _mod()
+    assert m.robust_limits(np.array([0.0, 1.0]), vmin=-2, vmax=3) == (-2, 3)
+
+
+def test_limits_survive_an_all_nan_input():
+    m = _mod()
+    lo, hi = m.robust_limits(np.array([np.nan, np.nan]))
+    assert np.isfinite([lo, hi]).all() and hi > lo
+
+
+def test_limits_never_collapse_to_a_point():
+    """A constant panel would otherwise give vmin == vmax and imshow would
+    raise rather than draw a flat colour."""
+    m = _mod()
+    lo, hi = m.robust_limits(np.full(100, 0.5))
+    assert hi > lo

@@ -138,6 +138,30 @@ def smooth(values, starts, step, window):
     return grid, out
 
 
+def robust_limits(values, vmin=None, vmax=None, lo_pct=1.0, hi_pct=99.0):
+    """Colour limits from the data actually present.
+
+    Forcing the scale symmetric about zero throws away half the range
+    whenever the values do not straddle zero -- D over one locus often sits
+    in a narrow positive band, and a -|max|..+|max| scale then paints every
+    cell the same colour and hides exactly the differences the figure is for.
+    Symmetric is kept only when the data really does span both signs, where
+    zero is a meaningful midpoint.
+    """
+    v = np.asarray(values, float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return (-1.0, 1.0) if vmin is None else (vmin, vmax)
+    lo = np.percentile(v, lo_pct) if vmin is None else vmin
+    hi = np.percentile(v, hi_pct) if vmax is None else vmax
+    if vmin is None and vmax is None and lo < 0 < hi:
+        m = max(abs(lo), abs(hi))
+        lo, hi = -m, m
+    if hi <= lo:
+        hi = lo + 1e-9
+    return float(lo), float(hi)
+
+
 def _gene_rows(genes, chrom, lo, hi, max_rows=4):
     """Genes overlapping the window, packed into non-overlapping rows.
 
@@ -170,7 +194,8 @@ def _gene_rows(genes, chrom, lo, hi, max_rows=4):
 
 def locus_figure(M, ct, order, region, tracks, genes, path, title,
                  ct_colors=None, step=10_000, window=250_000, bin_bp=250_000,
-                 highlight=None):
+                 highlight=None, heat_groups=None, cytoband=None,
+                 vmin=None, vmax=None, cmap="RdYlBu_r"):
     """Cells over the locus, then the tracks, then the genes -- one x axis."""
     import matplotlib
     matplotlib.use("Agg")
@@ -195,16 +220,29 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
     img = np.vstack([smooth(sub.loc[c].to_numpy(), starts, step, window)[1]
                      for c in cells])
 
+    heat_groups = heat_groups or {}
     n_track = len(tracks)
-    heights = [len(cells) * 0.055 + 1.2] + [0.62] * n_track + [0.9]
-    fig, axes = plt.subplots(
-        len(heights), 1, figsize=(11.5, sum(heights) + 1.0), sharex=True,
-        gridspec_kw={"height_ratios": heights, "hspace": 0.12})
+    heights = ([len(cells) * 0.055 + 1.2]
+               + [max(0.30 * len(v) + 0.30, 0.7) for v in heat_groups.values()]
+               + [0.62] * n_track
+               + [0.55]                      # dense gene track
+               + ([0.42] if cytoband is not None else []))
+    # x is shared by the locus panels only.  The ideogram shows the WHOLE
+    # chromosome -- that is the point of it -- so sharing would force it to
+    # the window and leave a bare rule where the chromosome should be.
+    n_locus = len(heights) - (1 if cytoband is not None else 0)
+    fig = plt.figure(figsize=(11.5, sum(heights) + 1.2))
+    gs = fig.add_gridspec(len(heights), 1, height_ratios=heights, hspace=0.16)
+    axes = [fig.add_subplot(gs[0])]
+    axes += [fig.add_subplot(gs[i], sharex=axes[0])
+             for i in range(1, n_locus)]
+    if cytoband is not None:
+        axes.append(fig.add_subplot(gs[len(heights) - 1]))
     ax0 = axes[0]
 
-    lim = np.nanpercentile(np.abs(img), 99) if np.isfinite(img).any() else 1.0
+    vlo, vhi = robust_limits(img, vmin, vmax)
     extent = [grid[0], grid[-1], len(cells), 0]
-    im = ax0.imshow(img, aspect="auto", cmap="RdYlBu_r", vmin=-lim, vmax=lim,
+    im = ax0.imshow(img, aspect="auto", cmap=cmap, vmin=vlo, vmax=vhi,
                     extent=extent, interpolation="nearest")
     ax0.set_yticks([])
     ax0.set_title(title, fontsize=11)
@@ -236,7 +274,31 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
         if y < len(cells):
             ax0.axhline(y, color="white", lw=1.2)
 
-    for ax, (label, values) in zip(axes[1:1 + n_track], tracks.items()):
+    nxt = 1
+    for gname, members in heat_groups.items():
+        ax = axes[nxt]
+        nxt += 1
+        rows, labels = [], []
+        for lab, vals in members.items():
+            rows.append(smooth(vals, starts, step, window)[1])
+            labels.append(lab)
+        block = np.vstack(rows)
+        glo, ghi = robust_limits(block)
+        gim = ax.imshow(block, aspect="auto", cmap="RdYlBu_r",
+                        vmin=glo, vmax=ghi,
+                        extent=[grid[0], grid[-1], len(labels), 0],
+                        interpolation="nearest")
+        ax.set_yticks(np.arange(len(labels)) + 0.5)
+        ax.set_yticklabels(labels, fontsize=7)
+        ax.tick_params(axis="y", length=0)
+        ax.set_ylabel(gname, fontsize=9, rotation=0, ha="right",
+                      va="center", labelpad=42)
+        gcb = fig.colorbar(gim, ax=ax, fraction=0.012, pad=0.005)
+        gcb.ax.tick_params(labelsize=6)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+
+    for ax, (label, values) in zip(axes[nxt:nxt + n_track], tracks.items()):
         tg, tv = smooth(values, starts, step, window)
         ok = np.isfinite(tv)
         ax.fill_between(tg[ok], 0, tv[ok], color="#4B5563", lw=0)
@@ -246,32 +308,70 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
 
-    axg = axes[-1]
-    gr = _gene_rows(genes, chrom, grid[0], grid[-1]) if genes is not None \
-        else pd.DataFrame()
+    # Dense, unlabelled: at a megabase-scale locus the names collide into an
+    # unreadable band, and what the track is for is where the genes ARE.
+    axg = axes[nxt + n_track]
+    gr = _gene_rows(genes, chrom, grid[0], grid[-1], max_rows=3) \
+        if genes is not None else pd.DataFrame()
     for _, r in gr.iterrows():
-        axg.add_patch(plt.Rectangle((r["start"], -r["row"] - 0.32),
-                                    max(r["end"] - r["start"], 1), 0.3,
-                                    facecolor="#2C6FAF", edgecolor="none"))
-        axg.text((r["start"] + r["end"]) / 2, -r["row"] - 0.42,
-                 str(r.get("name", "")), fontsize=6, ha="center", va="top")
-    axg.set_ylim(-4.2, 0.1)
+        axg.add_patch(plt.Rectangle((r["start"], -r["row"] * 0.32 - 0.28),
+                                    max(r["end"] - r["start"], 1), 0.24,
+                                    facecolor="#2C6FAF", edgecolor="none",
+                                    alpha=0.85))
+    axg.set_ylim(-1.05, 0.05)
     axg.set_yticks([])
-    axg.set_ylabel("genes", fontsize=8, rotation=0, ha="right", va="center")
+    axg.set_ylabel(f"genes (n={len(gr)})", fontsize=8, rotation=0,
+                   ha="right", va="center")
     for sp in ("top", "right", "left"):
         axg.spines[sp].set_visible(False)
 
+    # Ideogram: the whole chromosome with the window marked, so the locus has
+    # a position rather than only coordinates.
+    if cytoband is not None:
+        axi = axes[-1]
+        cb_ = cytoband[cytoband.chrom.astype(str) == str(chrom)]
+        clen = float(cb_.end.max()) if len(cb_) else float(grid[-1])
+        stain = {"gneg": "#FFFFFF", "gpos25": "#C8C8C8", "gpos50": "#969696",
+                 "gpos75": "#646464", "gpos100": "#1E1E1E",
+                 "acen": "#B03030", "gvar": "#8FA5C8", "stalk": "#5F8FBF"}
+        for _, r in cb_.iterrows():
+            axi.add_patch(plt.Rectangle(
+                (r["start"], 0.16), max(r["end"] - r["start"], 1), 0.34,
+                facecolor=stain.get(str(r.get("stain", "gneg")), "#C8C8C8"),
+                edgecolor="#4B5563", linewidth=0.25))
+        axi.add_patch(plt.Rectangle((grid[0], 0.06),
+                                    max(grid[-1] - grid[0], clen * 0.004),
+                                    0.54, fill=False, edgecolor="#D1495B",
+                                    linewidth=1.4))
+        axi.set_xlim(0, clen)
+        axi.set_ylim(0, 0.7)
+        axi.set_yticks([])
+        axi.set_ylabel(chrom, fontsize=8, rotation=0, ha="right", va="center")
+        axi.tick_params(labelsize=7)
+        axi.xaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v / 1e6:.0f}"))
+        for sp in axi.spines.values():
+            sp.set_visible(False)
+
+    # Ticks on the bottom locus panel only; repeated on every panel they read
+    # as separate axes rather than one coordinate system.
+    for ax in axes[:nxt + n_track]:
+        ax.tick_params(axis="x", labelbottom=False, length=0)
     if highlight is not None:
-        for ax in axes:
+        for ax in axes[:nxt + n_track + 1]:
             ax.axvspan(highlight[0], highlight[1], color="#F0C808",
                        alpha=0.13, lw=0, zorder=0)
     axg.set_xlim(grid[0], grid[-1])
-    axg.set_xlabel(
-        f"{chrom}  (Mb)   -- {window // 1000} kb window every "
-        f"{step // 1000} kb: interpolation between {bin_bp // 1000} kb bins, "
-        f"not {step // 1000} kb resolution", fontsize=8)
     axg.xaxis.set_major_formatter(
         matplotlib.ticker.FuncFormatter(lambda v, _: f"{v / 1e6:.2f}"))
+    axg.set_xlabel(f"{chrom} (Mb)", fontsize=9, labelpad=1)
+    axg.tick_params(axis="x", labelsize=8, pad=1)
+    # The caveat goes under the whole figure, not on an axis it would crowd.
+    fig.text(0.5, 0.005,
+             f"{window // 1000} kb window every {step // 1000} kb: "
+             f"interpolation between {bin_bp // 1000} kb bins, not "
+             f"{step // 1000} kb resolution",
+             ha="center", fontsize=7.5, color="#4B5563")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -319,7 +419,27 @@ def main(argv=None) -> int:
                     metavar="LABEL=PATH",
                     help="bigWig or bedGraph drawn under the heatmap "
                          "(RT early, RT late, LaminB1, ...).  Repeatable.")
+    ap.add_argument("--heatmap-track", action="append", default=None,
+                    metavar="GROUP:LABEL=PATH",
+                    help="A signal drawn as a HEATMAP ROW inside a named "
+                         "group panel, e.g. 'RT:HFFc6=rt/HFFc6_RT_250kb"
+                         ".bedGraph'.  Repeatable; every track sharing a "
+                         "GROUP becomes one panel, so the transition can be "
+                         "read across cell types instead of one at a time.")
     ap.add_argument("--gene-annotation", default=None, metavar="GTF|BED")
+    ap.add_argument("--cytoband", default=None, metavar="FILE",
+                    help="UCSC cytoBand.txt(.gz) -- draws the whole "
+                         "chromosome with the window marked, so the locus has "
+                         "a position and not only coordinates.")
+    ap.add_argument("--vmin", type=float, default=None)
+    ap.add_argument("--vmax", type=float, default=None,
+                    help="Colour limits for the cell heatmap.  Default is the "
+                         "1st-99th percentile of the values actually present, "
+                         "symmetric about zero only when they straddle it -- "
+                         "a fixed -|max|..+|max| scale wastes half the range "
+                         "when D sits in a narrow positive band and paints "
+                         "every cell alike.")
+    ap.add_argument("--cmap", default="RdYlBu_r")
     ap.add_argument("--region", default=None, metavar="chr:start-end",
                     help="Draw this locus instead of searching for one.")
     ap.add_argument("--flank-bins", type=int, default=6,
@@ -366,12 +486,28 @@ def main(argv=None) -> int:
     require = None
     if args.scores:
         sc = pd.read_csv(args.scores, sep="\t")
-        col = args.fdr_column or next(
-            (c for c in sc.columns
-             if c.startswith("contrast_") and c.endswith("_fdr")), None)
+        cands = [c for c in sc.columns
+                 if c.startswith("contrast_") and c.endswith("_fdr")]
+        col = args.fdr_column
+        if col is None and len(cands) > 1:
+            # Picking the first silently answers a different question from the
+            # one the figure asks, and the count in the log then disagrees
+            # with whichever volcano the reader has open.
+            sys.exit(
+                f"--scores {args.scores} holds {len(cands)} contrasts:\n"
+                + "\n".join(f"    {c}" for c in cands)
+                + "\n  pass --fdr-column to say which one, or drop --scores "
+                  "and let --low/--high choose the region on separation "
+                  "alone -- which is the stricter test here, since it wants "
+                  "every high group above every low one rather than one "
+                  "pooled reference.")
+        col = col or (cands[0] if cands else None)
         if col is None:
             sys.exit(f"--scores {args.scores}: no contrast_*_fdr column "
                      f"({list(sc.columns)}); pass --fdr-column")
+        if col not in sc.columns:
+            sys.exit(f"--fdr-column {col!r} not in {args.scores} "
+                     f"(have: {cands or list(sc.columns)})")
         key = sc["chrom"].astype(str) + ":" + sc["start"].astype(str)
         sig = pd.Series(sc[col].to_numpy(), index=key.to_numpy())
         q = sig.reindex(M.columns).to_numpy(float)
@@ -381,9 +517,42 @@ def main(argv=None) -> int:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    heat_spec = {}
+    for spec in (args.heatmap_track or []):
+        if "=" not in spec or ":" not in spec.split("=", 1)[0]:
+            sys.exit(f"--heatmap-track must be GROUP:LABEL=PATH, got {spec!r}")
+        key, path = spec.split("=", 1)
+        grp, lab = key.split(":", 1)
+        heat_spec.setdefault(grp.strip(), {})[lab.strip()] = path.strip()
+
     tracks_spec = _named(args.signal_track, "--signal-track")
+    # Checked before the region search, not when the first track is drawn:
+    # the search is the slow part, and failing after it wastes the work and
+    # makes a missing file look like a plotting bug.
+    absent = {k: v for k, v in tracks_spec.items()
+              if "://" not in v and not Path(v).exists()}
+    absent.update({f"{g}:{k}": v for g, mem in heat_spec.items()
+                   for k, v in mem.items()
+                   if "://" not in v and not Path(v).exists()})
+    if absent:
+        lines = [f"    {k} = {v}" for k, v in absent.items()]
+        hint = ""
+        if any("_early_" in v or "_late_" in v for v in absent.values()):
+            hint = ("\n  fetch_4dn_repliseq.py writes the per-fraction "
+                    "bedGraphs only with --keep-fractions; without it the "
+                    "directory holds <cell>_RT_<grid>kb.bedGraph, the "
+                    "log2(early/late) ratio.  Either re-run the fetcher with "
+                    "--keep-fractions, or pass the single RT track instead of "
+                    "the two fractions.")
+        sys.exit("--signal-track: file(s) not found:\n"
+                 + "\n".join(lines) + hint)
     genes = (mbe._read_genes(args.gene_annotation)
              if args.gene_annotation else None)
+    cyto = None
+    if args.cytoband:
+        cyto = pd.read_csv(args.cytoband, sep="\t", header=None,
+                           compression="infer",
+                           names=["chrom", "start", "end", "band", "stain"])
     ct_colors = {}
     if args.color_column and args.color_column in samples.columns:
         for g, c in zip(samples[args.cell_type_column].astype(str),
@@ -426,6 +595,9 @@ def main(argv=None) -> int:
         tracks = {}
         for label, path in tracks_spec.items():
             tracks[label] = mbe._signal_bin_means(win, path)
+        heat = {g: {lab: mbe._signal_bin_means(win, pth)
+                    for lab, pth in mem.items()}
+                for g, mem in heat_spec.items()}
         cols = [f"{run['chrom']}:{s}" for s in win.start
                 if f"{run['chrom']}:{s}" in set(M.columns)]
         sub = M[cols]
@@ -437,7 +609,9 @@ def main(argv=None) -> int:
             f"({run['n']} bins, {len(M):,} cells, mean gap {gap:.3g} in D "
             f"between {'+'.join(low)} and {'+'.join(high)})",
             ct_colors=ct_colors, step=args.step, window=args.window,
-            bin_bp=step_bp, highlight=(run["start"], run["end"]))
+            bin_bp=step_bp, highlight=(run["start"], run["end"]),
+            heat_groups=heat, cytoband=cyto, vmin=args.vmin, vmax=args.vmax,
+            cmap=args.cmap)
         print(f"  {run['chrom']}:{run['start']:,}-{run['end']:,}  "
               f"{run['n']} bins, mean gap {gap:.3g} -> {dest.name}")
     return 0
