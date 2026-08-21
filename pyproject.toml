@@ -64,3 +64,19 @@ nome_hic_compartments = "nome_hic_concordance.compartments_cli:main"
 [tool.setuptools.packages.find]
 include = ["nome_hic_concordance*"]
 exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+# Run in parallel by default.  The suite is ~1,000 tests of which 49 launch a
+# subprocess, each paying ~1.5 s of interpreter start plus numpy/pandas/scipy/
+# sklearn imports before doing anything; there is no hot spot to optimise --
+# the slowest twelve are 139 s of 423 s -- so the cost is spread across
+# independent, startup-bound work, which is the shape that parallelises.
+# Measured on 8 cores: 423 s -> 136 s.
+#
+# Safe as an unconditional addopts because pytest itself is only in the [dev]
+# extra, so anyone able to run the suite has installed pytest-xdist with it.
+# Debug a single test serially with `-n 0`.  NOT `-p no:xdist`: that
+# disables the plugin while addopts still passes -n, and pytest then exits on
+# an unrecognised argument.
+addopts = "-n auto"
+testpaths = ["tests"]
