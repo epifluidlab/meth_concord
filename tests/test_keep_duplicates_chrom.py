@@ -169,3 +169,26 @@ def test_an_explicit_list_overrides_the_default():
               keep_duplicates_chrom=["chrY"])) == {"Y"}
     assert _keep_dup_chroms(
         _args(keep_duplicates_chrom=["chrM,chrY"])) == {"M", "Y"}
+
+
+def test_adding_chrM_is_purely_additive_for_the_nuclear_rows(tmp_path):
+    """The upgrade path.  Re-running the parse with chrM added must leave
+    every nuclear row exactly as a run that never knew about chrM produced
+    it -- same values, same order, at the same positions -- so the existing
+    downstream results stay valid and only chrM is new.
+    """
+    bam = _write_bam(tmp_path / "a.bam", _spec())
+    ctx_all = _ctx()
+    ctx_nuclear = {c: a for c, a in ctx_all.items() if c != "chrM"}
+
+    before = bp.parse_cell_bam(bam, ctx_nuclear, trim_ends=0, mapq_min=0)
+    after = bp.parse_cell_bam(bam, ctx_all, trim_ends=0, mapq_min=0,
+                              keep_duplicates_chroms={"M"})
+
+    assert set(before["chrom"]) == {"chr1"}
+    assert set(after["chrom"]) == {"chr1", "chrM"}
+    # nuclear rows come FIRST and are untouched -- concat order matters here,
+    # because "additive" has to mean appended, not interleaved
+    head = after.iloc[: len(before)].reset_index(drop=True)
+    pd.testing.assert_frame_equal(before.reset_index(drop=True), head)
+    assert (after.iloc[len(before):]["chrom"] == "chrM").all()
