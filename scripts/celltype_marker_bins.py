@@ -572,6 +572,48 @@ def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects")
     return out
 
 
+def batch_negative_control(X, ct, batch, min_cells, test, fdr_cut,
+                           V=None, mode="none", counts=None):
+    """Run the contrast with the arms defined by BATCH instead of biology.
+
+    The decisive check that a confounding statistic cannot give.  Cramer's V
+    says whether the contrast and a batch are associated; --max-batch-icc is a
+    within-cell-type statistic and reports nothing when a batch is nested
+    inside cell type.  Neither answers the question actually being asked --
+    how many bins would this pipeline call at this FDR if the arms differed
+    ONLY by processing?
+
+    So: same matrix, same test, same weighting, same correction, arms taken
+    from the batch column, stratified by cell type so the comparison is
+    within-cell-type and cannot be biology.  The count that comes back is the
+    number of bins this design yields from processing alone.  Compared with
+    the real contrast's count it is either reassuring or fatal, and it needs
+    no assumption about how batch and biology relate.
+    """
+    levels = [v for v in pd.unique(batch) if v == v]
+    if len(levels) < 2:
+        return None
+    counts_by = pd.Series(batch).value_counts()
+    top = [v for v in counts_by.index[:2]]
+    a = (batch == top[0])
+    b = (batch == top[1])
+    if int(a.sum()) < min_cells or int(b.sum()) < min_cells:
+        return None
+    comb, per = stratified_contrast(X, np.asarray(ct), a, b, min_cells,
+                                    test, V, mode, counts=counts)
+    if comb is None:
+        cs = (weighted_contrast(X, V, a, b, min_cells, mode) if V is not None
+              else contrast_stats(X, a, min_cells, b, test))
+        comb, per = cs, {}
+    q = _bh_fdr(comb["p"])
+    sig = int(np.sum(np.isfinite(q) & (q < fdr_cut)))
+    return {"levels": [str(top[0]), str(top[1])],
+            "n_cells": [int(a.sum()), int(b.sum())],
+            "n_significant": sig,
+            "n_tested": int(np.isfinite(comb["p"]).sum()),
+            "n_strata": len(per)}
+
+
 def dropout_report(X, in_mask, out_mask, min_cells, strata=None):
     """Why bins are not testable, counted at each requirement in turn.
 
@@ -2046,6 +2088,15 @@ def main():
                          "belong in --batch-column and --remove-batch, not "
                          "here.  Per-stratum differences are written to the "
                          "BED so a bin carried by one stratum is visible.")
+    ap.add_argument("--contrast-batch-control", action="store_true",
+                    help="After each contrast, run the SAME pipeline with the "
+                         "arms taken from each --batch-column instead of from "
+                         "biology, stratified by cell type.  It answers the "
+                         "question a confounding statistic cannot: how many "
+                         "bins this design calls at this FDR when the arms "
+                         "differ only by processing.  A nuisance variable "
+                         "yielding as many bins as the biology means the two "
+                         "are not separable here, whatever Cramer's V says.")
     ap.add_argument("--contrast-consistency", action="store_true",
                     help="Also run the contrast SEPARATELY for each group in "
                          "the arm and keep only bins that move the same way, "
@@ -2936,6 +2987,36 @@ def main():
                           f"differential coordination until the effect "
                           f"survives inside copy-neutral regions — re-run with "
                           f"--cnv-max-delta.", file=sys.stderr)
+            if args.contrast_batch_control:
+                for c in bcols:
+                    nc = batch_negative_control(
+                        Xc, ct.to_numpy(), batch_df[c].to_numpy(),
+                        args.min_cells_per_group, args.contrast_test,
+                        args.contrast_fdr,
+                        Vc if args.contrast_weight != "none" else None,
+                        args.contrast_weight,
+                        counts=(Cc if args.contrast_weight != "none"
+                                else None))
+                    if nc is None:
+                        print(f"  negative control {c}: fewer than two levels "
+                              f"with {args.min_cells_per_group} cells -- not "
+                              f"run", file=sys.stderr)
+                        continue
+                    summary_contrast.setdefault(label, {})
+                    verdict = ""
+                    if nc["n_significant"] >= int(mask.sum()):
+                        verdict = ("   <- AS MANY AS THE BIOLOGY: these bins "
+                                   "are not separable from processing")
+                    elif nc["n_significant"] > 0.25 * max(int(mask.sum()), 1):
+                        verdict = "   <- a sizeable share of the biology"
+                    print(f"  negative control {c} "
+                          f"({nc['levels'][0]} vs {nc['levels'][1]}, "
+                          f"{nc['n_cells'][0]} vs {nc['n_cells'][1]} cells, "
+                          f"within cell type): {nc['n_significant']:,} bins at "
+                          f"FDR<{args.contrast_fdr} against "
+                          f"{int(mask.sum()):,} for {label!r}{verdict}",
+                          file=sys.stderr)
+                    cons_info[f"negcontrol_{c}"] = nc
             if worst and conf[worst] > 0.5:
                 print(f"  WARNING contrast {label!r} is confounded with "
                       f"{worst} (Cramer's V {conf[worst]:.2f}): these cells "

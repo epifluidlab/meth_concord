@@ -2207,3 +2207,68 @@ def test_joint_figure_invents_colours_when_none_are_given(tmp_path):
                    {"n_both": 2, "frac_both_same_direction": 1.0},
                    {"a": a, "b": a.copy()}, ct, out, "lab", ct_colors=None)
     assert out.stat().st_size > 0
+
+
+# ------------------------------------------------- batch negative control --
+
+def _neg_frame(n_cells=60, n_bins=40, batch_shift=0.0, bio_shift=0.0,
+               seed=0):
+    rng = np.random.default_rng(seed)
+    ct = np.array(["A"] * (n_cells // 2) + ["B"] * (n_cells // 2))
+    batch = np.array([f"b{i % 2}" for i in range(n_cells)])
+    X = rng.normal(0, 1, (n_cells, n_bins))
+    X += np.where((batch == "b0")[:, None], batch_shift, -batch_shift)
+    X[ct == "A"] += bio_shift
+    return X, ct, batch
+
+
+def test_a_harmless_batch_yields_almost_no_bins():
+    """The question a confounding statistic cannot answer: how many bins does
+    this pipeline call when the arms differ ONLY by processing?"""
+    m = _mod()
+    X, ct, batch = _neg_frame(batch_shift=0.01, seed=1)
+    got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
+    assert got["n_significant"] <= 2, got
+
+
+def test_a_strong_batch_lights_up_the_whole_genome():
+    """And when it does, the biological bins are not separable from it --
+    whatever Cramer's V says, and whatever the within-cell-type batch ICC
+    filter reports."""
+    m = _mod()
+    X, ct, batch = _neg_frame(batch_shift=1.5, seed=2)
+    got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
+    assert got["n_significant"] >= 0.8 * got["n_tested"], got
+
+
+def test_the_control_is_stratified_so_it_cannot_be_biology():
+    """Arms taken from batch, compared WITHIN cell type: a difference it finds
+    cannot be a cell-type difference."""
+    m = _mod()
+    X, ct, batch = _neg_frame(batch_shift=0.0, bio_shift=4.0, seed=3)
+    got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
+    assert got["n_significant"] <= 2, "a pure cell-type effect must not leak"
+    assert got["n_strata"] == 2
+
+
+def test_one_batch_level_cannot_make_a_control():
+    m = _mod()
+    X, ct, _ = _neg_frame()
+    assert m.batch_negative_control(X, ct, np.array(["b0"] * len(ct)),
+                                    3, "welch", 0.05) is None
+
+
+def test_a_batch_level_with_too_few_cells_is_refused():
+    m = _mod()
+    X, ct, _ = _neg_frame(n_cells=20)
+    batch = np.array(["b0"] * 18 + ["b1"] * 2)
+    assert m.batch_negative_control(X, ct, batch, 5, "welch", 0.05) is None
+
+
+def test_the_control_reports_the_levels_it_used():
+    m = _mod()
+    X, ct, _ = _neg_frame(n_cells=60)
+    batch = np.array(["b0"] * 25 + ["b1"] * 25 + ["rare"] * 10)
+    got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
+    assert set(got["levels"]) == {"b0", "b1"}, "the two largest levels"
+    assert got["n_cells"] == [25, 25]
