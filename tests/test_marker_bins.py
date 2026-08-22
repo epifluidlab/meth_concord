@@ -2314,3 +2314,78 @@ def test_the_bridge_does_not_pick_up_a_cell_type_effect():
     got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
     assert got["strata"] == ["bridge"]
     assert got["n_significant"] <= 3, "a cell-type effect must not leak in"
+
+
+# --------------------------------------------- within-cell permutation ----
+
+def test_permutation_keeps_every_per_cell_property():
+    """Offset, spread and coverage all survive; only WHICH bin a value
+    belongs to is destroyed.  That is what makes the null contain a
+    genome-wide shift."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    X = rng.normal(0, 1, (6, 40))
+    X[0] += 5.0                       # a cell with its own offset
+    X[1, :10] = np.nan                # and one with its own coverage
+    got = m.permute_within_cells(X, np.random.default_rng(1))
+    np.testing.assert_allclose(np.nanmean(got, axis=1), np.nanmean(X, axis=1))
+    np.testing.assert_allclose(np.nanstd(got, axis=1), np.nanstd(X, axis=1))
+    np.testing.assert_array_equal(np.isnan(got), np.isnan(X))
+    for i in range(X.shape[0]):
+        a = np.sort(X[i][np.isfinite(X[i])])
+        b = np.sort(got[i][np.isfinite(got[i])])
+        np.testing.assert_allclose(a, b)
+
+
+def test_a_whole_cell_offset_alone_survives_no_permutation_test():
+    """The failure this exists for: a genome-wide shift makes the parametric
+    p call almost every bin, and there is no bin-specific difference at all."""
+    m = _mod()
+    rng = np.random.default_rng(2)
+    X = rng.normal(0, 1, (40, 300))
+    a = np.arange(40) < 20
+    X[a] += 1.0                       # offset only, nothing bin-specific
+    got = m.permutation_null(X, a, ~a, 3, "welch", 60)
+    q = m._bh_fdr(got["p_empirical"])
+    assert int(np.sum(np.isfinite(q) & (q < 0.05))) == 0
+    para = m._bh_fdr(m.contrast_stats(X, a, 3, ~a, "welch")["p"])
+    assert int(np.sum(np.isfinite(para) & (para < 0.05))) > 200, (
+        "the parametric p should call most of the genome here")
+
+
+def test_a_real_bin_specific_effect_survives_permutation():
+    m = _mod()
+    rng = np.random.default_rng(3)
+    X = rng.normal(0, 1, (40, 300))
+    a = np.arange(40) < 20
+    X[a] += 1.0                       # the same nuisance offset
+    X[np.ix_(a, np.arange(20))] += 3.0    # plus 20 genuinely different bins
+    got = m.permutation_null(X, a, ~a, 3, "welch", 60)
+    q = m._bh_fdr(got["p_empirical"])
+    hit = np.isfinite(q) & (q < 0.05)
+    assert hit[:20].sum() >= 18, "the planted bins should survive"
+    assert hit[20:].sum() <= 5, "and little else should"
+
+
+def test_the_empirical_p_never_reaches_zero():
+    """N draws cannot evidence p = 0; the +1 keeps the floor at 1/(N+1)."""
+    m = _mod()
+    rng = np.random.default_rng(4)
+    X = rng.normal(0, 1, (20, 50))
+    a = np.arange(20) < 10
+    X[np.ix_(a, [0])] += 50.0         # absurdly extreme
+    got = m.permutation_null(X, a, ~a, 3, "welch", 20)
+    assert got["p_empirical"][0] == pytest.approx(1.0 / (got["n_null"] + 1))
+    assert (np.nan_to_num(got["p_empirical"], nan=1.0) > 0).all()
+
+
+def test_the_null_is_pooled_over_bins():
+    """A per-bin null of 100 permutations cannot resolve a p below 0.01;
+    pooling gives n_bins x n_perm draws because permuted bins are
+    exchangeable."""
+    m = _mod()
+    rng = np.random.default_rng(5)
+    X = rng.normal(0, 1, (20, 40))
+    a = np.arange(20) < 10
+    got = m.permutation_null(X, a, ~a, 3, "welch", 10)
+    assert got["n_null"] > 300, got["n_null"]

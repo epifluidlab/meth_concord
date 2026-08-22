@@ -572,6 +572,80 @@ def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects")
     return out
 
 
+def permute_within_cells(X, rng):
+    """Shuffle each cell's values across bins, keeping its NaN pattern.
+
+    Destroys WHICH bin a value belongs to while preserving everything about
+    the cell: its offset, its spread, and which bins it covers.  So a
+    difference that survives this is not bin-specific -- it is a property of
+    the cells, which is what a genome-wide batch or purity shift is.
+
+    The NaN positions stay put deliberately.  Moving them would shuffle
+    coverage as well, and coverage differs between bins for reasons that have
+    nothing to do with the contrast; holding it fixed keeps the null about bin
+    IDENTITY alone.
+    """
+    out = np.array(X, dtype=float, copy=True)
+    for i in range(out.shape[0]):
+        idx = np.flatnonzero(np.isfinite(out[i]))
+        if idx.size > 1:
+            out[i, idx] = out[i, rng.permutation(idx)]
+    return out
+
+
+def permutation_null(X, in_mask, out_mask, min_cells, test, n_perm,
+                     V=None, mode="none", strata=None, counts=None, seed=0):
+    """Empirical p per bin against a within-cell permutation null.
+
+    The parametric p asks whether the arms differ.  It cannot tell a
+    bin-specific difference from a whole-cell one, so a genome-wide offset --
+    batch, purity, coverage -- makes every bin significant, which is exactly
+    what a real run produced.  Permuting bins WITHIN each cell leaves that
+    offset untouched and removes bin identity, so the null it generates
+    already contains the offset, and a bin only clears it by differing MORE
+    than the cell-level shift explains.
+
+    The null is pooled over bins and permutations: after permutation the bins
+    are exchangeable, so every permuted statistic is a draw from the same null
+    and pooling buys n_bins x n_perm draws instead of n_perm.  That matters --
+    a per-bin null of 100 permutations cannot resolve a p below 0.01.
+    """
+    rng = np.random.default_rng(seed)
+
+    def stat_of(mat):
+        if strata is not None:
+            cs, _ = stratified_contrast(mat, strata, in_mask, out_mask,
+                                        min_cells, test, V, mode,
+                                        counts=counts, min_strata=1)
+            if cs is None:
+                cs = (weighted_contrast(mat, V, in_mask, out_mask, min_cells,
+                                        mode) if V is not None
+                      else contrast_stats(mat, in_mask, min_cells, out_mask,
+                                          test))
+        elif V is not None:
+            cs = weighted_contrast(mat, V, in_mask, out_mask, min_cells, mode)
+        else:
+            cs = contrast_stats(mat, in_mask, min_cells, out_mask, test)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return np.abs(np.asarray(cs["t"], float)), cs
+
+    obs, cs_obs = stat_of(np.asarray(X, float))
+    null = []
+    for _ in range(int(n_perm)):
+        v, _ = stat_of(permute_within_cells(X, rng))
+        null.append(v[np.isfinite(v)])
+    pooled = np.sort(np.concatenate(null)) if null else np.array([])
+    if pooled.size == 0:
+        return None
+    # +1 in numerator and denominator: an observed value beyond every draw
+    # gets 1/(N+1), not zero, because N draws cannot evidence p = 0.
+    rank = np.searchsorted(pooled, obs, side="left")
+    emp = (pooled.size - rank + 1.0) / (pooled.size + 1.0)
+    emp = np.where(np.isfinite(obs), emp, np.nan)
+    return {"stat": obs, "p_empirical": emp, "n_null": int(pooled.size),
+            "n_perm": int(n_perm), "cs": cs_obs}
+
+
 def batch_negative_control(X, ct, batch, min_cells, test, fdr_cut,
                            V=None, mode="none", counts=None):
     """Run the contrast with the arms defined by BATCH instead of biology.
@@ -2098,6 +2172,18 @@ def main():
                          "belong in --batch-column and --remove-batch, not "
                          "here.  Per-stratum differences are written to the "
                          "BED so a bin carried by one stratum is visible.")
+    ap.add_argument("--contrast-permutations", type=int, default=0,
+                    metavar="N",
+                    help="Replace the parametric p with an empirical one from "
+                         "N within-cell permutations.  Shuffling each cell's "
+                         "values across bins keeps everything about the CELL "
+                         "-- its offset, its spread, its coverage -- and "
+                         "removes which bin is which, so the null already "
+                         "contains any genome-wide batch or purity shift and "
+                         "a bin clears it only by differing MORE than that "
+                         "shift explains.  100 is usually enough; the null is "
+                         "pooled over bins, so N permutations give N x n_bins "
+                         "draws.")
     ap.add_argument("--contrast-batch-control", action="store_true",
                     help="After each contrast, run the SAME pipeline with the "
                          "arms taken from each --batch-column instead of from "
@@ -2782,6 +2868,33 @@ def main():
                           f"of its own estimate.", file=sys.stderr)
             else:
                 summary_cov = {}
+            if args.contrast_permutations > 0:
+                pn = permutation_null(
+                    Xc, in_mask, out_mask, args.min_cells_per_group,
+                    args.contrast_test, args.contrast_permutations,
+                    Vc if args.contrast_weight != "none" else None,
+                    args.contrast_weight,
+                    strata=_lev if args.contrast_stratify else None,
+                    counts=(Cc if args.contrast_weight != "none" else None))
+                if pn is None:
+                    print(f"  contrast {label!r}: permutation null produced "
+                          f"no usable statistic -- keeping the parametric p",
+                          file=sys.stderr)
+                else:
+                    n_para = int(np.sum(np.isfinite(_bh_fdr(cs["p"]))
+                                        & (_bh_fdr(cs["p"])
+                                           < args.contrast_fdr)))
+                    cs["p_parametric"] = cs["p"]
+                    cs["p"] = pn["p_empirical"]
+                    n_emp = int(np.sum(np.isfinite(_bh_fdr(cs["p"]))
+                                       & (_bh_fdr(cs["p"])
+                                          < args.contrast_fdr)))
+                    print(f"  contrast {label!r}: {args.contrast_permutations} "
+                          f"within-cell permutations, {pn['n_null']:,} null "
+                          f"draws -> {n_emp:,} bins at FDR<"
+                          f"{args.contrast_fdr} against {n_para:,} from the "
+                          f"parametric p.  The gap is what a whole-cell shift "
+                          f"was buying.", file=sys.stderr)
             q = _bh_fdr(cs["p"])
             gs = global_shift_report(cs["diff"],
                                      np.isfinite(q) & (q < args.contrast_fdr))
