@@ -2389,3 +2389,78 @@ def test_the_null_is_pooled_over_bins():
     a = np.arange(20) < 10
     got = m.permutation_null(X, a, ~a, 3, "welch", 10)
     assert got["n_null"] > 300, got["n_null"]
+
+
+# ------------------------------------------------- coverage confounding ---
+
+def test_the_effect_is_correlated_with_the_coverage_gap_when_depth_drives_it():
+    """The failure a permutation null cannot catch: a coverage gap that
+    varies BY BIN is bin-specific, so the shuffle keeps it, and shallower D
+    is pulled toward the prior -- technical, and only ever one-directional."""
+    m = _mod()
+    rng = np.random.default_rng(4)
+    n_cells, n_bins = 80, 600
+    a = np.arange(n_cells) < 40
+    gap = rng.uniform(0.2, 1.0, n_bins)
+    depth = np.where(a[:, None], rng.poisson(60 * gap, (n_cells, n_bins)) + 1,
+                     rng.poisson(60, (n_cells, n_bins)) + 1)
+    X = 0.5 * (depth / (depth + 25.0)) + rng.normal(0, 0.2 / np.sqrt(depth))
+    diff = m.contrast_stats(X, a, 3, ~a, "welch")["diff"]
+    got = m.coverage_confound(depth, a, ~a, diff)
+    assert got["pearson_r_effect_vs_coverage_gap"] > 0.8
+
+
+def test_no_coverage_gap_gives_no_correlation():
+    m = _mod()
+    rng = np.random.default_rng(5)
+    n_cells, n_bins = 80, 600
+    a = np.arange(n_cells) < 40
+    depth = np.full((n_cells, n_bins), 50.0)
+    X = rng.normal(0.5, 0.1, (n_cells, n_bins))
+    X[a] += 0.3                                  # a real effect, equal depth
+    diff = m.contrast_stats(X, a, 3, ~a, "welch")["diff"]
+    got = m.coverage_confound(depth, a, ~a, diff)
+    # Matched bin for bin: there is no gap to correlate with, which is a
+    # different statement from "the check ran and found nothing".
+    assert got["gap_is_constant"] is True
+    assert np.isnan(got["pearson_r_effect_vs_coverage_gap"])
+
+
+def test_a_gap_that_does_not_track_the_effect_gives_a_low_correlation():
+    m = _mod()
+    rng = np.random.default_rng(6)
+    n_cells, n_bins = 80, 600
+    a = np.arange(n_cells) < 40
+    # a real gap, but the effect is planted independently of it
+    gap = rng.uniform(0.4, 1.0, n_bins)
+    depth = np.where(a[:, None], rng.poisson(200 * gap, (n_cells, n_bins)) + 1,
+                     rng.poisson(200, (n_cells, n_bins)) + 1)
+    X = rng.normal(0.5, 0.05, (n_cells, n_bins))
+    X[np.ix_(a, rng.permutation(n_bins)[:60])] += 0.5
+    diff = m.contrast_stats(X, a, 3, ~a, "welch")["diff"]
+    got = m.coverage_confound(depth, a, ~a, diff)
+    assert abs(got["pearson_r_effect_vs_coverage_gap"]) < 0.3
+
+
+def test_direction_skew_counts_the_sides():
+    """Real regional biology goes both ways somewhere; a 99% one-sided result
+    is usually a monotone technical gradient."""
+    m = _mod()
+    diff = np.array([-1.0, -2.0, -3.0, 1.0, 0.5])
+    sig = np.array([True, True, True, True, False])
+    got = m.direction_skew(diff, sig)
+    assert (got["n_down"], got["n_up"]) == (3, 1)
+    assert got["frac_one_direction"] == pytest.approx(0.75)
+
+
+def test_direction_skew_on_nothing_significant():
+    m = _mod()
+    assert m.direction_skew(np.array([1.0, -1.0]),
+                            np.array([False, False])) == {}
+
+
+def test_coverage_confound_needs_enough_bins():
+    m = _mod()
+    depth = np.full((10, 4), 50.0)
+    a = np.arange(10) < 5
+    assert m.coverage_confound(depth, a, ~a, np.zeros(4)) == {}

@@ -572,6 +572,66 @@ def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects")
     return out
 
 
+def coverage_confound(counts, in_mask, out_mask, diff):
+    """Does the contrast track the per-bin COVERAGE gap between the arms?
+
+    The failure a permutation null cannot catch.  Permuting bins within a cell
+    absorbs anything whole-cell -- an offset, a purity shift, a uniform depth
+    difference -- because those survive the shuffle.  A coverage gap that
+    varies BY BIN does not: mappability, GC and capture make one arm relatively
+    thinner in some bins than others, D is estimated from the pairs in a bin,
+    and shallower estimates are pulled toward the prior.  That is a genuine
+    bin-specific difference, so permutation keeps it, and it is technical.
+
+    Its signature is unmistakable once looked for: an effect that is almost
+    entirely one-directional, tiny in size, and correlated with the coverage
+    gap.  On a fixture with identical biology everywhere and only a bin-varying
+    gap: 1,431 of 3,000 bins called, 1,431 down and 0 up, r = 0.97.
+    """
+    n = np.asarray(counts, float)
+    n = np.where(np.isfinite(n) & (n > 0), n, np.nan)
+    with np.errstate(invalid="ignore"):
+        a = np.nanmean(n[np.asarray(in_mask, bool)], axis=0)
+        b = np.nanmean(n[np.asarray(out_mask, bool)], axis=0)
+        gap = np.log2((a + 1.0) / (b + 1.0))
+    d = np.asarray(diff, float)
+    ok = np.isfinite(gap) & np.isfinite(d)
+    if int(ok.sum()) < 10:
+        return {}
+    if float(np.nanstd(gap[ok])) < 1e-12:
+        # The arms are matched bin for bin, so there is no gap to correlate
+        # with.  Reporting NaN silently would read as "the check ran and
+        # found nothing" when it is "there was nothing to check".
+        return {"pearson_r_effect_vs_coverage_gap": np.nan,
+                "spearman_rho_effect_vs_coverage_gap": np.nan,
+                "median_log2_coverage_gap": float(np.nanmedian(gap)),
+                "n_bins": int(ok.sum()), "gap_is_constant": True}
+    from scipy.stats import pearsonr, spearmanr
+    r = float(pearsonr(gap[ok], d[ok])[0])
+    rho = float(spearmanr(gap[ok], d[ok])[0])
+    return {"pearson_r_effect_vs_coverage_gap": r,
+            "spearman_rho_effect_vs_coverage_gap": rho,
+            "median_log2_coverage_gap": float(np.nanmedian(gap)),
+            "n_bins": int(ok.sum())}
+
+
+def direction_skew(diff, sig):
+    """How one-sided the significant bins are.
+
+    Real regional biology goes both ways somewhere.  A result that is 99%
+    one-directional is usually a monotone technical gradient -- attenuation
+    pulls toward the prior and never away from it.
+    """
+    d = np.asarray(diff, float)
+    m = np.asarray(sig, bool) & np.isfinite(d)
+    n = int(m.sum())
+    if not n:
+        return {}
+    up = int(np.sum(d[m] > 0))
+    return {"n_significant": n, "n_up": up, "n_down": n - up,
+            "frac_one_direction": max(up, n - up) / n}
+
+
 def permute_within_cells(X, rng):
     """Shuffle each cell's values across bins, keeping its NaN pattern.
 
@@ -2992,6 +3052,29 @@ def main():
                                                    or args.n_bins]
                 keep_rank = keep_rank[np.isfinite(rank[keep_rank])]
                 mask[keep_rank] = True
+            cov_conf = {}
+            if Cc is not None:
+                cov_conf = coverage_confound(Cc, in_mask, out_mask,
+                                             cs["diff"])
+            skew = direction_skew(cs["diff"],
+                                  np.isfinite(q) & (q < args.contrast_fdr))
+            if cov_conf and skew:
+                r = cov_conf["pearson_r_effect_vs_coverage_gap"]
+                if abs(r) > 0.5 and skew["frac_one_direction"] > 0.9:
+                    print(f"  contrast {label!r}: WARNING the effect tracks "
+                          f"the per-bin COVERAGE GAP between the arms "
+                          f"(r = {r:+.2f}) and {skew['frac_one_direction']:.0%}"
+                          f" of the {skew['n_significant']:,} significant bins "
+                          f"point the same way ({skew['n_down']:,} down, "
+                          f"{skew['n_up']:,} up).  A gap that varies by bin is "
+                          f"bin-specific, so a permutation null keeps it, and "
+                          f"shallower D is pulled toward the prior -- which is "
+                          f"why it only ever goes one way.  On a fixture with "
+                          f"identical biology and only such a gap this "
+                          f"produced 1,431 bins, all down, at r = 0.97.  "
+                          f"--contrast-weight random-effects weights each cell "
+                          f"by its own precision; if the effect survives that, "
+                          f"it is not depth.", file=sys.stderr)
             cons_info = {}
             # When stratifying, consistency runs across the STRATA: combining
             # per-stratum evidence (Stouffer) asks whether there is an average
@@ -3075,6 +3158,8 @@ def main():
                 **{f"shift_{k}": v for k, v in gs.items()},
                 **{f"dropout_{k}": v for k, v in dropout.items()},
                 **{f"coverage_{k}": v for k, v in summary_cov.items()},
+                **{f"covconf_{k}": v for k, v in cov_conf.items()},
+                **{f"skew_{k}": v for k, v in skew.items()},
                 **{f"consistency_{k}": v for k, v in cons_info.items()},
                 "weight": args.contrast_weight, "test": args.contrast_test,
                 "groups_in": present, "n_cells_in": int(in_mask.sum()),
