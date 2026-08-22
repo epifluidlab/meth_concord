@@ -15,7 +15,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from .utils import ensure_dir
+from .utils import chrom_key, ensure_dir
 
 logger = logging.getLogger(__name__)
 
@@ -446,6 +446,7 @@ def stream_subsample_from_parquets(
     short_range_max: int = 1_000,
     min_distance: int = 20_000,
     random_state: int = 42,
+    exclude_chroms=None,
 ) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict]:
     """Stream through per-cell parquets, drawing a proportional sample per cell.
 
@@ -498,12 +499,28 @@ def stream_subsample_from_parquets(
     }
     total_ends: dict[str, int] = {"all": 0, "short": 0, "long": 0}
 
+    drop = set(exclude_chroms or ())
+    cols = ["k1", "n1", "k2", "n2", "distance"]
+    if drop:
+        cols.append("chrom")
+    n_dropped = 0
+
     for cell_name, parquet_path in cell_parquet_paths.items():
-        df = pd.read_parquet(
-            parquet_path, columns=["k1", "n1", "k2", "n2", "distance"],
-        )
+        df = pd.read_parquet(parquet_path, columns=cols)
         if len(df) == 0:
             continue
+        if drop:
+            # A reference contig is carried through the pipeline for
+            # calibration, not as data.  chrM has no nucleosomes at all, so
+            # its read ends do not come from the accessible/inaccessible
+            # mixture this model describes -- letting them into the fit would
+            # pull the components and change the posterior of every NUCLEAR
+            # site, which is the opposite of adding a reference.
+            keep = ~df["chrom"].map(chrom_key).isin(drop)
+            n_dropped += int((~keep).sum())
+            df = df.loc[keep]
+            if len(df) == 0:
+                continue
 
         # Stack both ends.  Each pair contributes two read ends.
         k_both = np.concatenate([df["k1"].values, df["k2"].values]).astype(float)
@@ -588,6 +605,7 @@ def fit_and_compare_from_parquets(
     max_iter: int = 200,
     tol: float = 1e-6,
     n_restarts: int = 5,
+    exclude_chroms=None,
 ) -> dict:
     """Fit mixture on three distance subsets using streaming subsampling.
 
@@ -604,6 +622,14 @@ def fit_and_compare_from_parquets(
     output_dir : str
     max_subsample, random_state, max_iter, tol, n_restarts :
         Passed through to EM fitting.
+    exclude_chroms : iterable of str, optional
+        Contigs kept out of the fit, matched by canonical key.  Meant for
+        reference contigs such as chrM, which are carried through the
+        pipeline for calibration rather than as data: chrM has no
+        nucleosomes, so its read ends do not come from the
+        accessible/inaccessible mixture being fitted, and including them
+        would shift the components and with them the posterior of every
+        NUCLEAR site.
 
     Returns
     -------
@@ -615,9 +641,17 @@ def fit_and_compare_from_parquets(
         f"Stream-subsampling from {len(cell_parquet_paths)} cell parquets "
         f"(target {max_subsample:,} read ends per subset)..."
     )
+    if exclude_chroms:
+        logger.info(
+            f"Excluding {sorted(exclude_chroms)} from the mixture fit: a "
+            f"reference contig is carried for calibration, not as data, and "
+            f"letting it into the fit would move the posterior of every "
+            f"nuclear site."
+        )
     subsampled, subsample_log = stream_subsample_from_parquets(
         cell_parquet_paths,
         max_subsample=max_subsample,
+        exclude_chroms=exclude_chroms,
         short_range_max=short_range_max,
         min_distance=min_distance,
         random_state=random_state,
@@ -793,6 +827,7 @@ def fit_cell_specific_models(
     n_threads: int = 4,
     output_dir: str = "output/03_mixture_model",
     group_labels: "pd.Series | None" = None,
+    exclude_chroms=None,
 ) -> pd.DataFrame:
     """Fit mixture independently per cell for diagnostic comparison.
 
@@ -803,8 +838,15 @@ def fit_cell_specific_models(
 
     out_path = ensure_dir(output_dir)
 
+    _drop = set(exclude_chroms or ())
+
     def _fit_one_cell(cell_name: str, parquet_path: str) -> dict:
         df = pd.read_parquet(parquet_path)
+        if _drop and "chrom" in df.columns:
+            # Same reason as the pooled fit: a reference contig is not a
+            # sample from the mixture, so a per-cell fit that included it
+            # would report a per-cell parameter that is partly chrM.
+            df = df.loc[~df["chrom"].map(chrom_key).isin(_drop)]
         k_all = np.concatenate([df["k1"].values, df["k2"].values]).astype(float)
         n_all = np.concatenate([df["n1"].values, df["n2"].values]).astype(float)
         mask = n_all >= 1

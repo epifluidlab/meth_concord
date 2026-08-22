@@ -569,6 +569,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Bases to trim from read ends.")
     add_include_chrom_arg(parser)
     parser.add_argument(
+        "--mixture-exclude-chrom", action="append", default=None,
+        metavar="CHROM",
+        help="Contigs kept OUT of the step-3 beta-binomial fit, repeatable "
+             "and/or comma-separated.  chrM carries no nucleosomes, so its "
+             "read ends are not draws from the accessible/inaccessible "
+             "mixture being fitted; including them moves the components and "
+             "with them the posterior of every NUCLEAR site, which turns "
+             "adding a reference into silently changing every existing "
+             "result.  DEFAULTS to whatever --include-chrom added, since "
+             "such a contig is there to calibrate rather than to be "
+             "modelled.  Posteriors are still computed for it, under the "
+             "nuclear model -- which is what makes the reference comparable "
+             "to the bins it corrects.  Pass 'none' to fit on everything.")
+    parser.add_argument(
         "--keep-duplicates-chrom", action="append", default=None,
         metavar="CHROM",
         help="Contigs on which the BAM duplicate flag is IGNORED, "
@@ -742,6 +756,28 @@ def _keep_dup_chroms(args):
     make the quiet failure the easy one to hit, so opting out is explicit.
     """
     raw = getattr(args, "keep_duplicates_chrom", None)
+    if raw is None:
+        return {chrom_key(c)
+                for c in parse_include_chroms(
+                    getattr(args, "include_chrom", None))}
+    names = parse_include_chroms(raw)
+    if [n.lower() for n in names] == ["none"]:
+        return set()
+    return {chrom_key(c) for c in names}
+
+
+def _mixture_exclude_chroms(args):
+    """Contigs kept out of the beta-binomial fit, as canonical keys.
+
+    Defaults to whatever --include-chrom added, for the same reason
+    :func:`_keep_dup_chroms` does: a contig outside the default set is there
+    to calibrate, not to be modelled.  chrM carries no nucleosomes, so its
+    read ends are not draws from the accessible/inaccessible mixture at all;
+    fitting on them moves the components and therefore the posterior of every
+    NUCLEAR site -- turning "add a reference" into "silently change all the
+    existing results".  Pass 'none' to fit on everything.
+    """
+    raw = getattr(args, "mixture_exclude_chrom", None)
     if raw is None:
         return {chrom_key(c)
                 for c in parse_include_chroms(
@@ -1283,6 +1319,7 @@ def run_context(
             max_iter=args.em_max_iter,
             tol=args.em_tol,
             n_restarts=args.em_restarts,
+            exclude_chroms=_mixture_exclude_chroms(args),
         )
         fitted_model = fit_results["models"]["all"]
 
@@ -1293,6 +1330,7 @@ def run_context(
                 n_threads=args.n_threads,
                 output_dir=str(mixture_dir),
                 group_labels=samples.set_index("cell_name")["group"],
+                exclude_chroms=_mixture_exclude_chroms(args),
             )
     else:
         # Only load step 3 output if a downstream step needs it.
