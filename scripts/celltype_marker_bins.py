@@ -572,6 +572,87 @@ def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects")
     return out
 
 
+def _logit(x, eps=1e-4):
+    """logit on the D scale, with the out-of-range values pinned.
+
+    D is a Pearson r, so sampling noise puts some bins at or below 0 where the
+    logit does not exist.  Those are bins with no reliable signal, and pinning
+    them to eps keeps them in the matrix at the floor rather than turning them
+    into NaN, which would silently change WHICH bins are testable between the
+    corrected and uncorrected runs -- the one difference that would make the
+    two runs incomparable.
+    """
+    x = np.asarray(x, float)
+    out = np.full(x.shape, np.nan)
+    ok = np.isfinite(x)
+    v = np.clip(x[ok], eps, 1.0 - eps)
+    out[ok] = np.log(v / (1.0 - v))
+    return out
+
+
+def _expit(z):
+    z = np.asarray(z, float)
+    out = np.full(z.shape, np.nan)
+    ok = np.isfinite(z)
+    out[ok] = 1.0 / (1.0 + np.exp(-z[ok]))
+    return out
+
+
+def correct_by_reference(X, ref_d, eps=1e-4):
+    """Divide out each cell's assay reliability, measured on a reference.
+
+    D is a Pearson r between the posteriors at the two ends of a read pair,
+    which under a noise model is a RELIABILITY coefficient rather than a
+    structural correlation:
+
+        D = S / (S + N),   S = e^2 var_A,   N = Vbar / n_sites
+
+    with ``e`` the GpC methyltransferase efficiency in that cell.  On the
+    logit scale that is additive,
+
+        logit(D) = 2 log e + log var_A + log n_sites - log Vbar
+
+    so subtracting the logit of a reference D measured in the SAME cell
+    cancels the enzyme term exactly (to first order -- Vbar depends on e too,
+    but that is second order beside 2 log e).
+
+    This is why the transform is logit and not Fisher z: Fisher z stabilises
+    the variance of a sampling correlation, which is a different goal.  Logit
+    is the scale on which the attenuation being removed is additive.
+
+    Cells with no reference (too few pairs, or a degenerate one) keep their
+    uncorrected values.  Correcting some cells and not others would put two
+    scales in one matrix, so the grand mean is added back from the corrected
+    cells only and the untouched cells are reported.
+    """
+    X = np.asarray(X, float)
+    ref = np.asarray(ref_d, float)
+    if ref.shape[0] != X.shape[0]:
+        raise ValueError(f"reference has {ref.shape[0]} cells, "
+                         f"matrix has {X.shape[0]}")
+    usable = np.isfinite(ref) & (ref > 0)
+    info = {"n_cells": int(X.shape[0]), "n_corrected": int(usable.sum()),
+            "n_uncorrected": int((~usable).sum())}
+    if not usable.any():
+        info["note"] = "no cell had a usable reference"
+        return X, info
+    finite = np.isfinite(X)
+    info["frac_at_floor"] = float(np.mean(X[finite] <= eps)) if finite.any() \
+        else float("nan")
+    z = _logit(X, eps)
+    zr = _logit(ref, eps)
+    out = np.array(z, copy=True)
+    out[usable] = z[usable] - zr[usable, None] + float(np.nanmean(zr[usable]))
+    corrected = _expit(out)
+    # cells without a reference are returned exactly as they came in, not
+    # round-tripped through logit/expit, so eps-clipping cannot move them
+    corrected[~usable] = X[~usable]
+    info["reference_d_median"] = float(np.nanmedian(ref[usable]))
+    info["reference_d_min"] = float(np.nanmin(ref[usable]))
+    info["reference_d_max"] = float(np.nanmax(ref[usable]))
+    return corrected, info
+
+
 def regress_out_coverage(X, counts, n_strata=24):
     """Subtract the shared relationship between D and sequencing depth.
 
@@ -2293,6 +2374,19 @@ def main():
                          "belong in --batch-column and --remove-batch, not "
                          "here.  Per-stratum differences are written to the "
                          "BED so a bin carried by one stratum is visible.")
+    ap.add_argument("--contrast-reference-d", metavar="NAME=PATH",
+                    action="append", default=[],
+                    help="Per-cell reference concordance from "
+                         "scripts/reference_concordance.py, used to divide "
+                         "out each cell's assay reliability.  D is a Pearson "
+                         "r, hence a reliability coefficient S/(S+N) with "
+                         "S = e^2 var_A, so the GpC enzyme efficiency e is "
+                         "ADDITIVE on the logit scale and subtracting the "
+                         "reference's logit cancels it.  Measured on chrM, "
+                         "which -- unlike cLADs, replication timing or PMDs "
+                         "-- has no chromatin state for a tumour to "
+                         "rearrange.  Cells with no usable reference keep "
+                         "their uncorrected values.")
     ap.add_argument("--contrast-regress-coverage", action="store_true",
                     help="Subtract the shared D-versus-depth curve before the "
                          "contrast.  A shallow D is pulled toward the prior, "
@@ -2468,6 +2562,7 @@ def main():
             out[k.strip()] = v.strip()
         return out
 
+    ref_specs = _named_map(args.contrast_reference_d, "--contrast-reference-d")
     marginal_explicit = _named_map(args.marginal_matrix, "--marginal-matrix")
     coord_explicit = _named_map(args.coordination_matrix,
                                 "--coordination-matrix")
@@ -2606,6 +2701,25 @@ def main():
         C_df = _companion(path, args.pair_counts, name,
                           "pair_counts_per_bin.parquet", "--pair-counts",
                           matrix=M)
+        R_ser = None
+        if name in ref_specs:
+            rpath = Path(ref_specs[name])
+            if not rpath.exists():
+                sys.exit(f"--contrast-reference-d {name}: no such file "
+                         f"{rpath}")
+            rdf = pd.read_csv(rpath, sep="\t")
+            if "cell" not in rdf.columns or "reference_d" not in rdf.columns:
+                sys.exit(f"--contrast-reference-d {name}: {rpath} needs "
+                         f"'cell' and 'reference_d' columns (write it with "
+                         f"scripts/reference_concordance.py)")
+            R_ser = rdf.set_index("cell")["reference_d"]
+            shared = R_ser.index.intersection(M.index)
+            if len(shared) < 0.5 * len(M.index):
+                sys.exit(
+                    f"--contrast-reference-d {name}: the reference covers "
+                    f"{len(shared)} of {len(M.index)} cells in the matrix.  "
+                    f"Correcting a minority would leave two scales in one "
+                    f"matrix; regenerate it over the same cells.")
         if args.contrast_weight != "none" and V_df is None and C_df is None:
             here = sorted(x.name for x in Path(path).parent.glob("*.parquet"))
             sys.exit(
@@ -2920,6 +3034,31 @@ def main():
             if C_df is not None:
                 Cc = C_df.reindex(index=M.index,
                                   columns=M.columns).to_numpy()
+            _rd = {}
+            if R_ser is not None:
+                Xc, _rd = correct_by_reference(
+                    Xc, R_ser.reindex(M.index).to_numpy())
+                if _rd.get("n_corrected"):
+                    print(f"  {name}: divided out assay reliability using "
+                          f"the reference for {_rd['n_corrected']}/"
+                          f"{_rd['n_cells']} cells (reference D "
+                          f"{_rd['reference_d_min']:.3f}.."
+                          f"{_rd['reference_d_max']:.3f}, median "
+                          f"{_rd['reference_d_median']:.3f})",
+                          file=sys.stderr)
+                if _rd.get("n_uncorrected"):
+                    print(f"  {name}: WARNING {_rd['n_uncorrected']} cells "
+                          f"had no usable reference and keep their "
+                          f"uncorrected values -- two scales in one matrix.  "
+                          f"Drop them, or lower --n-pairs when building the "
+                          f"reference.", file=sys.stderr)
+                if args.contrast_center == "cell-median":
+                    print(f"  {name}: NOTE --contrast-center cell-median and "
+                          f"--contrast-reference-d both remove a per-cell "
+                          f"effect.  Using both is not wrong, but the "
+                          f"reference is the measured version and centring "
+                          f"the inferred one; the second has nothing left to "
+                          f"take.", file=sys.stderr)
             _rg = {}
             if args.contrast_regress_coverage:
                 if Cc is None:
@@ -3268,6 +3407,7 @@ def main():
                 **{f"coverage_{k}": v for k, v in summary_cov.items()},
                 **{f"covconf_{k}": v for k, v in cov_conf.items()},
                 **{f"depthreg_{k}": v for k, v in _rg.items()},
+                **{f"refd_{k}": v for k, v in _rd.items()},
                 "regressed_coverage": bool(args.contrast_regress_coverage),
                 **{f"skew_{k}": v for k, v in skew.items()},
                 **{f"consistency_{k}": v for k, v in cons_info.items()},

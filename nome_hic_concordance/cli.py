@@ -27,8 +27,9 @@ from . import (
     shrinkage,
     visualization,
 )
-from .utils import (add_exclude_chrom_arg, chrom_excluded, ensure_dir,
-                    parse_exclude_chroms, report_excluded, setup_logging)
+from .utils import (add_exclude_chrom_arg, add_include_chrom_arg,
+                    chrom_excluded, ensure_dir, parse_exclude_chroms,
+                    parse_include_chroms, report_excluded, setup_logging)
 
 logger = logging.getLogger("nome_hic_concordance")
 
@@ -565,6 +566,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Read processing
     parser.add_argument("--trim-ends", type=int, default=5,
                         help="Bases to trim from read ends.")
+    add_include_chrom_arg(parser)
     parser.add_argument("--mapq-min", type=int, default=30,
                         help="Minimum mapping quality on both ends.")
     parser.add_argument("--require-proper-pair", action="store_true",
@@ -1859,6 +1861,8 @@ def main(argv: list[str] | None = None) -> int:
             contexts=contexts,
             dbsnp_vcf=args.dbsnp_vcf,
             n_threads=args.n_threads,
+            extra_chroms=parse_include_chroms(
+                getattr(args, "include_chrom", None)),
         )
     else:
         logger.info("Step 1: Skipped (loading precomputed context positions)")

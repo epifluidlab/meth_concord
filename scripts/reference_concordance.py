@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Per-cell reference concordance from a chromosome with no 3D structure.
+
+WHY.  The concordance D reported per bin is a Pearson r between the posteriors
+at the two ends of a read pair, taken across pairs.  Under a noise model that
+is a RELIABILITY coefficient, not a structural correlation:
+
+    D = S / (S + N),    S = e^2 * var_A,    N = Vbar / n_sites
+
+where ``e`` is the GpC methyltransferase efficiency for that cell, ``var_A``
+the between-molecule variance in true accessibility, and ``n_sites`` the GCH
+sites per read end.  Taking logits,
+
+    logit(D) = 2 log e + log var_A + log n_sites - log Vbar
+
+so the per-cell enzyme efficiency enters ADDITIVELY.  Subtracting the logit of
+a reference D measured in the same cell cancels it.
+
+WHY chrM.  Every nuclear reference candidate -- cLADs, replication-timing
+domains, PMDs -- is defined as invariant across a panel of NORMAL cell types,
+and chromatin reorganisation is exactly what a tumour does.  Using one assumes
+away the thing under test, and because the reference set is small, being wrong
+about it is worse than not correcting at all.  chrM does not make that
+assumption: it carries no nucleosomes, so it has no chromatin state to
+rearrange.  What it costs instead is the assumption that mtDNA packaging
+heterogeneity (``var_A`` above) is constant across cells.
+
+NO DISTANCE FLOOR.  The nuclear analysis discards pairs closer than
+``--min-distance`` because short-range co-methylation is dominated by
+nucleosome-scale structure rather than long-range architecture.  chrM has
+neither: no nucleosomes, and no 3D contacts to speak of on a 16.6 kb circle.
+A distance floor there discards almost all the data and keeps only spurious
+ligations, so the default here is 0.
+
+FIXED PAIR COUNT.  Pearson r carries a small-sample bias toward zero,
+E[r_hat] ~ rho (1 - (1 - rho^2) / 2n).  mtDNA copy number differs severalfold
+between cell types, so leaving the pair count free would make the reference
+differently biased in each arm -- injecting the artefact it is meant to
+remove.  Every cell is therefore subsampled to the SAME number of pairs, and a
+cell that cannot reach it is reported unusable rather than quietly estimated
+from fewer.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+MITO = ("chrM", "M", "MT", "chrMT")
+
+
+def canon_chrom(c):
+    """'chrM', 'M', 'MT' all name the same sequence; a reference that silently
+    matches nothing is worse than one that fails loudly."""
+    c = str(c)
+    c = c[3:] if c.startswith("chr") else c
+    return "M" if c in ("M", "MT") else c
+
+
+def _seed_for(cell, seed):
+    """Deterministic per-cell seed, independent between cells.  Deriving it
+    from the name rather than a counter keeps a cell's subsample identical
+    whether or not its neighbours were processed."""
+    h = hashlib.sha1(f"{cell}:{seed}".encode()).digest()
+    return int.from_bytes(h[:8], "little")
+
+
+def reference_pairs(df, chrom="chrM", min_gch_sites=3, min_distance=0):
+    """Rows of *df* usable for the reference, before subsampling."""
+    need = {"chrom", "n1", "n2", "posterior1", "posterior2"}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"posteriors missing columns {sorted(missing)}")
+    want = canon_chrom(chrom)
+    keep = df["chrom"].map(canon_chrom) == want
+    keep &= (df["n1"] >= min_gch_sites) & (df["n2"] >= min_gch_sites)
+    keep &= df["posterior1"].notna() & df["posterior2"].notna()
+    if min_distance > 0 and "distance" in df.columns:
+        keep &= df["distance"] >= min_distance
+    return df.loc[keep]
+
+
+def reference_d(df, cell, n_pairs, chrom="chrM", min_gch_sites=3,
+                min_distance=0, seed=0):
+    """Reference D for one cell, from exactly *n_pairs* subsampled pairs."""
+    sub = reference_pairs(df, chrom, min_gch_sites, min_distance)
+    n_avail = int(len(sub))
+    out = {"cell": cell, "n_pairs_available": n_avail,
+           "n_pairs_used": 0, "reference_d": np.nan,
+           "median_sites_per_end": np.nan, "note": ""}
+    if n_avail:
+        out["median_sites_per_end"] = float(
+            np.median(np.concatenate([sub["n1"].to_numpy(),
+                                      sub["n2"].to_numpy()])))
+    if n_avail < n_pairs:
+        out["note"] = f"only {n_avail} pairs, need {n_pairs}"
+        return out
+    rng = np.random.default_rng(_seed_for(cell, seed))
+    idx = rng.choice(n_avail, n_pairs, replace=False)
+    p1 = sub["posterior1"].to_numpy(float)[idx]
+    p2 = sub["posterior2"].to_numpy(float)[idx]
+    out["n_pairs_used"] = int(n_pairs)
+    if np.std(p1) < 1e-10 or np.std(p2) < 1e-10:
+        # var_A ~ 0: the molecules do not differ, so there is no reliability
+        # to measure.  Reported rather than returned as a number, because
+        # dividing the genome by a degenerate reference is silently wrong.
+        out["note"] = "posteriors have no variance (var_A ~ 0)"
+        return out
+    out["reference_d"] = float(np.corrcoef(p1, p2)[0, 1])
+    return out
+
+
+def discover(posterior_dir, suffix=".posteriors.parquet"):
+    """cell -> path, from the 04_posteriors layout the pipeline writes."""
+    d = Path(posterior_dir)
+    return {p.name[: -len(suffix)]: p
+            for p in sorted(d.glob(f"*{suffix}"))}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--posteriors", required=True,
+                    help="Directory of CELL.posteriors.parquet (the "
+                         "pipeline's 04_posteriors), or a single parquet.")
+    ap.add_argument("--chrom", default="chrM",
+                    help="Reference sequence (default chrM).  chrM/M/MT are "
+                         "matched interchangeably.")
+    ap.add_argument("--n-pairs", type=int, default=2000,
+                    help="Pairs to subsample per cell.  IDENTICAL in every "
+                         "cell so the small-sample bias of Pearson r is a "
+                         "constant rather than a per-arm nuisance; cells "
+                         "below it are reported unusable (default 2000).")
+    ap.add_argument("--min-gch-sites", type=int, default=3,
+                    help="Minimum GCH sites per read end, matching the "
+                         "nuclear run so the posteriors carry the same "
+                         "precision (default 3).")
+    ap.add_argument("--min-distance", type=int, default=0,
+                    help="Distance floor.  Default 0: chrM has no "
+                         "nucleosomes and no 3D structure, so the nuclear "
+                         "reason for a floor does not apply and a floor "
+                         "would keep only spurious ligations.")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--output", required=True, help="Per-cell TSV.")
+    args = ap.parse_args(argv)
+
+    src = Path(args.posteriors)
+    paths = ({src.stem.replace(".posteriors", ""): src} if src.is_file()
+             else discover(src))
+    if not paths:
+        sys.exit(f"no posteriors parquet found under {src}")
+
+    rows = []
+    for cell, path in paths.items():
+        cols = ["chrom", "n1", "n2", "posterior1", "posterior2"]
+        if args.min_distance > 0:
+            cols.append("distance")
+        try:
+            df = pd.read_parquet(path, columns=cols)
+        except Exception:                     # older files may lack a column
+            df = pd.read_parquet(path)
+        rows.append(reference_d(df, cell, args.n_pairs, args.chrom,
+                                args.min_gch_sites, args.min_distance,
+                                args.seed))
+
+    out = pd.DataFrame(rows).set_index("cell").sort_index()
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(args.output, sep="\t")
+
+    ok = out["reference_d"].notna()
+    print(f"{len(out)} cells; {int(ok.sum())} with a usable reference "
+          f"({args.n_pairs} pairs each)", file=sys.stderr)
+    if ok.any():
+        d = out.loc[ok, "reference_d"]
+        print(f"  reference D: median {d.median():.3f}, "
+              f"range {d.min():.3f}..{d.max():.3f}", file=sys.stderr)
+        if d.median() < 0.05:
+            print("  WARNING reference D is near zero, so mtDNA molecules "
+                  "barely differ from one another (var_A ~ 0).  There is "
+                  "little reliability signal to divide out and the "
+                  "correction will mostly add noise.", file=sys.stderr)
+    if (~ok).any():
+        n_thin = int((out.loc[~ok, "n_pairs_available"]
+                      < args.n_pairs).sum())
+        print(f"  {int((~ok).sum())} cells unusable "
+              f"({n_thin} short of {args.n_pairs} pairs).  They keep their "
+              f"uncorrected values downstream.", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

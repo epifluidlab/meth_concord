@@ -173,6 +173,36 @@ def _extract_chrom_contexts(
     return chrom, results
 
 
+def select_chroms(all_chroms, chroms=None, extra_chroms=None):
+    """Which contigs to extract contexts from.
+
+    ``chroms`` names the set outright.  ``extra_chroms`` instead ADDS to the
+    default (autosomes + sex), which is how chrM gets in: it is excluded by
+    default because it is not somewhere you want bins, but it is the only
+    sequence carrying no nucleosomes, and that makes it the reference for
+    per-cell assay reliability.
+
+    A name matching no contig raises.  The failure it prevents is remote from
+    its cause: contexts would extract fine, the pipeline would run to
+    completion, and only the reference step much later would find nothing on
+    chrM -- by which point the reason is several hours behind you.
+    """
+    all_list = list(all_chroms)
+    if chroms is not None:
+        return [c for c in chroms if c in all_list]
+    out = [c for c in all_list if chrom_is_autosomal_or_sex(c)]
+    for c in (extra_chroms or []):
+        if c not in all_list:
+            raise ValueError(
+                f"--include-chrom {c!r} is not in the reference, which has "
+                f"{', '.join(all_list[:5])}...  Spell it as the reference "
+                f"does; a silently ignored name would leave the reference "
+                f"empty steps later, far from the cause.")
+        if c not in out:
+            out.append(c)
+    return out
+
+
 def extract_context_positions(
     twobit_path: str,
     output_dir: str,
@@ -180,6 +210,7 @@ def extract_context_positions(
     dbsnp_vcf: str | None = None,
     n_threads: int = 4,
     chroms: Iterable[str] | None = None,
+    extra_chroms: Iterable[str] | None = None,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Extract cytosine context positions from a .2bit reference genome.
 
@@ -199,6 +230,13 @@ def extract_context_positions(
     chroms : iterable of str, optional
         Restrict processing to these chromosomes. Defaults to chr1..chr22,
         chrX, chrY (autosomes + sex chromosomes, excluding chrM and alts).
+    extra_chroms : iterable of str, optional
+        Added to the default set rather than replacing it. This is how chrM
+        gets in: it is excluded by default because it is not somewhere you
+        want bins, but it is the one sequence carrying no nucleosomes, which
+        makes it the reference for per-cell assay reliability (see
+        scripts/reference_concordance.py). Ignored when ``chroms`` is given
+        explicitly, since that already names everything wanted.
 
     Returns
     -------
@@ -217,10 +255,7 @@ def extract_context_positions(
     finally:
         tb.close()
 
-    if chroms is None:
-        chrom_list = [c for c in all_chroms if chrom_is_autosomal_or_sex(c)]
-    else:
-        chrom_list = [c for c in chroms if c in all_chroms]
+    chrom_list = select_chroms(all_chroms, chroms, extra_chroms)
 
     snp_per_chrom: dict[str, set[int]] = {}
     if dbsnp_vcf:

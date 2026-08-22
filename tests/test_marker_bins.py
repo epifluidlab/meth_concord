@@ -2611,10 +2611,11 @@ def test_regress_coverage_without_counts_refuses_with_a_usable_message(tmp_path)
          "--samples", str(stab), "--cell-type-column", "cell_type",
          "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "20",
          "--output-dir", str(tmp_path / "out"), "--plot-format", "png",
-         "--contrast-select", "CT0", "--contrast-regress-coverage"],
+         "--contrast", "a=CT0", "--contrast-regress-coverage"],
         capture_output=True, text=True)
     assert r.returncode != 0
-    assert "--pair-counts" in r.stderr
+    # the real guard, not argparse's usage text (which also lists the flag)
+    assert "needs the read-pair" in r.stderr
 
 
 def test_a_stratum_too_thin_to_centre_is_left_alone_not_shifted():
@@ -2641,3 +2642,275 @@ def test_a_stratum_too_thin_to_centre_is_left_alone_not_shifted():
     # not shifted by the grand mean
     assert (depth[untouched] > 10.0).all()
     np.testing.assert_array_equal(out[untouched], X[untouched])
+
+
+# --------------------------------------------------------------------------
+# Dividing out assay reliability with a reference measured on chrM.
+#
+# D is a Pearson r between the posteriors at the two ends of a read pair, so
+# under a noise model it is a RELIABILITY coefficient, D = S/(S+N) with
+# S = e^2 var_A and N = Vbar/n_sites.  On the logit scale the GpC enzyme
+# efficiency e is additive (2 log e), so subtracting the logit of a reference
+# measured in the same cell cancels it.  chrM is the reference because it
+# carries no nucleosomes -- unlike cLADs or replication-timing domains, there
+# is no chromatin state there for a tumour to rearrange.
+# --------------------------------------------------------------------------
+
+def _corr_axis(p1, p2):
+    a = p1 - p1.mean(-1, keepdims=True)
+    b = p2 - p2.mean(-1, keepdims=True)
+    den = np.sqrt((a * a).sum(-1) * (b * b).sum(-1))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(den > 0, (a * b).sum(-1) / den, np.nan)
+
+
+def _reliability_fixture(seed=0, n_cells=80, n_bins=400, n_real=25,
+                         e_lo=0.55, e_hi=0.85, n_sites=6, n_pairs=40,
+                         ref_pairs=2000):
+    """Two arms whose enzyme differs, plus bins where the biology really does.
+
+    D is BUILT the way the pipeline builds it -- a Pearson r across simulated
+    read pairs -- rather than written down directly, so the attenuation under
+    test arises from the model instead of being assumed.
+    """
+    rng = np.random.default_rng(seed)
+    arm = np.zeros(n_cells, bool)
+    arm[: n_cells // 2] = True
+    e = np.where(arm, e_lo, e_hi)                  # arm A: the weaker enzyme
+    sd_A = rng.uniform(0.05, 0.25, n_bins)         # the biology, per bin
+    real = np.zeros(n_bins, bool)
+    real[rng.choice(n_bins, n_real, replace=False)] = True
+    sd = np.tile(sd_A, (n_cells, 1))
+    sd[np.ix_(arm, real)] *= 2.0                   # a genuine effect in arm A
+    A = np.clip(rng.normal(0.5, sd[:, :, None], (n_cells, n_bins, n_pairs)),
+                0, 1)
+    mu = np.clip(e[:, None, None] * A, 0, 1)
+    X = _corr_axis(rng.binomial(n_sites, mu) / n_sites,
+                   rng.binomial(n_sites, mu) / n_sites)
+    # chrM: same model, var_A fixed (no chromatin to vary), many pairs
+    Aref = np.clip(rng.normal(0.5, 0.15, (n_cells, ref_pairs)), 0, 1)
+    mur = np.clip(e[:, None] * Aref, 0, 1)
+    ref = _corr_axis(rng.binomial(n_sites, mur) / n_sites,
+                     rng.binomial(n_sites, mur) / n_sites)
+    return X, ref, arm, real
+
+
+def _perm_called(m, X, arm, n_perm=100, seed=1):
+    null = m.permutation_null(X, arm, ~arm, 2, "mwu", n_perm, seed=seed)
+    q = m._bh_fdr(np.asarray(null["p_empirical"], float))
+    cs = m.contrast_stats(X, arm, 2, out_mask=~arm, test="mwu")
+    return (np.isfinite(q) & (q < 0.1)), np.asarray(cs["diff"], float)
+
+
+def test_an_enzyme_efficiency_gap_survives_the_permutation_null():
+    """The motivating failure.  A weaker enzyme attenuates D in EVERY bin,
+    but not by the same amount -- the attenuation scales with each bin's own
+    var_A -- so it is bin-specific and the permutation keeps it."""
+    m = _mod()
+    X, ref, arm, real = _reliability_fixture()
+    sig, diff = _perm_called(m, X, arm)
+    false = int((sig & ~real).sum())
+    assert false > 50, f"fixture did not reproduce the artefact ({false})"
+    assert int((sig & ~real & (diff < 0)).sum()) > 0.9 * false
+
+
+def test_the_reference_removes_the_gap_and_recovers_the_real_bins():
+    """Both halves matter.  Killing the false positives is easy -- a blunt
+    filter does that.  The point of dividing out a MEASURED nuisance rather
+    than permuting an unmeasured one away is that the real bins come back."""
+    m = _mod()
+    X, ref, arm, real = _reliability_fixture()
+    raw_sig, _ = _perm_called(m, X, arm)
+    Xc, info = m.correct_by_reference(X, ref)
+    cor_sig, _ = _perm_called(m, Xc, arm)
+    assert info["n_corrected"] == X.shape[0]
+    assert int((cor_sig & ~real).sum()) < 0.1 * int((raw_sig & ~real).sum())
+    # the power gain, not just the false-positive cut
+    assert int((cor_sig & real).sum()) > 2 * int((raw_sig & real).sum())
+    assert int((cor_sig & real).sum()) >= 0.8 * real.sum()
+
+
+def test_a_constant_reference_changes_nothing_that_matters():
+    """If every cell has the same reliability there is nothing to divide out,
+    and the contrast must come back where it started."""
+    m = _mod()
+    rng = np.random.default_rng(3)
+    X = np.clip(rng.normal(0.4, 0.1, (40, 200)), 0.01, 0.99)
+    arm = np.zeros(40, bool)
+    arm[:20] = True
+    X[np.ix_(arm, np.arange(15))] += 0.2
+    out, info = m.correct_by_reference(X, np.full(40, 0.3))
+    assert info["n_corrected"] == 40
+    before = np.nanmean(X[arm][:, :15]) - np.nanmean(X[~arm][:, :15])
+    after = np.nanmean(out[arm][:, :15]) - np.nanmean(out[~arm][:, :15])
+    assert after == pytest.approx(before, abs=0.02)
+
+
+def test_cells_without_a_reference_are_returned_untouched():
+    """Correcting some cells and not others leaves two scales in one matrix.
+    The untouched ones must at least be EXACTLY untouched -- not round-tripped
+    through logit/expit, where the eps clip would move them."""
+    m = _mod()
+    rng = np.random.default_rng(4)
+    X = np.clip(rng.normal(0.4, 0.1, (30, 120)), -0.5, 0.99)
+    ref = np.full(30, 0.3)
+    ref[:5] = np.nan                       # too few pairs upstream
+    ref[5:8] = -0.02                       # degenerate / negative
+    out, info = m.correct_by_reference(X, ref)
+    assert info["n_corrected"] == 22 and info["n_uncorrected"] == 8
+    np.testing.assert_array_equal(out[:8], X[:8])
+    assert not np.array_equal(out[8:], X[8:])
+
+
+def test_missing_bins_stay_missing_through_the_correction():
+    m = _mod()
+    rng = np.random.default_rng(5)
+    X = np.clip(rng.normal(0.4, 0.1, (30, 150)), 0.01, 0.99)
+    X[rng.random(X.shape) < 0.25] = np.nan
+    out, _ = m.correct_by_reference(X, np.full(30, 0.3))
+    np.testing.assert_array_equal(np.isnan(out), np.isnan(X))
+
+
+def test_a_negative_or_zero_D_is_floored_not_dropped():
+    """Sampling noise puts some bins at or below 0, where the logit does not
+    exist.  Turning those into NaN would change WHICH bins are testable
+    between a corrected and an uncorrected run -- the one difference that
+    would make the two incomparable."""
+    m = _mod()
+    rng = np.random.default_rng(6)
+    X = rng.normal(0.05, 0.2, (30, 200))          # plenty below zero
+    assert (X < 0).any()
+    out, info = m.correct_by_reference(X, np.full(30, 0.3))
+    assert np.isfinite(out).all()
+    assert info["frac_at_floor"] > 0
+    assert (out >= 0).all() and (out <= 1).all()
+
+
+def test_a_mismatched_reference_length_is_an_error():
+    m = _mod()
+    with pytest.raises(ValueError, match="cells"):
+        m.correct_by_reference(np.zeros((10, 5)), np.zeros(9))
+
+
+def _ref_run(tmp_path, ref_table, extra=None):
+    """Run the CLI with a reference table, returning the completed process."""
+    m = _mod()
+    X, ct, batch, classes = _data(seed=1, n_per=30)
+    cts = [f"CT{c}" for c in ct]
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "gch.parquet"
+    pd.DataFrame(X, index=samples, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": cts,
+                  "sample": ["batch2" if b == 0 else "scNH" for b in batch]}
+                 ).to_csv(stab, sep="\t", index=False)
+    rpath = tmp_path / "ref.tsv"
+    ref_table(samples).to_csv(rpath, sep="\t", index=False)
+    return subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "20",
+         "--output-dir", str(tmp_path / "out"), "--plot-format", "png",
+         "--contrast", "a=CT0",
+         "--contrast-reference-d", f"gch={rpath}"] + (extra or []),
+        capture_output=True, text=True)
+
+
+def test_cli_applies_the_reference_and_says_how_many_cells_it_covered(tmp_path):
+    r = _ref_run(tmp_path, lambda s: pd.DataFrame(
+        {"cell": s, "reference_d": np.linspace(0.2, 0.5, len(s))}))
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    assert "divided out assay reliability" in r.stderr
+
+
+def test_cli_warns_when_some_cells_have_no_reference(tmp_path):
+    """Two scales in one matrix is a real hazard, not a footnote."""
+    def table(s):
+        d = np.linspace(0.2, 0.5, len(s))
+        d[: len(s) // 4] = np.nan
+        return pd.DataFrame({"cell": s, "reference_d": d})
+    r = _ref_run(tmp_path, table)
+    assert r.returncode == 0, r.stderr
+    assert "no usable reference" in r.stderr and "two scales" in r.stderr
+
+
+def test_cli_refuses_a_reference_covering_a_minority_of_cells(tmp_path):
+    r = _ref_run(tmp_path, lambda s: pd.DataFrame(
+        {"cell": list(s[: len(s) // 4]) + [f"ghost{i}" for i in range(5)],
+         "reference_d": 0.3}))
+    assert r.returncode != 0
+    assert "regenerate it over the same cells" in r.stderr
+
+
+def test_cli_refuses_a_table_without_the_expected_columns(tmp_path):
+    r = _ref_run(tmp_path, lambda s: pd.DataFrame(
+        {"cell_name": s, "D": 0.3}))
+    assert r.returncode != 0
+    assert "reference_concordance.py" in r.stderr
+
+
+def test_cli_notes_the_overlap_with_cell_median_centering(tmp_path):
+    """Both remove a per-cell effect; the run should say the second has
+    nothing left to take rather than let the user assume they stack."""
+    r = _ref_run(tmp_path, lambda s: pd.DataFrame(
+        {"cell": s, "reference_d": np.linspace(0.2, 0.5, len(s))}),
+        extra=["--contrast-center", "cell-median"])
+    assert r.returncode == 0, r.stderr
+    assert "nothing left to take" in r.stderr
+
+
+def test_the_extractor_output_feeds_the_contrast_unmodified(tmp_path):
+    """The two halves are separate programs joined by a TSV, so the column
+    names are a real interface.  A rename on either side would pass both
+    unit suites and fail only here."""
+    ref_script = _SCRIPT.parent / "reference_concordance.py"
+    X, ct, batch, classes = _data(seed=1, n_per=30)
+    cts = [f"CT{c}" for c in ct]
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "gch.parquet"
+    pd.DataFrame(X, index=samples, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": cts,
+                  "sample": ["batch2" if b == 0 else "scNH" for b in batch]}
+                 ).to_csv(stab, sep="\t", index=False)
+
+    # posteriors for the SAME cells, with correlated ends on chrM
+    pdir = tmp_path / "04_posteriors"
+    pdir.mkdir()
+    rng = np.random.default_rng(0)
+    for cell in samples:
+        n = 1500
+        shared = rng.normal(0, 1, n)
+        e1 = 0.6 * shared + 0.8 * rng.normal(0, 1, n)
+        e2 = 0.6 * shared + 0.8 * rng.normal(0, 1, n)
+        pd.DataFrame({
+            "chrom": "chrM", "pos1": rng.integers(0, 16000, n),
+            "pos2": rng.integers(0, 16000, n),
+            "distance": rng.integers(1, 16000, n), "n1": 6, "n2": 6,
+            "posterior1": 1 / (1 + np.exp(-e1)),
+            "posterior2": 1 / (1 + np.exp(-e2)),
+        }).to_parquet(pdir / f"{cell}.posteriors.parquet")
+
+    ref_tsv = tmp_path / "ref.tsv"
+    r1 = subprocess.run(
+        [sys.executable, str(ref_script), "--posteriors", str(pdir),
+         "--n-pairs", "800", "--output", str(ref_tsv)],
+        capture_output=True, text=True)
+    assert r1.returncode == 0, r1.stderr
+    assert "with a usable reference" in r1.stderr
+
+    r2 = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "20",
+         "--output-dir", str(tmp_path / "out"), "--plot-format", "png",
+         "--contrast", "a=CT0", "--contrast-reference-d", f"gch={ref_tsv}"],
+        capture_output=True, text=True)
+    assert r2.returncode == 0, f"stdout:\n{r2.stdout}\nstderr:\n{r2.stderr}"
+    assert "divided out assay reliability" in r2.stderr
+    # every cell had a reference, so nothing was left on the other scale
+    assert "no usable reference" not in r2.stderr

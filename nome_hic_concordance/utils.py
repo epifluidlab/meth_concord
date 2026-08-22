@@ -90,6 +90,42 @@ def parse_exclude_chroms(values) -> set[str]:
     return out
 
 
+def parse_include_chroms(values) -> list[str]:
+    """``--include-chrom`` -> contig names, in the order given.
+
+    The mirror of :func:`parse_exclude_chroms`, but a LIST rather than a set
+    of canonical keys: these names are handed to the reference reader, which
+    needs them spelled the way the reference spells them.  Accepts the flag
+    repeated, comma-separated, or both.
+    """
+    if not values:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    out: list[str] = []
+    for v in values:
+        for part in str(v).split(","):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def add_include_chrom_arg(parser) -> None:
+    """Register --include-chrom identically across the CLIs."""
+    parser.add_argument(
+        "--include-chrom", action="append", default=None, metavar="CHROM",
+        help="Contigs to ADD to the default set (chr1-22, chrX, chrY), "
+             "repeatable and/or comma-separated.  Use '--include-chrom chrM' "
+             "to keep the mitochondrial genome: it is excluded by default "
+             "because it is not somewhere you want bins, but it carries no "
+             "nucleosomes, which makes it the one reference for per-cell "
+             "assay reliability that does not assume the tumour left its "
+             "chromatin alone (scripts/reference_concordance.py).  Spell it "
+             "as the reference does; a name matching no contig is an error, "
+             "not a silent skip.")
+
+
 def chrom_excluded(chrom: str, excluded: set[str]) -> bool:
     return bool(excluded) and chrom_key(chrom) in excluded
 
