@@ -599,19 +599,29 @@ def batch_negative_control(X, ct, batch, min_cells, test, fdr_cut,
     b = (batch == top[1])
     if int(a.sum()) < min_cells or int(b.sum()) < min_cells:
         return None
+    # Stratified by cell type, so only cell types present in BOTH batches
+    # contribute -- which is exactly a bridge sample if you have one.  A cell
+    # type split across two experiments measures the batch effect with the
+    # biology held constant, and is the best estimate of it available.
     comb, per = stratified_contrast(X, np.asarray(ct), a, b, min_cells,
-                                    test, V, mode, counts=counts)
+                                    test, V, mode, counts=counts,
+                                    min_strata=1)
     if comb is None:
-        cs = (weighted_contrast(X, V, a, b, min_cells, mode) if V is not None
-              else contrast_stats(X, a, min_cells, b, test))
-        comb, per = cs, {}
+        # NOT falling back to an unstratified comparison.  Where a batch is
+        # nested inside cell type, comparing the batches directly compares the
+        # cell types too, and the count that comes back is biology wearing a
+        # batch label -- the exact confusion this control exists to resolve.
+        return {"levels": [str(top[0]), str(top[1])],
+                "n_cells": [int(a.sum()), int(b.sum())],
+                "n_significant": None, "n_tested": 0,
+                "n_strata": 0, "strata": []}
     q = _bh_fdr(comb["p"])
     sig = int(np.sum(np.isfinite(q) & (q < fdr_cut)))
     return {"levels": [str(top[0]), str(top[1])],
             "n_cells": [int(a.sum()), int(b.sum())],
             "n_significant": sig,
             "n_tested": int(np.isfinite(comb["p"]).sum()),
-            "n_strata": len(per)}
+            "n_strata": len(per), "strata": sorted(per)}
 
 
 def dropout_report(X, in_mask, out_mask, min_cells, strata=None):
@@ -3002,6 +3012,18 @@ def main():
                               f"with {args.min_cells_per_group} cells -- not "
                               f"run", file=sys.stderr)
                         continue
+                    if nc["n_significant"] is None:
+                        print(f"  negative control {c}: no cell type appears "
+                              f"in both {nc['levels'][0]} and "
+                              f"{nc['levels'][1]}, so this batch is NESTED "
+                              f"inside cell type and cannot be measured "
+                              f"separately from it -- comparing the batches "
+                              f"would compare the cell types.  A bridge "
+                              f"sample, one cell type split across both "
+                              f"batches, is what makes this answerable.",
+                              file=sys.stderr)
+                        cons_info[f"negcontrol_{c}"] = nc
+                        continue
                     summary_contrast.setdefault(label, {})
                     verdict = ""
                     if nc["n_significant"] >= int(mask.sum()):
@@ -3009,13 +3031,21 @@ def main():
                                    "are not separable from processing")
                     elif nc["n_significant"] > 0.25 * max(int(mask.sum()), 1):
                         verdict = "   <- a sizeable share of the biology"
+                    via = (f"within {', '.join(nc['strata'])}"
+                           if nc.get("strata") else "unstratified")
                     print(f"  negative control {c} "
                           f"({nc['levels'][0]} vs {nc['levels'][1]}, "
                           f"{nc['n_cells'][0]} vs {nc['n_cells'][1]} cells, "
-                          f"within cell type): {nc['n_significant']:,} bins at "
+                          f"{via}): {nc['n_significant']:,} bins at "
                           f"FDR<{args.contrast_fdr} against "
                           f"{int(mask.sum()):,} for {label!r}{verdict}",
                           file=sys.stderr)
+                    if len(nc.get("strata", [])) == 1:
+                        print(f"    that one cell type spans both batches, so "
+                              f"it is a BRIDGE: the same biology on either "
+                              f"side of the batch, and the cleanest estimate "
+                              f"of the batch effect this design offers.",
+                              file=sys.stderr)
                     cons_info[f"negcontrol_{c}"] = nc
             if worst and conf[worst] > 0.5:
                 print(f"  WARNING contrast {label!r} is confounded with "

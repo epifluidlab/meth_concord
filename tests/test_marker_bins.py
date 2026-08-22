@@ -2272,3 +2272,45 @@ def test_the_control_reports_the_levels_it_used():
     got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
     assert set(got["levels"]) == {"b0", "b1"}, "the two largest levels"
     assert got["n_cells"] == [25, 25]
+
+
+def test_a_nested_batch_is_reported_as_unmeasurable_not_as_a_number():
+    """Where no cell type spans both batches, comparing the batches compares
+    the cell types.  Falling back to an unstratified test returns biology
+    wearing a batch label -- the exact confusion the control exists to
+    resolve."""
+    m = _mod()
+    rng = np.random.default_rng(7)
+    ct = np.array(["A"] * 30 + ["B"] * 30)
+    batch = np.where(ct == "A", "e1", "e2")          # perfectly nested
+    X = rng.normal(0, 1, (60, 50))
+    X[ct == "A"] += 3.0                              # a huge CELL TYPE effect
+    got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
+    assert got["n_significant"] is None, "must not report a count here"
+    assert got["strata"] == []
+
+
+def test_one_cell_type_spanning_both_batches_is_used_as_a_bridge():
+    """A cell type split across two experiments measures the batch effect with
+    the biology held constant."""
+    m = _mod()
+    rng = np.random.default_rng(8)
+    ct = np.array(["tum"] * 20 + ["bridge"] * 20 + ["bridge"] * 20)
+    batch = np.array(["e1"] * 20 + ["e1"] * 20 + ["e2"] * 20)
+    X = rng.normal(0, 1, (60, 60))
+    X[batch == "e2"] += 2.0                          # pure batch
+    got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
+    assert got["strata"] == ["bridge"]
+    assert got["n_significant"] > 0.8 * got["n_tested"]
+
+
+def test_the_bridge_does_not_pick_up_a_cell_type_effect():
+    m = _mod()
+    rng = np.random.default_rng(9)
+    ct = np.array(["tum"] * 20 + ["bridge"] * 20 + ["bridge"] * 20)
+    batch = np.array(["e1"] * 20 + ["e1"] * 20 + ["e2"] * 20)
+    X = rng.normal(0, 1, (60, 60))
+    X[ct == "tum"] += 4.0                            # cell type only, no batch
+    got = m.batch_negative_control(X, ct, batch, 3, "welch", 0.05)
+    assert got["strata"] == ["bridge"]
+    assert got["n_significant"] <= 3, "a cell-type effect must not leak in"
