@@ -173,3 +173,54 @@ def test_cli_warns_when_the_reference_is_degenerate(tmp_path):
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "near zero" in r.stderr
+
+
+def test_a_deduplicated_reference_is_detected_and_called_out(tmp_path):
+    """The failure this catches is silent by construction.  A dedup'd chrM
+    still yields a number, and a plausible one -- but the between-molecule
+    variance it is supposed to measure has been removed by keeping one read
+    per coordinate.  Absence of coordinate collisions on 16.6 kb carried in
+    thousands of copies is the giveaway."""
+    d = tmp_path / "04_posteriors"
+    d.mkdir()
+    df = _posteriors(n_pairs=3000, seed=1)
+    ref = df["chrom"] == "chrM"
+    # every pair at its own coordinate: what markdup leaves behind
+    df.loc[ref, "pos1"] = np.arange(int(ref.sum())) * 5
+    df.loc[ref, "pos2"] = np.arange(int(ref.sum())) * 5 + 3
+    df.to_parquet(d / "dedup.posteriors.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--posteriors", str(d),
+         "--n-pairs", "1000", "--output", str(tmp_path / "r.tsv")],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "--keep-duplicates-chrom" in r.stderr
+    # worded as a NOTE, not a verdict: a library that simply never collides
+    # looks identical from here, and claiming otherwise would be wrong
+    assert "cannot be told" in r.stderr
+    assert pd.read_csv(tmp_path / "r.tsv", sep="\t"
+                       )["frac_repeated_coords"].iloc[0] == 0.0
+
+
+def test_a_properly_parsed_reference_does_not_trip_the_warning(tmp_path):
+    """mtDNA reads pile onto shared coordinates; that is the healthy case
+    and must not be reported as a problem."""
+    d = tmp_path / "04_posteriors"
+    d.mkdir()
+    df = _posteriors(n_pairs=3000, seed=2)
+    ref = df["chrom"] == "chrM"
+    rng = np.random.default_rng(0)
+    n = int(ref.sum())
+    df.loc[ref, "pos1"] = rng.integers(0, 60, n)       # heavy collisions
+    df.loc[ref, "pos2"] = rng.integers(0, 60, n)
+    df.to_parquet(d / "ok.posteriors.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--posteriors", str(d),
+         "--n-pairs", "1000", "--output", str(tmp_path / "r.tsv")],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "--keep-duplicates-chrom" not in r.stderr
+    # comfortably clear of the threshold; the exact rate depends on library
+    # prep, which is why the check only fires at essentially zero
+    assert pd.read_csv(tmp_path / "r.tsv", sep="\t"
+                       )["frac_repeated_coords"].iloc[0] > 0.05

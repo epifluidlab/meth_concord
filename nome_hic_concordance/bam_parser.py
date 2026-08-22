@@ -33,7 +33,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from .utils import ensure_dir
+from .utils import chrom_key, ensure_dir
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +359,7 @@ def _parse_cell_bam_python(
     mapq_min: int = 30,
     require_proper_pair: bool = False,
     keep_supplementary: bool = False,
+    keep_duplicates: bool = False,
 ) -> pd.DataFrame:
     """Parse a single cell's BAM using pure Python/pysam (fallback).
 
@@ -390,6 +391,16 @@ def _parse_cell_bam_python(
 
     # Local aliases for hot-path speed.
     skip_flags = _SKIP_FLAGS_BASE if keep_supplementary else _SKIP_FLAGS
+    if keep_duplicates:
+        # On a sequence present in hundreds to thousands of copies per cell,
+        # two reads sharing start and end coordinates are overwhelmingly
+        # likely to come from DIFFERENT molecules -- on 16.6 kb the collision
+        # is expected by chance, not evidence of PCR.  Honouring the
+        # duplicate flag there does not just cost depth: deduplication keeps
+        # one read per coordinate, collapsing molecules that differ in
+        # methylation into one, which destroys the between-molecule variance
+        # (var_A) that a reliability reference exists to measure.
+        skip_flags &= ~_FLAG_DUPLICATE
     proper_flag = _FLAG_PROPER_PAIR
     searchsorted = np.searchsorted
 
@@ -481,6 +492,7 @@ def parse_cell_bam(
     mapq_min: int = 30,
     require_proper_pair: bool = False,
     keep_supplementary: bool = False,
+    keep_duplicates_chroms=None,
 ) -> pd.DataFrame:
     """Parse a single cell's BAM into a DataFrame of read-pair context counts.
 
@@ -506,22 +518,57 @@ def parse_cell_bam(
     keep_supplementary : bool
         If True, keep supplementary alignments (chimeric-read splits).
         Default False — standard Hi-C practice to avoid double-counting.
+    keep_duplicates_chroms : iterable of str, optional
+        Contigs on which the BAM duplicate flag is IGNORED, matched by
+        canonical key so chrM/M/MT are the same contig.  Meant for chrM,
+        which is present in hundreds to thousands of copies per cell: two
+        reads sharing coordinates there are overwhelmingly likely to be
+        different molecules, so the marker's calls are wrong.  Every other
+        contig keeps the normal filtering, and the fast C++ path.
 
     Returns
     -------
     DataFrame with columns ``chrom, pos1, k1, n1, pos2, k2, n2, distance``.
     """
-    if _CPP_AVAILABLE:
-        return _parse_cell_bam_cpp(
-            bam_path, context_positions, trim_ends, mapq_min,
+    dup_keys = set(keep_duplicates_chroms or ())
+    exempt = {c: a for c, a in context_positions.items()
+              if chrom_key(c) in dup_keys} if dup_keys else {}
+    rest = ({c: a for c, a in context_positions.items()
+             if chrom_key(c) not in dup_keys} if exempt
+            else context_positions)
+
+    frames = []
+    if rest:
+        if _CPP_AVAILABLE:
+            frames.append(_parse_cell_bam_cpp(
+                bam_path, rest, trim_ends, mapq_min,
+                require_proper_pair=require_proper_pair,
+                keep_supplementary=keep_supplementary,
+            ))
+        else:
+            frames.append(_parse_cell_bam_python(
+                bam_path, rest, trim_ends, mapq_min,
+                require_proper_pair=require_proper_pair,
+                keep_supplementary=keep_supplementary,
+            ))
+    if exempt:
+        # Python backend for these contigs only: the compiled extension takes
+        # one flag mask for the whole call, so a per-contig exemption cannot
+        # be expressed there.  Splitting the parse rather than relaxing the
+        # mask globally is what keeps every OTHER chromosome byte-identical
+        # to a run without this option -- and chrM is 16.6 kb, so the slow
+        # path over it costs nothing measurable.
+        frames.append(_parse_cell_bam_python(
+            bam_path, exempt, trim_ends, mapq_min,
             require_proper_pair=require_proper_pair,
             keep_supplementary=keep_supplementary,
-        )
-    return _parse_cell_bam_python(
-        bam_path, context_positions, trim_ends, mapq_min,
-        require_proper_pair=require_proper_pair,
-        keep_supplementary=keep_supplementary,
-    )
+            keep_duplicates=True,
+        ))
+    if not frames:
+        return pd.DataFrame({c: [] for c in READ_PAIR_COLUMNS})
+    if len(frames) == 1:
+        return frames[0]
+    return pd.concat(frames, ignore_index=True)
 
 
 def parse_all_cells(
@@ -533,6 +580,7 @@ def parse_all_cells(
     mapq_min: int = 30,
     require_proper_pair: bool = False,
     keep_supplementary: bool = False,
+    keep_duplicates_chroms=None,
     blacklist_bed: str | None = None,
     **_unused_kwargs,
 ) -> dict[str, str]:
@@ -593,6 +641,7 @@ def parse_all_cells(
             bam, context_positions, trim_ends=trim_ends, mapq_min=mapq_min,
             require_proper_pair=require_proper_pair,
             keep_supplementary=keep_supplementary,
+            keep_duplicates_chroms=keep_duplicates_chroms,
         )
         n_pre = len(df)
 

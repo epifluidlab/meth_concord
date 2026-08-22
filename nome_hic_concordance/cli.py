@@ -28,8 +28,9 @@ from . import (
     visualization,
 )
 from .utils import (add_exclude_chrom_arg, add_include_chrom_arg,
-                    chrom_excluded, ensure_dir, parse_exclude_chroms,
-                    parse_include_chroms, report_excluded, setup_logging)
+                    chrom_excluded, chrom_key, ensure_dir,
+                    parse_exclude_chroms, parse_include_chroms,
+                    report_excluded, setup_logging)
 
 logger = logging.getLogger("nome_hic_concordance")
 
@@ -567,6 +568,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trim-ends", type=int, default=5,
                         help="Bases to trim from read ends.")
     add_include_chrom_arg(parser)
+    parser.add_argument(
+        "--keep-duplicates-chrom", action="append", default=None,
+        metavar="CHROM",
+        help="Contigs on which the BAM duplicate flag is IGNORED, "
+             "repeatable and/or comma-separated.  chrM is present in "
+             "hundreds to thousands of copies per cell, so on 16.6 kb two "
+             "reads sharing coordinates collide by chance rather than by "
+             "PCR, and the marker's calls there are wrong.  It costs more "
+             "than depth: deduplication keeps one read per coordinate, "
+             "collapsing molecules that differ in methylation, which "
+             "destroys the between-molecule variance a reliability "
+             "reference measures.  DEFAULTS to whatever --include-chrom "
+             "added, since that is the only reason to add a contig; pass "
+             "'none' to keep the normal filtering everywhere.  Every other "
+             "contig is unaffected and keeps the fast path.")
     parser.add_argument("--mapq-min", type=int, default=30,
                         help="Minimum mapping quality on both ends.")
     parser.add_argument("--require-proper-pair", action="store_true",
@@ -713,6 +729,27 @@ def group_colors_from_samples(samples: pd.DataFrame,
             f"they fall back to the default palette."
         )
     return mapping
+
+
+def _keep_dup_chroms(args):
+    """Contigs whose duplicate flag is ignored, as canonical keys.
+
+    Defaults to whatever --include-chrom added rather than to nothing.  The
+    only reason to add a contig outside the default set is to use it as a
+    reliability reference, and a deduplicated reference is not merely thinner
+    -- it is wrong, because collapsing coordinate-sharing molecules removes
+    the between-molecule variance being measured.  Defaulting to empty would
+    make the quiet failure the easy one to hit, so opting out is explicit.
+    """
+    raw = getattr(args, "keep_duplicates_chrom", None)
+    if raw is None:
+        return {chrom_key(c)
+                for c in parse_include_chroms(
+                    getattr(args, "include_chrom", None))}
+    names = parse_include_chroms(raw)
+    if [n.lower() for n in names] == ["none"]:
+        return set()
+    return {chrom_key(c) for c in names}
 
 
 def _parse_context_bed(spec: str) -> dict[str, str]:
@@ -1192,6 +1229,7 @@ def run_context(
             trim_ends=args.trim_ends, mapq_min=args.mapq_min,
             require_proper_pair=args.require_proper_pair,
             keep_supplementary=args.keep_supplementary,
+            keep_duplicates_chroms=_keep_dup_chroms(args),
             blacklist_bed=args.blacklist_bed,
         )
     else:

@@ -32,6 +32,16 @@ neither: no nucleosomes, and no 3D contacts to speak of on a 16.6 kb circle.
 A distance floor there discards almost all the data and keeps only spurious
 ligations, so the default here is 0.
 
+PCR DUPLICATES.  The reference must be built from a parse that IGNORED the
+duplicate flag on chrM (``--keep-duplicates-chrom chrM``).  mtDNA is present
+in hundreds to thousands of copies per cell, so two reads sharing
+coordinates on 16.6 kb collide by chance rather than by PCR, and marking them
+duplicates is simply wrong.  The cost is not depth: deduplication keeps one
+read per coordinate, collapsing molecules that differ in methylation into a
+single observation, which removes the between-molecule variance that IS the
+reference.  This script checks for it -- if no two pairs share coordinates,
+it says so rather than returning a confident, wrong number.
+
 FIXED PAIR COUNT.  Pearson r carries a small-sample bias toward zero,
 E[r_hat] ~ rho (1 - (1 - rho^2) / 2n).  mtDNA copy number differs severalfold
 between cell types, so leaving the pair count free would make the reference
@@ -92,11 +102,23 @@ def reference_d(df, cell, n_pairs, chrom="chrM", min_gch_sites=3,
     n_avail = int(len(sub))
     out = {"cell": cell, "n_pairs_available": n_avail,
            "n_pairs_used": 0, "reference_d": np.nan,
-           "median_sites_per_end": np.nan, "note": ""}
+           "median_sites_per_end": np.nan,
+           "frac_repeated_coords": np.nan, "note": ""}
     if n_avail:
         out["median_sites_per_end"] = float(
             np.median(np.concatenate([sub["n1"].to_numpy(),
                                       sub["n2"].to_numpy()])))
+    if n_avail and {"pos1", "pos2"} <= set(sub.columns):
+        # How often two pairs share coordinates.  On a 16.6 kb sequence
+        # carried in hundreds to thousands of copies per cell, collisions are
+        # expected -- so their ABSENCE is the signature of a duplicate-marked
+        # BAM parsed without the chrM exemption.  That is worth detecting
+        # rather than trusting: deduplication keeps one read per coordinate,
+        # collapsing molecules that differ in methylation, which removes the
+        # between-molecule variance this whole number is made of.  The result
+        # is not a thinner reference, it is a wrong one, and it looks fine.
+        coords = list(zip(sub["pos1"].to_numpy(), sub["pos2"].to_numpy()))
+        out["frac_repeated_coords"] = 1.0 - len(set(coords)) / float(n_avail)
     if n_avail < n_pairs:
         out["note"] = f"only {n_avail} pairs, need {n_pairs}"
         return out
@@ -158,7 +180,10 @@ def main(argv=None):
 
     rows = []
     for cell, path in paths.items():
-        cols = ["chrom", "n1", "n2", "posterior1", "posterior2"]
+        # pos1/pos2 are read for the duplicate-marking check, not for the
+        # statistic itself
+        cols = ["chrom", "pos1", "pos2", "n1", "n2",
+                "posterior1", "posterior2"]
         if args.min_distance > 0:
             cols.append("distance")
         try:
@@ -185,6 +210,18 @@ def main(argv=None):
                   "barely differ from one another (var_A ~ 0).  There is "
                   "little reliability signal to divide out and the "
                   "correction will mostly add noise.", file=sys.stderr)
+    rep = out["frac_repeated_coords"].dropna()
+    if len(rep) and rep.median() < 0.001:
+        print(f"  NOTE no two read pairs share coordinates on "
+              f"{args.chrom}.  That is what a deduplicated parse looks "
+              f"like -- and dedup here is harmful, because keeping one read "
+              f"per coordinate collapses molecules that differ in "
+              f"methylation and removes the between-molecule variance this "
+              f"number is made of.  It is ALSO what a library whose reads "
+              f"simply never collide looks like, in which case dedup was a "
+              f"no-op and the reference is fine; the two cannot be told "
+              f"apart from here.  If the parse did not use "
+              f"--keep-duplicates-chrom chrM, re-run it.", file=sys.stderr)
     if (~ok).any():
         n_thin = int((out.loc[~ok, "n_pairs_available"]
                       < args.n_pairs).sum())
