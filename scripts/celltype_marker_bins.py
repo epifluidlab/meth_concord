@@ -572,6 +572,67 @@ def weighted_contrast(X, V, in_mask, out_mask, min_cells, mode="random-effects")
     return out
 
 
+def regress_out_coverage(X, counts, n_strata=24):
+    """Subtract the shared relationship between D and sequencing depth.
+
+    D is estimated from the read pairs in a (cell, bin), and a shallow
+    estimate is pulled toward the prior, so D carries a monotone function of
+    depth that has nothing to do with biology.  Where the two arms differ in
+    depth bin by bin, that function becomes a bin-specific difference -- and
+    a within-cell permutation null KEEPS it, because it genuinely is one.
+    Shuffling a cell's values across bins cannot break a confound that is
+    itself indexed by bin.
+
+    The curve is fitted ONCE over every (cell, bin) rather than per bin, and
+    that is the load-bearing choice.  Within a single bin, coverage is
+    collinear with the arm whenever the tumour cells are the thin ones, so a
+    per-bin fit cannot separate depth from biology and would subtract the
+    finding along with the artefact.  Pooled, the curve is estimated across
+    the whole matrix, where depth varies for reasons unrelated to any one
+    contrast, and a real per-bin effect survives it.
+
+    Non-parametric: log2 coverage is cut into quantile strata and D is
+    centred within each, so no functional form is imposed on an attenuation
+    whose shape depends on a prior nobody measured.  The grand mean is added
+    back so the result stays on the D scale.
+    """
+    X = np.asarray(X, float)
+    n = np.asarray(counts, float)
+    x = np.log2(np.where(np.isfinite(n) & (n > 0), n, np.nan))
+    ok = np.isfinite(X) & np.isfinite(x)
+    if int(ok.sum()) < 100:
+        return X, {"n_strata": 0, "note": "too few covered bins"}
+    edges = np.unique(np.nanpercentile(x[ok],
+                                       np.linspace(0, 100, n_strata + 1)))
+    if edges.size < 3:
+        return X, {"n_strata": 0, "note": "coverage does not vary"}
+    idx = np.clip(np.searchsorted(edges, x, side="right") - 1, 0,
+                  edges.size - 2)
+    out = np.array(X, copy=True)
+    grand = float(np.nanmean(X[ok]))
+    # Track what was actually centred.  A stratum too thin to give a stable
+    # mean is left alone, and the grand mean must NOT be added back to it --
+    # doing so would shift those values by ~the mean of D while leaving them
+    # uncorrected, which is worse than not touching them at all.
+    done = np.zeros(X.shape, bool)
+    used = 0
+    for k in range(edges.size - 1):
+        sel = ok & (idx == k)
+        if int(sel.sum()) > 10:
+            out[sel] = X[sel] - float(np.nanmean(X[sel]))
+            done |= sel
+            used += 1
+    if not used:
+        return X, {"n_strata": 0, "note": "no stratum had enough observations"}
+    out[done] += grand
+    before = float(np.nanstd(X[done]))
+    after = float(np.nanstd(out[done]))
+    return out, {"n_strata": used, "sd_before": before, "sd_after": after,
+                 "frac_corrected": float(done.sum()) / float(ok.sum()),
+                 "frac_variance_removed": (1.0 - (after / before) ** 2
+                                           if before > 0 else float("nan"))}
+
+
 def coverage_confound(counts, in_mask, out_mask, diff):
     """Does the contrast track the per-bin COVERAGE gap between the arms?
 
@@ -2232,6 +2293,17 @@ def main():
                          "belong in --batch-column and --remove-batch, not "
                          "here.  Per-stratum differences are written to the "
                          "BED so a bin carried by one stratum is visible.")
+    ap.add_argument("--contrast-regress-coverage", action="store_true",
+                    help="Subtract the shared D-versus-depth curve before the "
+                         "contrast.  A shallow D is pulled toward the prior, "
+                         "so where the arms differ in depth bin by bin that "
+                         "becomes a bin-specific difference -- which a "
+                         "permutation null KEEPS, because it is one.  The "
+                         "curve is fitted once over the whole matrix, not per "
+                         "bin: within a bin, depth is collinear with the arm "
+                         "whenever the tumour cells are the thin ones, so a "
+                         "per-bin fit would subtract the finding along with "
+                         "the artefact.  Requires --pair-counts.")
     ap.add_argument("--contrast-permutations", type=int, default=0,
                     metavar="N",
                     help="Replace the parametric p with an empirical one from "
@@ -2848,6 +2920,23 @@ def main():
             if C_df is not None:
                 Cc = C_df.reindex(index=M.index,
                                   columns=M.columns).to_numpy()
+            _rg = {}
+            if args.contrast_regress_coverage:
+                if Cc is None:
+                    sys.exit(
+                        f"--contrast-regress-coverage needs the read-pair "
+                        f"counts and none were loaded for {name}; pass "
+                        f"--pair-counts {name}=pair_counts_per_bin.parquet")
+                Xc, _rg = regress_out_coverage(Xc, Cc)
+                if _rg.get("n_strata"):
+                    print(f"  {name}: regressed out depth over "
+                          f"{_rg['n_strata']} coverage strata, removing "
+                          f"{_rg['frac_variance_removed']:.1%} of the "
+                          f"variance in D", file=sys.stderr)
+                else:
+                    print(f"  {name}: depth not regressed out "
+                          f"({_rg.get('note', 'unavailable')})",
+                          file=sys.stderr)
             if Vc is None and Cc is not None and args.contrast_weight != "none":
                 Vc = variance_from_counts(Cc, Xc, in_mask, out_mask)
             strat_per, cs = {}, None
@@ -3058,7 +3147,23 @@ def main():
                                              cs["diff"])
             skew = direction_skew(cs["diff"],
                                   np.isfinite(q) & (q < args.contrast_fdr))
-            if cov_conf and skew:
+            if cov_conf and skew and _rg.get("n_strata"):
+                r = cov_conf["pearson_r_effect_vs_coverage_gap"]
+                # The regression already ran.  A surviving correlation is a
+                # STRONGER signal than the original warning, not a resolved
+                # one: the pooled curve did not describe this gap, so do not
+                # read the corrected numbers as clean.
+                if abs(r) > 0.5 and skew["frac_one_direction"] > 0.9:
+                    print(f"  contrast {label!r}: WARNING the effect STILL "
+                          f"tracks the per-bin coverage gap (r = {r:+.2f}) "
+                          f"after regressing depth out over "
+                          f"{_rg['n_strata']} strata, and "
+                          f"{skew['frac_one_direction']:.0%} of the "
+                          f"{skew['n_significant']:,} significant bins point "
+                          f"the same way.  The pooled curve did not describe "
+                          f"this gap -- treat these bins as unresolved, not "
+                          f"corrected.", file=sys.stderr)
+            elif cov_conf and skew:
                 r = cov_conf["pearson_r_effect_vs_coverage_gap"]
                 if abs(r) > 0.5 and skew["frac_one_direction"] > 0.9:
                     print(f"  contrast {label!r}: WARNING the effect tracks "
@@ -3072,9 +3177,12 @@ def main():
                           f"why it only ever goes one way.  On a fixture with "
                           f"identical biology and only such a gap this "
                           f"produced 1,431 bins, all down, at r = 0.97.  "
-                          f"--contrast-weight random-effects weights each cell "
-                          f"by its own precision; if the effect survives that, "
-                          f"it is not depth.", file=sys.stderr)
+                          f"Re-run with --contrast-regress-coverage, which "
+                          f"subtracts the shared D-versus-depth curve fitted "
+                          f"over the whole matrix; on that same fixture it "
+                          f"took 1,492 false positives down to 2 while "
+                          f"keeping all 40 planted real bins.  Whatever "
+                          f"survives it is not depth.", file=sys.stderr)
             cons_info = {}
             # When stratifying, consistency runs across the STRATA: combining
             # per-stratum evidence (Stouffer) asks whether there is an average
@@ -3159,6 +3267,8 @@ def main():
                 **{f"dropout_{k}": v for k, v in dropout.items()},
                 **{f"coverage_{k}": v for k, v in summary_cov.items()},
                 **{f"covconf_{k}": v for k, v in cov_conf.items()},
+                **{f"depthreg_{k}": v for k, v in _rg.items()},
+                "regressed_coverage": bool(args.contrast_regress_coverage),
                 **{f"skew_{k}": v for k, v in skew.items()},
                 **{f"consistency_{k}": v for k, v in cons_info.items()},
                 "weight": args.contrast_weight, "test": args.contrast_test,

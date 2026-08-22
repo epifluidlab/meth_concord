@@ -2464,3 +2464,180 @@ def test_coverage_confound_needs_enough_bins():
     depth = np.full((10, 4), 50.0)
     a = np.arange(10) < 5
     assert m.coverage_confound(depth, a, ~a, np.zeros(4)) == {}
+
+
+# --------------------------------------------------------------------------
+# Regressing depth out before the permutation null.
+#
+# The within-cell permutation absorbs any whole-cell effect -- a global offset,
+# purity, uniform shallowness -- because shuffling a cell's values across bins
+# leaves per-cell summaries untouched.  What it cannot absorb is a confound
+# indexed BY BIN, and a bin-varying depth gap between the arms is exactly that.
+# D is pulled toward its prior when thin, so a bin where one arm is thinner
+# carries a real, reproducible, bin-specific difference that is not biology.
+# These tests pin that the pooled depth curve removes it without eating the
+# genuine effects sitting alongside it.
+# --------------------------------------------------------------------------
+
+def _depth_fixture(seed=0, n_cells=120, n_bins=1200, n_real=40, effect=0.30):
+    """Two arms, arm A systematically thinner by a per-bin amount, plus a
+    handful of bins where the biology is genuinely different."""
+    rng = np.random.default_rng(seed)
+    arm = np.zeros(n_cells, bool)
+    arm[: n_cells // 2] = True                      # arm A: the thin one
+    gap = rng.uniform(0.2, 1.0, n_bins)             # per-bin, so permutation-proof
+    depth = rng.gamma(3.0, 20.0, (n_cells, n_bins))
+    depth[arm] *= gap                               # A is thinner, bin by bin
+    lam = depth / (depth + 25.0)                    # shrinkage toward the prior
+    X = 0.5 * lam + rng.normal(0, 0.05, (n_cells, n_bins))
+    real = np.zeros(n_bins, bool)
+    real[rng.choice(n_bins, n_real, replace=False)] = True
+    X[np.ix_(arm, real)] += effect                  # the only true signal
+    return X, depth, arm, real
+
+
+def _called(m, X, counts, arm, n_perm=60, regress=False):
+    if regress:
+        X, _ = m.regress_out_coverage(X, counts)
+    cs = m.contrast_stats(X, arm, 2, out_mask=~arm, test="mwu")
+    null = m.permutation_null(X, arm, ~arm, 2, "mwu", n_perm, seed=1)
+    q = m._bh_fdr(np.asarray(null["p_empirical"], float))
+    return np.asarray(q) < 0.1, np.asarray(cs["diff"])
+
+
+def test_bin_varying_depth_gap_survives_the_permutation_null():
+    """The motivating failure: identical biology in all but 40 bins, yet the
+    raw contrast calls hundreds of bins, nearly all in one direction, and the
+    permutation null passes them because the confound really is per-bin."""
+    m = _mod()
+    X, depth, arm, real = _depth_fixture()
+    sig, diff = _called(m, X, depth, arm)
+    false = int((sig & ~real).sum())
+    assert false > 100, f"fixture did not reproduce the artefact ({false})"
+    # and it is one-directional, the signature the user saw in the volcano
+    down = int((sig & ~real & (diff < 0)).sum())
+    assert down > 0.9 * false, "attenuation should push one way"
+
+
+def test_regressing_depth_out_kills_the_artefact_and_keeps_the_biology():
+    m = _mod()
+    X, depth, arm, real = _depth_fixture()
+    raw_sig, _ = _called(m, X, depth, arm)
+    reg_sig, _ = _called(m, X, depth, arm, regress=True)
+    raw_false = int((raw_sig & ~real).sum())
+    reg_false = int((reg_sig & ~real).sum())
+    assert reg_false < 0.05 * raw_false, (
+        f"depth regression left {reg_false} of {raw_false} false positives")
+    # the 40 planted bins must still be there -- this is the half that makes
+    # the correction worth having rather than just conservative
+    assert int((reg_sig & real).sum()) >= 0.9 * real.sum()
+
+
+def test_regression_is_a_no_op_when_depth_does_not_vary():
+    """Nothing to regress out means nothing removed: a flat-coverage matrix
+    must come back as it went in, not shifted or flattened."""
+    m = _mod()
+    rng = np.random.default_rng(3)
+    X = rng.normal(0.5, 0.1, (60, 400))
+    counts = np.full((60, 400), 50.0)
+    out, info = m.regress_out_coverage(X, counts)
+    assert info["n_strata"] == 0
+    np.testing.assert_allclose(out, X)
+
+
+def test_regression_preserves_a_real_effect_at_equal_depth():
+    """When both arms are sequenced the same, a genuine difference must pass
+    through untouched -- the curve is fitted on depth, and depth says nothing
+    about the arm here."""
+    m = _mod()
+    rng = np.random.default_rng(4)
+    X = rng.normal(0.5, 0.05, (80, 300))
+    depth = rng.gamma(3.0, 20.0, (80, 300))         # same law in both arms
+    arm = np.zeros(80, bool)
+    arm[:40] = True
+    X[np.ix_(arm, np.arange(20))] += 0.25
+    out, info = m.regress_out_coverage(X, depth)
+    assert info["n_strata"] > 1
+    before = np.nanmean(X[arm][:, :20]) - np.nanmean(X[~arm][:, :20])
+    after = np.nanmean(out[arm][:, :20]) - np.nanmean(out[~arm][:, :20])
+    assert after == pytest.approx(before, abs=0.02)
+
+
+def test_regression_keeps_the_matrix_on_the_D_scale():
+    """The grand mean is added back, so downstream --contrast-min-diff and the
+    volcano axes still mean what they meant."""
+    m = _mod()
+    rng = np.random.default_rng(5)
+    X = rng.normal(0.5, 0.1, (60, 500))
+    depth = rng.gamma(3.0, 20.0, (60, 500))
+    out, _ = m.regress_out_coverage(X, depth)
+    assert np.nanmean(out) == pytest.approx(np.nanmean(X), abs=1e-9)
+    assert np.isnan(out[~np.isfinite(X)]).all() if (~np.isfinite(X)).any() else True
+
+
+def test_regression_leaves_missing_values_missing():
+    m = _mod()
+    rng = np.random.default_rng(6)
+    X = rng.normal(0.5, 0.1, (40, 200))
+    depth = rng.gamma(3.0, 20.0, (40, 200))
+    X[rng.random(X.shape) < 0.2] = np.nan
+    depth[rng.random(depth.shape) < 0.1] = 0.0      # uncovered
+    out, _ = m.regress_out_coverage(X, depth)
+    assert np.isnan(out[~np.isfinite(X)]).all()
+    # a bin with no reads has no depth to regress against; it must survive
+    # unchanged rather than being quietly dropped
+    untouched = np.isfinite(X) & (depth <= 0)
+    if untouched.any():
+        np.testing.assert_allclose(out[untouched], X[untouched])
+
+
+def test_regress_coverage_without_counts_refuses_with_a_usable_message(tmp_path):
+    """Silently skipping the correction would be the worst outcome: the run
+    looks corrected and is not.  It must name the flag that fixes it."""
+    m = _mod()
+    X, ct, batch, classes = _data(seed=1, n_per=30)
+    cts = [f"CT{c}" for c in ct]
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "gch.parquet"
+    pd.DataFrame(X, index=samples, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": cts,
+                  "sample": ["batch2" if b == 0 else "scNH" for b in batch]}
+                 ).to_csv(stab, sep="\t", index=False)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20", "--n-permutations", "20",
+         "--output-dir", str(tmp_path / "out"), "--plot-format", "png",
+         "--contrast-select", "CT0", "--contrast-regress-coverage"],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "--pair-counts" in r.stderr
+
+
+def test_a_stratum_too_thin_to_centre_is_left_alone_not_shifted():
+    """A stratum with too few observations to give a stable mean is skipped.
+    It must come back untouched -- adding the grand mean to a value that was
+    never centred would move it by ~the mean of D while leaving the depth
+    effect in place, which is worse than doing nothing."""
+    m = _mod()
+    rng = np.random.default_rng(11)
+    X = rng.normal(0.5, 0.05, (12, 15))
+    # Most observations at one identical depth, so the quantile edges collapse
+    # onto it and the upper edges come from a sparse tail.  That is what makes
+    # a mix of one fat stratum and several thin ones: with a smooth depth
+    # distribution, quantile edges guarantee equal occupancy and no stratum is
+    # ever thin.
+    depth = np.full((12, 15), 10.0)
+    tail = np.unravel_index(rng.choice(X.size, 50, replace=False), X.shape)
+    depth[tail] = np.linspace(100.0, 5000.0, 50)
+    out, info = m.regress_out_coverage(X, depth)
+    assert 0.0 < info["frac_corrected"] < 1.0
+    untouched = np.isclose(out, X)
+    assert untouched.any()
+    # what was skipped is the sparse tail, and it came back byte-for-byte --
+    # not shifted by the grand mean
+    assert (depth[untouched] > 10.0).all()
+    np.testing.assert_array_equal(out[untouched], X[untouched])
