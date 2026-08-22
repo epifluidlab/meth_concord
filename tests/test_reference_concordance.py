@@ -224,3 +224,52 @@ def test_a_properly_parsed_reference_does_not_trip_the_warning(tmp_path):
     # prep, which is why the check only fires at essentially zero
     assert pd.read_csv(tmp_path / "r.tsv", sep="\t"
                        )["frac_repeated_coords"].iloc[0] > 0.05
+
+
+def test_it_suggests_a_pair_count_the_cells_can_actually_reach(tmp_path):
+    """Hitting the floor is the common first outcome, and bisecting
+    --n-pairs by hand is a poor use of anyone's afternoon.  The run should
+    say what the data supports and what it costs."""
+    d = tmp_path / "04_posteriors"
+    d.mkdir()
+    for i, n in enumerate([300, 350, 400, 4000, 5000]):
+        _posteriors(n_pairs=n, seed=i).to_parquet(
+            d / f"cell{i}.posteriors.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--posteriors", str(d),
+         "--n-pairs", "2000", "--output", str(tmp_path / "r.tsv")],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "pairs available per cell" in r.stderr
+    assert "would keep ~90% of cells" in r.stderr
+    # and it must say what the cheaper floor costs, not just offer it
+    assert "noise on the logit" in r.stderr
+
+
+@pytest.mark.parametrize("avail,want_at_most", [
+    ([300, 350, 400, 4000], 300),
+    ([5000] * 10, 5000),
+    ([120, 900, 900], 100),
+])
+def test_the_suggestion_never_exceeds_what_the_thin_cells_have(avail,
+                                                               want_at_most):
+    m = _mod()
+    s = m.suggest_n_pairs(np.array(avail, float), keep_frac=0.9)
+    assert s is not None and s <= want_at_most
+    # keeping 90% means at most one in ten falls below it
+    assert (np.asarray(avail) < s).mean() <= 0.1 + 1e-9
+
+
+def test_the_suggestion_handles_having_nothing_to_go_on():
+    m = _mod()
+    assert m.suggest_n_pairs([]) is None
+    assert m.suggest_n_pairs([np.nan, np.nan]) is None
+
+
+def test_reference_noise_falls_with_pairs_and_rises_as_r_approaches_zero():
+    """The two levers a user actually has, in the direction they act."""
+    m = _mod()
+    assert m.reference_noise(0.3, 5000) < m.reference_noise(0.3, 300)
+    assert m.reference_noise(0.05, 1000) > m.reference_noise(0.4, 1000)
+    assert np.isnan(m.reference_noise(0.0, 1000))
+    assert np.isnan(m.reference_noise(0.3, 2))

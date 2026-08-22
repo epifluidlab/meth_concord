@@ -137,6 +137,44 @@ def reference_d(df, cell, n_pairs, chrom="chrM", min_gch_sites=3,
     return out
 
 
+def suggest_n_pairs(available, keep_frac=0.9):
+    """Largest round pair count that still keeps *keep_frac* of the cells.
+
+    The count is a floor every cell must clear, so it trades cells against
+    per-cell precision: raise it and thin cells drop out, lower it and the
+    reference gets noisier in ALL of them.  Neither end is free, so report
+    the achievable value rather than leaving the user to bisect --n-pairs by
+    hand.
+    """
+    a = np.asarray([x for x in available if np.isfinite(x)], float)
+    if a.size == 0:
+        return None
+    # An order statistic, not an interpolated quantile.  With a handful of
+    # cells, interpolation lands ABOVE the smallest value and would quietly
+    # exclude a third of them while claiming to keep 90%.  Taking the k-th
+    # smallest makes the promise exact: at most k cells fall below it, and
+    # rounding down to a round number can only ever keep more.
+    k = int(np.floor((1.0 - keep_frac) * a.size))
+    target = float(np.sort(a)[min(k, a.size - 1)])
+    for step in (5000, 2000, 1000, 500, 200, 100, 50, 20):
+        if target >= step:
+            return int(step * int(target // step))
+    return int(target) if target >= 1 else None
+
+
+def reference_noise(r, n):
+    """Per-cell noise this reference ADDS, on the logit scale it acts on.
+
+    SE(r) ~ (1 - r^2)/sqrt(n - 3), propagated through the logit.  Worth
+    printing because the correction is only a gain while this is well under
+    the between-cell spread it removes: subtracting a noisy per-cell number
+    is itself a per-cell effect, just a random one.
+    """
+    if not (np.isfinite(r) and 0 < r < 1) or n <= 3:
+        return float("nan")
+    return ((1.0 - r ** 2) / np.sqrt(n - 3)) / (r * (1.0 - r))
+
+
 def discover(posterior_dir, suffix=".posteriors.parquet"):
     """cell -> path, from the 04_posteriors layout the pipeline writes."""
     d = Path(posterior_dir)
@@ -228,6 +266,24 @@ def main(argv=None):
         print(f"  {int((~ok).sum())} cells unusable "
               f"({n_thin} short of {args.n_pairs} pairs).  They keep their "
               f"uncorrected values downstream.", file=sys.stderr)
+        if n_thin:
+            a = out["n_pairs_available"].to_numpy(float)
+            qs = np.quantile(a, [0.05, 0.25, 0.5, 0.95])
+            print(f"  pairs available per cell: 5% {qs[0]:,.0f} | "
+                  f"25% {qs[1]:,.0f} | median {qs[2]:,.0f} | "
+                  f"95% {qs[3]:,.0f}", file=sys.stderr)
+            sug = suggest_n_pairs(a, 0.9)
+            if sug:
+                r_med = (float(out.loc[ok, "reference_d"].median())
+                         if ok.any() else 0.3)
+                noise = reference_noise(r_med, sug)
+                print(f"  --n-pairs {sug} would keep ~90% of cells.  At that "
+                      f"count and r = {r_med:.2f} the reference itself "
+                      f"carries about {noise:.2f} of noise on the logit "
+                      f"scale it corrects on -- worth it only while that is "
+                      f"well under the between-cell spread you are removing, "
+                      f"since subtracting a noisy per-cell number is itself "
+                      f"a per-cell effect.", file=sys.stderr)
     return 0
 
 
