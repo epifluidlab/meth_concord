@@ -3532,6 +3532,61 @@ def main():
             bed[bed[key]].drop(columns=flags).to_csv(
                 out_dir / f"bin_scores_{name}.{key}.bed", sep="\t",
                 index=False, na_rep="NA")
+        # Per-contrast up / down / ns, so an enrichment run can take the
+        # changed bins as foreground and the UNCHANGED-BUT-MEASURED bins as
+        # background, instead of every bin in the genome.
+        #
+        # 'ns' is the one that has to be defined carefully.  It means TESTED
+        # and not significant -- never merely "not selected".  A bin whose
+        # statistic is NaN was never testable (too few cells, no coverage),
+        # and untestable bins are not a random sample of the genome: they sit
+        # in poor mappability, repeats and pericentromeric sequence.  Letting
+        # them into the background makes the enrichment partly a measure of
+        # testable-versus-untestable rather than changed-versus-unchanged,
+        # which is the whole reason not to use the all-bins file.
+        #
+        # Bins significant at FDR but dropped by a later filter (--contrast-
+        # min-diff, --contrast-consistency) land in NEITHER set.  They are
+        # changed, so they do not belong in the background, and they were not
+        # kept, so they do not belong in the foreground.  The count is
+        # reported rather than silently absorbed.
+        for lab in summary_contrast:
+            pre = f"contrast_{lab}"
+            dcol, qcol = f"{pre}_diff", f"{pre}_fdr"
+            if not {pre, dcol, qcol} <= set(bed.columns):
+                continue
+            d = bed[dcol].to_numpy(float)
+            qv = bed[qcol].to_numpy(float)
+            keep = bed[pre].to_numpy(bool)
+            tested = np.isfinite(qv)
+            parts = {"up": keep & (d > 0), "down": keep & (d < 0),
+                     "ns": tested & (qv >= args.contrast_fdr)}
+            for suf, msk in parts.items():
+                bed[msk].drop(columns=flags).to_csv(
+                    out_dir / f"bin_scores_{name}.{pre}.{suf}.bed",
+                    sep="\t", index=False, na_rep="NA")
+            gap = int((tested & (qv < args.contrast_fdr) & ~keep).sum())
+            summary_contrast[lab].update({
+                "n_bed_up": int(parts["up"].sum()),
+                "n_bed_down": int(parts["down"].sum()),
+                "n_bed_ns": int(parts["ns"].sum()),
+                "n_bed_untested": int((~tested).sum()),
+                "n_bed_ambiguous": gap})
+            print(f"  contrast {lab}: {int(parts['up'].sum()):,} up / "
+                  f"{int(parts['down'].sum()):,} down / "
+                  f"{int(parts['ns'].sum()):,} ns "
+                  f"-> bin_scores_{name}.{pre}.{{up,down,ns}}.bed  "
+                  f"({int((~tested).sum()):,} bins never testable and in "
+                  f"none of them"
+                  + (f"; {gap:,} significant but filtered, also in none)"
+                     if gap else ")"), file=sys.stderr)
+            if int(parts["ns"].sum()) < 50:
+                print(f"  contrast {lab}: WARNING only "
+                      f"{int(parts['ns'].sum()):,} bins in the ns "
+                      f"background.  An enrichment against that has almost "
+                      f"no resolution; widen the testable set or fall back "
+                      f"to bin_scores_{name}.all.bed and accept that it "
+                      f"mixes in untestable sequence.", file=sys.stderr)
         summary[name] = {
             "n_cells": int(M.shape[0]), "n_bins": int(M.shape[1]),
             "n_selected": int(sel.size),
@@ -3575,6 +3630,11 @@ def main():
                   f"{s['n_selected_batch_clean']}/{s['n_selected']} "
                   f"batch-invariant -> bin_scores_{name}.contrast_{lab}.bed")
         print(f"  heatmap on all {M.shape[0]} cells -> {fig_hm.name}")
+        if summary_contrast:
+            print(f"  for enrichment: --bed {name}=bin_scores_{name}."
+                  f"contrast_<label>.up.bed --background-bed "
+                  f"{name}=bin_scores_{name}.contrast_<label>.ns.bed",
+                  file=sys.stderr)
         print(f"  per-bin stats -> bin_scores_{name}.{{all,selected}}.bed "
               f"(chrom/start/end, cell-type ICC, ANOVA p, BH-FDR, batch ICC)")
         if np.isfinite(sil):
