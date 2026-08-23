@@ -132,3 +132,73 @@ def test_the_caption_says_it_is_a_model(tmp_path):
     src = _SCRIPT.read_text()
     assert "Model consistent with" in src
     assert "MODEL, not a measurement" in src
+
+
+def test_no_arc_connects_one_domain_to_another():
+    """The claim the drawing must NOT make.
+
+    D is a concordance between the two ends of one read pair, so it speaks
+    to loci within a single bin -- kilobases to a few hundred kilobases
+    apart, inside a domain.  It carries no information about whether two
+    separate cLADs coordinate with each other.  An arc between them would be
+    a claim the measurement cannot support, so the geometry is checked here
+    rather than trusted to the drawing code.
+    """
+    m = _mod()
+    fig, ax = _axes()
+    # two runs far apart in space: an inter-run arc would span ~10 units,
+    # an intra-run arc at most 1
+    x = np.concatenate([np.linspace(0.0, 1.0, 60), np.linspace(10.0, 11.0, 60)])
+    y = np.zeros_like(x)
+    m._within_arcs(ax, x, y, [(0, 59), (60, 119)], 0.9, "#000000", n_per=3)
+    assert ax.patches, "no arcs drawn -- the test would pass vacuously"
+    for p in ax.patches:
+        v = p.get_path().vertices
+        assert abs(v[-1][0] - v[0][0]) < 2.0, "arc jumped between domains"
+
+
+def test_every_arc_stays_inside_the_run_it_belongs_to():
+    m = _mod()
+    fig, ax = _axes()
+    x = np.linspace(0.0, 10.0, 200)
+    y = np.zeros_like(x)
+    m._within_arcs(ax, x, y, [(40, 90)], 0.9, "#000000", n_per=4)
+    lo, hi = x[40], x[90]
+    for p in ax.patches:
+        v = p.get_path().vertices
+        assert lo - 1e-9 <= v[0][0] <= hi + 1e-9
+        assert lo - 1e-9 <= v[-1][0] <= hi + 1e-9
+
+
+def test_a_run_too_short_to_carry_an_arc_is_skipped_not_squeezed():
+    m = _mod()
+    fig, ax = _axes()
+    x = np.linspace(0.0, 1.0, 200)
+    y = np.zeros_like(x)
+    m._within_arcs(ax, x, y, [(0, 5)], 0.9, "#000000", n_per=3)
+    assert not ax.patches
+
+
+def test_the_lamina_domains_are_wide_enough_to_carry_coordination():
+    """A flat-topped sector, not a harmonic peak.  A fibre following a raised
+    cosine touches the lamina at a point and the domain comes out a nub with
+    no room for an arc along it."""
+    m = _mod()
+    x, y, r = m.chromosome_path(0.5, 0.5, 0.40, 0.35)
+    runs = m._runs(r > 0.72)
+    assert len(runs) >= 3
+    assert min(b - a for a, b in runs) > 30
+    # and they differ in extent, the way real lamina contacts do
+    widths = [b - a for a, b in runs]
+    assert max(widths) > 1.3 * min(widths)
+
+
+def test_both_panels_draw_the_same_chromosome():
+    """Any visible difference between the nuclei must be the arc weight.  A
+    different random draw per panel would let a reader read the shape as
+    part of the claim."""
+    m = _mod()
+    a = m.chromosome_path(0.5, 0.5, 0.40, 0.35)
+    b = m.chromosome_path(0.5, 0.5, 0.40, 0.35)
+    for u, v in zip(a, b):
+        np.testing.assert_array_equal(u, v)
