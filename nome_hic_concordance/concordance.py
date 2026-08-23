@@ -1573,18 +1573,60 @@ def compute_signed_concordance_matrix(
         direction-ambiguous rather than mixed — so C is emitted alongside D
         to separate the two cases (mixed → C ≈ 0; balanced-coordinated →
         C large with D ≈ 0).
+
+        WHERE THE ZERO OF D BELONGS.  ``2F − 1`` puts "no directional
+        preference" at F = 0.5, i.e. half the concordant mass co-open.  That
+        is the right zero only when the marginal is p̄ = 0.5.  Under
+        independence at marginal p̄ the concordant mass already splits
+
+            F_indep = p̄² / (p̄² + (1 − p̄)²)
+
+        which is 0.31 at p̄ = 0.40 and 0.012 at p̄ = 0.10.  So on sparse
+        accessibility data a bin with NO directional preference scores
+        2F − 1 ≈ −0.38, and D reports −0.38·C: every coordinated bin looks
+        co-closed, and D collapses to a scaled −C.  That is the marginal
+        contamination this docstring rejects for 'signed-diff' walking back
+        in through F.  Measured on one meningioma GCH run: p̄ = 0.4009,
+        F = 0.3230, corr(D, −C) = 0.970.
+
+        Referencing F to the SAME expected pool removes it:
+
+          F_exp = E_open / (E_open + E_closed)      direction under the null
+          D' = C · (F − F_exp)                      marginal-free direction
+
+        D' = 0 means the concordant mass sits where the marginal-matched
+        null puts it — the honest "balanced" — and its sign says co-open or
+        co-closed relative to that.  On the same run F − F_exp came out
+        POSITIVE where 2F − 1 was negative, so the two disagree on direction,
+        not merely on scale.
+
+        Both are emitted.  D is kept unchanged so existing outputs do not
+        move; D' ("directional_corrected") is the one to interpret.
         """
         coord = (o_open + o_closed) - (e_open + e_closed)
         mass = o_open + o_closed
         # No concordant mass → no direction → F = 0.5 → D = 0.
         safe_mass = np.where(mass > 1e-12, mass, 1.0)
         frac = np.where(mass > 1e-12, o_open / safe_mass, 0.5)
+        # The same split under the marginal-matched null.
+        e_mass = e_open + e_closed
+        safe_e = np.where(e_mass > 1e-12, e_mass, 1.0)
+        frac_exp = np.where(e_mass > 1e-12, e_open / safe_e, 0.5)
+        # Excess is 0, not 0.5 - F_exp, when either pool is empty: with no
+        # observed concordant mass there is no direction to report, and a
+        # non-zero excess there would be an artefact of the F = 0.5 default
+        # rather than a measurement.
+        ok = (mass > 1e-12) & (e_mass > 1e-12)
+        excess = np.where(ok, frac - frac_exp, 0.0)
         # Mean per-end openness, from the exact identity above.
         marginal = (o_open - o_closed + 1.0) / 2.0
         return {
             "coordination": coord,
             "direction": frac,
+            "direction_expected": frac_exp,
+            "direction_excess": excess,
             "directional": coord * (2.0 * frac - 1.0),
+            "directional_corrected": coord * excess,
             "marginal": marginal,
         }
 
@@ -1813,10 +1855,16 @@ def compute_signed_concordance_matrix(
         "uses_expected": uses_expected,
         # C (marginal-free coordination), F (realized direction),
         # D = C·(2F−1) (directional coordination), p̄ (mean per-end openness).
-        "coordination":   components["coordination"],
-        "direction":      components["direction"],
-        "directional":    components["directional"],
-        "marginal":       components["marginal"],
+        # D' = C·(F−F_exp) is the one to interpret: D's zero sits at F = 0.5,
+        # which is only "no preference" when p̄ = 0.5, so on sparse data D
+        # collapses to a scaled −C (see _decompose).
+        "coordination":          components["coordination"],
+        "direction":             components["direction"],
+        "direction_expected":    components["direction_expected"],
+        "direction_excess":      components["direction_excess"],
+        "directional":           components["directional"],
+        "directional_corrected": components["directional_corrected"],
+        "marginal":              components["marginal"],
     }
 
 

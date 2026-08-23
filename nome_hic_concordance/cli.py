@@ -1785,8 +1785,12 @@ def run_context(
                 and _resolve_concordance_combine(args) == "concordant-signed"
             ):
                 for comp, comp_title in (
-                    ("directional", "directional D = C·(2F−1)"),
+                    ("directional_corrected",
+                     "directional D' = C·(F−F_exp) (marginal-free)"),
                     ("coordination", "coordination C (marginal-free)"),
+                    ("direction_excess",
+                     "direction excess F−F_exp (co-open vs null)"),
+                    ("directional", "directional D = C·(2F−1) (legacy)"),
                     ("direction", "direction F (co-open share)"),
                     ("marginal", "marginal p̄ (mean openness)"),
                 ):

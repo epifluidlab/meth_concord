@@ -48,7 +48,8 @@ GCH_STATES = ("co-closed", "mixed", "co-open")
 HCG_STATES = ("co-unmethylated", "mixed", "co-methylated")
 
 
-def costate_codes(coordination, direction, min_coordination=0.0):
+def costate_codes(coordination, direction, min_coordination=0.0,
+                  expected=None):
     """Per (cell, bin) co-state code from the components.
 
     A cell-bin is given a direction only when it is actually coordinated
@@ -61,14 +62,29 @@ def costate_codes(coordination, direction, min_coordination=0.0):
     above 0.5, by the identity above; the classification is honest about a
     single (cell, bin) and becomes a statement about coordination only once it
     is compared ACROSS CELLS WITHIN A BIN, where the level is held fixed.
+
+    ``expected`` is the fix for that when an absolute call is wanted.  Pass
+    the direction under the marginal-matched null, F_exp = E_open/(E_open +
+    E_closed) (emitted as ``concordance_direction_excess``'s reference), and
+    the split is taken against it rather than against 0.5.  It matters more
+    than it looks: under independence at marginal p-bar the concordant mass
+    already splits F_indep = p^2/(p^2 + (1-p)^2), which is 0.31 at
+    p-bar = 0.40.  Thresholding such data at 0.5 puts EVERY coordinated
+    cell-bin in CO_LOW and leaves CO_HIGH empty -- not because nothing is
+    co-open, but because the threshold is unreachable.
     """
     C = np.asarray(coordination, dtype=float)
     F = np.asarray(direction, dtype=float)
     out = np.full(C.shape, CO_MIXED, dtype=np.int8)
-    ok = np.isfinite(C) & np.isfinite(F)
+    if expected is None:
+        ref = np.full(C.shape, 0.5)
+    else:
+        ref = np.broadcast_to(np.asarray(expected, dtype=float),
+                              C.shape).astype(float)
+    ok = np.isfinite(C) & np.isfinite(F) & np.isfinite(ref)
     coord = ok & (C > min_coordination)
-    out[coord & (F > 0.5)] = CO_HIGH
-    out[coord & (F < 0.5)] = CO_LOW
+    out[coord & (F > ref)] = CO_HIGH
+    out[coord & (F < ref)] = CO_LOW
     out[~ok] = UNUSABLE
     return out
 
