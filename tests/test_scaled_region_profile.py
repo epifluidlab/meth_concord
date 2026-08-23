@@ -287,3 +287,122 @@ def test_an_unknown_cell_type_in_a_group_is_an_error(tmp_path):
         capture_output=True, text=True)
     assert r.returncode != 0
     assert "tumour_typo" in r.stderr and "have:" in r.stderr
+
+
+# ---------------------------------------------------------- normalisation --
+
+def _offset_matrix(n_bins=400, body=(100, 180), seed=2,
+                   offset=-0.06, structure=0.010):
+    """A large genome-wide arm offset with small domain structure on top.
+
+    This is the shape the real data has: the tumour arm sits far from the
+    reference EVERYWHERE, and the domain effect is an order of magnitude
+    smaller.  Plotted raw, the panel is a picture of the offset.
+    """
+    rng = np.random.default_rng(seed)
+    cts = (["tumor1"] * 12 + ["tumor2"] * 12
+           + ["GM12878"] * 10 + ["IMR90"] * 10 + ["monocyte"] * 10)
+    X = rng.normal(0.40, 0.002, (len(cts), n_bins))
+    tum = np.array([c.startswith("tumor") for c in cts])
+    X[tum] += offset                                   # the nuisance
+    X[np.ix_(tum, np.arange(*body))] += structure      # the finding
+    cells = [f"cell{i}" for i in range(len(cts))]
+    return (pd.DataFrame(X, index=cells,
+                         columns=[f"chr1:{i * BIN}" for i in range(n_bins)]),
+            pd.Series(cts, index=cells))
+
+
+def _profile(M, ct, tmp_path, extra=None):
+    mat = tmp_path / "gch.parquet"
+    M.to_parquet(mat)
+    pd.DataFrame({"cell_name": M.index, "bam_path": "x",
+                  "cell_type": ct.values}).to_csv(
+        tmp_path / "s.tsv", sep="\t", index=False)
+    _domains([(100 * BIN, 180 * BIN)]).to_csv(
+        tmp_path / "d.bed", sep="\t", header=False, index=False)
+    out = tmp_path / ("out" + ("_n" if extra else ""))
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(tmp_path / "s.tsv"),
+         "--group", "tumor=tumor1,tumor2",
+         "--group", "other=GM12878,IMR90,monocyte",
+         "--region", f"D={tmp_path / 'd.bed'}",
+         "--output-dir", str(out), "--plot-format", "png"] + (extra or []),
+        capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    tab = pd.read_csv(out / "scaled_profile_gch.tsv",
+                      sep="\t").set_index("group")
+    return tab, r
+
+
+def test_without_centring_the_arms_differ_by_the_offset_everywhere(tmp_path):
+    """The reported problem, stated as a test: raw, the panel separates the
+    arms by a constant that has nothing to do with the domains."""
+    M, ct = _offset_matrix()
+    tab, r = _profile(M, ct, tmp_path)
+    gap_flank = (tab.loc["tumor", "mean_flank"]
+                 - tab.loc["other", "mean_flank"])
+    assert gap_flank < -0.05          # the whole-cell offset, not biology
+    assert "no normalisation applied" in r.stderr
+
+
+def test_centring_removes_the_offset_and_leaves_the_structure(tmp_path):
+    M, ct = _offset_matrix()
+    tab, r = _profile(M, ct, tmp_path,
+                      extra=["--contrast-center", "cell-median"])
+    gap_flank = (tab.loc["tumor", "mean_flank"]
+                 - tab.loc["other", "mean_flank"])
+    assert abs(gap_flank) < 0.005     # the arms now sit together outside
+    # and the domain effect survives, which is the half that matters
+    assert tab.loc["tumor", "body_minus_flank"] > 0.005
+    assert abs(tab.loc["other", "body_minus_flank"]) < 0.002
+    assert "centred each cell on its median" in r.stderr
+
+
+def test_the_normalisation_that_ran_is_named_in_the_output(tmp_path):
+    """A panel is only interpretable next to what was done to the values."""
+    M, ct = _offset_matrix()
+    _, r = _profile(M, ct, tmp_path,
+                    extra=["--contrast-center", "cell-median"])
+    assert "normalised:" in r.stderr
+
+
+def test_regressing_coverage_needs_the_counts_and_says_so(tmp_path):
+    M, ct = _offset_matrix()
+    mat = tmp_path / "gch.parquet"
+    M.to_parquet(mat)
+    pd.DataFrame({"cell_name": M.index, "bam_path": "x",
+                  "cell_type": ct.values}).to_csv(
+        tmp_path / "s.tsv", sep="\t", index=False)
+    _domains([(100 * BIN, 180 * BIN)]).to_csv(
+        tmp_path / "d.bed", sep="\t", header=False, index=False)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(tmp_path / "s.tsv"),
+         "--group", "tumor=tumor1,tumor2",
+         "--region", f"D={tmp_path / 'd.bed'}",
+         "--output-dir", str(tmp_path / "o"),
+         "--contrast-regress-coverage"],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "--pair-counts" in r.stderr
+
+
+def test_excluding_contigs_matches_what_the_detection_run_saw(tmp_path):
+    """--contrast-center subtracts a per-cell median over the bins present,
+    so profiling a different contig set silently re-centres everything."""
+    M, ct = _offset_matrix()
+    extra = pd.DataFrame(
+        np.full((len(M), 20), 5.0), index=M.index,
+        columns=[f"chrX:{i * BIN}" for i in range(20)])
+    M2 = pd.concat([M, extra], axis=1)
+    other_dir = tmp_path / "b"
+    other_dir.mkdir()
+    with_x, _ = _profile(M2, ct, tmp_path,
+                         extra=["--contrast-center", "cell-median"])
+    without_x, r = _profile(M2, ct, other_dir,
+                            extra=["--contrast-center", "cell-median",
+                                   "--exclude-chrom", "chrX"])
+    assert "dropped 20 bins" in r.stderr
+    assert (with_x.loc["tumor", "mean_body"]
+            != without_x.loc["tumor", "mean_body"])

@@ -239,6 +239,30 @@ def main(argv=None) -> int:
                     default="none",
                     help="Centre each bin within cell type across batches "
                          "before profiling.")
+    ap.add_argument("--exclude-chrom", default=None, metavar="CHROM[,...]",
+                    help="Contigs to drop before anything else.  Must match "
+                         "the detection run: --contrast-center subtracts each "
+                         "cell's median over the bins PRESENT, so a different "
+                         "contig set gives a different centring and a "
+                         "different picture.")
+    ap.add_argument("--contrast-center", choices=["none", "cell-median"],
+                    default="none",
+                    help="Same flag, same meaning, as in "
+                         "celltype_marker_bins.py.  Without it the panel "
+                         "shows the genome-wide offset between the arms and "
+                         "the domain structure rides on top of it, invisible.")
+    ap.add_argument("--contrast-reference-d", action="append", default=[],
+                    metavar="NAME=PATH",
+                    help="Per-cell reference from "
+                         "scripts/reference_concordance.py, as in "
+                         "celltype_marker_bins.py.")
+    ap.add_argument("--contrast-regress-coverage", action="store_true",
+                    help="Subtract the shared D-versus-depth curve, as in "
+                         "celltype_marker_bins.py.  Needs --pair-counts.")
+    ap.add_argument("--pair-counts", action="append", default=[],
+                    metavar="NAME=PATH",
+                    help="pair_counts_per_bin.parquet for the matching "
+                         "matrix.")
     ap.add_argument("--body-bins", type=int, default=40,
                     help="Bins the domain body is scaled to (default 40).  "
                          "Past roughly the median domain width divided by "
@@ -273,6 +297,18 @@ def main(argv=None) -> int:
     ct = ct.reindex(M.index).dropna()
     M = M.loc[ct.index]
 
+    if args.exclude_chrom:
+        drop = {c.strip().lower().replace("chr", "")
+                for c in args.exclude_chrom.split(",") if c.strip()}
+        drop = {"m" if c in ("m", "mt") else c for c in drop}
+        keep = [c for c in M.columns
+                if str(c).rsplit(":", 1)[0].lower().replace("chr", "")
+                not in drop]
+        if len(keep) < len(M.columns):
+            print(f"  dropped {len(M.columns) - len(keep):,} bins on "
+                  f"{args.exclude_chrom}", file=sys.stderr)
+        M = M[keep]
+
     if args.remove_batch == "within-celltype":
         if not args.batch_column:
             sys.exit("--remove-batch needs --batch-column")
@@ -283,6 +319,52 @@ def main(argv=None) -> int:
         bdf = samples.set_index("cell_name")[cols].astype(str).reindex(M.index)
         M = bp._marker_mod()._remove_batch(M, ct, bdf)
         print(f"  batch-corrected within cell type on {'+'.join(cols)}",
+              file=sys.stderr)
+
+    # The SAME chain as celltype_marker_bins.py, in the same order: batch,
+    # then centring, then the reference, then depth.  Profiling raw values of
+    # bins that were DETECTED on the normalised matrix shows the genome-wide
+    # offset between the arms with the domain structure riding invisibly on
+    # top -- the panel is then a picture of the nuisance the contrast removed.
+    mk = bp._marker_mod()
+    steps = []
+    Xc = M.to_numpy(float)
+    if args.contrast_center == "cell-median":
+        Xc = mk.center_cells(Xc)
+        steps.append("centred each cell on its median")
+    ref_specs = _named(args.contrast_reference_d, "--contrast-reference-d")
+    if name in ref_specs:
+        rp = Path(ref_specs[name])
+        if not rp.exists():
+            sys.exit(f"--contrast-reference-d {name}: no such file {rp}")
+        rdf = pd.read_csv(rp, sep="\t")
+        if "cell" not in rdf.columns or "reference_d" not in rdf.columns:
+            sys.exit(f"--contrast-reference-d {name}: {rp} needs 'cell' and "
+                     f"'reference_d' columns")
+        rs = rdf.set_index("cell")["reference_d"].reindex(M.index)
+        Xc, rinfo = mk.correct_by_reference(Xc, rs.to_numpy(float))
+        steps.append(f"divided out assay reliability for "
+                     f"{rinfo.get('n_corrected', 0)}/{len(M)} cells")
+    cnt_specs = _named(args.pair_counts, "--pair-counts")
+    if args.contrast_regress_coverage:
+        if name not in cnt_specs:
+            sys.exit(f"--contrast-regress-coverage needs --pair-counts "
+                     f"{name}=pair_counts_per_bin.parquet")
+        C = pd.read_parquet(cnt_specs[name]).reindex(
+            index=M.index, columns=M.columns)
+        Xc, ginfo = mk.regress_out_coverage(Xc, C.to_numpy(float))
+        steps.append(f"regressed out depth over "
+                     f"{ginfo.get('n_strata', 0)} strata")
+    if steps:
+        M = pd.DataFrame(Xc, index=M.index, columns=M.columns)
+        print("  normalised: " + "; ".join(steps), file=sys.stderr)
+    else:
+        print("  WARNING no normalisation applied.  If these regions came "
+              "from a contrast, its bins were called on a matrix that had "
+              "been centred and corrected, so a raw profile shows the "
+              "genome-wide arm offset instead of the structure -- pass the "
+              "same --contrast-center / --contrast-reference-d / "
+              "--contrast-regress-coverage as the detection run.",
               file=sys.stderr)
 
     groups = {}
