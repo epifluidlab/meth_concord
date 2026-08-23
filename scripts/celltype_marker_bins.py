@@ -3560,7 +3560,27 @@ def main():
             keep = bed[pre].to_numpy(bool)
             tested = np.isfinite(qv)
             parts = {"up": keep & (d > 0), "down": keep & (d < 0),
-                     "ns": tested & (qv >= args.contrast_fdr)}
+                     "ns": tested & (qv >= args.contrast_fdr),
+                     # Every bin that HAD a statistic.  A superset of
+                     # up|down|ns by the significant-but-filtered bins, and
+                     # deliberately so: this is the universe, the honest
+                     # answer to "which bins could this analysis have
+                     # called?".  Use it to draw a matched random control --
+                     # matching against all genomic bins would sample
+                     # sequence the contrast could never have reported.
+                     #
+                     # As a BACKGROUND it is the other reasonable choice:
+                     # the script removes the foreground from it, so testing
+                     # 'up' against it means up-vs-(down+ns).  That differs
+                     # from up-vs-ns only when the annotation marks BOTH
+                     # directions -- with 400 up, 5,775 down and 3,000 ns, an
+                     # annotation covering 40% of up and 20% of everything
+                     # else gives OR 2.67 either way, but one covering 40% of
+                     # up AND 40% of down gives 2.67 against ns and 1.34
+                     # here.  That divergence is the useful signal: it says
+                     # the annotation is not about direction, which is what
+                     # an assay artefact looks like.
+                     "tested": tested}
             for suf, msk in parts.items():
                 bed[msk].drop(columns=flags).to_csv(
                     out_dir / f"bin_scores_{name}.{pre}.{suf}.bed",
@@ -3570,12 +3590,14 @@ def main():
                 "n_bed_up": int(parts["up"].sum()),
                 "n_bed_down": int(parts["down"].sum()),
                 "n_bed_ns": int(parts["ns"].sum()),
+                "n_bed_tested": int(parts["tested"].sum()),
                 "n_bed_untested": int((~tested).sum()),
                 "n_bed_ambiguous": gap})
             print(f"  contrast {lab}: {int(parts['up'].sum()):,} up / "
                   f"{int(parts['down'].sum()):,} down / "
-                  f"{int(parts['ns'].sum()):,} ns "
-                  f"-> bin_scores_{name}.{pre}.{{up,down,ns}}.bed  "
+                  f"{int(parts['ns'].sum()):,} ns / "
+                  f"{int(parts['tested'].sum()):,} tested "
+                  f"-> bin_scores_{name}.{pre}.{{up,down,ns,tested}}.bed  "
                   f"({int((~tested).sum()):,} bins never testable and in "
                   f"none of them"
                   + (f"; {gap:,} significant but filtered, also in none)"
@@ -3635,6 +3657,14 @@ def main():
                   f"contrast_<label>.up.bed --background-bed "
                   f"{name}=bin_scores_{name}.contrast_<label>.ns.bed",
                   file=sys.stderr)
+            print(f"    ns is the reference for a claim about CHANGE, since "
+                  f"it is the only set that means measured-and-unchanged.  "
+                  f"Re-running against .tested.bed (= down+ns once the "
+                  f"foreground is removed) answers a different question and "
+                  f"gives the same answer unless the annotation marks BOTH "
+                  f"directions -- if the two disagree, that is the finding: "
+                  f"test up against down directly to see what is "
+                  f"directional.", file=sys.stderr)
         print(f"  per-bin stats -> bin_scores_{name}.{{all,selected}}.bed "
               f"(chrom/start/end, cell-type ICC, ANOVA p, BH-FDR, batch ICC)")
         if np.isfinite(sil):

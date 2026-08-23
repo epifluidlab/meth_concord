@@ -155,3 +155,46 @@ def test_a_tiny_background_is_flagged(tmp_path):
     is worth saying rather than letting the odds ratio look authoritative."""
     out, r = _run(tmp_path, extra=["--contrast-fdr", "0.9999"])
     assert "almost no resolution" in r.stderr
+
+
+# ------------------------------------------------------------- the universe --
+
+def test_tested_bed_is_written_for_both_modalities(tmp_path):
+    out, _ = _run(tmp_path)
+    for name in ("gch", "hcg"):
+        assert len(_bed(out, name, "tested")) > 0
+
+
+def test_tested_excludes_the_bins_that_never_had_a_statistic(tmp_path):
+    """Its job is to be the universe of what the contrast COULD have called,
+    which is the right pool to draw a matched random control from -- matching
+    against all genomic bins would sample sequence no contrast could report."""
+    out, _ = _run(tmp_path)
+    for name in ("gch", "hcg"):
+        assert not (_starts(_bed(out, name, "tested")) & set(range(N_DEAD)))
+
+
+def test_tested_contains_up_down_and_ns(tmp_path):
+    out, _ = _run(tmp_path)
+    for name in ("gch", "hcg"):
+        t = _starts(_bed(out, name, "tested"))
+        for suffix in ("up", "down", "ns"):
+            assert _starts(_bed(out, name, suffix)) <= t, suffix
+
+
+def test_tested_may_exceed_up_down_ns_by_the_filtered_bins(tmp_path):
+    """A superset, deliberately: bins significant at FDR but dropped by a
+    later filter belong to the universe even though they are in neither the
+    foreground nor the background."""
+    out, _ = _run(tmp_path, extra=["--contrast-min-diff", "0.25"])
+    t = _starts(_bed(out, "gch", "tested"))
+    three = set().union(*(_starts(_bed(out, "gch", s))
+                          for s in ("up", "down", "ns")))
+    assert three <= t
+
+
+def test_the_two_background_choices_are_both_offered_and_explained(tmp_path):
+    out, r = _run(tmp_path)
+    assert "tested" in r.stderr
+    assert "measured-and-unchanged" in r.stderr
+    assert "both" in r.stderr.lower()
