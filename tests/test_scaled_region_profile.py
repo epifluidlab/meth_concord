@@ -406,3 +406,139 @@ def test_excluding_contigs_matches_what_the_detection_run_saw(tmp_path):
     assert "dropped 20 bins" in r.stderr
     assert (with_x.loc["tumor", "mean_body"]
             != without_x.loc["tumor", "mean_body"])
+
+
+# ------------------------------------------------------- flank anchoring --
+
+def _residual_matrix(n_bins=400, body=(100, 180), seed=4,
+                     arm_gap=2.0e-5, structure=2.0e-5, cell_sd=1.5e-5):
+    """A residual arm difference that survives cell-median centring.
+
+    Centring equalises each cell's GENOME median, which does not make one
+    particular set of flank bins line up.  This is the shape left on the
+    real figure: the arms are parallel but offset outside the domain.
+    """
+    rng = np.random.default_rng(seed)
+    cts = (["tumor1"] * 12 + ["tumor2"] * 12
+           + ["GM12878"] * 10 + ["IMR90"] * 10 + ["monocyte"] * 10)
+    X = rng.normal(1.0e-4, 3.0e-5, (len(cts), n_bins))
+    # Cells differ in overall level, which real cells do: it is the thing
+    # anchoring exists to remove.  Without it the flank mean is pure noise
+    # and subtracting it can only ADD variance.
+    X += rng.normal(0.0, cell_sd, (len(cts), 1))
+    tum = np.array([c.startswith("tumor") for c in cts])
+    X[tum] += arm_gap                                   # parallel offset
+    X[np.ix_(tum, np.arange(*body))] += structure       # and the finding
+    cells = [f"cell{i}" for i in range(len(cts))]
+    return (pd.DataFrame(X, index=cells,
+                         columns=[f"chr1:{i * BIN}" for i in range(n_bins)]),
+            pd.Series(cts, index=cells))
+
+
+def _idx(n_bins=400, span=(100, 180)):
+    m = _mod()
+    return m.scaled_index(_bins(n_bins),
+                          _domains([(span[0] * BIN, span[1] * BIN)]),
+                          40, 2_000_000, 20)
+
+
+def test_without_anchoring_the_flanks_stay_apart():
+    """The reported problem."""
+    m = _mod()
+    M, ct = _residual_matrix()
+    bi, pi, total = _idx()
+    a = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
+    b = m.group_profile(M, ct, ["GM12878", "IMR90", "monocyte"], bi, pi, total)
+    gap = np.nanmean(a["mean"][:20]) - np.nanmean(b["mean"][:20])
+    assert gap > 1.0e-5
+
+
+def test_anchoring_puts_both_flanks_on_zero():
+    m = _mod()
+    M, ct = _residual_matrix()
+    bi, pi, total = _idx()
+    kw = dict(baseline="flank", n_flank=20, n_body=40)
+    a = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total, **kw)
+    b = m.group_profile(M, ct, ["GM12878", "IMR90", "monocyte"], bi, pi,
+                        total, **kw)
+    for r in (a, b):
+        flank = np.concatenate([r["mean"][:20], r["mean"][60:]])
+        assert abs(np.nanmean(flank)) < 1.0e-9
+
+
+def test_anchoring_keeps_the_domain_effect_it_is_meant_to_reveal():
+    """It must move the baseline, not the finding."""
+    m = _mod()
+    M, ct = _residual_matrix()
+    bi, pi, total = _idx()
+    plain = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
+    anch = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total,
+                           baseline="flank", n_flank=20, n_body=40)
+    body = slice(20, 60)
+    d_plain = np.nanmean(plain["mean"][body]) - np.nanmean(plain["mean"][:20])
+    d_anch = np.nanmean(anch["mean"][body]) - np.nanmean(anch["mean"][:20])
+    assert d_anch == pytest.approx(d_plain, rel=1e-6)
+
+
+def test_anchoring_is_per_cell_so_it_tightens_the_interval():
+    """Subtracting a GROUP mean would leave each cell's own level intact and
+    the band would still be dominated by it.  Per cell, the between-cell
+    level spread is removed and the band reports the change."""
+    m = _mod()
+    M, ct = _residual_matrix()
+    bi, pi, total = _idx()
+    plain = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
+    anch = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total,
+                           baseline="flank", n_flank=20, n_body=40)
+    body = slice(20, 60)
+    w_plain = np.nanmean(plain["hi"][body] - plain["lo"][body])
+    w_anch = np.nanmean(anch["hi"][body] - anch["lo"][body])
+    assert w_anch < w_plain
+
+
+def test_anchoring_removes_a_genuine_global_difference_too():
+    """The honest cost, pinned so it is not forgotten: with no domain effect
+    at all, anchoring makes two arms that really do differ look identical."""
+    m = _mod()
+    M, ct = _residual_matrix(structure=0.0)
+    bi, pi, total = _idx()
+    tum, ref = ["tumor1", "tumor2"], ["GM12878", "IMR90", "monocyte"]
+    kw = dict(baseline="flank", n_flank=20, n_body=40)
+    before = (np.nanmean(m.group_profile(M, ct, tum, bi, pi, total)["mean"])
+              - np.nanmean(m.group_profile(M, ct, ref, bi, pi,
+                                           total)["mean"]))
+    after = (np.nanmean(m.group_profile(M, ct, tum, bi, pi, total,
+                                        **kw)["mean"])
+             - np.nanmean(m.group_profile(M, ct, ref, bi, pi, total,
+                                          **kw)["mean"]))
+    assert before > 1.0e-5                     # the arms really do differ
+    assert abs(after) < 0.2 * before           # and the figure no longer says so
+
+
+def test_member_curves_are_anchored_the_same_way():
+    """Faint lines on a different baseline from the line they explain would
+    be worse than not drawing them."""
+    m = _mod()
+    M, ct = _residual_matrix()
+    bi, pi, total = _idx()
+    cur = m.member_curves(M, ct, ["tumor1", "tumor2"], bi, pi, total,
+                          baseline="flank", n_flank=20, n_body=40)
+    for y in cur.values():
+        flank = np.concatenate([y[:20], y[60:]])
+        assert abs(np.nanmean(flank)) < 1.0e-9
+
+
+def test_the_cli_anchors_and_says_what_that_means(tmp_path):
+    M, ct = _residual_matrix()
+    tab, r = _profile(M, ct, tmp_path, extra=["--baseline", "flank"])
+    assert abs(tab.loc["tumor", "mean_flank"]) < 1.0e-9
+    assert abs(tab.loc["other", "mean_flank"]) < 1.0e-9
+    assert "not as level" in r.stderr
+
+
+def test_anchoring_alone_does_not_silence_the_normalisation_warning(tmp_path):
+    """It is a display choice made after the fact and cannot stand in for
+    matching what the detection run did to the values."""
+    M, ct = _residual_matrix()
+    _, r = _profile(M, ct, tmp_path, extra=["--baseline", "flank"])
+    assert "no normalisation applied" in r.stderr

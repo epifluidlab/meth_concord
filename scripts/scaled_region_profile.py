@@ -102,24 +102,19 @@ def scaled_index(bins, domains, n_body, flank_bp, n_flank):
     return np.concatenate(bi), np.concatenate(pi), total
 
 
-def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95):
-    """Mean and interval per axis position for one group of cell types.
+def cell_profiles(M, ct, members, bin_idx, pos_idx, total):
+    """One curve per CELL: mean D at each axis position.
 
-    The per-cell value at a position is the mean over every bin placed there,
-    so a domain contributing many bins to a position does not thereby count
-    as many observations: the observation is the CELL.
+    A domain contributing many bins to a position does not thereby count as
+    many observations -- they are averaged into that cell's single value, so
+    the observation stays the cell.
     """
-    from scipy.stats import t as _t
-
     cells = ct.index[ct.isin(members)]
     rows = M.loc[M.index.intersection(cells)]
-    out = {"mean": np.full(total, np.nan), "lo": np.full(total, np.nan),
-           "hi": np.full(total, np.nan), "n_bins": np.zeros(total, int),
-           "n_cells": int(len(rows)),
-           "members": {g: int((ct.loc[rows.index] == g).sum())
-                       for g in members}}
+    P = np.full((len(rows), total), np.nan)
+    n_bins = np.zeros(total, int)
     if not len(rows):
-        return out
+        return P, rows.index, n_bins
     v = rows.to_numpy(float)
     order = np.argsort(pos_idx, kind="stable")
     bi, pi = bin_idx[order], pos_idx[order]
@@ -127,12 +122,64 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95):
     ends = np.searchsorted(pi, np.arange(total), side="right")
     for i in range(total):
         cols = bi[starts[i]:ends[i]]
-        out["n_bins"][i] = cols.size
+        n_bins[i] = cols.size
         if cols.size == 0:
             continue
         with np.errstate(invalid="ignore"), warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            per_cell = np.nanmean(v[:, cols], axis=1)
+            P[:, i] = np.nanmean(v[:, cols], axis=1)
+    return P, rows.index, n_bins
+
+
+def anchor_to_flank(P, n_flank, n_body):
+    """Subtract each cell's OWN mean over the flanks.
+
+    Makes the outside baseline identical between groups by construction, so
+    the panel shows the change across the domain rather than the level.
+    That is a real loss as well as a gain: any genuine genome-wide
+    difference between the arms is gone from the figure, and 'tumour is
+    higher overall' can no longer be read off it -- only 'tumour changes
+    more from its own flank'.
+
+    Per CELL, not per group.  Subtracting a group mean would leave every
+    cell's deviation from that mean intact and shrink nothing, so the
+    interval would still be dominated by the between-cell level differences
+    the anchoring is meant to remove.
+    """
+    if not P.size:
+        return P
+    total = P.shape[1]
+    flank = np.concatenate([np.arange(n_flank),
+                            np.arange(n_flank + n_body, total)])
+    if flank.size == 0:
+        return P
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        base = np.nanmean(P[:, flank], axis=1)
+    return P - base[:, None]
+
+
+def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
+                  baseline="none", n_flank=0, n_body=0):
+    """Mean and interval per axis position for one group of cell types.
+
+    The interval is across CELLS.  Bins inside one domain are heavily
+    correlated, so treating (cell, bin) pairs as independent would give a
+    band far too tight to mean anything.
+    """
+    from scipy.stats import t as _t
+
+    P, idx, n_bins = cell_profiles(M, ct, members, bin_idx, pos_idx, total)
+    if baseline == "flank":
+        P = anchor_to_flank(P, n_flank, n_body)
+    out = {"mean": np.full(total, np.nan), "lo": np.full(total, np.nan),
+           "hi": np.full(total, np.nan), "n_bins": n_bins,
+           "n_cells": int(P.shape[0]),
+           "members": {g: int((ct.loc[idx] == g).sum()) for g in members}}
+    if not P.shape[0]:
+        return out
+    for i in range(total):
+        per_cell = P[:, i]
         per_cell = per_cell[np.isfinite(per_cell)]
         if per_cell.size == 0:
             continue
@@ -145,15 +192,19 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95):
     return out
 
 
-def member_curves(M, ct, members, bin_idx, pos_idx, total):
+def member_curves(M, ct, members, bin_idx, pos_idx, total, baseline="none",
+                  n_flank=0, n_body=0):
     """Mean per axis position for each constituent cell type, no interval.
 
     Drawn behind the group line so a group mean carried by ONE of its
     members is visible.  With two tumours that is the difference between a
     tumour finding and a tumour-1 finding, and no interval across cells can
-    show it.
+    show it.  Anchored the same way as the group, or the faint lines would
+    sit on a different baseline from the line they are meant to explain.
     """
-    return {g: group_profile(M, ct, [g], bin_idx, pos_idx, total)["mean"]
+    return {g: group_profile(M, ct, [g], bin_idx, pos_idx, total,
+                             baseline=baseline, n_flank=n_flank,
+                             n_body=n_body)["mean"]
             for g in members}
 
 
@@ -277,6 +328,18 @@ def main(argv=None) -> int:
                          "the matrix bin size contributes one bin smeared "
                          "over the whole body axis, which is noise given a "
                          "confident shape.")
+    ap.add_argument("--baseline", choices=["none", "flank"], default="none",
+                    help="'flank' subtracts each CELL's own mean over the "
+                         "unscaled flanks, so the outside baseline is "
+                         "identical between groups by construction and the "
+                         "panel shows CHANGE across the domain rather than "
+                         "level.  That is a loss as well as a gain: a "
+                         "genuine genome-wide difference between the arms "
+                         "disappears from the figure, and 'tumour is higher "
+                         "overall' can no longer be read off it.  Per cell, "
+                         "not per group -- subtracting a group mean would "
+                         "leave every cell's own level intact and the "
+                         "interval would still be dominated by it.")
     ap.add_argument("--conf", type=float, default=0.95)
     ap.add_argument("--ylabel", default="GCH-GCH concordance (D)")
     ap.add_argument("--title", default=None)
@@ -358,7 +421,17 @@ def main(argv=None) -> int:
     if steps:
         M = pd.DataFrame(Xc, index=M.index, columns=M.columns)
         print("  normalised: " + "; ".join(steps), file=sys.stderr)
-    else:
+    if args.baseline == "flank":
+        # Reported apart from the matrix normalisation, and not counted as
+        # it: anchoring is a DISPLAY choice made after the fact, and it
+        # cannot stand in for matching what the detection run did to the
+        # values.  Conflating them would let --baseline flank silence the
+        # warning below while the profile still disagreed with the contrast.
+        print("  anchored each cell to its own flank mean: the outside "
+              "baseline is now identical between groups by construction, so "
+              "read the panel as change across the domain, not as level.",
+              file=sys.stderr)
+    if not steps:
         print("  WARNING no normalisation applied.  If these regions came "
               "from a contrast, its bins were called on a matrix that had "
               "been centred and corrected, so a raw profile shows the "
@@ -407,10 +480,12 @@ def main(argv=None) -> int:
         thin = int((w < step_bp).sum())
         bi, pi, total = scaled_index(bins, dom, args.body_bins, args.flank,
                                      args.flank_bins)
-        prof = {lab: group_profile(M, ct, mem, bi, pi, total, args.conf)
+        kw = dict(baseline=args.baseline, n_flank=args.flank_bins,
+                  n_body=args.body_bins)
+        prof = {lab: group_profile(M, ct, mem, bi, pi, total, args.conf, **kw)
                 for lab, mem in groups.items()}
         results[rname] = prof
-        members[rname] = {lab: member_curves(M, ct, mem, bi, pi, total)
+        members[rname] = {lab: member_curves(M, ct, mem, bi, pi, total, **kw)
                           for lab, mem in groups.items() if len(mem) > 1}
         print(f"  {rname}: {len(dom):,} of {n_all:,} domains "
               f"(median width {np.median(w) / 1e6:.2f} Mb), "
