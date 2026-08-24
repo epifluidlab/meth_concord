@@ -56,11 +56,11 @@ STATES = [
 # confusion the whole re-referencing exists to remove.
 PAIRS_NULL = (2, 4, 6)
 PAIRS = {
-    "uncoordinated":         (2, 4, 6),      # same as the null
-    "coordinated balanced":  (3, 6, 3),      # more concordant, same ratio
-    "co-open shifted":       (6, 3, 3),      # more concordant, toward open
-    "co-closed shifted":     (1, 8, 3),      # more concordant, toward closed
-    "anti-coordinated":      (1, 2, 9),      # FEWER concordant than the null
+    "uncoordinated":         (2, 4, 6),      # exactly the null
+    "coordinated balanced":  (4, 8, 0),      # every pair concordant, null ratio
+    "co-open shifted":       (12, 0, 0),     # every pair co-open
+    "co-closed shifted":     (0, 12, 0),     # every pair co-closed
+    "anti-coordinated":      (1, 2, 9),      # fewest concordant, null ratio
 }
 
 R_CUT = 2.0
@@ -119,9 +119,23 @@ def _sectors(ax, lim):
                 color="0.75", lw=0.7, ls=(0, (3, 3)), zorder=1)
     ax.add_patch(Circle((0, 0), R_CUT, fc="white", ec="0.45", lw=1.1,
                         ls="--", alpha=0.92, zorder=2))
-    ax.annotate(f"R < {R_CUT:g}: uncoordinated", xy=(-1.41, -1.41),
-                xytext=(-3.7, -3.3), fontsize=7.2, color="0.35",
-                ha="left", zorder=3,
+    # What the radius actually MEANS.  R^2 is chi-square(2), so every circle
+    # is a p contour; R_CUT is a display default, not a threshold anyone
+    # derived, and with millions of cell-bins the real cut is FDR on
+    # polar_p, which sits far outside this frame.
+    for pv, col in ((0.05, "0.55"), (0.01, "0.65")):
+        rr = float(np.sqrt(-2.0 * np.log(pv)))
+        ax.add_patch(Circle((0, 0), rr, fc="none", ec=col, lw=0.8,
+                            ls=(0, (1.5, 2.5)), zorder=2))
+        ax.text(rr * np.cos(np.radians(112.5)),
+                rr * np.sin(np.radians(112.5)), f"p={pv:g}", fontsize=6.4,
+                color=col, ha="center", va="center", zorder=3,
+                bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none",
+                          alpha=0.85))
+    ax.annotate(f"R < {R_CUT:g}  (p > {np.exp(-R_CUT ** 2 / 2):.2f}):\n"
+                f"class default, not a test",
+                xy=(-R_CUT * 0.71, -R_CUT * 0.71), xytext=(-3.85, -3.45),
+                fontsize=6.9, color="0.35", ha="left", zorder=3,
                 arrowprops=dict(arrowstyle="-", color="0.55", lw=0.7,
                                 shrinkA=0, shrinkB=2))
 
@@ -166,17 +180,16 @@ def panel_plane(ax):
 def panel_collapse(ax):
     """Which pairs each scalar cannot tell apart, beside what each state is."""
     ax.axis("off")
-    cols = ["C", r"F$-$F$_{exp}$", r"D = C(2F$-$1)", "R", r"$\theta$",
-            r"(R, $\theta$)"]
+    cols = ["C", r"F$-$F$_{exp}$", "R", r"$\theta$", r"polar $p$"]
     rows = []
     for lab, c, f, col, _o, _h, _v in STATES:
         R = float(np.hypot(c, f))
         th = np.degrees(np.arctan2(f, c)) if R > 1e-9 else np.nan
-        rows.append((lab, col, [c, f, c * D_MULT, R, th]))
+        rows.append((lab, col, [c, f, R, th, float(np.exp(-R * R / 2))]))
     arr = np.array([r[2] for r in rows], float)
 
     x_lab, x_art, w_art = 0.005, 0.150, 0.252
-    x0, w, h = 0.447, 0.092, 0.136
+    x0, w, h = 0.470, 0.104, 0.136
     y0 = 0.655
 
     # The null, drawn once above the table: every row below is read against
@@ -202,16 +215,20 @@ def panel_collapse(ax):
                 transform=ax.transAxes)
         _cartoon(ax, x_art, yy + 0.020, PAIRS[lab], w_art)
         for j in range(len(cols)):
-            if j == len(cols) - 1:
-                txt, clash = "distinct", False
+            v = arr[i, j]
+            if not np.isfinite(v):
+                txt = "--"
+            elif j == 3:
+                txt = f"{v:+.0f}\u00b0"
+            elif j == 4:
+                txt = "1.00" if v > 0.995 else f"{v:.3f}"
             else:
-                v = arr[i, j]
-                txt = ("--" if not np.isfinite(v)
-                       else (f"{v:+.0f}\u00b0" if j == 4 else f"{v:+.2f}"))
-                other = np.delete(arr[:, j], i)
-                clash = bool(np.any(np.isfinite(other)
-                                    & np.isclose(other, v, atol=0.02))
-                             ) if np.isfinite(v) else False
+                txt = f"{v:+.2f}"
+            other = np.delete(arr[:, j], i)
+            atol = 0.002 if j == 4 else 0.02
+            clash = bool(np.any(np.isfinite(other)
+                                & np.isclose(other, v, atol=atol))
+                         ) if np.isfinite(v) else False
             if clash:
                 ax.add_patch(plt_rect(x0 + j * w + 0.006, yy - h * 0.30,
                                       w - 0.012, h * 0.56, "#c0392b", ax,
@@ -239,13 +256,20 @@ def panel_collapse(ax):
             "shaded = this statistic gives the same value to another state, "
             "so it cannot tell them apart", fontsize=7.4, color="#c0392b",
             transform=ax.transAxes)
-    ax.text(x_lab, yb - 0.085,
-            "Every scalar collides at least one pair -- each is a projection "
-            "of the plane onto a line.  Only the pair separates all five.\n"
-            r"D also inverts: with $\bar{p}$ = 0.40 it is $\approx$ "
-            r"$-0.35\,$C, so C falling reads as D rising.  Note "
-            r"'balanced' keeps the NULL's open:closed ratio, not 50/50.",
-            fontsize=7.4, color="0.30", transform=ax.transAxes)
+    ax.text(x_lab, yb - 0.075,
+            "Every column collides at least one pair -- each is a projection "
+            "of the plane onto a line.  Only R and "
+            r"$\theta$ TOGETHER separate all five." "\n"
+            r"polar $p$ = exp($-R^2/2$): whitened, $R^2$ is "
+            r"$\chi^2_2$ under the null, so ONE calibrated test covers both "
+            "axes and needs no reconciling of two FDRs.\n"
+            r"It says how far from the null, never which way -- $\theta$ "
+            "does that -- so balanced and anti-coordinated share a "
+            r"$p$ and are told apart only by angle." "\n"
+            "'balanced' keeps the NULL's open:closed ratio, not 50/50: at "
+            r"F$_{exp}$ = 1/3 a 50/50 split is itself a co-open shift.",
+            fontsize=7.4, color="0.30", va="top", linespacing=1.6,
+            transform=ax.transAxes)
     ax.set_title("b   what each summary can and cannot separate",
                  fontsize=10, loc="left", pad=8)
 
@@ -261,9 +285,9 @@ def figure(path, title):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig = plt.figure(figsize=(13.2, 5.9))
+    fig = plt.figure(figsize=(13.2, 6.3))
     gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 2.05], wspace=0.10,
-                          left=0.055, right=0.985, top=0.87, bottom=0.14)
+                          left=0.055, right=0.985, top=0.87, bottom=0.19)
     panel_plane(fig.add_subplot(gs[0, 0]))
     panel_collapse(fig.add_subplot(gs[0, 1]))
     fig.suptitle(title, fontsize=11.5, y=0.97)

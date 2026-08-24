@@ -56,7 +56,6 @@ def test_five_states_one_per_sector():
 @pytest.mark.parametrize("col,idx,collide", [
     ("C", 1, {"co-open shifted", "co-closed shifted"}),
     ("dF", 2, {"uncoordinated", "coordinated balanced", "anti-coordinated"}),
-    ("D", 3, {"co-open shifted", "co-closed shifted"}),
 ])
 def test_each_scalar_collapses_the_pair_the_figure_says_it_does(col, idx,
                                                                 collide):
@@ -92,6 +91,34 @@ def test_the_pair_separates_all_five():
     for lab, _c, _f, _d, R, th in _table(m):
         keys.add((round(R, 2), "-" if not np.isfinite(th) else round(th, 0)))
     assert len(keys) == 5
+
+
+def test_polar_p_collapses_too_which_is_why_theta_is_shown_beside_it():
+    """p answers 'how far from the null', never 'which way'.  Balanced and
+    anti-coordinated are equidistant, so they share a p exactly -- and a
+    reader given only p would call them the same state."""
+    m = _mod()
+    pv = {}
+    for lab, _c, _f, _d, R, _th in _table(m):
+        pv[lab] = float(np.exp(-R * R / 2))
+    assert pv["coordinated balanced"] == pytest.approx(
+        pv["anti-coordinated"], rel=1e-9)
+    assert pv["co-open shifted"] == pytest.approx(
+        pv["co-closed shifted"], rel=1e-9)
+    assert pv["uncoordinated"] > 0.9          # the null looks like the null
+
+
+def test_the_radius_cut_is_a_weak_threshold_and_the_figure_says_so():
+    """R_CUT = 2 is p = 0.135 -- not significant by any standard.  It is a
+    naming default for the sector diagram, and the panel must not imply it
+    is a test, because with millions of cell-bins the real cut is FDR on
+    polar_p and lands near R = 5.3."""
+    m = _mod()
+    p_at_cut = float(np.exp(-m.R_CUT ** 2 / 2))
+    assert 0.10 < p_at_cut < 0.20
+    src = _SCRIPT.read_text()
+    assert "class default, not a test" in src
+    assert "p=0.05" in src or "0.05" in src
 
 
 def test_D_inverts_the_sign_of_C_at_the_measured_marginal():
@@ -176,6 +203,18 @@ def test_the_cartoons_imply_the_points_drawn_in_panel_a():
         # and the signs agree with the point plotted in panel a
         assert np.sign(C) == np.sign(c)
         assert np.sign(round(dF, 6)) == np.sign(round(f, 6))
+
+
+def test_the_cartoons_are_the_extreme_of_each_category():
+    """Chosen so a reader can see the category at a glance: every pair
+    co-open, every pair co-closed, every pair concordant at the null ratio,
+    and the smallest concordant count that still keeps that ratio."""
+    m = _mod()
+    assert m.PAIRS["co-open shifted"][1] == 0      # no co-closed at all
+    assert m.PAIRS["co-closed shifted"][0] == 0    # no co-open at all
+    assert m.PAIRS["coordinated balanced"][2] == 0  # nothing left mixed
+    o, c, _ = m.PAIRS["anti-coordinated"]
+    assert o + c < sum(m.PAIRS_NULL[:2])           # a deficit
 
 
 def test_balanced_keeps_the_nulls_ratio_rather_than_splitting_fifty_fifty():
