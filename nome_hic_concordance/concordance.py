@@ -1733,6 +1733,24 @@ def compute_signed_concordance_matrix(
         name: pd.DataFrame(arr, index=cell_names, columns=sorted_bins)
         for name, arr in _decompose(_o_o, _o_c, _e_o, _e_c).items()
     }
+    _pol = coordination_polar(components["coordination"].to_numpy(float),
+                              components["direction_excess"].to_numpy(float))
+    polar_info = {k: v for k, v in _pol.items()
+                  if k not in ("R", "theta", "p")}
+    logger.info(
+        "Coordination plane: scale(C) = %.4g, scale(F-F_exp) = %.4g, "
+        "rho = %+.3f over %d cell-bins.  R is Mahalanobis in these units, so "
+        "R^2 is chi-square(2) and polar_p is one test across both axes.  A "
+        "large |rho| means the two axes are not measuring separate things in "
+        "this run and the plane is nearly a line.",
+        polar_info.get("scale_c", float("nan")),
+        polar_info.get("scale_f", float("nan")),
+        polar_info.get("rho", float("nan")),
+        polar_info.get("n_used", 0))
+    for _key, _arr in (("polar_R", _pol["R"]), ("polar_theta", _pol["theta"]),
+                       ("polar_p", _pol["p"])):
+        components[_key] = pd.DataFrame(_arr, index=cell_names,
+                                        columns=sorted_bins)
     for _df in components.values():
         _df.columns.name = "bin"
         _df.index.name = "cell"
@@ -1858,6 +1876,13 @@ def compute_signed_concordance_matrix(
         # D' = C·(F−F_exp) is the one to interpret: D's zero sits at F = 0.5,
         # which is only "no preference" when p̄ = 0.5, so on sparse data D
         # collapses to a scaled −C (see _decompose).
+        # The polar reading of the (C, dF) plane.  R separates
+        # 'uncoordinated' from all three coordinated states -- including
+        # 'coordinated balanced', which neither axis can do alone -- and
+        # theta names which.  polar_p is a chi-square(2) test across both.
+        "polar_R":               components["polar_R"],
+        "polar_theta":           components["polar_theta"],
+        "polar_p":               components["polar_p"],
         "coordination":          components["coordination"],
         "direction":             components["direction"],
         "direction_expected":    components["direction_expected"],
@@ -1866,6 +1891,117 @@ def compute_signed_concordance_matrix(
         "directional_corrected": components["directional_corrected"],
         "marginal":              components["marginal"],
     }
+
+
+def _robust_sd(x):
+    """MAD-based scale.  The (C, dF) plane has heavy tails from thin bins,
+    and a plain sd would let those set the units for every other bin."""
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return np.nan
+    mad = float(np.median(np.abs(x - np.median(x))))
+    if mad > 0:
+        return 1.4826 * mad
+    sd = float(np.std(x))
+    return sd if sd > 0 else np.nan
+
+
+def coordination_polar(coordination, direction_excess, scale_c=None,
+                       scale_f=None, rho=None):
+    """Departure from the null in the (C, dF) plane: how far, and which way.
+
+    C and dF answer different questions and each is blind where the other
+    sees:
+
+      C  alone cannot tell coordinated co-open from coordinated co-closed --
+         Cov is unchanged by swapping open for closed, so both score the same.
+      dF alone cannot tell coordinated co-open from UNCOORDINATED.  It is a
+         ratio describing where the concordant mass sits and does not know
+         whether that mass exceeds chance, so it assigns a direction to a bin
+         with no coordination to have a direction about.
+
+    Neither can be dropped and no monotone function of one recovers the
+    other: the state is two-dimensional.  What CAN be done is to change
+    coordinates.  Standardise both axes, then read the plane in polar form:
+
+      R      distance from the null in either sense.  R ~ 0 only when BOTH
+             axes are null, so it separates 'uncoordinated' from all three
+             coordinated states INCLUDING 'coordinated balanced' -- which is
+             what a single magnitude has to do to be worth having.
+      theta  which kind of departure.  0 deg = pure magnitude, no directional
+             preference (coordinated balanced); +90 = direction shifted
+             co-open with no excess mass; 180 = anti-coordinated; -90 =
+             shifted co-closed.  The four cells become four sectors, and
+             everything between them is representable rather than forced
+             into a corner.
+
+    R is Mahalanobis, not Euclidean: C and dF are correlated in real data,
+    and an unwhitened radius counts the shared part twice, calling a bin
+    extreme for being ordinary along the correlated direction.  Whitened,
+    R^2 is chi-square with 2 d.o.f. under the null, so ``p`` is a calibrated
+    test of "this bin departs from the null in coordination space" -- one
+    p-value across both axes, which is what a summary statistic owes you.
+
+    Scales and rho are estimated ACROSS THE WHOLE MATRIX by default, so they
+    are set by millions of entries dominated by noise and no single bin can
+    move its own units.  Pass them explicitly to put two runs on one plane
+    instead of letting each choose units and be silently incomparable.
+    """
+    C = np.asarray(coordination, float)
+    dF = np.asarray(direction_excess, float)
+    if C.shape != dF.shape:
+        raise ValueError(f"C has shape {C.shape}, direction excess "
+                         f"{dF.shape}")
+    ok = np.isfinite(C) & np.isfinite(dF)
+    sc = _robust_sd(C[ok]) if scale_c is None else float(scale_c)
+    sf = _robust_sd(dF[ok]) if scale_f is None else float(scale_f)
+    info = {"scale_c": sc, "scale_f": sf, "n_used": int(ok.sum())}
+    if not np.isfinite(sc) or not np.isfinite(sf):
+        nan = np.full(C.shape, np.nan)
+        info["note"] = "one axis has no spread; polar form undefined"
+        return {"R": nan, "theta": nan, "p": nan, **info}
+    zc, zf = C / sc, dF / sf
+    if rho is None:
+        rho = (float(np.corrcoef(zc[ok], zf[ok])[0, 1])
+               if int(ok.sum()) > 2 else 0.0)
+    rho = float(np.clip(rho if np.isfinite(rho) else 0.0, -0.99, 0.99))
+    info["rho"] = rho
+    with np.errstate(invalid="ignore"):
+        r2 = (zc ** 2 - 2.0 * rho * zc * zf + zf ** 2) / (1.0 - rho ** 2)
+        r2 = np.where(np.isfinite(r2) & (r2 > 0), r2,
+                      np.where(ok, 0.0, np.nan))
+        R = np.sqrt(r2)
+        theta = np.degrees(np.arctan2(zf, zc))
+        pv = np.exp(-r2 / 2.0)          # chi-square(2) upper tail
+    theta = np.where(ok, theta, np.nan)
+    return {"R": R, "theta": theta, "p": np.where(ok, pv, np.nan), **info}
+
+
+COORD_CLASSES = ("uncoordinated", "coordinated balanced", "co-open shifted",
+                 "co-closed shifted", "anti-coordinated")
+
+
+def coordination_class(R, theta, r_cut=2.0, sector=30.0):
+    """Name each bin's sector.  Returns an integer code into COORD_CLASSES.
+
+    r_cut is a distance in standardised units, so 2.0 is roughly the 86th
+    percentile of a chi-square(2): nearer the origin than that is not
+    distinguishable from the null on either axis and is called uncoordinated
+    whatever its angle.  Naming a sector for a bin at the origin is exactly
+    how dF alone goes wrong.
+    """
+    R = np.asarray(R, float)
+    th = np.asarray(theta, float)
+    out = np.zeros(R.shape, dtype=np.int8)
+    far = np.isfinite(R) & np.isfinite(th) & (R >= r_cut)
+    a = np.abs(th)
+    out[far & (a <= sector)] = 1                                # balanced
+    out[far & (th > sector) & (th < 180.0 - sector)] = 2        # co-open
+    out[far & (th < -sector) & (th > -180.0 + sector)] = 3      # co-closed
+    out[far & (a >= 180.0 - sector)] = 4                        # anti-coord
+    out[~np.isfinite(R) | ~np.isfinite(th)] = -1
+    return out
 
 
 def _json_safe(obj):
