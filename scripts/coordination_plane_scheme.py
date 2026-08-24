@@ -48,19 +48,30 @@ STATES = [
     ("anti-coordinated",     -3.00,  0.00, C_ANTI,   (0.00,  0.85), "center", "bottom"),
 ]
 
-# 12 linked pairs per state as (co-open, co-closed, mixed), chosen so the
-# implied C and F - F_exp reproduce the points drawn in panel a exactly.
-# 'balanced' is NOT a 50/50 split of the concordant pairs: it is the same
-# open:closed RATIO as the null, which at F_exp = 1/3 is one open to two
-# closed.  Drawing it 50/50 would make it a co-open shift, which is the
-# confusion the whole re-referencing exists to remove.
-PAIRS_NULL = (2, 4, 6)
+# 10 linked pairs per state, written out in DRAWING ORDER as O (co-open),
+# C (co-closed), M (mixed).  Order is explicit rather than grouped by type:
+# sorting the pairs made every state look arranged, so the null did not read
+# as a null and 'uncoordinated' was indistinguishable from anti-coordination
+# at a glance.  Scattering the null and leaving the coordinated states nearly
+# uniform is what makes the categories legible.
+#
+# The counts are chosen so the implied C and F - F_exp reproduce the signs of
+# the points drawn in panel a.
+PAIRS_NULL = "MCOMCMCOMC"          # 2 co-open, 4 co-closed, 4 mixed
 PAIRS = {
-    "uncoordinated":         (2, 4, 6),      # exactly the null
-    "coordinated balanced":  (4, 8, 0),      # every pair concordant, null ratio
-    "co-open shifted":       (12, 0, 0),     # every pair co-open
-    "co-closed shifted":     (0, 12, 0),     # every pair co-closed
-    "anti-coordinated":      (1, 2, 9),      # fewest concordant, null ratio
+    "uncoordinated":         "MCOMCMCOMC",   # exactly the null
+    "coordinated balanced":  "CCOCCOCMCO",   # nearly all concordant, null ratio
+    "co-open shifted":       "OOOOMOOOOO",   # nearly all co-open
+    "co-closed shifted":     "CCCCMCCCCC",   # nearly all co-closed
+    "anti-coordinated":      "MMCMOMMCMM",   # far MORE mixed than the null
+}
+# What to look for in each row, so the drawing does not have to be decoded.
+READS = {
+    "uncoordinated":         "same as the null",
+    "coordinated balanced":  "more concordant, the null's open:closed ratio",
+    "co-open shifted":       "more concordant, and nearly all open",
+    "co-closed shifted":     "more concordant, and nearly all closed",
+    "anti-coordinated":      "FEWER concordant than the null",
 }
 
 R_CUT = 2.0
@@ -91,15 +102,14 @@ def _pair(ax, x, y, left_open, right_open, w, r=0.0062):
             ec=(C_OPEN if is_open else "0.35"), lw=0.8))
 
 
-def _cartoon(ax, x0, y0, counts, cell_w, n_col=6, gap=0.007):
-    """12 pairs in two rows: co-open first, then co-closed, then mixed."""
-    n_open, n_closed, n_mixed = counts
-    kinds = ([(True, True)] * n_open + [(False, False)] * n_closed
-             + [(True, False)] * n_mixed)
+def _cartoon(ax, x0, y0, layout, cell_w, n_col=5, gap=0.010):
+    """10 pairs in two rows, drawn in the order the layout string gives."""
+    kind = {"O": (True, True), "C": (False, False), "M": (True, False)}
     pw = (cell_w - (n_col - 1) * gap) / n_col
-    for i, (lo, ro) in enumerate(kinds):
+    for i, ch in enumerate(layout):
         r, c = divmod(i, n_col)
-        _pair(ax, x0 + c * (pw + gap), y0 - r * 0.046, lo, ro, pw * 0.52)
+        lo, ro = kind[ch]
+        _pair(ax, x0 + c * (pw + gap), y0 - r * 0.046, lo, ro, pw * 0.50)
 
 
 def _sectors(ax, lim):
@@ -188,16 +198,16 @@ def panel_collapse(ax):
         rows.append((lab, col, [c, f, R, th, float(np.exp(-R * R / 2))]))
     arr = np.array([r[2] for r in rows], float)
 
-    x_lab, x_art, w_art = 0.005, 0.150, 0.252
-    x0, w, h = 0.470, 0.104, 0.136
-    y0 = 0.655
+    x_lab, x_art, w_art = 0.005, 0.150, 0.230
+    x0, w, h = 0.452, 0.108, 0.150
+    y0 = 0.640
 
     # The null, drawn once above the table: every row below is read against
     # it, and without it "more concordant than expected" has no referent.
     ax.text(x_art, y0 + 0.292, "expected under the null (E)", fontsize=7.4,
             style="italic", color="0.35", va="bottom",
             transform=ax.transAxes)
-    _cartoon(ax, x_art, y0 + 0.256, PAIRS_NULL, w_art)
+    _cartoon(ax, x_art, y0 + 0.262, PAIRS_NULL, w_art)
     ax.plot([x_lab, 0.412], [y0 + 0.163] * 2, color="0.8", lw=0.8,
             transform=ax.transAxes, clip_on=False)
 
@@ -213,7 +223,9 @@ def panel_collapse(ax):
         ax.add_patch(plt_rect(x_lab, yy - h * 0.30, 0.016, h * 0.56, col, ax))
         ax.text(x_lab + 0.026, yy, lab, fontsize=7.8, va="center",
                 transform=ax.transAxes)
-        _cartoon(ax, x_art, yy + 0.020, PAIRS[lab], w_art)
+        _cartoon(ax, x_art, yy + 0.026, PAIRS[lab], w_art)
+        ax.text(x_art, yy - 0.052, READS[lab], fontsize=6.6, color="0.42",
+                style="italic", va="center", transform=ax.transAxes)
         for j in range(len(cols)):
             v = arr[i, j]
             if not np.isfinite(v):
@@ -240,12 +252,14 @@ def panel_collapse(ax):
 
     yb = y0 - len(rows) * h
     from matplotlib.patches import Circle
-    ax.add_patch(Circle((x_lab + 0.006, yb + 0.045), 0.0075, fc=C_OPEN,
-                        ec=C_OPEN, lw=0.8, transform=ax.transAxes))
+    ax.add_patch(Circle((x_lab + 0.006, yb + 0.045), 0.0062, fc=C_OPEN,
+                        ec=C_OPEN, lw=0.8, transform=ax.transAxes,
+                        clip_on=False))
     ax.text(x_lab + 0.020, yb + 0.045, "accessible end", fontsize=7,
             va="center", transform=ax.transAxes)
-    ax.add_patch(Circle((x_lab + 0.135, yb + 0.045), 0.0075, fc="white",
-                        ec="0.35", lw=0.8, transform=ax.transAxes))
+    ax.add_patch(Circle((x_lab + 0.135, yb + 0.045), 0.0062, fc="white",
+                        ec="0.35", lw=0.8, transform=ax.transAxes,
+                        clip_on=False))
     ax.text(x_lab + 0.149, yb + 0.045, "inaccessible end", fontsize=7,
             va="center", transform=ax.transAxes)
     ax.text(x_lab + 0.300, yb + 0.045,

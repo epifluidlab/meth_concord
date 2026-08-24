@@ -170,22 +170,29 @@ def test_the_sector_bounds_match_the_pipeline_classifier():
 
 # --------------------------------------------------- the pair cartoons --
 
-def _implied(counts, null):
-    """(C, F, dF) implied by a state's pair counts, read against the null."""
-    o, c, _m = counts
+def _counts(layout):
+    """(co-open, co-closed, mixed) from a drawing-order layout string."""
+    return layout.count("O"), layout.count("C"), layout.count("M")
+
+
+def _implied(layout, null):
+    """(C, F, dF) implied by a state's pairs, read against the null."""
+    o, c, _m = _counts(layout)
     M = o + c
-    Me = null[0] + null[1]
-    Fe = null[0] / Me
+    no, nc, _ = _counts(null)
+    Me = no + nc
+    Fe = no / Me
     F = o / M if M else float("nan")
     return M - Me, F, F - Fe
 
 
-def test_every_state_draws_twelve_pairs():
+def test_every_state_draws_ten_pairs():
     """The cartoons are comparable only if each shows the same total."""
     m = _mod()
-    assert sum(m.PAIRS_NULL) == 12
-    for lab, counts in m.PAIRS.items():
-        assert sum(counts) == 12, lab
+    assert len(m.PAIRS_NULL) == 10
+    for lab, layout in m.PAIRS.items():
+        assert len(layout) == 10, lab
+        assert set(layout) <= set("OCM"), lab
 
 
 def test_the_cartoons_imply_the_points_drawn_in_panel_a():
@@ -210,11 +217,15 @@ def test_the_cartoons_are_the_extreme_of_each_category():
     co-open, every pair co-closed, every pair concordant at the null ratio,
     and the smallest concordant count that still keeps that ratio."""
     m = _mod()
-    assert m.PAIRS["co-open shifted"][1] == 0      # no co-closed at all
-    assert m.PAIRS["co-closed shifted"][0] == 0    # no co-open at all
-    assert m.PAIRS["coordinated balanced"][2] == 0  # nothing left mixed
-    o, c, _ = m.PAIRS["anti-coordinated"]
-    assert o + c < sum(m.PAIRS_NULL[:2])           # a deficit
+    assert _counts(m.PAIRS["co-open shifted"])[1] == 0     # no co-closed
+    assert _counts(m.PAIRS["co-closed shifted"])[0] == 0   # no co-open
+    no, nc, nm = _counts(m.PAIRS_NULL)
+    for lab in ("coordinated balanced", "co-open shifted",
+                "co-closed shifted"):
+        assert _counts(m.PAIRS[lab])[2] < nm, lab          # less mixed
+    o, c, mm = _counts(m.PAIRS["anti-coordinated"])
+    assert o + c < no + nc                                 # a deficit
+    assert mm > nm                                         # visibly so
 
 
 def test_balanced_keeps_the_nulls_ratio_rather_than_splitting_fifty_fifty():
@@ -222,8 +233,8 @@ def test_balanced_keeps_the_nulls_ratio_rather_than_splitting_fifty_fifty():
     'balanced' as half co-open would make it a co-open SHIFT at any marginal
     other than 0.5 -- which is the error the old D = C(2F-1) encodes."""
     m = _mod()
-    o, c, _ = m.PAIRS["coordinated balanced"]
-    no, nc, _ = m.PAIRS_NULL
+    o, c, _ = _counts(m.PAIRS["coordinated balanced"])
+    no, nc, _ = _counts(m.PAIRS_NULL)
     assert o / (o + c) == pytest.approx(no / (no + nc))     # same ratio
     assert o / (o + c) != pytest.approx(0.5)                # not 50/50
     _C, _F, dF = _implied(m.PAIRS["coordinated balanced"], m.PAIRS_NULL)
@@ -234,8 +245,8 @@ def test_anti_coordinated_shows_fewer_concordant_pairs_than_the_null():
     """Anti-coordination is a deficit, not a direction.  A cartoon with more
     concordant pairs than the null would be showing coordination."""
     m = _mod()
-    o, c, _ = m.PAIRS["anti-coordinated"]
-    no, nc, _ = m.PAIRS_NULL
+    o, c, _ = _counts(m.PAIRS["anti-coordinated"])
+    no, nc, _ = _counts(m.PAIRS_NULL)
     assert o + c < no + nc
 
 
