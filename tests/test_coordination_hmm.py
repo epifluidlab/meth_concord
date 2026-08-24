@@ -776,3 +776,117 @@ def test_cli_accepts_k_three(tmp_path):
     assert len(lab) == 3
     assert "coordinated balanced" not in set(lab["label"])
     assert "anti-coordinated" not in set(lab["label"])
+
+
+# ------------------------------------------- the log-radial warp, and its cost --
+
+def test_the_warp_keeps_every_angle_and_only_changes_radius():
+    """Angles must survive exactly, or the direction labelling would mean
+    something different in the two spaces."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    X = rng.normal(0, 5, (4000, 2)) + np.array([120.0, -110.0])
+    obs = np.ones(len(X), bool)
+    W, centre = m.warp_log_radial(X, obs)
+    d = X - centre
+    th_in = np.arctan2(d[:, 1], d[:, 0])
+    th_out = np.arctan2(W[:, 1], W[:, 0])
+    np.testing.assert_allclose(np.cos(th_in), np.cos(th_out), atol=1e-9)
+    np.testing.assert_allclose(np.sin(th_in), np.sin(th_out), atol=1e-9)
+    # radius is compressed, monotonically
+    r_in = np.linalg.norm(d, axis=1)
+    r_out = np.linalg.norm(W, axis=1)
+    assert (r_out <= r_in + 1e-9).all()
+    o = np.argsort(r_in)
+    assert np.all(np.diff(r_out[o]) >= -1e-9)
+
+
+def test_unwarp_is_the_inverse():
+    m = _mod()
+    rng = np.random.default_rng(1)
+    X = rng.normal(0, 8, (500, 2)) + np.array([50.0, -30.0])
+    obs = np.ones(len(X), bool)
+    W, centre = m.warp_log_radial(X, obs)
+    np.testing.assert_allclose(m.unwarp_log_radial(W, centre), X, atol=1e-7)
+
+
+def test_the_warp_spreads_a_dense_core_but_costs_accuracy():
+    """It doubles the separation k-means finds, which is why it looked like
+    the fix -- and on data with known truth it recovers FEWER of the true
+    arms while producing longer, better-looking domains.  Long runs are not
+    evidence of a correct fit, and that is the whole point of this test."""
+    m = _mod()
+    from sklearn.cluster import KMeans
+    rng = np.random.default_rng(0)
+    dirs = np.array([[0.15, 0.99], [0.80, -0.60], [-0.95, 0.05]])
+    lens = np.array([32.0, 55.0, 32.0])
+    lab = rng.integers(0, 3, 30_000)
+    t = rng.random(30_000) ** 12 * lens[lab]
+    P = dirs[lab] * t[:, None] + rng.normal(0, 3.5, (30_000, 2))
+    obs = np.ones(len(P), bool)
+    W, _c = m.warp_log_radial(P, obs)
+
+    def sep(Z):
+        c = KMeans(3, n_init=10, random_state=0).fit(Z).cluster_centers_
+        import itertools
+        smallest = min(np.linalg.norm(a - b)
+                       for a, b in itertools.combinations(c, 2))
+        size = np.percentile(np.linalg.norm(Z - np.median(Z, 0), axis=1), 95)
+        return smallest / size
+
+    assert sep(W) > 1.7 * sep(P)
+
+
+def test_the_warp_is_not_the_default():
+    """It is available and documented, not recommended."""
+    src = _SCRIPT.read_text()
+    i = src.index('"--space"')
+    block = src[i:i + 400]
+    assert '"plane"' in block and 'default="plane"' in block
+
+
+def test_density_equalised_flattens_the_sampling_over_the_plane():
+    m = _mod()
+    rng = np.random.default_rng(2)
+    core = rng.normal(0, 1, (40_000, 2))
+    arm = np.c_[rng.uniform(5, 30, 1_500), rng.normal(0, 1, 1_500)]
+    X = np.vstack([core, arm])
+    sub = m.density_equalised(X, rng, n=5_000)
+    far_before = float(np.mean(X[:, 0] > 5))
+    far_after = float(np.mean(sub[:, 0] > 5))
+    assert far_after > 4 * far_before
+
+
+def test_the_qc_warns_when_the_mask_cuts_into_the_structure(tmp_path):
+    """The mask exists to remove a tail, and on real data the tail and the
+    structure can be the same points -- a cut sitting on the arms is the
+    likeliest reason a fit collapses into the core."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300, noise=2.0, missing=0.0)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--max-z", "1.5", "--qc",
+         "--plot-format", "png", "--output-dir", str(tmp_path / "o")],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "INSIDE the structure" in r.stderr
+    assert "--max-z 0" in r.stderr
+
+
+def test_space_flag_runs_end_to_end(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--space", "log-radial",
+         "--output-dir", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "log-radial space" in r.stderr
+    assert "reported back on the original plane" in r.stderr

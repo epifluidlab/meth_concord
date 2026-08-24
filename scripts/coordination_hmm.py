@@ -57,9 +57,10 @@ def robust_sd(x):
 class PlaneHMM:
     """Gaussian HMM over the 2-D coordination plane, shared transitions."""
 
-    def __init__(self, k, seed=0):
+    def __init__(self, k, seed=0, init="spread"):
         self.k = int(k)
         self.seed = int(seed)
+        self.init = init
 
     # -- emissions -------------------------------------------------------
     def _log_b(self, X, obs):
@@ -179,9 +180,12 @@ class PlaneHMM:
         # wrong: (5th pct of C, 5th pct of dF) through (95th, 95th) all lie
         # on the cloud's MAIN DIAGONAL, so a state at (+C, -dF) never gets
         # a mean anywhere near itself and EM lands in a bad optimum.
-        sub = good
-        if len(sub) > 200_000:
-            sub = sub[rng.choice(len(sub), 200_000, replace=False)]
+        if self.init == "spread":
+            sub = density_equalised(good, rng)
+        else:
+            sub = good
+            if len(sub) > 200_000:
+                sub = sub[rng.choice(len(sub), 200_000, replace=False)]
         try:
             from sklearn.cluster import KMeans
             km = KMeans(n_clusters=self.k, n_init=10,
@@ -287,6 +291,77 @@ def _runner(threads):
     return run
 
 
+def warp_log_radial(X, obs, centre=None):
+    """Compress the plane radially about its own centre.
+
+    The real plane is a dense core with arms radiating off it.  Gaussian
+    components in Cartesian coordinates are the wrong SHAPE for that: the
+    core holds most of the likelihood, so every component settles inside it
+    and the arms -- which are the structure -- go unmodelled.  A real fit
+    left three states within six units of each other while the cloud spanned
+    a hundred.
+
+    Replacing the radius r by log(1 + r) about the centre keeps every angle
+    exactly and shrinks distance non-linearly, so the crowded core takes up
+    less area and the sparse arms take up more.  Equal area in the warped
+    plane is then closer to equal information, which is the assumption
+    Gaussian components are making anyway.  On a fixture with a very dense
+    core it doubled the separation k-means found between centres, 0.371 to
+    0.803 relative to the cloud's own size.
+
+    Angles survive untouched, so the direction labelling means the same
+    thing in either space; only radii are comparable differently, and
+    ``unwarp_log_radial`` puts the fitted means back for reporting.
+    """
+    X = np.asarray(X, float)
+    if centre is None:
+        centre = (np.median(X[obs], axis=0) if obs.any()
+                  else np.zeros(X.shape[1]))
+    d = X - centre
+    r = np.linalg.norm(d, axis=1)
+    scale = np.where(r > 1e-12, np.log1p(r) / np.maximum(r, 1e-12), 1.0)
+    return d * scale[:, None], np.asarray(centre, float)
+
+
+def unwarp_log_radial(W, centre):
+    """Fitted means back on the original plane, for reporting."""
+    W = np.atleast_2d(np.asarray(W, float))
+    rw = np.linalg.norm(W, axis=1)
+    r = np.expm1(rw)
+    scale = np.where(rw > 1e-12, r / np.maximum(rw, 1e-12), 1.0)
+    return W * scale[:, None] + centre
+
+
+def density_equalised(X, rng, n=60_000, grid=120):
+    """Subsample so every occupied part of the plane is equally represented.
+
+    Gaussian-mixture EM weights by DENSITY, so when the plane is a dense
+    core with low-density arms radiating off it, k-means seeds every centre
+    inside the core and EM never leaves.  That is not a tuning problem: the
+    core genuinely holds most of the likelihood.  Re-weighting each point by
+    the inverse of its local density makes the ARMS as visible to the
+    initialiser as the core, which is what lets EM start with a component on
+    each and then refine.
+
+    The fit itself still uses every point at its true weight -- only the
+    starting positions are chosen this way.
+    """
+    X = np.asarray(X, float)
+    if len(X) == 0:
+        return X
+    lo = np.nanpercentile(X, 0.5, axis=0)
+    hi = np.nanpercentile(X, 99.5, axis=0)
+    span = np.where(hi > lo, hi - lo, 1.0)
+    ij = np.clip(((X - lo) / span * grid).astype(int), 0, grid - 1)
+    key = ij[:, 0] * grid + ij[:, 1]
+    counts = np.bincount(key, minlength=grid * grid)
+    w = 1.0 / np.maximum(counts[key], 1)
+    w = w / w.sum()
+    take = min(n, len(X))
+    idx = rng.choice(len(X), take, replace=False, p=w)
+    return X[idx]
+
+
 def _farthest_point_init(X, k, rng):
     """k-means++ style seeding, for when sklearn is unavailable."""
     idx = [int(rng.integers(len(X)))]
@@ -306,7 +381,7 @@ def _spans(lengths):
 
 
 def build_sequences(C, dF, bins, scale_c=None, scale_f=None,
-                    clip=10.0):
+                    clip=10.0, space="plane"):
     """Stack cells into one long array of chains, one per (cell, chromosome).
 
     The chain must break at every chromosome edge; a single chain per cell
@@ -366,6 +441,13 @@ def build_sequences(C, dF, bins, scale_c=None, scale_f=None,
                      "frac_masked_extreme": float(
                          extreme.sum() / max(int(obs.sum()), 1))})
         obs = obs & ~extreme
+    if space == "log-radial":
+        Xw, centre = warp_log_radial(np.where(np.isfinite(X), X, np.nan),
+                                     obs)
+        X = np.where(np.isfinite(Xw), Xw, 0.0)
+        info.update({"space": "log-radial", "warp_centre": centre.tolist()})
+    else:
+        info["space"] = "plane"
     X = np.where(np.isfinite(X), X, 0.0)
     lengths = list(per_chrom) * C.shape[0]
     return X, np.array(lengths, int), obs, order, info
@@ -508,7 +590,7 @@ def genome_autocorrelation(X, lengths, obs, n_cells, max_lag=20):
 
 
 def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
-              labels, title):
+              labels, title, masked=None):
     """Six panels that answer whether the fit means anything.
 
     Ordered by what would invalidate the result soonest: if the plane is one
@@ -524,10 +606,23 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
         np.random.default_rng(0).choice(len(good), 300_000, replace=False)]
 
     a = ax[0, 0]
+    # The masked points are drawn too, because the mask exists to remove a
+    # tail and on real data the tail and the STRUCTURE can be the same
+    # points.  A mask sitting where the arms are is the single most likely
+    # reason a fit collapses into the core, and it should be visible rather
+    # than inferred from the run log.
+    if masked is not None and masked.any():
+        ms = X[masked]
+        if len(ms) > 40_000:
+            ms = ms[np.random.default_rng(1).choice(len(ms), 40_000,
+                                                    replace=False)]
+        a.scatter(ms[:, 0], ms[:, 1], s=1.5, c="#c0392b", alpha=0.25,
+                  lw=0, zorder=1, label=f"masked ({masked.mean():.1%})")
+        a.legend(fontsize=6.5, frameon=False, loc="upper left")
     a.hexbin(sub[:, 0], sub[:, 1], gridsize=70, bins="log", cmap="Blues",
-             mincnt=1)
-    a.scatter(model.means[:, 0], model.means[:, 1], s=90, marker="x",
-              c="#c0392b", lw=2.2, zorder=5)
+             mincnt=1, zorder=2)
+    a.scatter(model.means[:, 0], model.means[:, 1], s=110, marker="x",
+              c="#1a1a1a", lw=2.4, zorder=5)
     for i, m in enumerate(model.means):
         a.annotate(str(i), m, fontsize=8, color="#c0392b",
                    xytext=(4, 4), textcoords="offset points", zorder=6)
@@ -749,12 +844,12 @@ def label_states_relative(means, A, anchor="auto"):
 
 
 def select_k(X, lengths, obs, n_cells, k_values, seed=0,
-             threads=1, verbose=False):
+             threads=1, init="spread", verbose=False):
     """Fit each K and keep the lowest BIC."""
     rows, best = [], None
     for k in k_values:
         try:
-            m = PlaneHMM(k, seed=seed).fit(
+            m = PlaneHMM(k, seed=seed, init=init).fit(
                 X, lengths, obs, n_cells, threads=threads,
                 verbose=verbose)
         except (ValueError, np.linalg.LinAlgError) as exc:
@@ -850,6 +945,29 @@ def main(argv=None) -> int:
                          "numpy and releases the GIL, and the batches are "
                          "large enough that pickling them to processes "
                          "would cost more than it saves.")
+    ap.add_argument("--space", choices=["plane", "log-radial"],
+                    default="plane",
+                    help="Coordinates the states are fitted in.  "
+                         "'log-radial' replaces the radius about the "
+                         "cloud's centre by log(1 + r), keeping every angle "
+                         "exactly.  Use it when the plane is a dense core "
+                         "with arms radiating off it: Gaussian components "
+                         "are the wrong shape for that and all settle in "
+                         "the core, which is what a real fit did.  Reported "
+                         "means are put back on the original plane.")
+    ap.add_argument("--init", choices=["spread", "kmeans"],
+                    default="spread",
+                    help="How the state means are seeded.  'spread' "
+                         "(default) re-weights each point by the inverse of "
+                         "its local density first, so low-density ARMS of "
+                         "the plane are as visible to the initialiser as a "
+                         "dense core.  Plain 'kmeans' seeds by density and "
+                         "puts every centre in the core when one exists -- "
+                         "which is what a real fit did, leaving three "
+                         "states within six units of each other while the "
+                         "cloud spanned a hundred.  Only the STARTING "
+                         "positions differ; the fit uses every point at its "
+                         "true weight either way.")
     ap.add_argument("--qc", action="store_true",
                     help="Write hmm_qc.<fmt> and "
                          "hmm_qc_autocorrelation.tsv: is the plane "
@@ -886,7 +1004,7 @@ def main(argv=None) -> int:
         except ValueError:
             sys.exit(f"--max-z must be a number or 'auto', got {_mz!r}")
     X, lengths, obs, order, sc = build_sequences(
-        C, dF, list(Cdf.columns), clip=_mz)
+        C, dF, list(Cdf.columns), clip=_mz, space=args.space)
     import os
     n_chrom_total = len(lengths) // max(C.shape[0], 1)
     if not args.threads:
@@ -941,7 +1059,8 @@ def main(argv=None) -> int:
         ks = [int(v) for v in args.k_range.split(",") if v.strip()]
         model, table = select_k(fit_X, fit_len, fit_obs,
                                 n_fit_cells, ks, args.seed,
-                                threads=args.threads)
+                                threads=args.threads,
+                                init=args.init)
         table.to_csv(out / "hmm_bic.tsv", sep="\t", index=False)
         if model is None:
             sys.exit("no K converged; try a narrower --k-range")
@@ -950,11 +1069,19 @@ def main(argv=None) -> int:
             if np.isfinite(r.bic)), file=sys.stderr)
         print(f"  selected k = {model.k}", file=sys.stderr)
     else:
-        model = PlaneHMM(int(args.k), seed=args.seed).fit(
+        model = PlaneHMM(int(args.k), seed=args.seed,
+                         init=args.init).fit(
             fit_X, fit_len, fit_obs, n_fit_cells, threads=args.threads)
         print(f"  fixed k = {model.k}  (BIC {model.bic():,.0f})",
               file=sys.stderr)
 
+    if sc.get("space") == "log-radial":
+        model.means_warped = model.means.copy()
+        model.means = unwarp_log_radial(model.means,
+                                        np.array(sc["warp_centre"]))
+        print(f"  fitted in log-radial space about "
+              f"({sc['warp_centre'][0]:+.2f}, {sc['warp_centre'][1]:+.2f}); "
+              f"means reported back on the original plane", file=sys.stderr)
     rel_info = {}
     if args.label == "relative":
         try:
@@ -1067,6 +1194,11 @@ def main(argv=None) -> int:
                  columns=cols).to_parquet(
         out / "concordance_state_posterior_clr.parquet")
     if args.qc:
+        masked_flag = np.zeros(X.shape[0], bool)
+        if "mask_beyond_z" in sc:
+            med = np.array([np.median(X[obs, 0]), np.median(X[obs, 1])])
+            masked_flag = ((np.abs(X - med) > sc["mask_beyond_z"]).any(1)
+                           & np.isfinite(X).all(1) & ~obs)
         acf = genome_autocorrelation(X, lengths, obs, n_cells,
                                      max_lag=args.qc_max_lag)
         pd.DataFrame(acf).to_csv(out / "hmm_qc_autocorrelation.tsv",
@@ -1075,6 +1207,18 @@ def main(argv=None) -> int:
         a1p = acf["C_pooled"][0]
         print(f"  QC: lag-1 autocorrelation of C is {a1:+.3f} within cells "
               f"and {a1p:+.3f} on the pooled track", file=sys.stderr)
+        if "mask_beyond_z" in sc and sc.get("frac_masked_extreme", 0) > 0.01:
+            good_r = np.linalg.norm(
+                X[obs] - np.median(X[obs], axis=0), axis=1)
+            reach = float(np.percentile(good_r, 99.5))
+            if reach > 0.8 * sc["mask_beyond_z"]:
+                print(f"  QC: the retained cloud reaches {reach:.0f} from "
+                      f"its median and the mask sits at "
+                      f"{sc['mask_beyond_z']:.0f} -- the cut is INSIDE the "
+                      f"structure, not beyond it.  A fit that only sees the "
+                      f"core can only place states in the core.  Re-run "
+                      f"with --max-z 0 and compare panel (a): the red "
+                      f"points are what the mask removed.", file=sys.stderr)
         if np.isfinite(a1) and abs(a1) < 0.05:
             msg = ("  QC: consecutive bins within a cell barely agree, so "
                    "the transition prior has nothing to work with -- an HMM "
@@ -1097,7 +1241,8 @@ def main(argv=None) -> int:
                       getattr(model, "trace", []),
                       [d["label"] for d in info],
                       f"HMM QC: k={model.k}, "
-                      f"{int(obs.sum()):,} observed bins")
+                      f"{int(obs.sum()):,} observed bins",
+                      masked=masked_flag)
             print(f"  QC figure -> {qc_path.name}", file=sys.stderr)
         except Exception as exc:
             print(f"  QC figure failed: {exc}", file=sys.stderr)
