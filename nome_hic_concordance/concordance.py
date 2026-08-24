@@ -1754,6 +1754,13 @@ def compute_signed_concordance_matrix(
     # anti-coordinated sector.  Anything that embeds or clusters direction
     # must use the pair, never the degrees.
     _th = np.radians(_pol["theta"])
+    _plane, _plane_cols, _plane_info = coordination_plane_matrix(
+        components["coordination"].to_numpy(float),
+        components["direction_excess"].to_numpy(float), list(sorted_bins),
+        scale_c=_pol.get("scale_c"), scale_f=_pol.get("scale_f"))
+    if _plane is not None:
+        components["plane"] = pd.DataFrame(_plane, index=cell_names,
+                                           columns=_plane_cols)
     for _key, _arr in (("polar_R", _pol["R"]), ("polar_theta", _pol["theta"]),
                        ("polar_theta_sin", np.sin(_th)),
                        ("polar_theta_cos", np.cos(_th)),
@@ -1889,6 +1896,7 @@ def compute_signed_concordance_matrix(
         # 'uncoordinated' from all three coordinated states -- including
         # 'coordinated balanced', which neither axis can do alone -- and
         # theta names which.  polar_p is a chi-square(2) test across both.
+        "plane":                 components.get("plane"),
         "polar_R":               components["polar_R"],
         "polar_theta":           components["polar_theta"],
         "polar_theta_sin":       components["polar_theta_sin"],
@@ -1987,6 +1995,50 @@ def coordination_polar(coordination, direction_excess, scale_c=None,
         pv = np.exp(-r2 / 2.0)          # chi-square(2) upper tail
     theta = np.where(ok, theta, np.nan)
     return {"R": R, "theta": theta, "p": np.where(ok, pv, np.nan), **info}
+
+
+def coordination_plane_matrix(coordination, direction_excess, bins,
+                              scale_c=None, scale_f=None):
+    """The two axes side by side, as ONE matrix to embed.
+
+    Two separate UMAPs answer two questions and leave the reader to join
+    them by eye.  One embedding over both axes answers the question actually
+    being asked -- do cells differ in WHERE they sit on the coordination
+    plane -- and SVD before UMAP does the joining.
+
+    Cartesian, not polar.  (R, theta) is the same information, but theta is
+    circular and an SVD on degrees tears the axis at +-180: on a fixture
+    where two cell types sit at +175 and -175 -- ten degrees apart -- the
+    degree stack puts them TWICE as far apart as a type 175 degrees away
+    (ratio 2.00), while the Cartesian stack gives 0.09.  Since
+    R*cos(theta) and R*sin(theta) ARE the standardised C and F - F_exp, the
+    faithful representation is just the two matrices concatenated, and no
+    polar step is needed at all.
+
+    Correlation between the axes needs no whitening here.  SVD finds its own
+    basis, so a shared component becomes the leading singular vector -- an
+    interpretable axis rather than something to divide out first.
+
+    Columns are ``<bin>|C`` and ``<bin>|dF``.  This matrix is for EMBEDDING;
+    it is twice as wide as the genome and its columns are not bin labels, so
+    do not feed it to anything that expects to parse coordinates out of them.
+    """
+    C = np.asarray(coordination, float)
+    dF = np.asarray(direction_excess, float)
+    if C.shape != dF.shape:
+        raise ValueError(f"C has shape {C.shape}, direction excess "
+                         f"{dF.shape}")
+    if C.shape[1] != len(bins):
+        raise ValueError(f"{C.shape[1]} columns but {len(bins)} bin labels")
+    ok = np.isfinite(C) & np.isfinite(dF)
+    sc = _robust_sd(C[ok]) if scale_c is None else float(scale_c)
+    sf = _robust_sd(dF[ok]) if scale_f is None else float(scale_f)
+    if not np.isfinite(sc) or not np.isfinite(sf):
+        return None, [], {"note": "one axis has no spread"}
+    stacked = np.hstack([C / sc, dF / sf])
+    names = [f"{b}|C" for b in bins] + [f"{b}|dF" for b in bins]
+    return stacked, names, {"scale_c": sc, "scale_f": sf,
+                            "n_bins": int(C.shape[1])}
 
 
 COORD_CLASSES = ("uncoordinated", "coordinated balanced", "co-open shifted",

@@ -259,3 +259,95 @@ def test_the_sine_and_cosine_pair_restores_the_true_separation():
     assert near < 0.1                # adjacent on the circle, adjacent here
     assert far == pytest.approx(2.0, abs=1e-9)       # genuinely opposite
     assert near < far
+
+
+# ------------------------------------- the joint plane matrix for embedding --
+
+def _plane():
+    from nome_hic_concordance.concordance import coordination_plane_matrix
+    return coordination_plane_matrix
+
+
+def test_the_plane_matrix_is_the_two_axes_side_by_side():
+    m = _plane()
+    C = np.arange(12, dtype=float).reshape(3, 4)
+    dF = np.arange(12, dtype=float).reshape(3, 4) * 0.1
+    bins = ["chr1:0", "chr1:250000", "chr1:500000", "chr1:750000"]
+    X, cols, info = m(C, dF, bins)
+    assert X.shape == (3, 8)
+    assert cols[:4] == [f"{b}|C" for b in bins]
+    assert cols[4:] == [f"{b}|dF" for b in bins]
+    assert info["n_bins"] == 4
+
+
+def test_each_axis_is_standardised_so_neither_dominates():
+    """Raw C and F-F_exp differ by orders of magnitude; concatenated
+    unscaled, the embedding would be the larger one alone."""
+    m = _plane()
+    rng = np.random.default_rng(0)
+    C = rng.normal(0, 1.0, (60, 40))
+    dF = rng.normal(0, 0.001, (60, 40))          # a thousand times smaller
+    X, _cols, _i = m(C, dF, [f"b{i}" for i in range(40)])
+    left, right = X[:, :40], X[:, 40:]
+    assert np.std(left) == pytest.approx(np.std(right), rel=0.25)
+
+
+def test_the_cartesian_stack_is_R_cos_theta_and_R_sin_theta():
+    """The identity the construction rests on: polar and Cartesian are the
+    same information, so no polar step is needed to embed the plane."""
+    from nome_hic_concordance.concordance import coordination_polar
+    m = _plane()
+    rng = np.random.default_rng(1)
+    C = rng.normal(0, 1, (40, 25))
+    dF = rng.normal(0, 1, (40, 25))
+    bins = [f"b{i}" for i in range(25)]
+    pol = coordination_polar(C, dF, rho=0.0)     # no whitening, plain polar
+    X, _c, _i = m(C, dF, bins, scale_c=pol["scale_c"], scale_f=pol["scale_f"])
+    th = np.radians(pol["theta"])
+    np.testing.assert_allclose(X[:, :25], pol["R"] * np.cos(th), atol=1e-9)
+    np.testing.assert_allclose(X[:, 25:], pol["R"] * np.sin(th), atol=1e-9)
+
+
+def test_degrees_would_tear_the_circle_but_the_stack_does_not():
+    """The reason this is not an SVD on (R, theta).  Two groups ten degrees
+    apart across the +-180 seam must not come out farther apart than a group
+    175 degrees away."""
+    rng = np.random.default_rng(0)
+    n, nb = 240, 200
+    ct = np.repeat([0, 1, 2], n // 3)
+    ang = np.array([175.0, -175.0, 0.0])[ct]
+    th = (ang[:, None] + rng.normal(0, 6, (n, nb)) + 180) % 360 - 180
+    R = 3.0 + rng.normal(0, 0.3, (n, nb))
+
+    def ratio(M):
+        M = M - M.mean(0, keepdims=True)
+        U, S, _ = np.linalg.svd(M, full_matrices=False)
+        e = U[:, :6] * S[:6]
+        g = np.array([e[ct == c].mean(0) for c in (0, 1, 2)])
+        return np.linalg.norm(g[0] - g[1]) / np.linalg.norm(g[0] - g[2])
+
+    degrees = ratio(np.hstack([R, th]))
+    cartesian = ratio(np.hstack([R * np.cos(np.radians(th)),
+                                 R * np.sin(np.radians(th))]))
+    assert degrees > 1.0            # 0 and 1 look FARTHER apart than 0 and 2
+    assert cartesian < 0.3          # faithful
+    assert cartesian < degrees / 5
+
+
+def test_a_flat_axis_returns_nothing_rather_than_dividing_by_zero():
+    m = _plane()
+    X, cols, info = m(np.ones((5, 3)), np.arange(15.0).reshape(5, 3),
+                      ["a", "b", "c"])
+    assert X is None and cols == [] and "note" in info
+
+
+def test_mismatched_shapes_are_errors():
+    m = _plane()
+    with pytest.raises(ValueError, match="shape"):
+        m(np.zeros((4, 5)), np.zeros((4, 6)), ["a"] * 5)
+    with pytest.raises(ValueError, match="bin labels"):
+        m(np.zeros((4, 5)), np.zeros((4, 5)), ["a", "b"])
+
+
+def test_the_plane_reaches_the_umap_step():
+    assert "plane" in _umap_components()

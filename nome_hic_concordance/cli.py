@@ -1801,6 +1801,8 @@ def run_context(
                 for comp, comp_title in (
                     ("directional_corrected",
                      "directional D' = C·(F−F_exp) (marginal-free)"),
+                    ("plane",
+                     "coordination plane (C and F−F_exp jointly)"),
                     ("polar_R",
                      "polar R (joint departure from the null)"),
                     ("coordination", "coordination C (marginal-free)"),
