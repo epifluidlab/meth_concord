@@ -411,3 +411,78 @@ def test_k_defaults_to_five(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "fixed k = 5" in r.stderr
     assert not (out / "hmm_bic.tsv").exists()
+
+
+# ------------------------------------- when the null is not in the data --
+
+_A5 = np.eye(5) * 0.9 + 0.025
+
+
+def test_auto_uses_the_origin_when_the_data_reaches_it():
+    m = _mod()
+    info, meta = m.label_states_relative(TRUE, _A5, anchor="auto")
+    assert meta["anchor"] == "origin"
+    assert not meta["origin_outside_cloud"]
+    assert all(d["label_identifiable"] for d in info)
+
+
+def test_auto_switches_when_the_cloud_never_approaches_zero():
+    """Real data had C strictly positive: 0.000479 at its smallest against a
+    robust sd of 0.00013, so C = 0 sat 3.7 sds below anything observed.
+    Anchoring on an origin the cloud never reaches labels states by how far
+    the whole cloud sits from it, not by what distinguishes them."""
+    m = _mod()
+    shifted = TRUE + np.array([12.0, 0.0])
+    info, meta = m.label_states_relative(shifted, _A5, anchor="auto")
+    assert meta["anchor"] == "min-c"
+    assert meta["origin_outside_cloud"]
+    assert meta["nearest_radius"] > meta["between_state_spread"]
+
+
+def test_the_unreachable_labels_are_flagged_not_asserted():
+    """'uncoordinated' and 'anti-coordinated' both mean 'less coordinated
+    than the rest'.  Separating them needs an absolute zero, so when the
+    data has none the bijection must not imply the distinction was made."""
+    m = _mod()
+    info, meta = m.label_states_relative(TRUE + np.array([12.0, 0.0]), _A5)
+    flags = {d["label"]: d["label_identifiable"] for d in info}
+    assert flags["uncoordinated"] is False
+    assert flags["anti-coordinated"] is False
+    # the directional ones survive: they are read off dF, which does reach 0
+    assert flags["co-open shifted"] is True
+    assert flags["co-closed shifted"] is True
+    assert flags["coordinated balanced"] is True
+
+
+def test_forcing_the_origin_anchor_is_still_possible():
+    m = _mod()
+    _i, meta = m.label_states_relative(TRUE + np.array([12.0, 0.0]), _A5,
+                                       anchor="origin")
+    assert meta["anchor"] == "origin"
+
+
+def test_a_bad_anchor_is_an_error():
+    m = _mod()
+    with pytest.raises(ValueError, match="anchor"):
+        m.label_states_relative(TRUE, _A5, anchor="whatever")
+
+
+def test_the_run_says_the_taxonomy_collapses_to_four(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=10, n_bins=400, missing=0.0)
+    Cv = np.abs(C.to_numpy(float)) + 40.0        # strictly positive, far off 0
+    pd.DataFrame(Cv, index=C.index, columns=C.columns).to_parquet(
+        tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--output-dir", str(tmp_path / "o")],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "origin is OUTSIDE" in r.stderr
+    assert "NOT IDENTIFIABLE" in r.stderr
+    assert "FOUR states" in r.stderr
+    lab = pd.read_csv(tmp_path / "o" / "hmm_states.tsv", sep="\t")
+    assert "label_identifiable" in lab.columns
+    assert (~lab["label_identifiable"]).sum() == 2

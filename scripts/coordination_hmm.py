@@ -246,8 +246,11 @@ def build_sequences(C, dF, bins, scale_c=None, scale_f=None,
     obs = np.isfinite(X).all(1)
     info = {"scale_c": sc, "scale_f": sf}
     if obs.any():
-        info["max_abs_z"] = float(np.max(np.abs(X[obs])))
-        info["frac_beyond_10"] = float(np.mean(np.abs(X[obs]) > 10))
+        _med = np.array([np.median(X[obs, 0]), np.median(X[obs, 1])])
+        _dev = np.abs(X[obs] - _med)
+        info["max_abs_z"] = float(_dev.max())
+        info["frac_beyond_10"] = float(np.mean(_dev > 10))
+        info["median_z"] = _med.tolist()
     if clip and clip > 0:
         # MASK the extremes, do not clip them to a boundary.  Clipping turns
         # a heavy tail into a spike at +-z, and EM allocates states to that
@@ -260,7 +263,14 @@ def build_sequences(C, dF, bins, scale_c=None, scale_f=None,
         #
         # A fixed z, not a percentile: with a Cauchy-ish tail the 99.5th
         # percentile of |z| came out 341, which left EM a tail to chase.
-        extreme = (np.abs(X) > clip).any(1) & obs
+        # CENTRED on the median, not on zero.  The values themselves stay
+        # uncentred, because C = 0 is a meaningful point and shifting it
+        # would destroy that -- but "extreme" has to mean far from the BULK,
+        # not far from zero.  On data whose whole cloud sits well away from
+        # zero (C came back strictly positive on real data) an uncentred cut
+        # marks every bin extreme and masks the entire matrix.
+        med = np.array([np.median(X[obs, 0]), np.median(X[obs, 1])])
+        extreme = (np.abs(X - med) > clip).any(1) & obs
         info.update({"mask_beyond_z": float(clip),
                      "n_masked_extreme": int(extreme.sum()),
                      "frac_masked_extreme": float(
@@ -338,27 +348,35 @@ def stationary(A):
     return pi / max(pi.sum(), 1e-12)
 
 
-def label_states_relative(means, A):
-    """Label states by their positions relative to the NULL AT THE ORIGIN.
+def label_states_relative(means, A, anchor="auto"):
+    """Label the fitted states by their positions relative to a null.
 
-    The origin needs no estimating: C = 0 is "no more concordant mass than
-    expected" and F - F_exp = 0 is "the mass sits where the null puts it".
-    Both statistics are already defined against the null, so (0, 0) IS the
-    uncoordinated point and nothing has to be inferred to find it.
+    WHICH NULL depends on the data, and getting this wrong mislabels
+    everything.
 
-    Anchoring on the most-OCCUPIED state was the obvious alternative and is
-    wrong whenever the null is not the commonest state: on a fixture with
-    five equally-sized domains it picked the balanced state as the null and
-    swapped two labels.  Occupancy is still reported, because a null state
-    holding a small share of the genome is worth seeing.
+    ``origin`` takes (0, 0) as the null, which needs no estimating: C = 0 is
+    "no more concordant mass than expected" and F - F_exp = 0 is "the mass
+    sits where the null puts it".  Both statistics are defined against the
+    null, so when the data reaches it this is exact.
 
-    What IS taken relatively is the scale.  Distances in the plane depend on
-    how the axes were standardised, so the fitted means are divided by their
-    own median radius before matching, and the five archetypes are matched
-    one-to-one by total distance.  Nothing then depends on the units.
+    ``min-c`` takes the state with the LOWEST C instead.  On real data C came
+    back strictly positive -- 0.000479 at its smallest against a robust sd of
+    0.00013, so C = 0 sat 3.7 sds below anything observed across ~11M
+    cell-bins.  Neither 'uncoordinated' nor 'anti-coordinated' is reachable
+    there, and anchoring on an origin the cloud never approaches labels
+    every state by how far the whole cloud sits from it rather than by what
+    distinguishes the states.
 
-    Requires exactly five states: with any other K the assignment is not a
-    bijection and the labels would be a guess dressed as a result.
+    ``auto`` compares the nearest state's distance from the origin against
+    the spread BETWEEN states.  If the cloud sits further from the origin
+    than the states sit from each other, the origin is not a reference the
+    data can support and min-c is used.
+
+    Only the SCALE is relative in both cases: offsets are divided by their
+    own median size before the five archetypes are matched one-to-one, so
+    nothing depends on the units of the plane.  Requires exactly five
+    states; with any other K the assignment is not a bijection and the
+    labels would be a guess dressed as a result.
     """
     from scipy.optimize import linear_sum_assignment
 
@@ -368,24 +386,53 @@ def label_states_relative(means, A):
                          f"{len(ARCHETYPES)} states, got {mu.shape[0]}")
     occ = stationary(A)
     radii = np.linalg.norm(mu, axis=1)
-    scale = float(np.median(radii))
+    pair = [np.linalg.norm(mu[i] - mu[j]) for i in range(len(mu))
+            for j in range(i + 1, len(mu))]
+    between = float(np.median(pair)) if pair else 0.0
+    origin_far = between > 0 and float(radii.min()) > between
+
+    if anchor == "auto":
+        anchor = "min-c" if origin_far else "origin"
+    if anchor == "origin":
+        ref = int(np.argmin(radii))
+        base = np.zeros(2)
+    elif anchor == "min-c":
+        ref = int(np.argmin(mu[:, 0]))
+        base = mu[ref]
+    else:
+        raise ValueError(f"anchor must be auto, origin or min-c, "
+                         f"got {anchor!r}")
+
+    off = mu - base
+    sizes = np.linalg.norm(off, axis=1)
+    scale = float(np.median(sizes[sizes > 0])) if (sizes > 0).any() else 0.0
     if not np.isfinite(scale) or scale <= 0:
         raise ValueError("fitted states are coincident; nothing to label")
-    z = mu / scale
+    z = off / scale
     names = list(ARCHETYPES)
     tgt = np.array([ARCHETYPES[n] for n in names], float)
     cost = np.linalg.norm(z[:, None, :] - tgt[None, :, :], axis=2)
     ri, ci = linear_sum_assignment(cost)
     out = [None] * len(names)
     for i, j in zip(ri, ci):
+        nm = names[j]
+        # With the origin unreachable there is no absolute point to measure
+        # "less coordinated than nothing" from, so the two labels that mean
+        # exactly that cannot be told apart.  Say so per state rather than
+        # let a bijection imply a distinction the data cannot make.
+        unreliable = (anchor == "min-c"
+                      and nm in ("uncoordinated", "anti-coordinated"))
         out[i] = {"mean_C": mu[i, 0], "mean_dF": mu[i, 1],
                   "rel_C": z[i, 0], "rel_dF": z[i, 1],
                   "R": float(np.hypot(*z[i])),
                   "theta": float(np.degrees(np.arctan2(z[i, 1], z[i, 0]))),
-                  "occupancy": occ[i], "label": names[j],
+                  "occupancy": occ[i], "label": nm,
+                  "label_identifiable": not unreliable,
                   "match_cost": cost[i, j]}
-    ref = int(np.argmin(radii))
-    return out, {"reference_state": ref, "spread": scale,
+    return out, {"anchor": anchor, "reference_state": ref, "spread": scale,
+                 "between_state_spread": between,
+                 "nearest_radius": float(radii.min()),
+                 "origin_outside_cloud": bool(origin_far),
                  "null_occupancy": float(occ[ref])}
 
 
@@ -466,6 +513,17 @@ def main(argv=None) -> int:
                          "five states sat exactly on the clip corners.  A "
                          "fixed z, not a percentile: the 99.5th percentile "
                          "of |z| there was still 341.")
+    ap.add_argument("--null-anchor", choices=["auto", "origin", "min-c"],
+                    default="auto",
+                    help="Which point counts as the null when labelling.  "
+                         "'origin' is exact when the data reaches C = 0.  "
+                         "'min-c' uses the lowest-C state instead, which is "
+                         "what real data needed: C came back strictly "
+                         "positive, so C = 0 sat 3.7 robust sds below "
+                         "anything observed and neither 'uncoordinated' nor "
+                         "'anti-coordinated' was reachable.  'auto' picks "
+                         "min-c when the cloud sits further from the origin "
+                         "than the states sit from each other.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--r-cut", default="auto",
                     help="Radius below which a fitted state is called "
@@ -493,8 +551,11 @@ def main(argv=None) -> int:
           f"{int(obs.sum()):,} observed ({obs.mean():.1%}); "
           f"{len(lengths):,} chains (cell x chromosome)", file=sys.stderr)
     if "max_abs_z" in sc:
-        print(f"  standardised spread: max |z| = {sc['max_abs_z']:,.1f}, "
-              f"{sc['frac_beyond_10']:.2%} beyond 10", file=sys.stderr)
+        print(f"  standardised spread about the median: max |z| = "
+              f"{sc['max_abs_z']:,.1f}, {sc['frac_beyond_10']:.2%} beyond "
+              f"10; median sits at "
+              f"({sc['median_z'][0]:+.2f}, {sc['median_z'][1]:+.2f}) "
+              f"relative to C = 0", file=sys.stderr)
         if sc["frac_beyond_10"] > 0.01:
             print(f"  NOTE {sc['frac_beyond_10']:.1%} of the plane sits "
                   f"beyond |z| = 10.  Gaussian emissions will chase that "
@@ -541,7 +602,8 @@ def main(argv=None) -> int:
     rel_info = {}
     if args.label == "relative":
         try:
-            info, rel_info = label_states_relative(model.means, model.A)
+            info, rel_info = label_states_relative(
+                model.means, model.A, anchor=args.null_anchor)
         except ValueError as exc:
             sys.exit(f"relative labelling failed: {exc}\n"
                      f"  pass --k 5, or --label angle to use the absolute "
@@ -559,12 +621,35 @@ def main(argv=None) -> int:
     lab["self_transition"] = np.diag(model.A)
     lab["expected_run_bins"] = 1.0 / np.maximum(1 - np.diag(model.A), 1e-9)
     if rel_info:
-        print(f"  labelling: against the null at the origin (C = 0, "
-              f"F - F_exp = 0); radii scaled by "
-              f"{rel_info['spread']:.3g}.  State "
-              f"{rel_info['reference_state']} is nearest the origin and "
-              f"holds {rel_info['null_occupancy']:.1%} of the genome.",
-              file=sys.stderr)
+        if rel_info["anchor"] == "origin":
+            print(f"  labelling: against the null at the origin (C = 0, "
+                  f"F - F_exp = 0); offsets scaled by "
+                  f"{rel_info['spread']:.3g}", file=sys.stderr)
+        else:
+            print(f"  labelling: against state "
+                  f"{rel_info['reference_state']}, the lowest-C state, "
+                  f"taken as the null; offsets scaled by "
+                  f"{rel_info['spread']:.3g}", file=sys.stderr)
+        if rel_info["origin_outside_cloud"]:
+            print(f"  NOTE the origin is OUTSIDE the fitted cloud: the "
+                  f"nearest state sits {rel_info['nearest_radius']:.3g} "
+                  f"from C = 0 while the states sit only "
+                  f"{rel_info['between_state_spread']:.3g} from each other.  "
+                  f"C never reaching zero means neither 'uncoordinated' nor "
+                  f"'anti-coordinated' exists in this data.\n"
+                  f"  Those two labels are therefore NOT IDENTIFIABLE and "
+                  f"are flagged as such in hmm_states.tsv: both mean 'less "
+                  f"coordinated than the rest', and separating them needs "
+                  f"an absolute zero the data never reaches.  Treat the "
+                  f"taxonomy here as FOUR states -- least-coordinated, "
+                  f"balanced, co-open, co-closed.\n"
+                  f"  Worth checking why C never reaches zero: O and E are "
+                  f"fitted with SEPARATE Dirichlet priors, and if the "
+                  f"linked pool's prior is more concordant than the "
+                  f"distance-matched one, every bin inherits that gap as a "
+                  f"positive offset.  A contrast between arms at the same "
+                  f"bin cancels it; an absolute reading of C does not.",
+                  file=sys.stderr)
     lab.to_csv(out / "hmm_states.tsv", sep="\t", index=False)
     print("  fitted states:", file=sys.stderr)
     for r in lab.itertuples():
