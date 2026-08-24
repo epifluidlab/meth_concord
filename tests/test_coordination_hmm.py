@@ -220,8 +220,11 @@ def test_relative_labelling_takes_four_or_five_states():
     info, _meta = m.label_states_relative(TRUE[:4], A4)
     assert len(info) == 4
     A3 = np.eye(3) * 0.9 + 0.05
-    with pytest.raises(ValueError, match="4 or 5"):
-        m.label_states_relative(TRUE[:3], A3)
+    info3, _m3 = m.label_states_relative(TRUE[:3], A3)
+    assert len(info3) == 3
+    A2 = np.eye(2) * 0.9 + 0.1
+    with pytest.raises(ValueError, match="3, 4 or 5"):
+        m.label_states_relative(TRUE[:2], A2)
 
 
 def test_an_absolute_radius_cut_mislabels_when_most_bins_carry_signal():
@@ -392,12 +395,12 @@ def test_relative_labelling_refuses_an_unsupported_k_with_a_usable_message(
     r = subprocess.run(
         [sys.executable, str(_SCRIPT), "--coordination",
          str(tmp_path / "c.parquet"), "--direction-excess",
-         str(tmp_path / "f.parquet"), "--k", "3",
+         str(tmp_path / "f.parquet"), "--k", "2",
          "--output-dir", str(tmp_path / "o")],
         capture_output=True, text=True)
     assert r.returncode != 0
-    assert "4 or 5" in r.stderr
-    assert "--k 4" in r.stderr and "--label angle" in r.stderr
+    assert "3, 4 or 5" in r.stderr
+    assert "--k 3" in r.stderr and "--label angle" in r.stderr
 
 
 def test_k_defaults_to_five(tmp_path):
@@ -548,11 +551,11 @@ def test_at_four_states_nothing_is_left_unidentifiable():
     assert all(d["label_identifiable"] for d in info)
 
 
-def test_three_states_is_refused_with_both_ways_out():
+def test_two_states_is_refused_with_the_ways_out():
     m = _mod()
-    A3 = np.eye(3) * 0.9 + 0.05
-    with pytest.raises(ValueError, match="4 or 5"):
-        m.label_states_relative(TRUE4[:3], A3)
+    A2 = np.eye(2) * 0.9 + 0.1
+    with pytest.raises(ValueError, match="3, 4 or 5"):
+        m.label_states_relative(TRUE4[:2], A2)
 
 
 def test_cli_accepts_k_four(tmp_path):
@@ -576,9 +579,9 @@ def test_cli_accepts_k_four(tmp_path):
     assert lab["label_identifiable"].all()
 
 
-def test_the_k_five_refusal_names_k_four(tmp_path):
-    """The message a user hits when they pick an unsupported K has to point
-    at the model that fits their data, not just at five."""
+def test_the_refusal_names_every_supported_model(tmp_path):
+    """The message a user hits on an unsupported K has to point at the
+    models that DO fit, and say what distinguishes them."""
     m = _mod()
     C, F, _st = _fixture(n_cells=6, n_bins=200)
     C.to_parquet(tmp_path / "c.parquet")
@@ -586,12 +589,13 @@ def test_the_k_five_refusal_names_k_four(tmp_path):
     r = subprocess.run(
         [sys.executable, str(_SCRIPT), "--coordination",
          str(tmp_path / "c.parquet"), "--direction-excess",
-         str(tmp_path / "f.parquet"), "--k", "3",
+         str(tmp_path / "f.parquet"), "--k", "2",
          "--output-dir", str(tmp_path / "o")],
         capture_output=True, text=True)
     assert r.returncode != 0
-    assert "--k 4" in r.stderr and "--k 5" in r.stderr
-    assert "positive everywhere" in r.stderr
+    for flag in ("--k 3", "--k 4", "--k 5"):
+        assert flag in r.stderr, flag
+    assert "directional" in r.stderr and "crosses zero" in r.stderr
 
 
 # ------------------------------------------------------- auto mask and QC --
@@ -721,3 +725,54 @@ def test_max_z_still_accepts_a_number(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "|z| = 8" in r.stderr
     assert "auto chose" not in r.stderr
+
+
+def test_the_archetype_sets_nest_so_a_smaller_k_is_a_simpler_claim():
+    """Each K adds one archetype to the one below.  If the sets did not
+    nest, choosing K would change the question rather than its resolution."""
+    m = _mod()
+    a3, _ = m.archetypes(3, "min-c")
+    a4, _ = m.archetypes(4, "min-c")
+    a5, _ = m.archetypes(5, "min-c")
+    assert set(a3) < set(a4) < set(a5)
+    assert set(a4) - set(a3) == {"coordinated balanced"}
+    assert set(a5) - set(a4) == {"anti-coordinated"}
+    assert set(a3) == {"least coordinated", "co-open shifted",
+                       "co-closed shifted"}
+
+
+def test_three_states_keep_only_the_directional_ones():
+    """The model for data whose elevated-C states are all directional --
+    which is what 'coordinated balanced' absorbing 79.6% of the genome
+    suggests is really going on."""
+    m = _mod()
+    three = np.array([(0., 0.), (2.1, 2.1), (2.1, -2.1)]) + np.array([12., 0.])
+    A3 = np.eye(3) * 0.9 + 0.05
+    info, meta = m.label_states_relative(three, A3)
+    got = {d["label"] for d in info}
+    assert got == {"least coordinated", "co-open shifted",
+                   "co-closed shifted"}
+    by = {d["label"]: d for d in info}
+    assert by["co-open shifted"]["mean_dF"] > 0
+    assert by["co-closed shifted"]["mean_dF"] < 0
+    assert all(d["label_identifiable"] for d in info)
+
+
+def test_cli_accepts_k_three(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=10, n_bins=400, missing=0.0)
+    Cv = np.abs(C.to_numpy(float)) + 40.0
+    pd.DataFrame(Cv, index=C.index, columns=C.columns).to_parquet(
+        tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    lab = pd.read_csv(out / "hmm_states.tsv", sep="\t")
+    assert len(lab) == 3
+    assert "coordinated balanced" not in set(lab["label"])
+    assert "anti-coordinated" not in set(lab["label"])

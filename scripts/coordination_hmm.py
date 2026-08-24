@@ -601,29 +601,41 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
 def archetypes(k, anchor):
     """The taxonomy to match against, which depends on K and on the anchor.
 
-    K = 4 drops anti-coordination, and that is the right model when C is
-    positive everywhere: C = 2*Cov below zero is what anti-coordination
-    MEANS, so if the statistic never goes there the state does not exist and
-    forcing a fifth archetype makes the assignment name something arbitrary.
+    Each K adds one archetype to the one below, so the sets nest and a
+    smaller K is a strictly simpler claim rather than a different one:
+
+      3  null, co-open shifted, co-closed shifted
+      4  + coordinated balanced
+      5  + anti-coordinated
+
+    K = 5 needs C to cross zero, since C = 2*Cov below zero is what
+    anti-coordination MEANS.  K = 4 keeps 'coordinated balanced', a state
+    with more concordant mass than the null but no directional preference.
+    K = 3 drops that too, which is the right model when the elevated-C
+    states are all directional -- on a real fit 'coordinated balanced'
+    absorbed 79.6% of the genome, which is not a plausible category and is
+    what a dominant unstructured blob looks like when a name is forced onto
+    it.
 
     The null archetype is called 'uncoordinated' only when the origin is the
     anchor, because that is when C = 0 is actually reached.  Anchored on the
     lowest-C state it is 'least coordinated', which is what it is: there is
-    coordination everywhere, and this state has the least of it.  The name
-    carries the caveat instead of a footnote having to.
+    coordination everywhere and this state has the least of it.
     """
-    if k not in (4, 5):
+    if k not in (3, 4, 5):
         raise ValueError(
-            f"relative labelling handles 4 or 5 states, got {k}.  Four when "
-            f"C is positive everywhere (no anti-coordination), five when it "
-            f"crosses zero.")
+            f"relative labelling handles 3, 4 or 5 states, got {k}.  Three "
+            f"when the coordinated states are all directional, four to add "
+            f"a balanced state, five when C crosses zero and "
+            f"anti-coordination exists.")
     null_name = ("uncoordinated" if anchor == "origin"
                  else "least coordinated")
     out = {null_name: (0.0, 0.0),
-           "coordinated balanced": (1.0, 0.0),
            "co-open shifted": (0.7, 0.7),
            "co-closed shifted": (0.7, -0.7)}
-    if k == 5:
+    if k >= 4:
+        out["coordinated balanced"] = (1.0, 0.0)
+    if k >= 5:
         out["anti-coordinated"] = (-1.0, 0.0)
     return out, null_name
 
@@ -950,8 +962,9 @@ def main(argv=None) -> int:
                 model.means, model.A, anchor=args.null_anchor)
         except ValueError as exc:
             sys.exit(f"relative labelling failed: {exc}\n"
-                     f"  use --k 4 when C is positive everywhere (no "
-                     f"anti-coordination) or --k 5 when it crosses zero; "
+                     f"  use --k 3 when the coordinated states are all "
+                     f"directional, --k 4 to add a balanced state, --k 5 "
+                     f"when C crosses zero; "
                      f"--label angle uses the absolute rule instead, and "
                      f"its labels should be read with suspicion.")
     else:
