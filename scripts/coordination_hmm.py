@@ -81,21 +81,96 @@ class PlaneHMM:
             out[obs, s] = -0.5 * (q + np.log(det)) - np.log(2 * np.pi)
         return out
 
-    # -- one chain -------------------------------------------------------
+    # -- one BATCH of equal-length chains --------------------------------
     def _fb(self, logB, lA, lpi):
-        n = logB.shape[0]
+        """Forward-backward over a batch of chains at once.
+
+        logB is (n_seq, L, k).  The recursion is sequential in t and cannot
+        be avoided, but every cell shares the same chromosome lengths, so
+        the CELL axis vectorises: one Python step per bin instead of one per
+        (cell, bin).  At 920 cells that is the difference between ~21,000
+        chains x 500 steps and 23 chromosomes x 500 steps per EM iteration.
+        """
+        n_seq, L, k = logB.shape
         la = np.empty_like(logB)
         lb = np.zeros_like(logB)
-        la[0] = lpi + logB[0]
-        for t in range(1, n):
-            la[t] = logB[t] + _lse(la[t - 1][:, None] + lA, 0)
-        for t in range(n - 2, -1, -1):
-            lb[t] = _lse(lA + (logB[t + 1] + lb[t + 1])[None, :], 1)
-        ll = _lse(la[-1], 0)
-        lg = la + lb - ll
-        return la, lb, lg, ll
+        la[:, 0] = lpi + logB[:, 0]
+        for t in range(1, L):
+            la[:, t] = logB[:, t] + _lse(la[:, t - 1][:, :, None]
+                                         + lA[None], 1)
+        for t in range(L - 2, -1, -1):
+            lb[:, t] = _lse(lA[None]
+                            + (logB[:, t + 1] + lb[:, t + 1])[:, None, :], 2)
+        ll = _lse(la[:, -1], 1)
+        return la, lb, la + lb - ll[:, None, None], ll
 
-    def fit(self, X, lengths, obs, n_iter=40, tol=1e-4, verbose=False):
+    def _batches(self, X, lengths, obs, n_cells):
+        """Group the flat arrays into one batch per chromosome.
+
+        Layout from build_sequences is cell-major: cell0-chr1..chrN, then
+        cell1-chr1..chrN.  Every cell has the same chromosome lengths, so
+        chromosome j is rows j, N+j, 2N+j, ... and they stack into one
+        (n_cells, L_j, .) array that the recursion runs over in a single
+        pass.
+        """
+        n_chrom = len(lengths) // n_cells
+        starts = np.r_[0, np.cumsum(lengths)]
+        out = []
+        for j in range(n_chrom):
+            idx = np.concatenate([np.arange(starts[c * n_chrom + j],
+                                            starts[c * n_chrom + j + 1])
+                                  for c in range(n_cells)])
+            L = int(lengths[j])
+            out.append((idx, X[idx].reshape(n_cells, L, 2),
+                        obs[idx].reshape(n_cells, L)))
+        return out
+
+    def _stats(self, Xb, ob, lA, lpi, want_xi=True):
+        """Sufficient statistics from one chromosome batch."""
+        logB = self._log_b_batch(Xb, ob)
+        la, lb, lg, ll = self._fb(logB, lA, lpi)
+        g = np.exp(lg)
+        gm = np.where(ob[:, :, None], g, 0.0)
+        g_sum = gm.sum((0, 1))
+        gx = np.einsum("nlk,nld->kd", gm, np.where(ob[:, :, None], Xb, 0.0))
+        gxx = np.zeros((self.k, 2, 2))
+        for s_ in range(self.k):
+            d = np.where(ob[:, :, None], Xb - self.means[s_], 0.0)
+            w = gm[:, :, s_]
+            flat_d = d.reshape(-1, 2)
+            gxx[s_] = (flat_d * w.reshape(-1, 1)).T @ flat_d
+        xi = np.zeros((self.k, self.k))
+        if want_xi and Xb.shape[1] > 1:
+            # chunk over cells: the (n_seq, L-1, k, k) tensor is the one
+            # place this can blow memory on a real matrix
+            step = max(1, int(4e6 // max(Xb.shape[1] * self.k ** 2, 1)))
+            for c0 in range(0, Xb.shape[0], step):
+                sl = slice(c0, c0 + step)
+                m2 = (la[sl, :-1, :, None] + lA[None, None]
+                      + (logB[sl, 1:] + lb[sl, 1:])[:, :, None, :])
+                m2 -= _lse(m2.reshape(m2.shape[0], m2.shape[1], -1), 2
+                           )[:, :, None, None]
+                xi += np.exp(m2).sum((0, 1))
+        return g_sum, gx, gxx, xi, g[:, 0].sum(0), float(ll.sum())
+
+    def _log_b_batch(self, Xb, ob):
+        """log-emissions for a batch; ZERO where masked, as in _log_b."""
+        n, L, _ = Xb.shape
+        out = np.zeros((n, L, self.k))
+        flat = Xb.reshape(-1, 2)
+        m = ob.reshape(-1)
+        for s_ in range(self.k):
+            d = flat[m] - self.means[s_]
+            S = self.covs[s_]
+            det = max(S[0, 0] * S[1, 1] - S[0, 1] * S[1, 0], 1e-12)
+            inv = np.array([[S[1, 1], -S[0, 1]], [-S[1, 0], S[0, 0]]]) / det
+            q = np.einsum("ij,jk,ik->i", d, inv, d)
+            col = out[:, :, s_].reshape(-1)
+            col[m] = -0.5 * (q + np.log(det)) - np.log(2 * np.pi)
+        return out
+
+    def fit(self, X, lengths, obs, n_cells, n_iter=40, tol=1e-4,
+            threads=1, verbose=False):
         rng = np.random.default_rng(self.seed)
         good = X[obs]
         if len(good) < self.k * 10:
@@ -104,7 +179,6 @@ class PlaneHMM:
         # wrong: (5th pct of C, 5th pct of dF) through (95th, 95th) all lie
         # on the cloud's MAIN DIAGONAL, so a state at (+C, -dF) never gets
         # a mean anywhere near itself and EM lands in a bad optimum.
-        # k-means initialises in the plane, which is where the states are.
         sub = good
         if len(sub) > 200_000:
             sub = sub[rng.choice(len(sub), 200_000, replace=False)]
@@ -113,7 +187,7 @@ class PlaneHMM:
             km = KMeans(n_clusters=self.k, n_init=10,
                         random_state=self.seed).fit(sub)
             self.means = km.cluster_centers_.astype(float)
-        except Exception:                       # no sklearn: farthest-point
+        except Exception:
             self.means = _farthest_point_init(sub, self.k, rng)
         self.means = self.means + rng.normal(0, 1e-6, self.means.shape)
         base = np.cov(good.T) + np.eye(2) * 1e-6
@@ -122,37 +196,22 @@ class PlaneHMM:
         np.fill_diagonal(A, 0.95)
         pi = np.full(self.k, 1.0 / self.k)
 
+        batches = self._batches(X, lengths, obs, n_cells)
+        runner = _runner(threads)
         prev = -np.inf
         for it in range(n_iter):
             lA, lpi = np.log(A), np.log(pi)
-            logB = self._log_b(X, obs)
-            g_sum = np.zeros((self.k,))
-            gx = np.zeros((self.k, 2))
-            gxx = np.zeros((self.k, 2, 2))
-            xi = np.zeros((self.k, self.k))
-            pi_acc = np.zeros(self.k)
-            total = 0.0
-            for a, b in _spans(lengths):
-                lb_, la_, lg, ll = self._fb(logB[a:b], lA, lpi)
-                total += ll
-                g = np.exp(lg)
-                pi_acc += g[0]
-                m = obs[a:b]
-                gm = g[m]
-                xm = X[a:b][m]
-                g_sum += gm.sum(0)
-                gx += gm.T @ xm
-                for s in range(self.k):
-                    d = xm - self.means[s]
-                    gxx[s] += (d * gm[:, s:s + 1]).T @ d
-                lg2 = (lb_[:-1][:, :, None] + lA[None]
-                       + (logB[a:b][1:] + la_[1:])[:, None, :])
-                lg2 -= _lse(lg2.reshape(lg2.shape[0], -1), 1)[:, None, None]
-                xi += np.exp(lg2).sum(0)
+            res = runner(self, batches, lA, lpi)
+            g_sum = sum(r[0] for r in res)
+            gx = sum(r[1] for r in res)
+            gxx = sum(r[2] for r in res)
+            xi = sum(r[3] for r in res)
+            pi_acc = sum(r[4] for r in res)
+            total = sum(r[5] for r in res)
             self.means = gx / np.maximum(g_sum[:, None], 1e-12)
-            for s in range(self.k):
-                self.covs[s] = (gxx[s] / max(g_sum[s], 1e-12)
-                                + np.eye(2) * 1e-6)
+            for s_ in range(self.k):
+                self.covs[s_] = (gxx[s_] / max(g_sum[s_], 1e-12)
+                                 + np.eye(2) * 1e-6)
             A = xi / np.maximum(xi.sum(1, keepdims=True), 1e-12)
             pi = pi_acc / max(pi_acc.sum(), 1e-12)
             if verbose:
@@ -166,27 +225,28 @@ class PlaneHMM:
         return self
 
     # -- decoding --------------------------------------------------------
-    def decode(self, X, lengths, obs):
+    def decode(self, X, lengths, obs, n_cells):
         lA, lpi = np.log(self.A), np.log(self.pi)
-        logB = self._log_b(X, obs)
         path = np.full(X.shape[0], -1, int)
         post = np.full((X.shape[0], self.k), np.nan)
-        for a, b in _spans(lengths):
-            lb_, la_, lg, _ = self._fb(logB[a:b], lA, lpi)
-            post[a:b] = np.exp(lg)
-            n = b - a
+        for idx, Xb, ob in self._batches(X, lengths, obs, n_cells):
+            logB = self._log_b_batch(Xb, ob)
+            _la, _lb, lg, _ll = self._fb(logB, lA, lpi)
+            n, L, _ = logB.shape
             dp = np.empty((n, self.k))
-            bp = np.zeros((n, self.k), int)
-            dp[0] = lpi + logB[a]
-            for t in range(1, n):
-                m = dp[t - 1][:, None] + lA
-                bp[t] = m.argmax(0)
-                dp[t] = m.max(0) + logB[a + t]
-            p = np.empty(n, int)
-            p[-1] = dp[-1].argmax()
-            for t in range(n - 2, -1, -1):
-                p[t] = bp[t + 1][p[t + 1]]
-            path[a:b] = p
+            bp = np.zeros((n, L, self.k), np.int8)
+            dp[:] = lpi + logB[:, 0]
+            for t in range(1, L):
+                mm = dp[:, :, None] + lA[None]
+                bp[:, t] = mm.argmax(1)
+                dp = mm.max(1) + logB[:, t]
+            p = np.empty((n, L), int)
+            p[:, -1] = dp.argmax(1)
+            for t in range(L - 2, -1, -1):
+                p[:, t] = np.take_along_axis(
+                    bp[:, t + 1], p[:, t + 1][:, None], 1)[:, 0]
+            path[idx] = p.reshape(-1)
+            post[idx] = np.exp(lg).reshape(-1, self.k)
         return path, post
 
     # -- model size ------------------------------------------------------
@@ -201,6 +261,28 @@ class PlaneHMM:
         matrix size: masked bins contribute no likelihood, so counting them
         would reward a model for the data it never saw."""
         return -2.0 * self.loglik + self.n_params() * np.log(max(self.n_obs, 2))
+
+
+def _runner(threads):
+    """Fan the per-chromosome work out, or run it in this process.
+
+    Chromosomes are independent given the current parameters, so the E step
+    parallelises exactly.  Threads, not processes: the inner work is numpy,
+    which releases the GIL, and the batches are large enough that pickling
+    them to workers would cost more than it saves.
+    """
+    if threads and threads > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def run(model, batches, lA, lpi):
+            with ThreadPoolExecutor(max_workers=threads) as ex:
+                return list(ex.map(
+                    lambda b: model._stats(b[1], b[2], lA, lpi), batches))
+        return run
+
+    def run(model, batches, lA, lpi):
+        return [model._stats(b[1], b[2], lA, lpi) for b in batches]
+    return run
 
 
 def _farthest_point_init(X, k, rng):
@@ -436,12 +518,15 @@ def label_states_relative(means, A, anchor="auto"):
                  "null_occupancy": float(occ[ref])}
 
 
-def select_k(X, lengths, obs, k_values, seed=0, verbose=False):
+def select_k(X, lengths, obs, n_cells, k_values, seed=0,
+             threads=1, verbose=False):
     """Fit each K and keep the lowest BIC."""
     rows, best = [], None
     for k in k_values:
         try:
-            m = PlaneHMM(k, seed=seed).fit(X, lengths, obs, verbose=verbose)
+            m = PlaneHMM(k, seed=seed).fit(
+                X, lengths, obs, n_cells, threads=threads,
+                verbose=verbose)
         except (ValueError, np.linalg.LinAlgError) as exc:
             rows.append({"k": k, "loglik": np.nan, "bic": np.nan,
                          "note": str(exc)[:60]})
@@ -524,6 +609,15 @@ def main(argv=None) -> int:
                          "'anti-coordinated' was reachable.  'auto' picks "
                          "min-c when the cloud sits further from the origin "
                          "than the states sit from each other.")
+    ap.add_argument("--threads", type=int, default=0, metavar="N",
+                    help="Parallel workers for the E step (0 = one per "
+                         "chromosome, capped at the CPU count).  "
+                         "Chromosomes are independent given the current "
+                         "parameters, so the E step parallelises exactly.  "
+                         "Threads rather than processes: the inner work is "
+                         "numpy and releases the GIL, and the batches are "
+                         "large enough that pickling them to processes "
+                         "would cost more than it saves.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--r-cut", default="auto",
                     help="Radius below which a fitted state is called "
@@ -545,11 +639,16 @@ def main(argv=None) -> int:
 
     X, lengths, obs, order, sc = build_sequences(
         C, dF, list(Cdf.columns), clip=args.clip or 0.0)
+    import os
+    n_chrom_total = len(lengths) // max(C.shape[0], 1)
+    if not args.threads:
+        args.threads = max(1, min(n_chrom_total, os.cpu_count() or 1))
     bins = list(np.asarray(Cdf.columns)[order])
     n_cells, n_bins = C.shape
     print(f"  {n_cells:,} cells x {n_bins:,} bins; "
           f"{int(obs.sum()):,} observed ({obs.mean():.1%}); "
-          f"{len(lengths):,} chains (cell x chromosome)", file=sys.stderr)
+          f"{len(lengths):,} chains (cell x chromosome); "
+          f"{args.threads} thread(s)", file=sys.stderr)
     if "max_abs_z" in sc:
         print(f"  standardised spread about the median: max |z| = "
               f"{sc['max_abs_z']:,.1f}, {sc['frac_beyond_10']:.2%} beyond "
@@ -566,7 +665,7 @@ def main(argv=None) -> int:
               f"({sc['frac_masked_extreme']:.2%} of observed)",
               file=sys.stderr)
 
-    fit_X, fit_len, fit_obs = X, lengths, obs
+    fit_X, fit_len, fit_obs, n_fit_cells = X, lengths, obs, n_cells
     if args.fit_cells and args.fit_cells < n_cells:
         rng = np.random.default_rng(args.seed)
         pick = np.sort(rng.choice(n_cells, args.fit_cells, replace=False))
@@ -580,12 +679,15 @@ def main(argv=None) -> int:
                 keep_len.append(lengths[i])
         idx = np.concatenate(keep_rows)
         fit_X, fit_len, fit_obs = X[idx], np.array(keep_len), obs[idx]
+        n_fit_cells = args.fit_cells
         print(f"  fitting on {args.fit_cells:,} cells "
               f"({int(fit_obs.sum()):,} observed bins)", file=sys.stderr)
 
     if str(args.k).lower() == "bic":
         ks = [int(v) for v in args.k_range.split(",") if v.strip()]
-        model, table = select_k(fit_X, fit_len, fit_obs, ks, args.seed)
+        model, table = select_k(fit_X, fit_len, fit_obs,
+                                n_fit_cells, ks, args.seed,
+                                threads=args.threads)
         table.to_csv(out / "hmm_bic.tsv", sep="\t", index=False)
         if model is None:
             sys.exit("no K converged; try a narrower --k-range")
@@ -595,7 +697,7 @@ def main(argv=None) -> int:
         print(f"  selected k = {model.k}", file=sys.stderr)
     else:
         model = PlaneHMM(int(args.k), seed=args.seed).fit(
-            fit_X, fit_len, fit_obs)
+            fit_X, fit_len, fit_obs, n_fit_cells, threads=args.threads)
         print(f"  fixed k = {model.k}  (BIC {model.bic():,.0f})",
               file=sys.stderr)
 
@@ -682,7 +784,7 @@ def main(argv=None) -> int:
               f"names cover; report the fitted means, not just the labels.",
               file=sys.stderr)
 
-    path, post = model.decode(X, lengths, obs)
+    path, post = model.decode(X, lengths, obs, n_cells)
     path = np.where(obs, path, -1).reshape(n_cells, -1)
     pd.DataFrame(path, index=Cdf.index, columns=bins).to_parquet(
         out / "concordance_state.parquet")

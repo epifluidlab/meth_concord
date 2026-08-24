@@ -84,8 +84,8 @@ def test_the_spatial_prior_beats_per_bin_thresholding():
     C, F, st = _fixture(n_cells=12, n_bins=400, noise=2.0, missing=0.0)
     X, lengths, obs, order, sc = m.build_sequences(
         C.to_numpy(float), F.to_numpy(float), list(C.columns))
-    model = m.PlaneHMM(5, seed=0).fit(X, lengths, obs)
-    path, _post = model.decode(X, lengths, obs)
+    model = m.PlaneHMM(5, seed=0).fit(X, lengths, obs, len(C))
+    path, _post = model.decode(X, lengths, obs, len(C))
 
     # map fitted states to planted ones by nearest emission mean
     scale = np.array([sc["scale_c"], sc["scale_f"]])
@@ -115,7 +115,7 @@ def test_it_recovers_the_planted_state_geometry():
     C, F, st = _fixture(n_cells=28, n_bins=600, noise=1.8)
     X, lengths, obs, order, sc = m.build_sequences(
         C.to_numpy(float), F.to_numpy(float), list(C.columns))
-    model = m.PlaneHMM(5, seed=0).fit(X, lengths, obs)
+    model = m.PlaneHMM(5, seed=0).fit(X, lengths, obs, len(C))
     scale = np.array([sc["scale_c"], sc["scale_f"]])
     want_all = TRUE / scale
     # neighbouring states sit ~0.6-1.2 apart in these units, so 0.4 still
@@ -152,7 +152,7 @@ def test_missing_bins_are_masked_not_zero_filled():
     X, lengths, obs, _o, _s = m.build_sequences(
         C.to_numpy(float), F.to_numpy(float), list(C.columns))
     assert 0.2 < (~obs).mean() < 0.45
-    model = m.PlaneHMM(4, seed=0).fit(X, lengths, obs)
+    model = m.PlaneHMM(4, seed=0).fit(X, lengths, obs, len(C))
     logB = model._log_b(X, obs)
     # a masked bin contributes nothing: it neither votes nor blocks
     assert np.allclose(logB[~obs], 0.0)
@@ -267,7 +267,7 @@ def test_bic_counts_observed_bins_not_matrix_size():
     C, F, _st = _fixture(n_cells=6, n_bins=200, missing=0.40)
     X, lengths, obs, _o, _s = m.build_sequences(
         C.to_numpy(float), F.to_numpy(float), list(C.columns))
-    model = m.PlaneHMM(3, seed=0).fit(X, lengths, obs)
+    model = m.PlaneHMM(3, seed=0).fit(X, lengths, obs, len(C))
     assert model.n_obs == int(obs.sum())
     assert model.n_obs < X.shape[0]
     penalty = model.n_params() * np.log(model.n_obs)
@@ -310,7 +310,7 @@ def test_bic_prefers_more_states_when_they_are_really_there():
     C, F, _st = _fixture(n_cells=12, n_bins=400, noise=1.6, missing=0.0)
     X, lengths, obs, _o, _s = m.build_sequences(
         C.to_numpy(float), F.to_numpy(float), list(C.columns))
-    best, table = m.select_k(X, lengths, obs, [2, 3, 5], seed=0)
+    best, table = m.select_k(X, lengths, obs, len(C), [2, 3, 5], seed=0)
     ok = table.dropna(subset=["bic"])
     assert best.k == int(ok.loc[ok["bic"].idxmin(), "k"])
     assert best.k >= 3, "two states should not win on five planted ones"
