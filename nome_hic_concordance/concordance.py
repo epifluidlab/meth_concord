@@ -1747,7 +1747,16 @@ def compute_signed_concordance_matrix(
         polar_info.get("scale_f", float("nan")),
         polar_info.get("rho", float("nan")),
         polar_info.get("n_used", 0))
+    # theta is CIRCULAR, so it is also emitted as its sine and cosine.
+    # Euclidean distance on degrees is wrong exactly where the interesting
+    # states are: +179 and -179 are two degrees apart on the circle and 358
+    # apart numerically, and that tear runs straight through the
+    # anti-coordinated sector.  Anything that embeds or clusters direction
+    # must use the pair, never the degrees.
+    _th = np.radians(_pol["theta"])
     for _key, _arr in (("polar_R", _pol["R"]), ("polar_theta", _pol["theta"]),
+                       ("polar_theta_sin", np.sin(_th)),
+                       ("polar_theta_cos", np.cos(_th)),
                        ("polar_p", _pol["p"])):
         components[_key] = pd.DataFrame(_arr, index=cell_names,
                                         columns=sorted_bins)
@@ -1882,6 +1891,8 @@ def compute_signed_concordance_matrix(
         # theta names which.  polar_p is a chi-square(2) test across both.
         "polar_R":               components["polar_R"],
         "polar_theta":           components["polar_theta"],
+        "polar_theta_sin":       components["polar_theta_sin"],
+        "polar_theta_cos":       components["polar_theta_cos"],
         "polar_p":               components["polar_p"],
         "coordination":          components["coordination"],
         "direction":             components["direction"],

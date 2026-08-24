@@ -1784,9 +1784,25 @@ def run_context(
                 args.component_umaps == "auto"
                 and _resolve_concordance_combine(args) == "concordant-signed"
             ):
+                # polar_R is here; polar_theta and polar_p are NOT, and
+                # both omissions are deliberate.
+                #
+                #   polar_p = exp(-R^2/2) is a deterministic monotone
+                #     function of R, so it carries nothing R does not, and it
+                #     is crushed toward zero for everything interesting --
+                #     the distances would be set by the null bins.
+                #   polar_theta is CIRCULAR.  Euclidean distance on degrees
+                #     calls +179 and -179 the far ends of the axis when they
+                #     are two degrees apart, and that tear runs through the
+                #     anti-coordinated sector.  Embed the sine and cosine
+                #     TOGETHER (concordance_polar_theta_{sin,cos}.parquet)
+                #     if a direction embedding is wanted, never the degrees;
+                #     for colouring an existing UMAP, use a cyclic colormap.
                 for comp, comp_title in (
                     ("directional_corrected",
                      "directional D' = C·(F−F_exp) (marginal-free)"),
+                    ("polar_R",
+                     "polar R (joint departure from the null)"),
                     ("coordination", "coordination C (marginal-free)"),
                     ("direction_excess",
                      "direction excess F−F_exp (co-open vs null)"),

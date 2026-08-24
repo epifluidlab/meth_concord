@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from pathlib import Path
 
 from nome_hic_concordance.concordance import (COORD_CLASSES,
                                               coordination_class,
@@ -205,3 +206,56 @@ def test_a_flat_axis_is_reported_not_divided_by():
 def test_shape_mismatch_is_an_error():
     with pytest.raises(ValueError, match="shape"):
         coordination_polar(np.zeros((4, 5)), np.zeros((4, 6)))
+
+
+# ------------------------------------------- what reaches the UMAP step --
+
+_CLI = (Path(__file__).resolve().parent.parent / "nome_hic_concordance"
+        / "cli.py")
+
+
+def _umap_components():
+    """The component names step 6/7 builds companion UMAPs for."""
+    import re
+    src = _CLI.read_text()
+    block = src[src.index("for comp, comp_title in ("):]
+    block = block[:block.index("):")]
+    return re.findall(r'\("([A-Za-z_]+)",', block)
+
+
+def test_polar_R_reaches_the_umap_step():
+    """Emitting a matrix that step 6 never reads would mean the statistic
+    exists only in the parquet nobody opens."""
+    assert "polar_R" in _umap_components()
+
+
+def test_polar_p_is_deliberately_not_embedded():
+    """p = exp(-R^2/2) is a monotone function of R, so a UMAP on it answers
+    the same question with worse conditioning: it is crushed toward zero for
+    everything interesting, leaving the null bins to set the distances."""
+    assert "polar_p" not in _umap_components()
+    R = np.array([0.5, 1.0, 2.0, 3.0, 4.0])
+    p = np.exp(-R ** 2 / 2)
+    assert np.all(np.diff(p) < 0)            # strictly monotone in R
+    assert p[-1] < 1e-3 and p[-2] < 0.02     # and crushed where it matters
+
+
+def test_polar_theta_degrees_are_deliberately_not_embedded():
+    """Circular.  Euclidean distance on degrees tears the circle at +-180,
+    which is exactly the anti-coordinated sector."""
+    assert "polar_theta" not in _umap_components()
+    assert abs(179.0 - (-179.0)) == 358.0            # what Euclid sees
+    d = abs(179.0 - (-179.0))
+    assert min(d, 360.0 - d) == 2.0                  # what is true
+
+
+def test_the_sine_and_cosine_pair_restores_the_true_separation():
+    """The representation a direction embedding has to use instead."""
+    def xy(deg):
+        r = np.radians(deg)
+        return np.array([np.sin(r), np.cos(r)])
+    near = np.linalg.norm(xy(179) - xy(-179))
+    far = np.linalg.norm(xy(90) - xy(-90))
+    assert near < 0.1                # adjacent on the circle, adjacent here
+    assert far == pytest.approx(2.0, abs=1e-9)       # genuinely opposite
+    assert near < far
