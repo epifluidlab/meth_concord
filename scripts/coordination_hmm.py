@@ -221,7 +221,8 @@ def _spans(lengths):
         a += L
 
 
-def build_sequences(C, dF, bins, scale_c=None, scale_f=None):
+def build_sequences(C, dF, bins, scale_c=None, scale_f=None,
+                    clip=10.0):
     """Stack cells into one long array of chains, one per (cell, chromosome).
 
     The chain must break at every chromosome edge; a single chain per cell
@@ -243,10 +244,31 @@ def build_sequences(C, dF, bins, scale_c=None, scale_f=None):
     X[:, 0] = (C / sc).ravel()
     X[:, 1] = (dF / sf).ravel()
     obs = np.isfinite(X).all(1)
+    info = {"scale_c": sc, "scale_f": sf}
+    if obs.any():
+        info["max_abs_z"] = float(np.max(np.abs(X[obs])))
+        info["frac_beyond_10"] = float(np.mean(np.abs(X[obs]) > 10))
+    if clip and clip > 0:
+        # MASK the extremes, do not clip them to a boundary.  Clipping turns
+        # a heavy tail into a spike at +-z, and EM allocates states to that
+        # spike just as happily: on a Cauchy-tailed fixture three of five
+        # states sat exactly on the clip corners with 1-bin runs.  Masking
+        # instead says what is true -- a bin whose estimate is ten robust
+        # sds from the median is not measuring coordination -- and it is
+        # already how bins with no data are handled, so the chain carries
+        # the transition prior across them untouched.
+        #
+        # A fixed z, not a percentile: with a Cauchy-ish tail the 99.5th
+        # percentile of |z| came out 341, which left EM a tail to chase.
+        extreme = (np.abs(X) > clip).any(1) & obs
+        info.update({"mask_beyond_z": float(clip),
+                     "n_masked_extreme": int(extreme.sum()),
+                     "frac_masked_extreme": float(
+                         extreme.sum() / max(int(obs.sum()), 1))})
+        obs = obs & ~extreme
     X = np.where(np.isfinite(X), X, 0.0)
     lengths = list(per_chrom) * C.shape[0]
-    return X, np.array(lengths, int), obs, order, {"scale_c": sc,
-                                                   "scale_f": sf}
+    return X, np.array(lengths, int), obs, order, info
 
 
 COORD_CLASSES = ("uncoordinated", "coordinated balanced", "co-open shifted",
@@ -298,6 +320,75 @@ def label_states(means, r_cut="auto", sector=30.0, auto_frac=0.35):
     return out
 
 
+ARCHETYPES = {
+    "uncoordinated":        (0.0, 0.0),
+    "coordinated balanced": (1.0, 0.0),
+    "co-open shifted":      (0.7, 0.7),
+    "co-closed shifted":    (0.7, -0.7),
+    "anti-coordinated":     (-1.0, 0.0),
+}
+
+
+def stationary(A):
+    """Long-run occupancy of each state, from the transition matrix."""
+    w, v = np.linalg.eig(np.asarray(A, float).T)
+    i = int(np.argmin(np.abs(w - 1.0)))
+    pi = np.real(v[:, i])
+    pi = np.abs(pi)
+    return pi / max(pi.sum(), 1e-12)
+
+
+def label_states_relative(means, A):
+    """Label states by their positions relative to the NULL AT THE ORIGIN.
+
+    The origin needs no estimating: C = 0 is "no more concordant mass than
+    expected" and F - F_exp = 0 is "the mass sits where the null puts it".
+    Both statistics are already defined against the null, so (0, 0) IS the
+    uncoordinated point and nothing has to be inferred to find it.
+
+    Anchoring on the most-OCCUPIED state was the obvious alternative and is
+    wrong whenever the null is not the commonest state: on a fixture with
+    five equally-sized domains it picked the balanced state as the null and
+    swapped two labels.  Occupancy is still reported, because a null state
+    holding a small share of the genome is worth seeing.
+
+    What IS taken relatively is the scale.  Distances in the plane depend on
+    how the axes were standardised, so the fitted means are divided by their
+    own median radius before matching, and the five archetypes are matched
+    one-to-one by total distance.  Nothing then depends on the units.
+
+    Requires exactly five states: with any other K the assignment is not a
+    bijection and the labels would be a guess dressed as a result.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    mu = np.asarray(means, float)
+    if mu.shape[0] != len(ARCHETYPES):
+        raise ValueError(f"relative labelling needs exactly "
+                         f"{len(ARCHETYPES)} states, got {mu.shape[0]}")
+    occ = stationary(A)
+    radii = np.linalg.norm(mu, axis=1)
+    scale = float(np.median(radii))
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("fitted states are coincident; nothing to label")
+    z = mu / scale
+    names = list(ARCHETYPES)
+    tgt = np.array([ARCHETYPES[n] for n in names], float)
+    cost = np.linalg.norm(z[:, None, :] - tgt[None, :, :], axis=2)
+    ri, ci = linear_sum_assignment(cost)
+    out = [None] * len(names)
+    for i, j in zip(ri, ci):
+        out[i] = {"mean_C": mu[i, 0], "mean_dF": mu[i, 1],
+                  "rel_C": z[i, 0], "rel_dF": z[i, 1],
+                  "R": float(np.hypot(*z[i])),
+                  "theta": float(np.degrees(np.arctan2(z[i, 1], z[i, 0]))),
+                  "occupancy": occ[i], "label": names[j],
+                  "match_cost": cost[i, j]}
+    ref = int(np.argmin(radii))
+    return out, {"reference_state": ref, "spread": scale,
+                 "null_occupancy": float(occ[ref])}
+
+
 def select_k(X, lengths, obs, k_values, seed=0, verbose=False):
     """Fit each K and keep the lowest BIC."""
     rows, best = [], None
@@ -337,10 +428,15 @@ def main(argv=None) -> int:
                     help="concordance_coordination.parquet (C)")
     ap.add_argument("--direction-excess", required=True,
                     help="concordance_direction_excess.parquet (F - F_exp)")
-    ap.add_argument("--k", default="bic",
-                    help="'bic' to select over --k-range (default), or a "
-                         "fixed integer such as 5 to pin the taxonomy's "
-                         "five states.")
+    ap.add_argument("--k", default="5",
+                    help="Number of states, default 5.  'bic' selects over "
+                         "--k-range, but BIC's penalty grows like log(n) "
+                         "while the likelihood grows like n: at ~1e7 "
+                         "cell-bins the whole penalty is under 2,000 "
+                         "against likelihood gains of hundreds of "
+                         "thousands, so it keeps buying states to absorb "
+                         "tail points and never turns around.  Read its "
+                         "table as a diagnostic, not a selector.")
     ap.add_argument("--k-range", default="2,3,4,5,6,7,8",
                     help="Candidate K for BIC selection.")
     ap.add_argument("--fit-cells", type=int, default=0, metavar="N",
@@ -348,6 +444,28 @@ def main(argv=None) -> int:
                          "The transition matrix is shared, so it does not "
                          "need every cell to estimate; decoding is where "
                          "each cell gets its own answer.  0 = use all.")
+    ap.add_argument("--label", choices=["relative", "angle"],
+                    default="relative",
+                    help="'relative' (default) anchors on the most-occupied "
+                         "state as the null and matches the other four to "
+                         "the archetypes by shape, so nothing depends on "
+                         "where the fitted cloud sits or how wide it is.  "
+                         "'angle' uses absolute radius and angle, which "
+                         "assumes the cloud is centred on the null -- on "
+                         "real data it filed all eight states under one "
+                         "name.  Needs exactly five states.")
+    ap.add_argument("--max-z", type=float, default=10.0, metavar="Z",
+                    dest="clip",
+                    help="Treat a bin beyond this |z| on either axis as "
+                         "MISSING (0 to disable).  Gaussian emissions on a "
+                         "heavy tail put every state on the tail and the "
+                         "transition matrix collapses to runs of one bin.  "
+                         "Masked, not clipped: clipping turns the tail into "
+                         "a spike at +-z that EM allocates states to just "
+                         "as happily -- on a Cauchy-tailed fixture three of "
+                         "five states sat exactly on the clip corners.  A "
+                         "fixed z, not a percentile: the 99.5th percentile "
+                         "of |z| there was still 341.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--r-cut", default="auto",
                     help="Radius below which a fitted state is called "
@@ -367,12 +485,25 @@ def main(argv=None) -> int:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    X, lengths, obs, order, sc = build_sequences(C, dF, list(Cdf.columns))
+    X, lengths, obs, order, sc = build_sequences(
+        C, dF, list(Cdf.columns), clip=args.clip or 0.0)
     bins = list(np.asarray(Cdf.columns)[order])
     n_cells, n_bins = C.shape
     print(f"  {n_cells:,} cells x {n_bins:,} bins; "
           f"{int(obs.sum()):,} observed ({obs.mean():.1%}); "
           f"{len(lengths):,} chains (cell x chromosome)", file=sys.stderr)
+    if "max_abs_z" in sc:
+        print(f"  standardised spread: max |z| = {sc['max_abs_z']:,.1f}, "
+              f"{sc['frac_beyond_10']:.2%} beyond 10", file=sys.stderr)
+        if sc["frac_beyond_10"] > 0.01:
+            print(f"  NOTE {sc['frac_beyond_10']:.1%} of the plane sits "
+                  f"beyond |z| = 10.  Gaussian emissions will chase that "
+                  f"tail unless it is clipped.", file=sys.stderr)
+    if "mask_beyond_z" in sc:
+        print(f"  masked {sc['n_masked_extreme']:,} bins beyond |z| = "
+              f"{sc['mask_beyond_z']:g} "
+              f"({sc['frac_masked_extreme']:.2%} of observed)",
+              file=sys.stderr)
 
     fit_X, fit_len, fit_obs = X, lengths, obs
     if args.fit_cells and args.fit_cells < n_cells:
@@ -407,28 +538,58 @@ def main(argv=None) -> int:
         print(f"  fixed k = {model.k}  (BIC {model.bic():,.0f})",
               file=sys.stderr)
 
-    _rc = args.r_cut
-    if not isinstance(_rc, str) or _rc.lower() != "auto":
+    rel_info = {}
+    if args.label == "relative":
         try:
-            _rc = float(_rc)
-        except ValueError:
-            sys.exit(f"--r-cut must be a number or 'auto', got {_rc!r}")
-    info = label_states(model.means, _rc, args.sector)
+            info, rel_info = label_states_relative(model.means, model.A)
+        except ValueError as exc:
+            sys.exit(f"relative labelling failed: {exc}\n"
+                     f"  pass --k 5, or --label angle to use the absolute "
+                     f"rule (and read its labels with suspicion).")
+    else:
+        _rc = args.r_cut
+        if not isinstance(_rc, str) or _rc.lower() != "auto":
+            try:
+                _rc = float(_rc)
+            except ValueError:
+                sys.exit(f"--r-cut must be a number or 'auto', got {_rc!r}")
+        info = label_states(model.means, _rc, args.sector)
     lab = pd.DataFrame(info)
     lab.insert(0, "state", range(model.k))
     lab["self_transition"] = np.diag(model.A)
     lab["expected_run_bins"] = 1.0 / np.maximum(1 - np.diag(model.A), 1e-9)
-    _eff = (_rc if not isinstance(_rc, str)
-            else 0.35 * float(lab["R"].max()))
-    print(f"  labelling radius cut: {_eff:.2f}"
-          + ("  (auto: 35% of the largest fitted radius)"
-             if isinstance(_rc, str) else "  (given)"), file=sys.stderr)
+    if rel_info:
+        print(f"  labelling: against the null at the origin (C = 0, "
+              f"F - F_exp = 0); radii scaled by "
+              f"{rel_info['spread']:.3g}.  State "
+              f"{rel_info['reference_state']} is nearest the origin and "
+              f"holds {rel_info['null_occupancy']:.1%} of the genome.",
+              file=sys.stderr)
     lab.to_csv(out / "hmm_states.tsv", sep="\t", index=False)
     print("  fitted states:", file=sys.stderr)
     for r in lab.itertuples():
-        print(f"    {r.state}  ({r.mean_C:+.2f}, {r.mean_dF:+.2f})  "
-              f"R={r.R:.2f} theta={r.theta:+.0f}  -> {r.label}  "
+        rel = (f"  rel=({r.rel_C:+.2f},{r.rel_dF:+.2f})"
+               if hasattr(r, "rel_C") else "")
+        occ = f"  occ={r.occupancy:.1%}" if hasattr(r, "occupancy") else ""
+        print(f"    {r.state}  mean=({r.mean_C:+.3g}, {r.mean_dF:+.3g})"
+              f"{rel}{occ}  -> {r.label}  "
               f"(runs ~{r.expected_run_bins:.0f} bins)", file=sys.stderr)
+    runs = float(np.mean(lab["expected_run_bins"]))
+    if runs < 3.0:
+        print(f"  WARNING mean run length is {runs:.1f} bins.  An HMM whose "
+              f"states switch almost every bin has found no domains -- the "
+              f"spatial prior is the only reason to use one, so this fit is "
+              f"not usable.  Usually a heavy tail: lower --clip.",
+              file=sys.stderr)
+    spread = float(np.max(np.linalg.norm(
+        model.means - model.means.mean(0), axis=1)))
+    if spread < 1e-6 or (len(model.means) > 1 and spread
+                         < 0.05 * float(np.linalg.norm(model.means.mean(0)))):
+        print(f"  WARNING the fitted states are nearly coincident (spread "
+              f"{spread:.3g} about a centroid at "
+              f"{np.linalg.norm(model.means.mean(0)):.3g}).  EM has put "
+              f"every state on one cluster; the labels below describe that "
+              f"cluster, not five states.", file=sys.stderr)
     dup = lab["label"].duplicated(keep=False)
     if dup.any():
         print(f"  NOTE {int(dup.sum())} states share a taxonomy label.  The "

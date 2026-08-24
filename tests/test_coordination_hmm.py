@@ -167,7 +167,7 @@ def test_masked_bins_get_no_state_in_the_output(tmp_path):
     r = subprocess.run(
         [sys.executable, str(_SCRIPT), "--coordination",
          str(tmp_path / "c.parquet"), "--direction-excess",
-         str(tmp_path / "f.parquet"), "--k", "4",
+         str(tmp_path / "f.parquet"), "--k", "5",
          "--output-dir", str(tmp_path / "o")],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -179,6 +179,45 @@ def test_masked_bins_get_no_state_in_the_output(tmp_path):
 
 
 # ------------------------------------------------------- the labelling cut --
+
+# ------------------------------------------------- relative labelling --
+
+def test_relative_labelling_recovers_the_taxonomy_at_any_scale():
+    """The units of the plane depend on how the axes were standardised, so
+    the assignment must not."""
+    m = _mod()
+    A = np.eye(5) * 0.9 + 0.025
+    for scale in (0.01, 1.0, 137.0):
+        info, meta = m.label_states_relative(TRUE * scale, A)
+        got = [d["label"] for d in info]
+        assert got == ["uncoordinated", "coordinated balanced",
+                       "co-open shifted", "co-closed shifted",
+                       "anti-coordinated"], scale
+
+
+def test_the_null_is_the_origin_not_the_commonest_state():
+    """Anchoring on occupancy is the obvious alternative and is wrong
+    whenever the null is not the commonest state -- on equally-sized domains
+    it picks whichever state happens to be largest and swaps two labels.
+    C = 0 and F - F_exp = 0 ARE the null by construction, so no estimate is
+    needed."""
+    m = _mod()
+    A = np.diag([0.5, 0.99, 0.5, 0.5, 0.5])       # 'balanced' dominates
+    A = A + (1 - A.sum(1, keepdims=True)) / 5
+    info, meta = m.label_states_relative(TRUE, A)
+    by_label = {d["label"]: d for d in info}
+    assert by_label["uncoordinated"]["mean_C"] == pytest.approx(0.0)
+    assert by_label["uncoordinated"]["mean_dF"] == pytest.approx(0.0)
+    # and the far more occupied state is still labelled by its POSITION
+    assert by_label["coordinated balanced"]["mean_C"] == pytest.approx(3.0)
+
+
+def test_relative_labelling_needs_exactly_five_states():
+    m = _mod()
+    A = np.eye(4) * 0.9 + 0.025
+    with pytest.raises(ValueError, match="exactly"):
+        m.label_states_relative(TRUE[:4], A)
+
 
 def test_an_absolute_radius_cut_mislabels_when_most_bins_carry_signal():
     """The bug this replaced.  Standardising by a scale that absorbed the
@@ -235,6 +274,37 @@ def test_bic_counts_observed_bins_not_matrix_size():
     assert model.bic() == pytest.approx(-2 * model.loglik + penalty)
 
 
+def test_extreme_bins_are_masked_not_clipped():
+    """Clipping turns a heavy tail into a spike at +-z, and EM allocates
+    states to the spike just as happily -- three of five states landed
+    exactly on the clip corners with 1-bin runs.  Masking says the true
+    thing instead: an estimate ten robust sds out is not a coordination
+    state."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300, missing=0.0)
+    Cv, Fv = C.to_numpy(float), F.to_numpy(float)
+    Cv[0, :10] = 1e6                       # a tail
+    X, lengths, obs, _o, info = m.build_sequences(
+        Cv, Fv, list(C.columns), clip=10.0)
+    assert info["n_masked_extreme"] >= 10
+    # masked, so nothing sits AT the boundary
+    assert np.abs(X[obs]).max() <= 10.0 + 1e-9
+    assert not np.isclose(np.abs(X[obs]).max(), 10.0)
+
+
+def test_disabling_the_mask_keeps_the_tail():
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300, missing=0.0)
+    Cv = C.to_numpy(float)
+    Cv[0, :10] = 1e6
+    _X, _l, obs_on, _o, on = m.build_sequences(
+        Cv, F.to_numpy(float), list(C.columns), clip=10.0)
+    _X2, _l2, obs_off, _o2, off = m.build_sequences(
+        Cv, F.to_numpy(float), list(C.columns), clip=0)
+    assert "n_masked_extreme" not in off
+    assert int(obs_off.sum()) > int(obs_on.sum())
+
+
 def test_bic_prefers_more_states_when_they_are_really_there():
     m = _mod()
     C, F, _st = _fixture(n_cells=12, n_bins=400, noise=1.6, missing=0.0)
@@ -272,7 +342,7 @@ def test_cli_writes_states_posteriors_and_the_clr(tmp_path):
     r = subprocess.run(
         [sys.executable, str(_SCRIPT), "--coordination",
          str(tmp_path / "c.parquet"), "--direction-excess",
-         str(tmp_path / "f.parquet"), "--k", "4", "--output-dir", str(out)],
+         str(tmp_path / "f.parquet"), "--k", "5", "--output-dir", str(out)],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     for f in ("concordance_state.parquet",
@@ -280,7 +350,7 @@ def test_cli_writes_states_posteriors_and_the_clr(tmp_path):
               "concordance_state_posterior_clr.parquet", "hmm_states.tsv"):
         assert (out / f).exists(), f
     post = pd.read_parquet(out / "concordance_state_posterior.parquet")
-    assert post.shape[1] == 200 * 4
+    assert post.shape[1] == 200 * 5
     lab = pd.read_csv(out / "hmm_states.tsv", sep="\t")
     assert set(lab.columns) >= {"state", "mean_C", "mean_dF", "R", "theta",
                                 "label", "expected_run_bins"}
@@ -297,8 +367,47 @@ def test_cli_reports_the_bic_table(tmp_path):
         [sys.executable, str(_SCRIPT), "--coordination",
          str(tmp_path / "c.parquet"), "--direction-excess",
          str(tmp_path / "f.parquet"), "--k", "bic", "--k-range", "2,3,4",
-         "--output-dir", str(out)], capture_output=True, text=True)
+         "--label", "angle", "--output-dir", str(out)],
+        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     t = pd.read_csv(out / "hmm_bic.tsv", sep="\t")
     assert set(t["k"]) == {2, 3, 4}
     assert "selected k" in r.stderr
+
+
+def test_relative_labelling_refuses_a_non_five_fit_with_a_usable_message(
+        tmp_path):
+    """K != 5 makes the assignment non-bijective, and a label that is a
+    guess should not look like a result.  The refusal has to name both
+    ways out."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=6, n_bins=200)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3",
+         "--output-dir", str(tmp_path / "o")],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "exactly" in r.stderr
+    assert "--k 5" in r.stderr and "--label angle" in r.stderr
+
+
+def test_k_defaults_to_five(tmp_path):
+    """BIC's penalty grows like log(n) while the likelihood grows like n; at
+    ~1e7 cell-bins it never turns around, so it must not be the default."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=6, n_bins=200)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "fixed k = 5" in r.stderr
+    assert not (out / "hmm_bic.tsv").exists()
