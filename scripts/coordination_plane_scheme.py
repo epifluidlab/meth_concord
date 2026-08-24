@@ -48,10 +48,58 @@ STATES = [
     ("anti-coordinated",     -3.00,  0.00, C_ANTI,   (0.00,  0.85), "center", "bottom"),
 ]
 
+# 12 linked pairs per state as (co-open, co-closed, mixed), chosen so the
+# implied C and F - F_exp reproduce the points drawn in panel a exactly.
+# 'balanced' is NOT a 50/50 split of the concordant pairs: it is the same
+# open:closed RATIO as the null, which at F_exp = 1/3 is one open to two
+# closed.  Drawing it 50/50 would make it a co-open shift, which is the
+# confusion the whole re-referencing exists to remove.
+PAIRS_NULL = (2, 4, 6)
+PAIRS = {
+    "uncoordinated":         (2, 4, 6),      # same as the null
+    "coordinated balanced":  (3, 6, 3),      # more concordant, same ratio
+    "co-open shifted":       (6, 3, 3),      # more concordant, toward open
+    "co-closed shifted":     (1, 8, 3),      # more concordant, toward closed
+    "anti-coordinated":      (1, 2, 9),      # FEWER concordant than the null
+}
+
 R_CUT = 2.0
 SECTOR = 30.0
 F_BAR = 0.3230          # measured; sets the legacy D multiplier
 D_MULT = 2 * F_BAR - 1
+
+
+def _pair(ax, x, y, left_open, right_open, w, r=0.0062):
+    """One linked read pair: two ends joined by a contact arc.
+
+    Filled = accessible end, hollow = inaccessible.  Both filled is a
+    co-open pair, both hollow co-closed, one of each is mixed -- the three
+    categories every statistic on this figure is built from.
+    """
+    from matplotlib.patches import Circle
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path as MPath
+
+    ax.add_patch(PathPatch(
+        MPath([(x, y), (x + w / 2, y + w * 0.78), (x + w, y)],
+              [MPath.MOVETO, MPath.CURVE3, MPath.CURVE3]),
+        fc="none", ec="0.62", lw=0.7, transform=ax.transAxes, zorder=3))
+    for cx, is_open in ((x, left_open), (x + w, right_open)):
+        ax.add_patch(Circle(
+            (cx, y), r, transform=ax.transAxes, zorder=4,
+            fc=(C_OPEN if is_open else "white"),
+            ec=(C_OPEN if is_open else "0.35"), lw=0.8))
+
+
+def _cartoon(ax, x0, y0, counts, cell_w, n_col=6, gap=0.007):
+    """12 pairs in two rows: co-open first, then co-closed, then mixed."""
+    n_open, n_closed, n_mixed = counts
+    kinds = ([(True, True)] * n_open + [(False, False)] * n_closed
+             + [(True, False)] * n_mixed)
+    pw = (cell_w - (n_col - 1) * gap) / n_col
+    for i, (lo, ro) in enumerate(kinds):
+        r, c = divmod(i, n_col)
+        _pair(ax, x0 + c * (pw + gap), y0 - r * 0.046, lo, ro, pw * 0.52)
 
 
 def _sectors(ax, lim):
@@ -116,60 +164,88 @@ def panel_plane(ax):
 
 
 def panel_collapse(ax):
-    """Which pairs each scalar cannot tell apart."""
+    """Which pairs each scalar cannot tell apart, beside what each state is."""
     ax.axis("off")
     cols = ["C", r"F$-$F$_{exp}$", r"D = C(2F$-$1)", "R", r"$\theta$",
             r"(R, $\theta$)"]
-    vals = []
+    rows = []
     for lab, c, f, col, _o, _h, _v in STATES:
         R = float(np.hypot(c, f))
         th = np.degrees(np.arctan2(f, c)) if R > 1e-9 else np.nan
-        vals.append([c, f, c * D_MULT, R, th])
-    arr = np.array(vals, float)
+        rows.append((lab, col, [c, f, c * D_MULT, R, th]))
+    arr = np.array([r[2] for r in rows], float)
 
-    n_r, n_c = len(STATES), len(cols)
-    x0, y0, w, h = 0.315, 0.86, 0.112, 0.138
+    x_lab, x_art, w_art = 0.005, 0.150, 0.252
+    x0, w, h = 0.447, 0.092, 0.136
+    y0 = 0.655
+
+    # The null, drawn once above the table: every row below is read against
+    # it, and without it "more concordant than expected" has no referent.
+    ax.text(x_art, y0 + 0.292, "expected under the null (E)", fontsize=7.4,
+            style="italic", color="0.35", va="bottom",
+            transform=ax.transAxes)
+    _cartoon(ax, x_art, y0 + 0.256, PAIRS_NULL, w_art)
+    ax.plot([x_lab, 0.412], [y0 + 0.163] * 2, color="0.8", lw=0.8,
+            transform=ax.transAxes, clip_on=False)
+
     for j, cname in enumerate(cols):
-        ax.text(x0 + j * w + w / 2, y0 + 0.055, cname, ha="center",
-                va="bottom", fontsize=8, fontweight="bold",
+        ax.text(x0 + j * w + w / 2, y0 + 0.115, cname, ha="center",
+                va="bottom", fontsize=7.8, fontweight="bold",
                 transform=ax.transAxes)
-    for i, (lab, c, f, col, _o, _h, _v) in enumerate(STATES):
+    ax.text(x_art, y0 + 0.115, "observed linked pairs (O)", fontsize=7.4,
+            fontweight="bold", va="bottom", transform=ax.transAxes)
+
+    for i, (lab, col, _v) in enumerate(rows):
         yy = y0 - i * h
-        ax.add_patch(plt_rect(0.005, yy - h * 0.34, 0.018, h * 0.62, col,
-                              ax))
-        ax.text(0.032, yy, lab, fontsize=8, va="center",
+        ax.add_patch(plt_rect(x_lab, yy - h * 0.30, 0.016, h * 0.56, col, ax))
+        ax.text(x_lab + 0.026, yy, lab, fontsize=7.8, va="center",
                 transform=ax.transAxes)
-        for j in range(n_c):
-            if j == n_c - 1:
+        _cartoon(ax, x_art, yy + 0.020, PAIRS[lab], w_art)
+        for j in range(len(cols)):
+            if j == len(cols) - 1:
                 txt, clash = "distinct", False
             else:
                 v = arr[i, j]
                 txt = ("--" if not np.isfinite(v)
-                       else (f"{v:+.0f}" + "°" if j == 4
-                             else f"{v:+.2f}"))
+                       else (f"{v:+.0f}\u00b0" if j == 4 else f"{v:+.2f}"))
                 other = np.delete(arr[:, j], i)
                 clash = bool(np.any(np.isfinite(other)
                                     & np.isclose(other, v, atol=0.02))
                              ) if np.isfinite(v) else False
-            cx = x0 + j * w + w / 2
             if clash:
-                ax.add_patch(plt_rect(x0 + j * w + 0.008, yy - h * 0.34,
-                                      w - 0.016, h * 0.62, "#c0392b", ax,
+                ax.add_patch(plt_rect(x0 + j * w + 0.006, yy - h * 0.30,
+                                      w - 0.012, h * 0.56, "#c0392b", ax,
                                       alpha=0.13))
-            ax.text(cx, yy, txt, ha="center", va="center", fontsize=7.8,
-                    color=("#c0392b" if clash else "0.15"),
+            ax.text(x0 + j * w + w / 2, yy, txt, ha="center", va="center",
+                    fontsize=7.6, color=("#c0392b" if clash else "0.15"),
                     fontweight=("bold" if clash else "normal"),
                     transform=ax.transAxes)
-    ax.text(0.005, y0 - n_r * h - 0.02,
+
+    yb = y0 - len(rows) * h
+    from matplotlib.patches import Circle
+    ax.add_patch(Circle((x_lab + 0.006, yb + 0.045), 0.0075, fc=C_OPEN,
+                        ec=C_OPEN, lw=0.8, transform=ax.transAxes))
+    ax.text(x_lab + 0.020, yb + 0.045, "accessible end", fontsize=7,
+            va="center", transform=ax.transAxes)
+    ax.add_patch(Circle((x_lab + 0.135, yb + 0.045), 0.0075, fc="white",
+                        ec="0.35", lw=0.8, transform=ax.transAxes))
+    ax.text(x_lab + 0.149, yb + 0.045, "inaccessible end", fontsize=7,
+            va="center", transform=ax.transAxes)
+    ax.text(x_lab + 0.300, yb + 0.045,
+            "both filled = co-open pair  ·  both hollow = co-closed  ·  "
+            "one of each = mixed", fontsize=7, va="center", color="0.35",
+            transform=ax.transAxes)
+    ax.text(x_lab, yb - 0.015,
             "shaded = this statistic gives the same value to another state, "
-            "so it cannot tell them apart",
-            fontsize=7.6, color="#c0392b", transform=ax.transAxes)
-    ax.text(0.005, y0 - n_r * h - 0.09,
+            "so it cannot tell them apart", fontsize=7.4, color="#c0392b",
+            transform=ax.transAxes)
+    ax.text(x_lab, yb - 0.085,
             "Every scalar collides at least one pair -- each is a projection "
-            "of the plane onto a line.\nOnly the pair separates all five.  "
+            "of the plane onto a line.  Only the pair separates all five.\n"
             r"D also inverts: with $\bar{p}$ = 0.40 it is $\approx$ "
-            r"$-0.35\,$C, so C falling reads as D rising.",
-            fontsize=7.6, color="0.30", transform=ax.transAxes)
+            r"$-0.35\,$C, so C falling reads as D rising.  Note "
+            r"'balanced' keeps the NULL's open:closed ratio, not 50/50.",
+            fontsize=7.4, color="0.30", transform=ax.transAxes)
     ax.set_title("b   what each summary can and cannot separate",
                  fontsize=10, loc="left", pad=8)
 
@@ -185,8 +261,8 @@ def figure(path, title):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig = plt.figure(figsize=(11.0, 4.9))
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.30], wspace=0.13,
+    fig = plt.figure(figsize=(13.2, 5.9))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 2.05], wspace=0.10,
                           left=0.055, right=0.985, top=0.87, bottom=0.14)
     panel_plane(fig.add_subplot(gs[0, 0]))
     panel_collapse(fig.add_subplot(gs[0, 1]))

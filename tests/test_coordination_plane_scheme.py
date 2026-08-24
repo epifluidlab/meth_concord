@@ -139,3 +139,72 @@ def test_the_sector_bounds_match_the_pipeline_classifier():
                 "co-closed shifted": "co-closed shifted",
                 "anti-coordinated": "anti-coordinated"}[lab]
         assert COORD_CLASSES[code] == want, lab
+
+
+# --------------------------------------------------- the pair cartoons --
+
+def _implied(counts, null):
+    """(C, F, dF) implied by a state's pair counts, read against the null."""
+    o, c, _m = counts
+    M = o + c
+    Me = null[0] + null[1]
+    Fe = null[0] / Me
+    F = o / M if M else float("nan")
+    return M - Me, F, F - Fe
+
+
+def test_every_state_draws_twelve_pairs():
+    """The cartoons are comparable only if each shows the same total."""
+    m = _mod()
+    assert sum(m.PAIRS_NULL) == 12
+    for lab, counts in m.PAIRS.items():
+        assert sum(counts) == 12, lab
+
+
+def test_the_cartoons_imply_the_points_drawn_in_panel_a():
+    """The two panels must be the same figure.  Cartoons chosen by eye
+    would illustrate states that are not the ones plotted."""
+    m = _mod()
+    want_sign = {"uncoordinated": (0, 0), "coordinated balanced": (+1, 0),
+                 "co-open shifted": (+1, +1), "co-closed shifted": (+1, -1),
+                 "anti-coordinated": (-1, 0)}
+    for lab, c, f, _col, _o, _h, _v in m.STATES:
+        C, _F, dF = _implied(m.PAIRS[lab], m.PAIRS_NULL)
+        sc, sf = want_sign[lab]
+        assert np.sign(C) == sc, f"{lab}: C sign"
+        assert np.sign(round(dF, 6)) == sf, f"{lab}: dF sign"
+        # and the signs agree with the point plotted in panel a
+        assert np.sign(C) == np.sign(c)
+        assert np.sign(round(dF, 6)) == np.sign(round(f, 6))
+
+
+def test_balanced_keeps_the_nulls_ratio_rather_than_splitting_fifty_fifty():
+    """The distinction the whole re-referencing exists for.  Drawing
+    'balanced' as half co-open would make it a co-open SHIFT at any marginal
+    other than 0.5 -- which is the error the old D = C(2F-1) encodes."""
+    m = _mod()
+    o, c, _ = m.PAIRS["coordinated balanced"]
+    no, nc, _ = m.PAIRS_NULL
+    assert o / (o + c) == pytest.approx(no / (no + nc))     # same ratio
+    assert o / (o + c) != pytest.approx(0.5)                # not 50/50
+    _C, _F, dF = _implied(m.PAIRS["coordinated balanced"], m.PAIRS_NULL)
+    assert dF == pytest.approx(0.0, abs=1e-9)
+
+
+def test_anti_coordinated_shows_fewer_concordant_pairs_than_the_null():
+    """Anti-coordination is a deficit, not a direction.  A cartoon with more
+    concordant pairs than the null would be showing coordination."""
+    m = _mod()
+    o, c, _ = m.PAIRS["anti-coordinated"]
+    no, nc, _ = m.PAIRS_NULL
+    assert o + c < no + nc
+
+
+def test_uncoordinated_is_drawn_identical_to_the_null():
+    m = _mod()
+    assert m.PAIRS["uncoordinated"] == m.PAIRS_NULL
+
+
+def test_every_drawn_state_has_a_cartoon():
+    m = _mod()
+    assert {lab for lab, *_ in m.STATES} == set(m.PAIRS)
