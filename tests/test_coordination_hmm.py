@@ -592,3 +592,132 @@ def test_the_k_five_refusal_names_k_four(tmp_path):
     assert r.returncode != 0
     assert "--k 4" in r.stderr and "--k 5" in r.stderr
     assert "positive everywhere" in r.stderr
+
+
+# ------------------------------------------------------- auto mask and QC --
+
+def test_auto_max_z_finds_the_knee_and_reports_the_ladder():
+    """A fixed z is a guess about how heavy the tail is.  The knee is where
+    the bulk has been captured and everything further out is tail."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    core = np.abs(rng.normal(0, 1, 200_000))
+    tail = np.abs(rng.standard_cauchy(6_000)) * 50
+    z, ladder = m.auto_max_z(np.r_[core, tail])
+    assert 2.0 <= z <= 12.0, z
+    assert ladder and all("z" in r and "frac_kept" in r for r in ladder)
+    kept = [r["frac_kept"] for r in ladder]
+    assert kept == sorted(kept)              # monotone in z
+
+
+def test_auto_max_z_keeps_almost_everything_when_there_is_no_tail():
+    m = _mod()
+    rng = np.random.default_rng(1)
+    z, _l = m.auto_max_z(np.abs(rng.normal(0, 1, 100_000)))
+    assert z <= 5.0
+
+
+def test_auto_max_z_survives_an_empty_input():
+    m = _mod()
+    z, ladder = m.auto_max_z(np.array([]))
+    assert np.isfinite(z) and ladder == []
+
+
+def test_autocorrelation_sees_domains_when_they_exist():
+    """The number that decides whether an HMM can help at all."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=12, n_bins=400, noise=0.8, missing=0.0)
+    X, lengths, obs, _o, _s = m.build_sequences(
+        C.to_numpy(float), F.to_numpy(float), list(C.columns), clip=0)
+    acf = m.genome_autocorrelation(X, lengths, obs, len(C), max_lag=5)
+    assert acf["C_within_cell"][0] > 0.25
+    # and it decays with distance, as a domain structure must
+    assert acf["C_within_cell"][0] > acf["C_within_cell"][-1]
+
+
+def test_autocorrelation_is_flat_when_bins_are_independent():
+    """The failure the QC exists to name: consecutive bins that do not agree
+    leave the transition prior -- the only reason to use an HMM -- with
+    nothing to work with."""
+    m = _mod()
+    rng = np.random.default_rng(3)
+    n_cells, n_bins = 10, 400
+    C = rng.normal(0, 1, (n_cells, n_bins))
+    F = rng.normal(0, 1, (n_cells, n_bins))
+    bins = [f"chr1:{i * 250000}" for i in range(n_bins)]
+    X, lengths, obs, _o, _s = m.build_sequences(C, F, bins, clip=0)
+    acf = m.genome_autocorrelation(X, lengths, obs, n_cells, max_lag=5)
+    assert abs(acf["C_within_cell"][0]) < 0.05
+
+
+def test_autocorrelation_separates_per_cell_noise_from_pooled_signal():
+    """The distinction that decides what to do next: a flat per-cell curve
+    with an autocorrelated POOLED one means the domains are real and buried
+    under sampling noise, not absent."""
+    m = _mod()
+    rng = np.random.default_rng(4)
+    n_cells, n_bins = 40, 400
+    shared = np.repeat(rng.normal(0, 1, n_bins // 20), 20)[:n_bins]
+    C = shared[None, :] + rng.normal(0, 6.0, (n_cells, n_bins))   # noisy
+    F = rng.normal(0, 1, (n_cells, n_bins))
+    bins = [f"chr1:{i * 250000}" for i in range(n_bins)]
+    X, lengths, obs, _o, _s = m.build_sequences(C, F, bins, clip=0)
+    acf = m.genome_autocorrelation(X, lengths, obs, n_cells, max_lag=3)
+    assert abs(acf["C_within_cell"][0]) < 0.10
+    assert acf["C_pooled"][0] > 0.4
+
+
+def test_qc_writes_a_figure_and_the_autocorrelation_table(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300, missing=0.05)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "4", "--qc",
+         "--plot-format", "png", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (out / "hmm_qc.png").exists()
+    t = pd.read_csv(out / "hmm_qc_autocorrelation.tsv", sep="\t")
+    assert {"lag", "C_within_cell", "C_pooled",
+            "dF_within_cell", "dF_pooled"} <= set(t.columns)
+    assert "lag-1 autocorrelation" in r.stderr
+
+
+def test_the_qc_says_an_hmm_cannot_help_when_bins_are_independent(tmp_path):
+    m = _mod()
+    rng = np.random.default_rng(5)
+    n_cells, n_bins = 8, 300
+    bins = [f"chr1:{i * 250000}" for i in range(n_bins)]
+    cells = [f"c{i}" for i in range(n_cells)]
+    pd.DataFrame(rng.normal(0, 1, (n_cells, n_bins)), index=cells,
+                 columns=bins).to_parquet(tmp_path / "c.parquet")
+    pd.DataFrame(rng.normal(0, 1, (n_cells, n_bins)), index=cells,
+                 columns=bins).to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "4", "--qc",
+         "--plot-format", "png", "--output-dir", str(tmp_path / "o")],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "an HMM cannot help here" in r.stderr
+
+
+def test_max_z_still_accepts_a_number(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=6, n_bins=200)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "4", "--max-z", "8",
+         "--output-dir", str(tmp_path / "o")],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "|z| = 8" in r.stderr
+    assert "auto chose" not in r.stderr

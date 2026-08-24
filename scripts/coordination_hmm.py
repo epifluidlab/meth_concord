@@ -199,6 +199,7 @@ class PlaneHMM:
         batches = self._batches(X, lengths, obs, n_cells)
         runner = _runner(threads)
         prev = -np.inf
+        self.trace = []
         for it in range(n_iter):
             lA, lpi = np.log(A), np.log(pi)
             res = runner(self, batches, lA, lpi)
@@ -214,6 +215,7 @@ class PlaneHMM:
                                  + np.eye(2) * 1e-6)
             A = xi / np.maximum(xi.sum(1, keepdims=True), 1e-12)
             pi = pi_acc / max(pi_acc.sum(), 1e-12)
+            self.trace.append(float(total))
             if verbose:
                 print(f"    iter {it:>2}  loglik {total:,.1f}",
                       file=sys.stderr)
@@ -333,6 +335,12 @@ def build_sequences(C, dF, bins, scale_c=None, scale_f=None,
         info["max_abs_z"] = float(_dev.max())
         info["frac_beyond_10"] = float(np.mean(_dev > 10))
         info["median_z"] = _med.tolist()
+    if isinstance(clip, str) and str(clip).lower() == "auto":
+        med0 = np.array([np.median(X[obs, 0]), np.median(X[obs, 1])])
+        dev0 = np.abs(X[obs] - med0).max(1)
+        clip, ladder = auto_max_z(dev0)
+        info["max_z_auto"] = float(clip)
+        info["max_z_ladder"] = ladder
     if clip and clip > 0:
         # MASK the extremes, do not clip them to a boundary.  Clipping turns
         # a heavy tail into a spike at +-z, and EM allocates states to that
@@ -410,6 +418,184 @@ def label_states(means, r_cut="auto", sector=30.0, auto_frac=0.35):
         out.append({"mean_C": mu[0], "mean_dF": mu[1], "R": R, "theta": th,
                     "label": name})
     return out
+
+
+def auto_max_z(dev, target_gauss=0.999, hard_max=50.0):
+    """Choose the mask threshold from the shape of the data.
+
+    A fixed z is a guess about how heavy the tail is.  Pick it instead where
+    the empirical tail departs from what a Gaussian core would produce: walk
+    a ladder of candidate cuts and take the smallest at which the retained
+    fraction stops rising materially -- the knee where the bulk has been
+    captured and everything further out is tail.
+
+    Returns (z, table) so the choice is reportable rather than magic.
+    """
+    dev = np.asarray(dev, float)
+    dev = dev[np.isfinite(dev)]
+    if dev.size == 0:
+        return hard_max, []
+    ladder = np.array([2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 30, 50], float)
+    ladder = ladder[ladder <= hard_max]
+    keep = np.array([float(np.mean(dev <= z)) for z in ladder])
+    rows = [{"z": float(z), "frac_kept": float(k)}
+            for z, k in zip(ladder, keep)]
+    # the knee: the first cut past which another step buys under 0.5% more
+    gain = np.r_[keep[0], np.diff(keep)]
+    knee = ladder[-1]
+    for z, g, k in zip(ladder, gain, keep):
+        if k >= target_gauss:
+            knee = z
+            break
+        if g < 0.005 and k > 0.90:
+            knee = z
+            break
+    return float(knee), rows
+
+
+def genome_autocorrelation(X, lengths, obs, n_cells, max_lag=20):
+    """Autocorrelation along the genome, per cell and for the group mean.
+
+    This is the number that decides whether an HMM can help at all.  The
+    transition prior is the only reason to use one, and it has nothing to
+    work with unless consecutive bins agree more than chance.
+
+    Both are reported because they answer different questions.  A low
+    PER-CELL value with a high POOLED value means the domain structure is
+    real but buried under per-cell sampling noise -- in which case the fit
+    should be learnt on the pooled track and only the decoding done per
+    cell.  Both low means there is no domain structure at this bin size.
+    """
+    n_chrom = len(lengths) // n_cells
+    starts = np.r_[0, np.cumsum(lengths)]
+    out = {"lag": list(range(1, max_lag + 1))}
+    for axis, name in ((0, "C"), (1, "dF")):
+        per_cell = np.zeros(max_lag)
+        pooled = np.zeros(max_lag)
+        wc = np.zeros(max_lag)
+        wp = np.zeros(max_lag)
+        for j in range(n_chrom):
+            L = int(lengths[j])
+            idx = np.concatenate([np.arange(starts[c * n_chrom + j],
+                                            starts[c * n_chrom + j + 1])
+                                  for c in range(n_cells)])
+            V = np.where(obs[idx], X[idx, axis], np.nan).reshape(n_cells, L)
+            with np.errstate(invalid="ignore"):
+                mean_track = np.nanmean(V, axis=0)
+            for lag in range(1, max_lag + 1):
+                if L <= lag:
+                    continue
+                a, b = V[:, :-lag], V[:, lag:]
+                ok = np.isfinite(a) & np.isfinite(b)
+                if ok.sum() > 10:
+                    av, bv = a[ok], b[ok]
+                    r = np.corrcoef(av, bv)[0, 1]
+                    if np.isfinite(r):
+                        per_cell[lag - 1] += r * ok.sum()
+                        wc[lag - 1] += ok.sum()
+                ma, mb = mean_track[:-lag], mean_track[lag:]
+                okm = np.isfinite(ma) & np.isfinite(mb)
+                if okm.sum() > 10:
+                    r = np.corrcoef(ma[okm], mb[okm])[0, 1]
+                    if np.isfinite(r):
+                        pooled[lag - 1] += r * okm.sum()
+                        wp[lag - 1] += okm.sum()
+        out[f"{name}_within_cell"] = list(
+            np.where(wc > 0, per_cell / np.maximum(wc, 1), np.nan))
+        out[f"{name}_pooled"] = list(
+            np.where(wp > 0, pooled / np.maximum(wp, 1), np.nan))
+    return out
+
+
+def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
+              labels, title):
+    """Six panels that answer whether the fit means anything.
+
+    Ordered by what would invalidate the result soonest: if the plane is one
+    blob there are no states to find, and nothing downstream matters.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(2, 3, figsize=(14.5, 8.4))
+    good = X[obs]
+    sub = good if len(good) < 300_000 else good[
+        np.random.default_rng(0).choice(len(good), 300_000, replace=False)]
+
+    a = ax[0, 0]
+    a.hexbin(sub[:, 0], sub[:, 1], gridsize=70, bins="log", cmap="Blues",
+             mincnt=1)
+    a.scatter(model.means[:, 0], model.means[:, 1], s=90, marker="x",
+              c="#c0392b", lw=2.2, zorder=5)
+    for i, m in enumerate(model.means):
+        a.annotate(str(i), m, fontsize=8, color="#c0392b",
+                   xytext=(4, 4), textcoords="offset points", zorder=6)
+    a.set_title("a  is the plane multimodal?", fontsize=10, loc="left")
+    a.set_xlabel("C (standardised)", fontsize=8)
+    a.set_ylabel("F − F_exp (standardised)", fontsize=8)
+
+    a = ax[0, 1]
+    lag = acf["lag"]
+    for key, style in (("C_within_cell", "-o"), ("C_pooled", "--s"),
+                       ("dF_within_cell", "-^"), ("dF_pooled", "--v")):
+        a.plot(lag, acf[key], style, ms=3.2, lw=1.2, label=key)
+    a.axhline(0, color="0.6", lw=0.8)
+    a.set_title("b  spatial autocorrelation along the genome", fontsize=10,
+                loc="left")
+    a.set_xlabel("lag (bins)", fontsize=8)
+    a.set_ylabel("correlation", fontsize=8)
+    a.legend(fontsize=6.5, frameon=False)
+
+    a = ax[0, 2]
+    dev = np.abs(good - np.median(good, axis=0)).max(1)
+    a.hist(np.clip(dev, 0, 60), bins=120, color="#7f8c8d")
+    a.axvline(mask_z, color="#c0392b", lw=1.4)
+    a.annotate(f"mask at |z| = {mask_z:g}", (mask_z, a.get_ylim()[1] * 0.8),
+               xytext=(6, 0), textcoords="offset points", fontsize=8,
+               color="#c0392b")
+    a.set_yscale("log")
+    a.set_title("c  distance from the median, and the cut", fontsize=10,
+                loc="left")
+    a.set_xlabel("|z| (max over the two axes)", fontsize=8)
+
+    a = ax[1, 0]
+    im = a.imshow(model.A, cmap="magma_r", vmin=0, vmax=1)
+    for i in range(model.k):
+        for j in range(model.k):
+            a.text(j, i, f"{model.A[i, j]:.2f}", ha="center", va="center",
+                   fontsize=7,
+                   color="white" if model.A[i, j] > 0.5 else "0.2")
+    a.set_xticks(range(model.k)); a.set_yticks(range(model.k))
+    a.set_title("d  transition matrix", fontsize=10, loc="left")
+    a.set_xlabel("to state", fontsize=8); a.set_ylabel("from state", fontsize=8)
+    fig.colorbar(im, ax=a, fraction=0.046)
+
+    a = ax[1, 1]
+    runs = 1.0 / np.maximum(1 - np.diag(model.A), 1e-9)
+    cols = ["#2c3e50" if r >= 3 else "#c0392b" for r in runs]
+    a.bar(range(model.k), runs, color=cols)
+    a.axhline(3, color="#c0392b", ls="--", lw=1.0)
+    a.annotate("below 3 bins = no domains", (0, 3), xytext=(2, 4),
+               textcoords="offset points", fontsize=7.5, color="#c0392b")
+    a.set_xticks(range(model.k))
+    a.set_xticklabels([f"{i}\n{labels[i][:12]}" for i in range(model.k)],
+                      fontsize=6.5)
+    a.set_title("e  expected run length per state", fontsize=10, loc="left")
+    a.set_ylabel("bins", fontsize=8)
+
+    a = ax[1, 2]
+    if loglik_trace:
+        a.plot(range(1, len(loglik_trace) + 1), loglik_trace, "-o", ms=3,
+               color="#2c3e50")
+        a.set_xlabel("EM iteration", fontsize=8)
+        a.set_ylabel("log-likelihood", fontsize=8)
+    a.set_title("f  EM convergence", fontsize=10, loc="left")
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def archetypes(k, anchor):
@@ -618,10 +804,12 @@ def main(argv=None) -> int:
                          "assumes the cloud is centred on the null -- on "
                          "real data it filed all eight states under one "
                          "name.  Needs exactly five states.")
-    ap.add_argument("--max-z", type=float, default=10.0, metavar="Z",
+    ap.add_argument("--max-z", default="auto", metavar="Z",
                     dest="clip",
                     help="Treat a bin beyond this |z| on either axis as "
-                         "MISSING (0 to disable).  Gaussian emissions on a "
+                         "MISSING.  'auto' (default) picks the knee of the "
+                         "|z| distribution and reports the ladder it chose "
+                         "from; a number pins it; 0 disables.  Gaussian emissions on a "
                          "heavy tail put every state on the tail and the "
                          "transition matrix collapses to runs of one bin.  "
                          "Masked, not clipped: clipping turns the tail into "
@@ -650,6 +838,16 @@ def main(argv=None) -> int:
                          "numpy and releases the GIL, and the batches are "
                          "large enough that pickling them to processes "
                          "would cost more than it saves.")
+    ap.add_argument("--qc", action="store_true",
+                    help="Write hmm_qc.<fmt> and "
+                         "hmm_qc_autocorrelation.tsv: is the plane "
+                         "multimodal, is there autocorrelation along the "
+                         "genome for the transition prior to use, where the "
+                         "mask fell, the transition matrix, run lengths, "
+                         "and the EM trace.")
+    ap.add_argument("--qc-max-lag", type=int, default=20)
+    ap.add_argument("--plot-format", default="pdf",
+                    choices=["pdf", "png", "svg"])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--r-cut", default="auto",
                     help="Radius below which a fitted state is called "
@@ -669,8 +867,14 @@ def main(argv=None) -> int:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    _mz = args.clip
+    if isinstance(_mz, str) and _mz.lower() != "auto":
+        try:
+            _mz = float(_mz)
+        except ValueError:
+            sys.exit(f"--max-z must be a number or 'auto', got {_mz!r}")
     X, lengths, obs, order, sc = build_sequences(
-        C, dF, list(Cdf.columns), clip=args.clip or 0.0)
+        C, dF, list(Cdf.columns), clip=_mz)
     import os
     n_chrom_total = len(lengths) // max(C.shape[0], 1)
     if not args.threads:
@@ -691,6 +895,12 @@ def main(argv=None) -> int:
             print(f"  NOTE {sc['frac_beyond_10']:.1%} of the plane sits "
                   f"beyond |z| = 10.  Gaussian emissions will chase that "
                   f"tail unless it is clipped.", file=sys.stderr)
+    if "max_z_auto" in sc:
+        print(f"  --max-z auto chose |z| = {sc['max_z_auto']:g} from the "
+              f"knee of the distribution ("
+              + ", ".join(f"z={r['z']:g}:{r['frac_kept']:.1%}"
+                          for r in sc["max_z_ladder"][:8]) + ")",
+              file=sys.stderr)
     if "mask_beyond_z" in sc:
         print(f"  masked {sc['n_masked_extreme']:,} bins beyond |z| = "
               f"{sc['mask_beyond_z']:g} "
@@ -843,6 +1053,41 @@ def main(argv=None) -> int:
     pd.DataFrame(np.hstack(flat_z), index=Cdf.index,
                  columns=cols).to_parquet(
         out / "concordance_state_posterior_clr.parquet")
+    if args.qc:
+        acf = genome_autocorrelation(X, lengths, obs, n_cells,
+                                     max_lag=args.qc_max_lag)
+        pd.DataFrame(acf).to_csv(out / "hmm_qc_autocorrelation.tsv",
+                                 sep="\t", index=False)
+        a1 = acf["C_within_cell"][0]
+        a1p = acf["C_pooled"][0]
+        print(f"  QC: lag-1 autocorrelation of C is {a1:+.3f} within cells "
+              f"and {a1p:+.3f} on the pooled track", file=sys.stderr)
+        if np.isfinite(a1) and abs(a1) < 0.05:
+            msg = ("  QC: consecutive bins within a cell barely agree, so "
+                   "the transition prior has nothing to work with -- an HMM "
+                   "cannot help here whatever K is.")
+            if np.isfinite(a1p) and abs(a1p) > 0.2:
+                msg += ("\n  QC: the POOLED track is autocorrelated though, "
+                        "so the domain structure is real and buried under "
+                        "per-cell sampling noise.  Learn the states on the "
+                        "pooled track and decode per cell, or aggregate "
+                        "bins before segmenting.")
+            else:
+                msg += ("\n  QC: the pooled track is not autocorrelated "
+                        "either, so there is no domain structure at this "
+                        "bin size to find.")
+            print(msg, file=sys.stderr)
+        try:
+            qc_path = out / f"hmm_qc.{args.plot_format}"
+            qc_figure(qc_path, X, obs, model, acf, sc.get("mask_beyond_z",
+                      float("nan")), sc.get("max_z_ladder", []),
+                      getattr(model, "trace", []),
+                      [d["label"] for d in info],
+                      f"HMM QC: k={model.k}, "
+                      f"{int(obs.sum()):,} observed bins")
+            print(f"  QC figure -> {qc_path.name}", file=sys.stderr)
+        except Exception as exc:
+            print(f"  QC figure failed: {exc}", file=sys.stderr)
     print(f"  -> concordance_state.parquet, "
           f"concordance_state_posterior{{,_clr}}.parquet, hmm_states.tsv",
           file=sys.stderr)
