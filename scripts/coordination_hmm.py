@@ -412,6 +412,36 @@ def label_states(means, r_cut="auto", sector=30.0, auto_frac=0.35):
     return out
 
 
+def archetypes(k, anchor):
+    """The taxonomy to match against, which depends on K and on the anchor.
+
+    K = 4 drops anti-coordination, and that is the right model when C is
+    positive everywhere: C = 2*Cov below zero is what anti-coordination
+    MEANS, so if the statistic never goes there the state does not exist and
+    forcing a fifth archetype makes the assignment name something arbitrary.
+
+    The null archetype is called 'uncoordinated' only when the origin is the
+    anchor, because that is when C = 0 is actually reached.  Anchored on the
+    lowest-C state it is 'least coordinated', which is what it is: there is
+    coordination everywhere, and this state has the least of it.  The name
+    carries the caveat instead of a footnote having to.
+    """
+    if k not in (4, 5):
+        raise ValueError(
+            f"relative labelling handles 4 or 5 states, got {k}.  Four when "
+            f"C is positive everywhere (no anti-coordination), five when it "
+            f"crosses zero.")
+    null_name = ("uncoordinated" if anchor == "origin"
+                 else "least coordinated")
+    out = {null_name: (0.0, 0.0),
+           "coordinated balanced": (1.0, 0.0),
+           "co-open shifted": (0.7, 0.7),
+           "co-closed shifted": (0.7, -0.7)}
+    if k == 5:
+        out["anti-coordinated"] = (-1.0, 0.0)
+    return out, null_name
+
+
 ARCHETYPES = {
     "uncoordinated":        (0.0, 0.0),
     "coordinated balanced": (1.0, 0.0),
@@ -463,9 +493,6 @@ def label_states_relative(means, A, anchor="auto"):
     from scipy.optimize import linear_sum_assignment
 
     mu = np.asarray(means, float)
-    if mu.shape[0] != len(ARCHETYPES):
-        raise ValueError(f"relative labelling needs exactly "
-                         f"{len(ARCHETYPES)} states, got {mu.shape[0]}")
     occ = stationary(A)
     radii = np.linalg.norm(mu, axis=1)
     pair = [np.linalg.norm(mu[i] - mu[j]) for i in range(len(mu))
@@ -485,14 +512,15 @@ def label_states_relative(means, A, anchor="auto"):
         raise ValueError(f"anchor must be auto, origin or min-c, "
                          f"got {anchor!r}")
 
+    arch, null_name = archetypes(mu.shape[0], anchor)
     off = mu - base
     sizes = np.linalg.norm(off, axis=1)
     scale = float(np.median(sizes[sizes > 0])) if (sizes > 0).any() else 0.0
     if not np.isfinite(scale) or scale <= 0:
         raise ValueError("fitted states are coincident; nothing to label")
     z = off / scale
-    names = list(ARCHETYPES)
-    tgt = np.array([ARCHETYPES[n] for n in names], float)
+    names = list(arch)
+    tgt = np.array([arch[n] for n in names], float)
     cost = np.linalg.norm(z[:, None, :] - tgt[None, :, :], axis=2)
     ri, ci = linear_sum_assignment(cost)
     out = [None] * len(names)
@@ -502,8 +530,11 @@ def label_states_relative(means, A, anchor="auto"):
         # "less coordinated than nothing" from, so the two labels that mean
         # exactly that cannot be told apart.  Say so per state rather than
         # let a bijection imply a distinction the data cannot make.
-        unreliable = (anchor == "min-c"
-                      and nm in ("uncoordinated", "anti-coordinated"))
+        # With the origin unreachable, 'anti-coordinated' cannot be
+        # verified as genuine anti-coordination -- it just means "lowest C
+        # present".  The null state does not need the flag: at K = 4 it is
+        # NAMED 'least coordinated', which is exactly what it is.
+        unreliable = anchor == "min-c" and nm == "anti-coordinated"
         out[i] = {"mean_C": mu[i, 0], "mean_dF": mu[i, 1],
                   "rel_C": z[i, 0], "rel_dF": z[i, 1],
                   "R": float(np.hypot(*z[i])),
@@ -511,7 +542,8 @@ def label_states_relative(means, A, anchor="auto"):
                   "occupancy": occ[i], "label": nm,
                   "label_identifiable": not unreliable,
                   "match_cost": cost[i, j]}
-    return out, {"anchor": anchor, "reference_state": ref, "spread": scale,
+    return out, {"anchor": anchor, "null_name": null_name,
+                 "reference_state": ref, "spread": scale,
                  "between_state_spread": between,
                  "nearest_radius": float(radii.min()),
                  "origin_outside_cloud": bool(origin_far),
@@ -708,8 +740,10 @@ def main(argv=None) -> int:
                 model.means, model.A, anchor=args.null_anchor)
         except ValueError as exc:
             sys.exit(f"relative labelling failed: {exc}\n"
-                     f"  pass --k 5, or --label angle to use the absolute "
-                     f"rule (and read its labels with suspicion).")
+                     f"  use --k 4 when C is positive everywhere (no "
+                     f"anti-coordination) or --k 5 when it crosses zero; "
+                     f"--label angle uses the absolute rule instead, and "
+                     f"its labels should be read with suspicion.")
     else:
         _rc = args.r_cut
         if not isinstance(_rc, str) or _rc.lower() != "auto":
@@ -732,7 +766,7 @@ def main(argv=None) -> int:
                   f"{rel_info['reference_state']}, the lowest-C state, "
                   f"taken as the null; offsets scaled by "
                   f"{rel_info['spread']:.3g}", file=sys.stderr)
-        if rel_info["origin_outside_cloud"]:
+        if rel_info["origin_outside_cloud"] and model.k >= 5:
             print(f"  NOTE the origin is OUTSIDE the fitted cloud: the "
                   f"nearest state sits {rel_info['nearest_radius']:.3g} "
                   f"from C = 0 while the states sit only "
@@ -742,9 +776,11 @@ def main(argv=None) -> int:
                   f"  Those two labels are therefore NOT IDENTIFIABLE and "
                   f"are flagged as such in hmm_states.tsv: both mean 'less "
                   f"coordinated than the rest', and separating them needs "
-                  f"an absolute zero the data never reaches.  Treat the "
-                  f"taxonomy here as FOUR states -- least-coordinated, "
-                  f"balanced, co-open, co-closed.\n"
+                  f"an absolute zero the data never reaches.  Re-run "
+                  f"with --k 4: with C positive everywhere there is no "
+                  f"anti-coordinated state to find, and four archetypes "
+                  f"(least coordinated, balanced, co-open, co-closed) is "
+                  f"the honest model.\n"
                   f"  Worth checking why C never reaches zero: O and E are "
                   f"fitted with SEPARATE Dirichlet priors, and if the "
                   f"linked pool's prior is more concordant than the "
@@ -784,6 +820,12 @@ def main(argv=None) -> int:
               f"names cover; report the fitted means, not just the labels.",
               file=sys.stderr)
 
+    if rel_info.get("origin_outside_cloud") and model.k == 4:
+        print(f"  NOTE the origin is outside the fitted cloud, so the null "
+              f"state is named 'least coordinated' rather than "
+              f"'uncoordinated': C is positive everywhere, so this state "
+              f"has the least coordination present, not none.",
+              file=sys.stderr)
     path, post = model.decode(X, lengths, obs, n_cells)
     path = np.where(obs, path, -1).reshape(n_cells, -1)
     pd.DataFrame(path, index=Cdf.index, columns=bins).to_parquet(

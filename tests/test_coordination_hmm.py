@@ -212,11 +212,16 @@ def test_the_null_is_the_origin_not_the_commonest_state():
     assert by_label["coordinated balanced"]["mean_C"] == pytest.approx(3.0)
 
 
-def test_relative_labelling_needs_exactly_five_states():
+def test_relative_labelling_takes_four_or_five_states():
+    """Four when C is positive everywhere, five when it crosses zero.
+    Anything else is not a bijection onto the taxonomy."""
     m = _mod()
-    A = np.eye(4) * 0.9 + 0.025
-    with pytest.raises(ValueError, match="exactly"):
-        m.label_states_relative(TRUE[:4], A)
+    A4 = np.eye(4) * 0.9 + 0.033
+    info, _meta = m.label_states_relative(TRUE[:4], A4)
+    assert len(info) == 4
+    A3 = np.eye(3) * 0.9 + 0.05
+    with pytest.raises(ValueError, match="4 or 5"):
+        m.label_states_relative(TRUE[:3], A3)
 
 
 def test_an_absolute_radius_cut_mislabels_when_most_bins_carry_signal():
@@ -375,11 +380,11 @@ def test_cli_reports_the_bic_table(tmp_path):
     assert "selected k" in r.stderr
 
 
-def test_relative_labelling_refuses_a_non_five_fit_with_a_usable_message(
+def test_relative_labelling_refuses_an_unsupported_k_with_a_usable_message(
         tmp_path):
-    """K != 5 makes the assignment non-bijective, and a label that is a
-    guess should not look like a result.  The refusal has to name both
-    ways out."""
+    """K outside 4 or 5 makes the assignment non-bijective, and a label that
+    is a guess should not look like a result.  The refusal has to name the
+    model that fits the data."""
     m = _mod()
     C, F, _st = _fixture(n_cells=6, n_bins=200)
     C.to_parquet(tmp_path / "c.parquet")
@@ -391,8 +396,8 @@ def test_relative_labelling_refuses_a_non_five_fit_with_a_usable_message(
          "--output-dir", str(tmp_path / "o")],
         capture_output=True, text=True)
     assert r.returncode != 0
-    assert "exactly" in r.stderr
-    assert "--k 5" in r.stderr and "--label angle" in r.stderr
+    assert "4 or 5" in r.stderr
+    assert "--k 4" in r.stderr and "--label angle" in r.stderr
 
 
 def test_k_defaults_to_five(tmp_path):
@@ -439,16 +444,18 @@ def test_auto_switches_when_the_cloud_never_approaches_zero():
     assert meta["nearest_radius"] > meta["between_state_spread"]
 
 
-def test_the_unreachable_labels_are_flagged_not_asserted():
-    """'uncoordinated' and 'anti-coordinated' both mean 'less coordinated
-    than the rest'.  Separating them needs an absolute zero, so when the
-    data has none the bijection must not imply the distinction was made."""
+def test_at_five_states_only_anti_is_left_unverifiable():
+    """With the origin unreachable, 'anti-coordinated' cannot be shown to be
+    genuine anti-coordination -- it just means lowest-C.  The null state
+    needs no flag because it is RENAMED 'least coordinated', which is what
+    it is.  The directional labels survive: they are read off dF, which
+    does reach zero."""
     m = _mod()
     info, meta = m.label_states_relative(TRUE + np.array([12.0, 0.0]), _A5)
     flags = {d["label"]: d["label_identifiable"] for d in info}
-    assert flags["uncoordinated"] is False
+    assert meta["null_name"] == "least coordinated"
     assert flags["anti-coordinated"] is False
-    # the directional ones survive: they are read off dF, which does reach 0
+    assert flags["least coordinated"] is True
     assert flags["co-open shifted"] is True
     assert flags["co-closed shifted"] is True
     assert flags["coordinated balanced"] is True
@@ -482,7 +489,106 @@ def test_the_run_says_the_taxonomy_collapses_to_four(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "origin is OUTSIDE" in r.stderr
     assert "NOT IDENTIFIABLE" in r.stderr
-    assert "FOUR states" in r.stderr
+    assert "--k 4" in r.stderr          # points at the model that fits
     lab = pd.read_csv(tmp_path / "o" / "hmm_states.tsv", sep="\t")
     assert "label_identifiable" in lab.columns
-    assert (~lab["label_identifiable"]).sum() == 2
+    # only anti-coordinated is unverifiable now; the null is renamed instead
+    assert (~lab["label_identifiable"]).sum() == 1
+    assert "least coordinated" in set(lab["label"])
+
+
+# ------------------------------------------- four states when C > 0 always --
+
+TRUE4 = np.array([(0., 0.), (3., 0.), (2.1, 2.1), (2.1, -2.1)])
+_A4 = np.eye(4) * 0.9 + 0.033
+
+
+def test_four_states_drop_anti_coordination():
+    """C = 2*Cov below zero is what anti-coordination MEANS.  Where C is
+    positive everywhere the state does not exist, and a fifth archetype
+    would make the assignment name something arbitrary."""
+    m = _mod()
+    arch, null = m.archetypes(4, "min-c")
+    assert "anti-coordinated" not in arch
+    assert set(arch) == {"least coordinated", "coordinated balanced",
+                         "co-open shifted", "co-closed shifted"}
+    arch5, _ = m.archetypes(5, "min-c")
+    assert "anti-coordinated" in arch5
+
+
+def test_the_null_is_named_for_what_it_actually_is():
+    """'uncoordinated' claims an absence of coordination.  Anchored on the
+    lowest-C state that claim is false -- there is coordination everywhere
+    and this state has the least of it -- so the NAME carries the caveat
+    rather than a footnote having to."""
+    m = _mod()
+    assert m.archetypes(4, "origin")[1] == "uncoordinated"
+    assert m.archetypes(4, "min-c")[1] == "least coordinated"
+
+
+def test_labelling_four_shifted_states_recovers_the_taxonomy():
+    m = _mod()
+    shifted = TRUE4 + np.array([12.0, 0.0])
+    info, meta = m.label_states_relative(shifted, _A4)
+    assert meta["anchor"] == "min-c"
+    got = {d["label"] for d in info}
+    assert got == {"least coordinated", "coordinated balanced",
+                   "co-open shifted", "co-closed shifted"}
+    by = {d["label"]: d for d in info}
+    assert by["least coordinated"]["mean_C"] == pytest.approx(12.0)
+    assert by["co-open shifted"]["mean_dF"] > 0
+    assert by["co-closed shifted"]["mean_dF"] < 0
+
+
+def test_at_four_states_nothing_is_left_unidentifiable():
+    """The K=5 fit had to flag 'anti-coordinated' as unverifiable.  Dropping
+    it removes the problem rather than annotating it."""
+    m = _mod()
+    info, _meta = m.label_states_relative(TRUE4 + np.array([12.0, 0.0]), _A4)
+    assert all(d["label_identifiable"] for d in info)
+
+
+def test_three_states_is_refused_with_both_ways_out():
+    m = _mod()
+    A3 = np.eye(3) * 0.9 + 0.05
+    with pytest.raises(ValueError, match="4 or 5"):
+        m.label_states_relative(TRUE4[:3], A3)
+
+
+def test_cli_accepts_k_four(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=10, n_bins=400, missing=0.0)
+    Cv = np.abs(C.to_numpy(float)) + 40.0
+    pd.DataFrame(Cv, index=C.index, columns=C.columns).to_parquet(
+        tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "4", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    lab = pd.read_csv(out / "hmm_states.tsv", sep="\t")
+    assert len(lab) == 4
+    assert "anti-coordinated" not in set(lab["label"])
+    assert "least coordinated" in set(lab["label"])
+    assert lab["label_identifiable"].all()
+
+
+def test_the_k_five_refusal_names_k_four(tmp_path):
+    """The message a user hits when they pick an unsupported K has to point
+    at the model that fits their data, not just at five."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=6, n_bins=200)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3",
+         "--output-dir", str(tmp_path / "o")],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "--k 4" in r.stderr and "--k 5" in r.stderr
+    assert "positive everywhere" in r.stderr
