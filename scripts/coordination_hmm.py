@@ -332,6 +332,31 @@ def unwarp_log_radial(W, centre):
     return W * scale[:, None] + centre
 
 
+def plane_sample(X, sel, warp_centre=None, cap=300_000, seed=0):
+    """Selected rows of X back on the ORIGINAL plane, capped for plotting.
+
+    Every diagnostic is quoted in plane units -- the |z| mask, the reach
+    warning, panel (a)'s axes -- and ``main`` reports ``model.means`` on the
+    plane.  But under ``--space log-radial`` the matrix the model was fitted
+    to is NOT the plane, and reading it as though it were fails silently in
+    both directions: the reach warning compares warped distances against a
+    plane threshold and never fires, and panel (a) draws a log-compressed
+    cloud with the means a hundred units away, which looks exactly like a
+    fit that has gone wrong rather than a figure that has.
+
+    Unwarping is exact, so this is a change of view and not of data.  It is
+    done after subsampling because the full matrix is tens of millions of
+    rows and nothing here needs more than the sample.
+    """
+    Xs = np.asarray(X, float)[np.asarray(sel, bool)]
+    if len(Xs) > cap:
+        Xs = Xs[np.random.default_rng(seed).choice(len(Xs), cap,
+                                                   replace=False)]
+    if warp_centre is None:
+        return Xs
+    return unwarp_log_radial(Xs, np.asarray(warp_centre, float))
+
+
 def density_equalised(X, rng, n=60_000, grid=120):
     """Subsample so every occupied part of the plane is equally represented.
 
@@ -437,6 +462,7 @@ def build_sequences(C, dF, bins, scale_c=None, scale_f=None,
         med = np.array([np.median(X[obs, 0]), np.median(X[obs, 1])])
         extreme = (np.abs(X - med) > clip).any(1) & obs
         info.update({"mask_beyond_z": float(clip),
+                     "masked_rows": extreme,
                      "n_masked_extreme": int(extreme.sum()),
                      "frac_masked_extreme": float(
                          extreme.sum() / max(int(obs.sum()), 1))})
@@ -590,7 +616,7 @@ def genome_autocorrelation(X, lengths, obs, n_cells, max_lag=20):
 
 
 def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
-              labels, title, masked=None):
+              labels, title, masked=None, warp_centre=None):
     """Six panels that answer whether the fit means anything.
 
     Ordered by what would invalidate the result soonest: if the plane is one
@@ -601,9 +627,9 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(2, 3, figsize=(14.5, 8.4))
-    good = X[obs]
-    sub = good if len(good) < 300_000 else good[
-        np.random.default_rng(0).choice(len(good), 300_000, replace=False)]
+    # Drawn on the PLANE, whatever space the fit ran in, because that is
+    # where model.means are reported and the axes are labelled.
+    sub = plane_sample(X, obs, warp_centre, seed=0)
 
     a = ax[0, 0]
     # The masked points are drawn too, because the mask exists to remove a
@@ -611,11 +637,9 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
     # points.  A mask sitting where the arms are is the single most likely
     # reason a fit collapses into the core, and it should be visible rather
     # than inferred from the run log.
+    ms = None
     if masked is not None and masked.any():
-        ms = X[masked]
-        if len(ms) > 40_000:
-            ms = ms[np.random.default_rng(1).choice(len(ms), 40_000,
-                                                    replace=False)]
+        ms = plane_sample(X, masked, warp_centre, cap=40_000, seed=1)
         a.scatter(ms[:, 0], ms[:, 1], s=1.5, c="#c0392b", alpha=0.25,
                   lw=0, zorder=1, label=f"masked ({masked.mean():.1%})")
         a.legend(fontsize=6.5, frameon=False, loc="upper left")
@@ -629,6 +653,11 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
     a.set_title("a  is the plane multimodal?", fontsize=10, loc="left")
     a.set_xlabel("C (standardised)", fontsize=8)
     a.set_ylabel("F − F_exp (standardised)", fontsize=8)
+    # Measured off the DATA, before the means expand the axes -- a mean
+    # outside this box is a mean in the wrong coordinates.
+    drawn = sub if ms is None else np.vstack([sub, ms])
+    extent = (float(drawn[:, 0].min()), float(drawn[:, 0].max()),
+              float(drawn[:, 1].min()), float(drawn[:, 1].max()))
 
     a = ax[0, 1]
     lag = acf["lag"]
@@ -643,8 +672,16 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
     a.legend(fontsize=6.5, frameon=False)
 
     a = ax[0, 2]
-    dev = np.abs(good - np.median(good, axis=0)).max(1)
-    a.hist(np.clip(dev, 0, 60), bins=120, color="#7f8c8d")
+    # Masked points included: the panel exists to show where the cut falls
+    # relative to the cloud, and the retained set stops at the cut by
+    # construction, so on its own it can only ever show the cut at its edge.
+    seen = obs if masked is None else (obs | masked)
+    dev = np.abs(plane_sample(X, seen, warp_centre, seed=2)
+                 - np.median(sub, axis=0)).max(1)
+    hi = float(np.percentile(dev, 99.5)) if len(dev) else 60.0
+    if np.isfinite(mask_z) and mask_z > 0:
+        hi = max(hi, mask_z * 1.3)
+    a.hist(np.clip(dev, 0, max(hi, 1e-9)), bins=120, color="#7f8c8d")
     a.axvline(mask_z, color="#c0392b", lw=1.4)
     a.annotate(f"mask at |z| = {mask_z:g}", (mask_z, a.get_ylim()[1] * 0.8),
                xytext=(6, 0), textcoords="offset points", fontsize=8,
@@ -691,6 +728,9 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
+    return {"panel_a_extent": extent, "dev_max": float(dev.max())
+            if len(dev) else 0.0,
+            "means": np.asarray(model.means, float).copy()}
 
 
 def archetypes(k, anchor):
@@ -1194,11 +1234,12 @@ def main(argv=None) -> int:
                  columns=cols).to_parquet(
         out / "concordance_state_posterior_clr.parquet")
     if args.qc:
-        masked_flag = np.zeros(X.shape[0], bool)
-        if "mask_beyond_z" in sc:
-            med = np.array([np.median(X[obs, 0]), np.median(X[obs, 1])])
-            masked_flag = ((np.abs(X - med) > sc["mask_beyond_z"]).any(1)
-                           & np.isfinite(X).all(1) & ~obs)
+        # Taken from the masker, not re-derived: re-deriving it compared
+        # a plane-unit threshold against whatever space X is in, so under
+        # --space log-radial it silently selected nothing and the red
+        # points that show what the cut removed never appeared.
+        masked_flag = sc.get("masked_rows",
+                             np.zeros(X.shape[0], bool))
         acf = genome_autocorrelation(X, lengths, obs, n_cells,
                                      max_lag=args.qc_max_lag)
         pd.DataFrame(acf).to_csv(out / "hmm_qc_autocorrelation.tsv",
@@ -1208,8 +1249,8 @@ def main(argv=None) -> int:
         print(f"  QC: lag-1 autocorrelation of C is {a1:+.3f} within cells "
               f"and {a1p:+.3f} on the pooled track", file=sys.stderr)
         if "mask_beyond_z" in sc and sc.get("frac_masked_extreme", 0) > 0.01:
-            good_r = np.linalg.norm(
-                X[obs] - np.median(X[obs], axis=0), axis=1)
+            pl = plane_sample(X, obs, sc.get("warp_centre"), seed=3)
+            good_r = np.linalg.norm(pl - np.median(pl, axis=0), axis=1)
             reach = float(np.percentile(good_r, 99.5))
             if reach > 0.8 * sc["mask_beyond_z"]:
                 print(f"  QC: the retained cloud reaches {reach:.0f} from "
@@ -1242,7 +1283,8 @@ def main(argv=None) -> int:
                       [d["label"] for d in info],
                       f"HMM QC: k={model.k}, "
                       f"{int(obs.sum()):,} observed bins",
-                      masked=masked_flag)
+                      masked=masked_flag,
+                      warp_centre=sc.get("warp_centre"))
             print(f"  QC figure -> {qc_path.name}", file=sys.stderr)
         except Exception as exc:
             print(f"  QC figure failed: {exc}", file=sys.stderr)

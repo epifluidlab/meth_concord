@@ -890,3 +890,136 @@ def test_space_flag_runs_end_to_end(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "log-radial space" in r.stderr
     assert "reported back on the original plane" in r.stderr
+
+
+# --------------------------------------- the QC and the fit share coordinates --
+
+def _offset_arms(n=6_000, centre=(130.0, -122.0), seed=0):
+    """A dense core with three arms, sitting far from the origin -- the
+    shape real data came back with, and the shape that makes a coordinate
+    mix-up visible instead of merely wrong by a little."""
+    rng = np.random.default_rng(seed)
+    dirs = np.array([[0.15, 0.99], [0.80, -0.60], [-0.95, 0.05]])
+    lab = rng.integers(0, 3, n)
+    t = rng.random(n) ** 8 * 40.0
+    return (dirs[lab] * t[:, None] + rng.normal(0, 2.0, (n, 2))
+            + np.array(centre, float))
+
+
+def _fake_model(m, centre):
+    class _M:
+        pass
+    mod = _M()
+    mod.k = 3
+    mod.A = np.full((3, 3), 1 / 3)
+    mod.means = m.unwarp_log_radial(
+        np.array([[0.5, 0.5], [1.0, -1.0], [-1.5, 0.1]]), centre)
+    return mod
+
+
+_ACF = {"lag": [1, 2], "C_within_cell": [0.4, 0.2], "C_pooled": [0.4, 0.2],
+        "dF_within_cell": [0.4, 0.2], "dF_pooled": [0.4, 0.2]}
+
+
+def _contains(extent, pts):
+    x0, x1, y0, y1 = extent
+    return bool(((pts[:, 0] >= x0) & (pts[:, 0] <= x1)
+                 & (pts[:, 1] >= y0) & (pts[:, 1] <= y1)).all())
+
+
+def test_the_qc_draws_the_cloud_and_the_means_in_one_coordinate_system(
+        tmp_path):
+    """Under --space log-radial the fit runs on a warped matrix but the
+    means are reported back on the plane.  Panel (a) drew the warped matrix
+    against plane means, which put a log-compressed cloud at the origin and
+    the state markers a hundred units away -- a picture identical to a fit
+    that has collapsed, produced by a figure that was simply lying."""
+    m = _mod()
+    P = _offset_arms()
+    obs = np.ones(len(P), bool)
+    W, centre = m.warp_log_radial(P, obs)
+    model = _fake_model(m, centre)
+    args = (W, obs, model, _ACF, float("nan"), [], [1.0, 2.0],
+            ["a", "b", "c"], "t")
+    right = m.qc_figure(tmp_path / "right.png", *args, warp_centre=centre)
+    wrong = m.qc_figure(tmp_path / "wrong.png", *args)
+    assert _contains(right["panel_a_extent"], right["means"])
+    assert not _contains(wrong["panel_a_extent"], wrong["means"])
+
+
+def test_the_qc_panel_is_on_the_plane_whatever_space_the_fit_used(tmp_path):
+    """Same data, same axes, whichever space it was fitted in."""
+    m = _mod()
+    P = _offset_arms()
+    obs = np.ones(len(P), bool)
+    W, centre = m.warp_log_radial(P, obs)
+    model = _fake_model(m, centre)
+    args = (_ACF, float("nan"), [], [1.0, 2.0], ["a", "b", "c"], "t")
+    flat = m.qc_figure(tmp_path / "p.png", P, obs, model, *args)
+    warped = m.qc_figure(tmp_path / "w.png", W, obs, model, *args,
+                         warp_centre=centre)
+    np.testing.assert_allclose(flat["panel_a_extent"],
+                               warped["panel_a_extent"], atol=1e-6)
+
+
+def test_the_cut_histogram_shows_what_the_cut_removed(tmp_path):
+    """Panel (c) asks where the cut falls relative to the cloud.  Drawn from
+    the retained points alone it cannot answer: the retained set stops at
+    the cut by construction, so the line always sits at the right edge."""
+    m = _mod()
+    P = _offset_arms()
+    med = np.median(P, axis=0)
+    far = (np.abs(P - med) > 12.0).any(1)
+    obs, model = ~far, _fake_model(m, med)
+    model.means = P[obs][:3]
+    args = (_ACF, 12.0, [], [1.0, 2.0], ["a", "b", "c"], "t")
+    with_mask = m.qc_figure(tmp_path / "m.png", P, obs, model, *args,
+                            masked=far)
+    without = m.qc_figure(tmp_path / "n.png", P, obs, model, *args)
+    assert far.sum() > 50
+    assert with_mask["dev_max"] > 2 * without["dev_max"]
+
+
+def test_the_mask_is_recorded_not_re_derived_from_a_warped_matrix():
+    """main used to reconstruct the mask by thresholding X against a
+    plane-unit cut.  X is only the plane in plane space; warped deviations
+    never reach the threshold, so under --space log-radial the red points
+    that show what the cut removed silently vanished."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300, missing=0.0)
+    P = _offset_arms(n=8 * 300)
+    Cv, Fv = P[:, 0].reshape(8, 300), P[:, 1].reshape(8, 300)
+    kw = dict(scale_c=1.0, scale_f=1.0, clip=12.0)
+    _X, _l, obs, _o, info = m.build_sequences(Cv, Fv, list(C.columns), **kw)
+    rows = info["masked_rows"]
+    assert int(rows.sum()) == info["n_masked_extreme"] >= 10
+    assert not (rows & obs).any()
+
+    Xw, _lw, obsw, _ow, infow = m.build_sequences(
+        Cv, Fv, list(C.columns), space="log-radial", **kw)
+    np.testing.assert_array_equal(infow["masked_rows"], rows)
+    # what the re-derivation used to find: log1p shrinks a 40-unit arm to
+    # under 4, so a 12-unit plane cut selects nothing at all.
+    med = np.array([np.median(Xw[obsw, 0]), np.median(Xw[obsw, 1])])
+    stale = ((np.abs(Xw - med) > 12.0).any(1) & np.isfinite(Xw).all(1)
+             & ~obsw)
+    assert int(stale.sum()) == 0 < int(rows.sum())
+
+
+def test_the_reach_warning_still_fires_in_log_radial_space(tmp_path):
+    """The one diagnostic that would have caught the mask sitting on the
+    arms was computed off the warped matrix too, so turning on the flag
+    turned off the warning."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300, noise=2.0, missing=0.0)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--max-z", "1.5", "--qc",
+         "--space", "log-radial", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "o")], capture_output=True,
+        text=True)
+    assert r.returncode == 0, r.stderr
+    assert "INSIDE the structure" in r.stderr
