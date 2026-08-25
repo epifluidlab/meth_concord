@@ -332,7 +332,8 @@ def unwarp_log_radial(W, centre):
     return W * scale[:, None] + centre
 
 
-def plane_sample(X, sel, warp_centre=None, cap=300_000, seed=0):
+def plane_sample(X, sel, warp_centre=None, cap=300_000, seed=0,
+                 return_index=False):
     """Selected rows of X back on the ORIGINAL plane, capped for plotting.
 
     Every diagnostic is quoted in plane units -- the |z| mask, the reach
@@ -348,13 +349,83 @@ def plane_sample(X, sel, warp_centre=None, cap=300_000, seed=0):
     done after subsampling because the full matrix is tens of millions of
     rows and nothing here needs more than the sample.
     """
-    Xs = np.asarray(X, float)[np.asarray(sel, bool)]
-    if len(Xs) > cap:
-        Xs = Xs[np.random.default_rng(seed).choice(len(Xs), cap,
-                                                   replace=False)]
-    if warp_centre is None:
-        return Xs
-    return unwarp_log_radial(Xs, np.asarray(warp_centre, float))
+    idx = np.flatnonzero(np.asarray(sel, bool))
+    if len(idx) > cap:
+        idx = np.random.default_rng(seed).choice(idx, cap, replace=False)
+    Xs = np.asarray(X, float)[idx]
+    if warp_centre is not None:
+        Xs = unwarp_log_radial(Xs, np.asarray(warp_centre, float))
+    return (Xs, idx) if return_index else Xs
+
+
+def point_colour(tab, column, n_bins, max_levels=12):
+    """A per-(cell, bin) colour spec from a per-cell column.
+
+    X is laid out cell-major, so row r belongs to cell r // n_bins whatever
+    order the bins were sorted into.
+    """
+    if column not in tab.columns:
+        raise SystemExit(f"--colour-by {column!r} not in the samples table; "
+                         f"columns are {list(tab.columns)[:12]}")
+    col = tab[column]
+    vals = pd.to_numeric(col, errors="coerce")
+    numeric = bool(col.notna().any() and vals.notna().sum()
+                   == col.notna().sum())
+    if numeric and col.nunique(dropna=True) > max_levels:
+        return {"kind": "num", "column": column,
+                "values": np.repeat(vals.to_numpy(float), n_bins)}
+    cat = pd.Categorical(col.astype(str).where(col.notna(), "n/a"))
+    if len(cat.categories) > max_levels:
+        raise SystemExit(
+            f"--colour-by {column!r} has {len(cat.categories)} levels; "
+            f"panel (a) can separate at most {max_levels}.  Pick a coarser "
+            f"column, or a numeric one for a colour bar.")
+    return {"kind": "cat", "column": column,
+            "names": [str(c) for c in cat.categories],
+            "codes": np.repeat(np.asarray(cat.codes, int), n_bins)}
+
+
+def load_cell_table(path, cell_column, index):
+    """Per-cell annotation aligned to the concordance matrix's rows."""
+    df = pd.read_csv(path, sep="\t")
+    if cell_column not in df.columns:
+        raise SystemExit(f"--cell-column {cell_column!r} not in {path}; "
+                         f"columns are {list(df.columns)[:10]}")
+    tab = df.set_index(cell_column)
+    tab = tab[~tab.index.duplicated(keep="first")]
+    return tab.reindex(index)
+
+
+def batch_series(tab, spec, flag, path):
+    """One column, or several as a frame -- what the pipeline's own
+    correction accepts, so 'exp_batch,lib_batch' means here what it means
+    there."""
+    cols = [c.strip() for c in str(spec).split(",") if c.strip()]
+    missing = [c for c in cols if c not in tab.columns]
+    if missing:
+        raise SystemExit(f"{flag} not in {path}: {missing}")
+    return tab[cols[0]] if len(cols) == 1 else tab[cols]
+
+
+def batch_group_confounding(batch, group):
+    """For each batch level, the share taken by its commonest group.
+
+    Every per-bin correction here removes each batch's mean.  Where a batch
+    is almost entirely one biological group, that mean IS the group, and
+    the correction deletes the difference it was meant to protect.  This is
+    the ordinary failure of ComBat on a design where the tumours and the
+    reference cell types were not prepared together, which is most designs.
+    """
+    b = pd.Series(np.asarray(batch, object), dtype=object).astype(str)
+    g = pd.Series(np.asarray(group, object), dtype=object).astype(str)
+    rows = []
+    for lev, sub in g.groupby(b.to_numpy()):
+        vc = sub.value_counts()
+        rows.append({"batch": str(lev), "n_cells": int(len(sub)),
+                     "top_group": str(vc.index[0]),
+                     "share": float(vc.iloc[0]) / max(len(sub), 1)})
+    return pd.DataFrame(rows).sort_values(
+        "share", ascending=False).reset_index(drop=True)
 
 
 def density_equalised(X, rng, n=60_000, grid=120):
@@ -616,7 +687,7 @@ def genome_autocorrelation(X, lengths, obs, n_cells, max_lag=20):
 
 
 def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
-              labels, title, masked=None, warp_centre=None):
+              labels, title, masked=None, warp_centre=None, colour=None):
     """Six panels that answer whether the fit means anything.
 
     Ordered by what would invalidate the result soonest: if the plane is one
@@ -629,7 +700,8 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
     fig, ax = plt.subplots(2, 3, figsize=(14.5, 8.4))
     # Drawn on the PLANE, whatever space the fit ran in, because that is
     # where model.means are reported and the axes are labelled.
-    sub = plane_sample(X, obs, warp_centre, seed=0)
+    sub, sub_idx = plane_sample(X, obs, warp_centre, seed=0,
+                                return_index=True)
 
     a = ax[0, 0]
     # The masked points are drawn too, because the mask exists to remove a
@@ -643,14 +715,40 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
         a.scatter(ms[:, 0], ms[:, 1], s=1.5, c="#c0392b", alpha=0.25,
                   lw=0, zorder=1, label=f"masked ({masked.mean():.1%})")
         a.legend(fontsize=6.5, frameon=False, loc="upper left")
-    a.hexbin(sub[:, 0], sub[:, 1], gridsize=70, bins="log", cmap="Blues",
-             mincnt=1, zorder=2)
+    if colour is None:
+        a.hexbin(sub[:, 0], sub[:, 1], gridsize=70, bins="log", cmap="Blues",
+                 mincnt=1, zorder=2)
+    elif colour["kind"] == "cat":
+        # One colour per level, with that level's median marked.  If an arm
+        # is one batch, or one cell type, it says so here and no amount of
+        # re-fitting is the answer.
+        cm = plt.get_cmap("tab10")
+        g = np.asarray(colour["codes"])[sub_idx]
+        for i, nm in enumerate(colour["names"]):
+            sel = g == i
+            if not sel.any():
+                continue
+            a.scatter(sub[sel, 0], sub[sel, 1], s=1.2, alpha=0.25, lw=0,
+                      color=cm(i % 10), zorder=2,
+                      label=f"{nm} ({sel.mean():.0%})")
+            med = np.median(sub[sel], axis=0)
+            a.scatter([med[0]], [med[1]], s=85, marker="D", zorder=4,
+                      facecolor=cm(i % 10), edgecolor="k", lw=1.0)
+        a.legend(fontsize=5.5, frameon=False, loc="best", markerscale=6,
+                 ncol=1 + len(colour["names"]) // 7)
+    else:
+        v = np.asarray(colour["values"], float)[sub_idx]
+        sm = a.scatter(sub[:, 0], sub[:, 1], c=v, s=1.2, alpha=0.35, lw=0,
+                       cmap="viridis", zorder=2)
+        fig.colorbar(sm, ax=a, fraction=0.046, label=colour["column"])
     a.scatter(model.means[:, 0], model.means[:, 1], s=110, marker="x",
               c="#1a1a1a", lw=2.4, zorder=5)
     for i, m in enumerate(model.means):
         a.annotate(str(i), m, fontsize=8, color="#c0392b",
                    xytext=(4, 4), textcoords="offset points", zorder=6)
-    a.set_title("a  is the plane multimodal?", fontsize=10, loc="left")
+    a.set_title("a  is the plane multimodal?" if colour is None else
+                f"a  the plane, coloured by {colour['column']}",
+                fontsize=10, loc="left")
     a.set_xlabel("C (standardised)", fontsize=8)
     a.set_ylabel("F − F_exp (standardised)", fontsize=8)
     # Measured off the DATA, before the means expand the axes -- a mean
@@ -1027,15 +1125,117 @@ def main(argv=None) -> int:
                          "scale -- true only when most bins are null.  Pass "
                          "a number to override.")
     ap.add_argument("--sector", type=float, default=30.0)
+    ap.add_argument("--samples", default=None, metavar="TSV",
+                    help="Per-cell annotation table, for "
+                         "--concordance-batch-correction and --colour-by.")
+    ap.add_argument("--cell-column", default="cell",
+                    help="Cell-id column in --samples.")
+    ap.add_argument("--concordance-batch-column", default=None,
+                    metavar="COLS",
+                    help="Batch variable(s) in --samples, comma-separated "
+                         "(e.g. 'exp_batch,lib_batch').")
+    ap.add_argument("--concordance-batch-correction",
+                    choices=["none", "center", "zscore", "combat"],
+                    default="none",
+                    help="Per-bin batch correction of C and F-F_exp before "
+                         "fitting, via the pipeline's own "
+                         "batch_correction.correct_and_report -- the "
+                         "identical transform the component UMAPs get.  It "
+                         "is OFF by default and that is not an oversight: "
+                         "concordance_coordination.parquet is written "
+                         "inside step 5, BEFORE the pipeline applies "
+                         "--concordance-batch-correction to the shrunk "
+                         "matrix, so no per-bin batch correction has "
+                         "touched these files however the pipeline was run "
+                         "(--batch-correction is a different stage and "
+                         "does reach them, indirectly, by correcting the "
+                         "accessibility matrix that seeds the RWR graph).  "
+                         "Turning it on here makes "
+                         "the HMM consistent with the rest of the run.  It "
+                         "is not free: every method removes each batch's "
+                         "per-bin MEAN, so wherever a batch is one "
+                         "biological group the correction deletes that "
+                         "group's biology -- see the confounding table this "
+                         "prints.  'combat' additionally rescales per "
+                         "(batch, bin) by a shrunken variance ratio, which "
+                         "on a non-negative quantity like C can push values "
+                         "below zero; the run reports how many.")
+    ap.add_argument("--colour-by", default=None, metavar="COLUMN",
+                    help="Colour QC panel (a) by this --samples column "
+                         "instead of point density.  A categorical column "
+                         "gets one colour per level with that level's "
+                         "median marked; a numeric one gets a colour bar.  "
+                         "This is how you find out what an arm of the plane "
+                         "IS: if each arm is one batch, or one cell type, "
+                         "or one coverage band, no choice of K or emission "
+                         "family is the answer.")
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args(argv)
 
     Cdf = pd.read_parquet(args.coordination)
     Fdf = pd.read_parquet(args.direction_excess).reindex(
         index=Cdf.index, columns=Cdf.columns)
-    C, dF = Cdf.to_numpy(float), Fdf.to_numpy(float)
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    tab = (load_cell_table(args.samples, args.cell_column, Cdf.index)
+           if args.samples else None)
+    if args.colour_by and tab is None:
+        sys.exit("--colour-by needs --samples")
+    cbc = args.concordance_batch_correction
+    if cbc != "none":
+        if tab is None or not args.concordance_batch_column:
+            sys.exit("--concordance-batch-correction needs --samples and "
+                     "--concordance-batch-column")
+        bl = batch_series(tab, args.concordance_batch_column,
+                          "--concordance-batch-column", args.samples)
+        n_lab = int(bl.notna().all(axis=1).sum()
+                    if isinstance(bl, pd.DataFrame) else bl.notna().sum())
+        print(f"  batch: {cbc} on C and F-F_exp over "
+              f"{args.concordance_batch_column} "
+              f"({n_lab:,}/{len(Cdf):,} cells labelled)", file=sys.stderr)
+        if args.colour_by and args.colour_by in getattr(tab, "columns", []):
+            key = (bl if isinstance(bl, pd.Series)
+                   else bl.astype(str).agg("|".join, axis=1))
+            conf = batch_group_confounding(key, tab[args.colour_by])
+            conf.to_csv(out / "hmm_batch_confounding.tsv", sep="\t",
+                        index=False)
+            worst = conf.iloc[0]
+            print(f"  batch vs {args.colour_by}: worst level "
+                  f"{worst['batch']!r} is {worst['share']:.0%} "
+                  f"{worst['top_group']!r} ({int(worst['n_cells'])} cells)",
+                  file=sys.stderr)
+            if float(worst["share"]) > 0.9:
+                print(f"  WARNING batch and {args.colour_by} are confounded "
+                      f"there.  Removing that batch's per-bin mean removes "
+                      f"that group's biology with it; the correction cannot "
+                      f"tell them apart.  See "
+                      f"hmm_batch_confounding.tsv.", file=sys.stderr)
+        neg_before = float(np.mean(Cdf.to_numpy(float)[
+            np.isfinite(Cdf.to_numpy(float))] < 0))
+        from nome_hic_concordance import batch_correction as _bc
+        Cdf = _bc.correct_and_report(Cdf, bl, cbc, args.seed, "coordination")
+        Fdf = _bc.correct_and_report(Fdf, bl, cbc, args.seed,
+                                     "direction_excess")
+        cv = Cdf.to_numpy(float)
+        neg_after = float(np.mean(cv[np.isfinite(cv)] < 0))
+        print(f"  C below zero: {neg_before:.2%} -> {neg_after:.2%}.  C is "
+              f"a covariance-scale magnitude; a location-scale correction "
+              f"is free to move it across zero, and C = 0 is the point the "
+              f"labelling calls the null.", file=sys.stderr)
+    else:
+        print("  batch: none applied here.  "
+              "concordance_coordination.parquet is written inside step 5, "
+              "BEFORE the pipeline's --concordance-batch-correction (which "
+              "acts on the shrunk matrix and writes "
+              "concordance_batchcorrected.parquet), so no per-bin batch "
+              "correction has touched these values however the pipeline "
+              "was run.  --batch-correction is a different stage and DID "
+              "reach them, indirectly: it corrects the accessibility "
+              "matrix at step 3.5, which changes the k-NN graph and so "
+              "what RWR imputes.", file=sys.stderr)
+
+    C, dF = Cdf.to_numpy(float), Fdf.to_numpy(float)
 
     _mz = args.clip
     if isinstance(_mz, str) and _mz.lower() != "auto":
@@ -1284,7 +1484,9 @@ def main(argv=None) -> int:
                       f"HMM QC: k={model.k}, "
                       f"{int(obs.sum()):,} observed bins",
                       masked=masked_flag,
-                      warp_centre=sc.get("warp_centre"))
+                      warp_centre=sc.get("warp_centre"),
+                      colour=(point_colour(tab, args.colour_by, n_bins)
+                              if args.colour_by else None))
             print(f"  QC figure -> {qc_path.name}", file=sys.stderr)
         except Exception as exc:
             print(f"  QC figure failed: {exc}", file=sys.stderr)

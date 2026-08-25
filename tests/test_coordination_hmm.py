@@ -1023,3 +1023,228 @@ def test_the_reach_warning_still_fires_in_log_radial_space(tmp_path):
         text=True)
     assert r.returncode == 0, r.stderr
     assert "INSIDE the structure" in r.stderr
+
+
+# ------------------------------------- batch: what actually reaches the fit --
+
+def _samples(tmp_path, n_cells, cells=None, seed=0):
+    rng = np.random.default_rng(seed)
+    cells = list(cells) if cells is not None else [
+        f"cell{i}" for i in range(n_cells)]
+    tab = pd.DataFrame({
+        "cell": cells,
+        "exp_batch": [f"E{i % 3}" for i in range(len(cells))],
+        "lib_batch": [f"L{i % 2}" for i in range(len(cells))],
+        "cell_type": ["tumour" if i % 3 == 0 else "reference"
+                      for i in range(len(cells))],
+        "n_pairs": rng.integers(500, 50_000, len(cells)),
+    })
+    path = tmp_path / "samples.tsv"
+    tab.to_csv(path, sep="\t", index=False)
+    return path
+
+
+def test_the_hmm_inputs_are_uncorrected_and_the_run_says_so(tmp_path):
+    """concordance_coordination.parquet is written inside step 5, before the
+    pipeline corrects the shrunk matrix.  Someone who ran the pipeline with
+    --concordance-batch-correction combat has every reason to believe these
+    values were corrected, and they were not."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3",
+         "--output-dir", str(tmp_path / "o")], capture_output=True,
+        text=True)
+    assert r.returncode == 0, r.stderr
+    assert "batch: none" in r.stderr
+    assert "BEFORE the pipeline" in r.stderr
+
+
+def test_batch_correction_needs_both_a_table_and_a_column(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3",
+         "--concordance-batch-correction", "center",
+         "--output-dir", str(tmp_path / "o")], capture_output=True,
+        text=True)
+    assert r.returncode != 0
+    assert "--concordance-batch-column" in r.stderr
+
+
+def test_correcting_removes_a_planted_batch_offset(tmp_path):
+    """The correction has to actually work, not merely run."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=12, n_bins=300, missing=0.0)
+    Cv = C.to_numpy(float).copy()
+    off = np.array([0.0, 5.0, -5.0])[np.arange(12) % 3]
+    Cv += off[:, None]
+    Cb = pd.DataFrame(Cv, index=C.index, columns=C.columns)
+    Cb.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    sp = _samples(tmp_path, 12, cells=list(C.index))
+
+    def spread(out):
+        d = pd.read_parquet(out / "concordance_state_posterior.parquet")
+        return d
+    before = float(np.nanstd(
+        [np.nanmean(Cv[np.arange(12) % 3 == g]) for g in range(3)]))
+    from nome_hic_concordance import batch_correction as _bc
+    fixed = _bc.correct_and_report(
+        Cb, pd.read_csv(sp, sep="\t").set_index("cell")["exp_batch"],
+        "center", 0, "coordination").to_numpy(float)
+    after = float(np.nanstd(
+        [np.nanmean(fixed[np.arange(12) % 3 == g]) for g in range(3)]))
+    assert after < 0.05 * before
+
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--samples", str(sp),
+         "--concordance-batch-column", "exp_batch,lib_batch",
+         "--concordance-batch-correction", "center",
+         "--output-dir", str(tmp_path / "o")], capture_output=True,
+        text=True)
+    assert r.returncode == 0, r.stderr
+    assert "batch: center on C and F-F_exp" in r.stderr
+
+
+def test_the_run_reports_how_much_of_c_the_correction_pushed_below_zero(
+        tmp_path):
+    """C is a covariance-scale magnitude and came back strictly positive on
+    real data, which is what makes C = 0 usable as the null.  A location-
+    scale correction is free to move mass across it, and that should be a
+    number in the log rather than a surprise in the labelling."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=12, n_bins=300, missing=0.0)
+    Cv = np.abs(C.to_numpy(float)) + 1.0
+    Cv[np.arange(12) % 3 == 1] += 8.0
+    pd.DataFrame(Cv, index=C.index, columns=C.columns).to_parquet(
+        tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    sp = _samples(tmp_path, 12, cells=list(C.index))
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--samples", str(sp),
+         "--concordance-batch-column", "exp_batch",
+         "--concordance-batch-correction", "center",
+         "--output-dir", str(tmp_path / "o")], capture_output=True,
+        text=True)
+    assert r.returncode == 0, r.stderr
+    assert "C below zero: 0.00% ->" in r.stderr
+    frac = float(r.stderr.split("C below zero: 0.00% -> ")[1].split("%")[0])
+    assert frac > 10.0
+
+
+def test_confounded_batch_and_biology_is_named_not_silently_corrected(
+        tmp_path):
+    """Removing a batch's per-bin mean removes whatever that batch IS.  When
+    a batch is one cell type -- tumours and references rarely prepared
+    together -- that is the biology, and no method separates them."""
+    m = _mod()
+    C, F, _st = _fixture(n_cells=12, n_bins=200, missing=0.0)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    tab = pd.DataFrame({
+        "cell": list(C.index),
+        "exp_batch": [f"E{i % 3}" for i in range(12)],
+        "cell_type": ["tumour" if i % 3 == 0 else "reference"
+                      for i in range(12)],
+    })
+    sp = tmp_path / "s.tsv"
+    tab.to_csv(sp, sep="\t", index=False)
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--samples", str(sp),
+         "--concordance-batch-column", "exp_batch",
+         "--concordance-batch-correction", "center",
+         "--colour-by", "cell_type", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "confounded" in r.stderr
+    conf = pd.read_csv(out / "hmm_batch_confounding.tsv", sep="\t")
+    assert float(conf["share"].max()) == 1.0
+
+
+def test_confounding_is_measured_per_batch_level():
+    m = _mod()
+    batch = ["A"] * 4 + ["B"] * 4
+    group = ["t", "t", "t", "t", "t", "r", "r", "r"]
+    tab = m.batch_group_confounding(batch, group).set_index("batch")
+    assert tab.loc["A", "share"] == 1.0
+    assert tab.loc["A", "top_group"] == "t"
+    assert tab.loc["B", "share"] == 0.75
+
+
+def test_colour_by_labels_every_row_by_its_own_cell():
+    """X is cell-major; a colour that drifts off the cells it names would
+    make every arm look mixed and answer the question wrongly."""
+    m = _mod()
+    tab = pd.DataFrame({"g": ["a", "b", "a"], "n": [1.0, 2.0, 3.0]},
+                       index=["c0", "c1", "c2"])
+    spec = m.point_colour(tab, "g", n_bins=4)
+    assert spec["kind"] == "cat" and spec["names"] == ["a", "b"]
+    np.testing.assert_array_equal(
+        spec["codes"], np.array([0] * 4 + [1] * 4 + [0] * 4))
+
+
+def test_a_numeric_column_gets_a_colour_bar_not_ten_thousand_levels():
+    m = _mod()
+    tab = pd.DataFrame({"n_pairs": np.arange(40, dtype=float)},
+                       index=[f"c{i}" for i in range(40)])
+    spec = m.point_colour(tab, "n_pairs", n_bins=2)
+    assert spec["kind"] == "num"
+    np.testing.assert_allclose(spec["values"][:4], [0, 0, 1, 1])
+
+
+def test_a_high_cardinality_categorical_is_refused_with_the_way_out():
+    m = _mod()
+    tab = pd.DataFrame({"donor": [f"d{i}" for i in range(30)]},
+                       index=[f"c{i}" for i in range(30)])
+    with pytest.raises(SystemExit) as e:
+        m.point_colour(tab, "donor", n_bins=2)
+    assert "30 levels" in str(e.value)
+
+
+def test_colour_by_needs_a_samples_table(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=200)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--colour-by", "batch",
+         "--output-dir", str(tmp_path / "o")], capture_output=True,
+        text=True)
+    assert r.returncode != 0
+    assert "--colour-by needs --samples" in r.stderr
+
+
+def test_the_coloured_qc_renders_end_to_end(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=9, n_bins=200)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    sp = _samples(tmp_path, 9, cells=list(C.index))
+    out = tmp_path / "o"
+    for col in ("exp_batch", "n_pairs"):
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--coordination",
+             str(tmp_path / "c.parquet"), "--direction-excess",
+             str(tmp_path / "f.parquet"), "--k", "3", "--samples", str(sp),
+             "--colour-by", col, "--qc", "--plot-format", "png",
+             "--output-dir", str(out)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert (out / "hmm_qc.png").exists()
