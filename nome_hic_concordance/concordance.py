@@ -1368,11 +1368,12 @@ def compute_signed_concordance_matrix(
     # bin's expected RATE is formed (see _compute_cell_dm_expected mode).
     uses_expected = baseline in ("distance-matched", "distance-pooled")
     if concordance_combine not in ("signed-diff", "log2-ratio", "linked-only",
-                                   "concordant-diff", "concordant-signed"):
+                                   "concordant-diff", "concordant-signed",
+                                   "direction-logor"):
         raise ValueError(
             f"concordance_combine must be 'signed-diff', 'log2-ratio', "
-            f"'linked-only', 'concordant-diff', or 'concordant-signed'; "
-            f"got {concordance_combine!r}.")
+            f"'linked-only', 'concordant-diff', 'concordant-signed', or "
+            f"'direction-logor'; got {concordance_combine!r}.")
 
     out_path = ensure_dir(output_dir) if save_outputs else None
     items = list(cell_posterior_paths.items())
@@ -1826,6 +1827,16 @@ def compute_signed_concordance_matrix(
             # sensitive at ~50% level where log2-ratio vanishes.  This is the
             # theoretically cleanest coordination statistic against an O/E null.
             delta_signed = (o_open + o_closed) - (e_open + e_closed)
+        elif concordance_combine == "direction-logor":
+            # L = log(O_open/O_closed) - log(E_open/E_closed), the natural
+            # parameter of the 2x2 table.  Identical to 'log2-ratio' up to
+            # the base (log2-ratio = L / ln 2) with ONE difference that
+            # matters on sparse data: where a bin has no observed concordant
+            # mass, log2-ratio still returns log2(E_closed/E_open) from the
+            # clip -- a confident direction read off the null, in a bin with
+            # no data.  decompose_components returns 0 there instead.
+            delta_signed = decompose_components(
+                o_open, o_closed, e_open, e_closed)["direction_logor"]
         elif concordance_combine == "concordant-signed":
             # D = C·(2F−1): the coordination magnitude of 'concordant-diff',
             # SIGNED by which co-state realizes it.  Gives the single

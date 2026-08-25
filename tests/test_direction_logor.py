@@ -127,3 +127,61 @@ def test_it_is_the_same_function_the_pipeline_calls():
     src = inspect.getsource(cc.compute_signed_concordance_matrix)
     assert "decompose_components(" in src
     assert "def _decompose" not in src
+
+
+# ------------------------- the headline matrix, and the option it duplicates --
+
+def _log2_ratio(oo, oc, eo, ec, eps=1e-6):
+    """What --concordance-combine log2-ratio computes."""
+    l2 = lambda x: np.log2(np.clip(x, eps, None))
+    return (l2(oo) - l2(eo)) - (l2(oc) - l2(ec))
+
+
+def test_log2_ratio_is_the_same_statistic_in_another_base():
+    rng = np.random.default_rng(3)
+    oo, oc, eo, ec = _rates(rng, 2_000)
+    L = dc(oo, oc, eo, ec)["direction_logor"]
+    np.testing.assert_allclose(_log2_ratio(oo, oc, eo, ec), L / np.log(2),
+                               rtol=1e-9)
+
+
+def test_log2_ratio_invents_a_direction_where_there_is_no_data():
+    """With no observed concordant mass the clip alone returns
+    log2(E_closed/E_open) -- a confident direction read off the NULL, in a
+    bin that measured nothing.  On sparse single-cell data that is not an
+    edge case, it is a large share of the matrix."""
+    z = np.zeros(1)
+    eo, ec = np.array([0.20]), np.array([0.60])
+    assert _log2_ratio(z, z, eo, ec)[0] == pytest.approx(np.log2(3.0))
+    assert dc(z, z, eo, ec)["direction_logor"][0] == 0.0
+
+
+def test_the_combine_option_is_exactly_the_emitted_component(tmp_path):
+    """One definition, not two that drift.  The headline matrix under
+    --concordance-combine direction-logor must equal concordance_direction_
+    logor.parquet entry for entry."""
+    import pandas as pd
+    from nome_hic_concordance import concordance as cc
+    from tests.test_signed_concordance import _focal_active_paths
+    src, out = tmp_path / "src", tmp_path / "o"
+    src.mkdir(parents=True, exist_ok=True)
+    res = cc.compute_signed_concordance_matrix(
+        _focal_active_paths(src, n_cells=3),
+        bin_size=1000, min_distance=100, min_gch_sites=2,
+        baseline="distance-matched", dm_dist_bin=100, dm_prior="shared",
+        concordance_combine="direction-logor",
+        output_dir=str(out), save_outputs=True, use_rwr=False,
+    )
+    delta = res["delta_signed"]
+    comp = pd.read_parquet(out / "concordance_direction_logor.parquet")
+    np.testing.assert_allclose(
+        delta.to_numpy(float),
+        comp.reindex(index=delta.index, columns=delta.columns).to_numpy(float),
+        rtol=0, atol=0, equal_nan=True)
+
+
+def test_the_option_is_accepted_and_a_typo_is_not():
+    from nome_hic_concordance import concordance as cc
+    with pytest.raises(ValueError, match="direction-logor"):
+        cc.compute_signed_concordance_matrix(
+            {}, concordance_combine="direction_logor", save_outputs=False)

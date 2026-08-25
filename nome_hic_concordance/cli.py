@@ -181,7 +181,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--concordance-combine",
         choices=["auto", "signed-diff", "log2-ratio", "linked-only",
-                 "concordant-diff", "concordant-signed"],
+                 "concordant-diff", "concordant-signed", "direction-logor"],
         default="concordant-signed",
         help="How the long-range observed (O) and baseline (E) co-state rates "
              "are combined.  'signed-diff' = "
@@ -191,6 +191,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "log2(O_open/E_open)−log2(O_closed/E_closed) (symmetric, "
              "scale-free, Hi-C O/E convention; retains coordination but with a "
              "marginal-dependent scaling that vanishes near the 0.5 level).  "
+             "'direction-logor' = log(O_open/O_closed) − log(E_open/E_closed), "
+             "the log odds ratio of the same 2×2 table: additive, with a "
+             "variance free of F, so bins of different depth and different "
+             "marginal are comparable — which a difference of proportions "
+             "is not.  It is the SAME statistic as 'log2-ratio' up to the "
+             "base (log2-ratio = L / ln 2), with one difference that matters "
+             "on sparse data: where a bin has no observed concordant mass, "
+             "log2-ratio still returns log2(E_closed/E_open) out of its "
+             "clip — a confident direction read off the null in a bin with "
+             "no data — while this returns 0.  Prefer it over 'log2-ratio'.  "
+             "It is DIRECTION only: scaling the concordant mass up at a "
+             "fixed co-open:co-closed ratio leaves it unchanged and raises "
+             "C, so a claim that coordination INCREASED needs "
+             "'concordant-diff'.  "
              "'concordant-diff' = (O_open+O_closed)−(E_open+E_closed), the "
              "excess concordant mass / mixed deficit = 2·Cov: the marginal-free "
              "coordination magnitude (theoretically the cleanest against an O/E "
