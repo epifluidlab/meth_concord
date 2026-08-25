@@ -1808,6 +1808,13 @@ def run_context(
                     ("coordination", "coordination C (marginal-free)"),
                     ("direction_excess",
                      "direction excess F−F_exp (co-open vs null)"),
+                    # The same direction on the log-odds scale, where the
+                    # variance is free of F so bins of different depth and
+                    # different marginal are comparable.  Its own UMAP, not
+                    # a second axis beside direction_excess: the two are
+                    # monotone in the same F (see _decompose).
+                    ("direction_logor",
+                     "direction log-OR logit(F)−logit(F_exp)"),
                     ("directional", "directional D = C·(2F−1) (legacy)"),
                     ("direction", "direction F (co-open share)"),
                     ("marginal", "marginal p̄ (mean openness)"),

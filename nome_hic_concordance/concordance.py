@@ -1085,6 +1085,137 @@ def _dm_posterior_variance_S(
     return (mu_o + mu_c - (mu_o - mu_c) ** 2) / (alpha_total + n + 1.0)
 
 
+def decompose_components(
+    o_open: np.ndarray, o_closed: np.ndarray,
+    e_open: np.ndarray, e_closed: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Directional decomposition of the co-state distribution.
+
+    The 3-state (open / closed / mixed) distribution has exactly TWO
+    degrees of freedom: the marginal level p̄ and the association Cov.
+    "Co-open vs co-closed" is NOT a third axis — it *is* the marginal:
+
+      π_open − π_closed  ==  p̄_1 + p̄_2 − 1   is an exact per-pair
+        identity (the p_i·p_j terms cancel), so 'signed-diff' carries
+        zero coordination signal against a marginal-matched O/E null.
+
+      (O_open − E_open) == (O_closed − E_closed) == Cov, identically —
+        coordination moves mass out of `mixed` into BOTH concordant
+        cells by the same amount, so the *excess* cannot be attributed
+        to a direction either (a "co-open excess" map and a "co-closed
+        excess" map would be the same map).
+
+    Direction therefore has to come from where the concordant mass
+    actually SITS rather than from the excess:
+
+      C = (O_open + O_closed) − (E_open + E_closed)  coordination (=2·Cov)
+      F = O_open / (O_open + O_closed)               realized direction
+      D = C · (2F − 1)                               directional coordination
+
+    D > 0 → coordinated, realized co-OPEN; D < 0 → coordinated
+    co-CLOSED; D ≈ 0 → uncoordinated (mixed dominates).  D is *also* ≈0
+    for a coordinated-but-balanced bin (F ≈ 0.5), which is
+    direction-ambiguous rather than mixed — so C is emitted alongside D
+    to separate the two cases (mixed → C ≈ 0; balanced-coordinated →
+    C large with D ≈ 0).
+
+    WHERE THE ZERO OF D BELONGS.  ``2F − 1`` puts "no directional
+    preference" at F = 0.5, i.e. half the concordant mass co-open.  That
+    is the right zero only when the marginal is p̄ = 0.5.  Under
+    independence at marginal p̄ the concordant mass already splits
+
+        F_indep = p̄² / (p̄² + (1 − p̄)²)
+
+    which is 0.31 at p̄ = 0.40 and 0.012 at p̄ = 0.10.  So on sparse
+    accessibility data a bin with NO directional preference scores
+    2F − 1 ≈ −0.38, and D reports −0.38·C: every coordinated bin looks
+    co-closed, and D collapses to a scaled −C.  That is the marginal
+    contamination this docstring rejects for 'signed-diff' walking back
+    in through F.  Measured on one meningioma GCH run: p̄ = 0.4009,
+    F = 0.3230, corr(D, −C) = 0.970.
+
+    Referencing F to the SAME expected pool removes it:
+
+      F_exp = E_open / (E_open + E_closed)      direction under the null
+      D' = C · (F − F_exp)                      marginal-free direction
+
+    D' = 0 means the concordant mass sits where the marginal-matched
+    null puts it — the honest "balanced" — and its sign says co-open or
+    co-closed relative to that.  On the same run F − F_exp came out
+    POSITIVE where 2F − 1 was negative, so the two disagree on direction,
+    not merely on scale.
+
+    Both are emitted.  D is kept unchanged so existing outputs do not
+    move; D' ("directional_corrected") is the one to interpret.
+
+    DIRECTION ON THE LOG-ODDS SCALE.  F − F_exp is a difference of two
+    proportions, so its sampling variance is F(1−F)/n: the same excess
+    means a different amount of evidence at F = 0.5 and at F = 0.03,
+    and bins are not comparable across depths or across marginals.
+    The log odds ratio referred to the same null is
+
+      L = logit(F) − logit(F_exp) = log[(O_open/O_closed)
+                                        / (E_open/E_closed)]
+
+    which is the natural parameter of the 2×2 table.  It is what a
+    logistic regression of co-open-vs-co-closed on group estimates, it
+    is additive so effects compose by adding rather than by a
+    marginal-dependent amount, and its variance is 1/O_open + 1/O_closed
+    — free of F, which is what makes bins comparable.
+
+    L IS NOT A SECOND STATISTIC ALONGSIDE F − F_exp.  Both are monotone
+    in F at fixed F_exp, and to first order
+
+      L ≈ (F − F_exp) / [F_exp (1 − F_exp)]
+
+    so their difference carries information about F_exp — the marginal —
+    and nothing else.  Feeding both to an embedding supplies one axis
+    twice.  Use L, or use F − F_exp and ``marginal``; not L and F − F_exp.
+
+    L SAYS NOTHING ABOUT HOW MUCH COORDINATION THERE IS.  Scaling the
+    excess concordant mass up while holding the co-open:co-closed ratio
+    fixed leaves L unchanged and raises C.  L is direction; C is
+    magnitude; a claim that coordination INCREASED is a claim about C.
+    """
+    coord = (o_open + o_closed) - (e_open + e_closed)
+    mass = o_open + o_closed
+    # No concordant mass → no direction → F = 0.5 → D = 0.
+    safe_mass = np.where(mass > 1e-12, mass, 1.0)
+    frac = np.where(mass > 1e-12, o_open / safe_mass, 0.5)
+    # The same split under the marginal-matched null.
+    e_mass = e_open + e_closed
+    safe_e = np.where(e_mass > 1e-12, e_mass, 1.0)
+    frac_exp = np.where(e_mass > 1e-12, e_open / safe_e, 0.5)
+    # Excess is 0, not 0.5 - F_exp, when either pool is empty: with no
+    # observed concordant mass there is no direction to report, and a
+    # non-zero excess there would be an artefact of the F = 0.5 default
+    # rather than a measurement.
+    ok = (mass > 1e-12) & (e_mass > 1e-12)
+    excess = np.where(ok, frac - frac_exp, 0.0)
+    # Same direction on the log-odds scale.  logit(F) = log(O_open /
+    # O_closed) exactly, so the concordant mass cancels and only the
+    # two ratios remain.  Clipped at the same eps 'log2-ratio' uses:
+    # DM rates are strictly inside (0, 1) but can be small enough that
+    # an unclipped log dominates every other bin.
+    _eps = 1e-6
+    _lr = lambda a, b: (np.log(np.clip(a, _eps, None))
+                        - np.log(np.clip(b, _eps, None)))
+    logor = np.where(ok, _lr(o_open, o_closed) - _lr(e_open, e_closed),
+                     0.0)
+    # Mean per-end openness, from the exact identity above.
+    marginal = (o_open - o_closed + 1.0) / 2.0
+    return {
+        "coordination": coord,
+        "direction": frac,
+        "direction_expected": frac_exp,
+        "direction_excess": excess,
+        "direction_logor": logor,
+        "directional": coord * (2.0 * frac - 1.0),
+        "directional_corrected": coord * excess,
+        "marginal": marginal,
+    }
+
+
 def compute_signed_concordance_matrix(
     cell_posterior_paths: dict[str, str],
     chrom_sizes: dict[str, int] | None = None,
@@ -1540,95 +1671,6 @@ def compute_signed_concordance_matrix(
 
         return o_open, o_closed, e_open, e_closed
 
-    def _decompose(
-        o_open: np.ndarray, o_closed: np.ndarray,
-        e_open: np.ndarray, e_closed: np.ndarray,
-    ) -> dict[str, np.ndarray]:
-        """Directional decomposition of the co-state distribution.
-
-        The 3-state (open / closed / mixed) distribution has exactly TWO
-        degrees of freedom: the marginal level p̄ and the association Cov.
-        "Co-open vs co-closed" is NOT a third axis — it *is* the marginal:
-
-          π_open − π_closed  ==  p̄_1 + p̄_2 − 1   is an exact per-pair
-            identity (the p_i·p_j terms cancel), so 'signed-diff' carries
-            zero coordination signal against a marginal-matched O/E null.
-
-          (O_open − E_open) == (O_closed − E_closed) == Cov, identically —
-            coordination moves mass out of `mixed` into BOTH concordant
-            cells by the same amount, so the *excess* cannot be attributed
-            to a direction either (a "co-open excess" map and a "co-closed
-            excess" map would be the same map).
-
-        Direction therefore has to come from where the concordant mass
-        actually SITS rather than from the excess:
-
-          C = (O_open + O_closed) − (E_open + E_closed)  coordination (=2·Cov)
-          F = O_open / (O_open + O_closed)               realized direction
-          D = C · (2F − 1)                               directional coordination
-
-        D > 0 → coordinated, realized co-OPEN; D < 0 → coordinated
-        co-CLOSED; D ≈ 0 → uncoordinated (mixed dominates).  D is *also* ≈0
-        for a coordinated-but-balanced bin (F ≈ 0.5), which is
-        direction-ambiguous rather than mixed — so C is emitted alongside D
-        to separate the two cases (mixed → C ≈ 0; balanced-coordinated →
-        C large with D ≈ 0).
-
-        WHERE THE ZERO OF D BELONGS.  ``2F − 1`` puts "no directional
-        preference" at F = 0.5, i.e. half the concordant mass co-open.  That
-        is the right zero only when the marginal is p̄ = 0.5.  Under
-        independence at marginal p̄ the concordant mass already splits
-
-            F_indep = p̄² / (p̄² + (1 − p̄)²)
-
-        which is 0.31 at p̄ = 0.40 and 0.012 at p̄ = 0.10.  So on sparse
-        accessibility data a bin with NO directional preference scores
-        2F − 1 ≈ −0.38, and D reports −0.38·C: every coordinated bin looks
-        co-closed, and D collapses to a scaled −C.  That is the marginal
-        contamination this docstring rejects for 'signed-diff' walking back
-        in through F.  Measured on one meningioma GCH run: p̄ = 0.4009,
-        F = 0.3230, corr(D, −C) = 0.970.
-
-        Referencing F to the SAME expected pool removes it:
-
-          F_exp = E_open / (E_open + E_closed)      direction under the null
-          D' = C · (F − F_exp)                      marginal-free direction
-
-        D' = 0 means the concordant mass sits where the marginal-matched
-        null puts it — the honest "balanced" — and its sign says co-open or
-        co-closed relative to that.  On the same run F − F_exp came out
-        POSITIVE where 2F − 1 was negative, so the two disagree on direction,
-        not merely on scale.
-
-        Both are emitted.  D is kept unchanged so existing outputs do not
-        move; D' ("directional_corrected") is the one to interpret.
-        """
-        coord = (o_open + o_closed) - (e_open + e_closed)
-        mass = o_open + o_closed
-        # No concordant mass → no direction → F = 0.5 → D = 0.
-        safe_mass = np.where(mass > 1e-12, mass, 1.0)
-        frac = np.where(mass > 1e-12, o_open / safe_mass, 0.5)
-        # The same split under the marginal-matched null.
-        e_mass = e_open + e_closed
-        safe_e = np.where(e_mass > 1e-12, e_mass, 1.0)
-        frac_exp = np.where(e_mass > 1e-12, e_open / safe_e, 0.5)
-        # Excess is 0, not 0.5 - F_exp, when either pool is empty: with no
-        # observed concordant mass there is no direction to report, and a
-        # non-zero excess there would be an artefact of the F = 0.5 default
-        # rather than a measurement.
-        ok = (mass > 1e-12) & (e_mass > 1e-12)
-        excess = np.where(ok, frac - frac_exp, 0.0)
-        # Mean per-end openness, from the exact identity above.
-        marginal = (o_open - o_closed + 1.0) / 2.0
-        return {
-            "coordination": coord,
-            "direction": frac,
-            "direction_expected": frac_exp,
-            "direction_excess": excess,
-            "directional": coord * (2.0 * frac - 1.0),
-            "directional_corrected": coord * excess,
-            "marginal": marginal,
-        }
 
     def _layer2(imputed: dict[str, np.ndarray]) -> pd.DataFrame:
         """Layer-2 callback used by run_rwr_pipeline (or called directly when
@@ -1666,7 +1708,7 @@ def compute_signed_concordance_matrix(
             # SIGNED by which co-state realizes it.  Gives the single
             # co-closed (−) → mixed (0) → co-open (+) scale.  See _decompose
             # for why the sign cannot come from the excess itself.
-            delta_signed = _decompose(o_open, o_closed, e_open, e_closed)[
+            delta_signed = decompose_components(o_open, o_closed, e_open, e_closed)[
                 "directional"]
         else:  # 'signed-diff' (legacy): (O_open−O_closed) − (E_open−E_closed)
             delta_signed = (o_open - o_closed) - (e_open - e_closed)
@@ -1731,7 +1773,7 @@ def compute_signed_concordance_matrix(
     _o_o, _o_c, _e_o, _e_c = _fit_and_rates(imputed_counts)
     components = {
         name: pd.DataFrame(arr, index=cell_names, columns=sorted_bins)
-        for name, arr in _decompose(_o_o, _o_c, _e_o, _e_c).items()
+        for name, arr in decompose_components(_o_o, _o_c, _e_o, _e_c).items()
     }
     _pol = coordination_polar(components["coordination"].to_numpy(float),
                               components["direction_excess"].to_numpy(float))
@@ -1906,6 +1948,10 @@ def compute_signed_concordance_matrix(
         "direction":             components["direction"],
         "direction_expected":    components["direction_expected"],
         "direction_excess":      components["direction_excess"],
+        # Same direction as direction_excess, on the scale where the
+        # variance does not depend on F.  Not an independent axis: see
+        # _decompose.  Direction only -- magnitude is 'coordination'.
+        "direction_logor":       components["direction_logor"],
         "directional":           components["directional"],
         "directional_corrected": components["directional_corrected"],
         "marginal":              components["marginal"],
