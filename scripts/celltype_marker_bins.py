@@ -630,6 +630,40 @@ def correct_by_reference(X, ref_d, eps=1e-4):
     if ref.shape[0] != X.shape[0]:
         raise ValueError(f"reference has {ref.shape[0]} cells, "
                          f"matrix has {X.shape[0]}")
+    # This transform is logit, and logit is only defined on (0, 1).  _logit
+    # PINS everything outside to the floor, which is the right thing for a
+    # Pearson r whose sampling noise dips below zero and a disaster for a
+    # matrix that legitimately spans both signs: direction_logor is a log
+    # odds ratio centred near zero, so half of it would collapse onto the
+    # single value logit(eps).  Not an approximation -- the whole negative
+    # half becomes one number.  Refuse rather than return it.
+    fin = np.isfinite(X)
+    frac_out = (float(np.mean((X[fin] < 0.0) | (X[fin] > 1.0)))
+                if fin.any() else 0.0)
+    med = float(np.median(X[fin])) if fin.any() else float("nan")
+    # A Pearson r whose sampling noise dips below zero is the case this was
+    # built for: on a simulated reliability matrix 12% of bins land below 0
+    # while the median sits at +0.26, and flooring those is right -- they are
+    # bins with no reliable signal.  A statistic that is genuinely SIGNED is
+    # a different animal: direction_logor sits at 50% and a median of ~0,
+    # D = C(2F-1) came back 100% negative.  There the clip is not a floor
+    # under a tail, it is the whole matrix, and each cell collapses to one
+    # value -- measured: bin-to-bin sd 0.153 -> 2.7e-20, one distinct value
+    # per cell, frac_at_floor 1.0, with the run reporting success.
+    if frac_out >= 0.30 or (fin.any() and med <= eps):
+        raise ValueError(
+            f"the reference correction is logit-based and assumes a "
+            f"reliability coefficient in (0, 1); this matrix has "
+            f"{frac_out:.1%} of its values outside that range and a median "
+            f"of {med:+.6g}, so the clip inside logit would flatten it -- "
+            f"on a wholly-signed matrix every bin in a cell collapses to a "
+            f"single value.  The attenuation enters as e^2, so the right "
+            f"operation follows the scale of the statistic: subtract "
+            f"logit(ref) for a Pearson r, DIVIDE by a reference C for a "
+            f"covariance (coordination), and for direction_logor it is "
+            f"multiplicative on the log odds ratio -- none of which is what "
+            f"this does.  Drop --contrast-reference-d for this matrix; "
+            f"--contrast-center is scale-free and still applies.")
     usable = np.isfinite(ref) & (ref > 0)
     info = {"n_cells": int(X.shape[0]), "n_corrected": int(usable.sum()),
             "n_uncorrected": int((~usable).sum())}
@@ -3025,8 +3059,16 @@ def main():
             # difference in per-cell rank, which is not what the volcano's
             # x-axis claims to show.
             Xc = M_contrast.to_numpy()
-            if args.contrast_center == "cell-median":
-                Xc = center_cells(Xc)
+            # The reference correction runs BEFORE centring, not after.
+            # It takes logit, so it needs the matrix on its natural (0, 1)
+            # reliability scale -- and centring is exactly what takes it off
+            # that scale, putting the median at 0 so the clip inside logit
+            # swallows half the matrix.  Run the other way round the two
+            # together collapsed every bin in a cell onto one value while
+            # the run reported success.  Both are per-cell operations, so
+            # the order is free to be the correct one: divide out the
+            # measured reliability on the scale it was measured on, then
+            # centre whatever location is left.
             Vc = Cc = None
             if V_df is not None:
                 Vc = V_df.reindex(index=M.index,
@@ -3059,6 +3101,8 @@ def main():
                           f"reference is the measured version and centring "
                           f"the inferred one; the second has nothing left to "
                           f"take.", file=sys.stderr)
+            if args.contrast_center == "cell-median":
+                Xc = center_cells(Xc)
             _rg = {}
             if args.contrast_regress_coverage:
                 if Cc is None:

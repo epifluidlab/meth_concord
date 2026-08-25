@@ -2778,7 +2778,11 @@ def test_a_negative_or_zero_D_is_floored_not_dropped():
     would make the two incomparable."""
     m = _mod()
     rng = np.random.default_rng(6)
-    X = rng.normal(0.05, 0.2, (30, 200))          # plenty below zero
+    # A Pearson r whose median sits well above zero with a real tail below
+    # it -- the case the floor exists for.  A matrix that is HALF negative
+    # is not a reliability coefficient and is refused outright; see
+    # test_a_log_odds_matrix_is_refused_not_flattened.
+    X = rng.normal(0.30, 0.20, (30, 200))         # ~7% below zero
     assert (X < 0).any()
     out, info = m.correct_by_reference(X, np.full(30, 0.3))
     assert np.isfinite(out).all()
@@ -2796,6 +2800,13 @@ def _ref_run(tmp_path, ref_table, extra=None):
     """Run the CLI with a reference table, returning the completed process."""
     m = _mod()
     X, ct, batch, classes = _data(seed=1, n_per=30)
+    # On the RELIABILITY scale, because that is the only scale this
+    # correction is defined on: it takes logit, which clips outside (0, 1).
+    # _data is symmetric about zero, and feeding that through used to
+    # collapse every bin in a cell onto one value while the run reported
+    # success.  expit is monotone, so it puts the matrix in range without
+    # changing which cells or which bins differ.
+    X = 1.0 / (1.0 + np.exp(-(X - 1.0)))
     cts = [f"CT{c}" for c in ct]
     samples = [f"cell{i}" for i in range(len(ct))]
     bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
@@ -2867,6 +2878,7 @@ def test_the_extractor_output_feeds_the_contrast_unmodified(tmp_path):
     unit suites and fail only here."""
     ref_script = _SCRIPT.parent / "reference_concordance.py"
     X, ct, batch, classes = _data(seed=1, n_per=30)
+    X = 1.0 / (1.0 + np.exp(-(X - 1.0)))     # the reliability scale; see _ref_run
     cts = [f"CT{c}" for c in ct]
     samples = [f"cell{i}" for i in range(len(ct))]
     bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]

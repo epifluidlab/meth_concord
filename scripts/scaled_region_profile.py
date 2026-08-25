@@ -392,9 +392,9 @@ def main(argv=None) -> int:
     mk = bp._marker_mod()
     steps = []
     Xc = M.to_numpy(float)
-    if args.contrast_center == "cell-median":
-        Xc = mk.center_cells(Xc)
-        steps.append("centred each cell on its median")
+    # Reference first, then centring -- see celltype_marker_bins.py: the
+    # reference correction takes logit and needs the natural (0, 1) scale,
+    # which centring destroys.
     ref_specs = _named(args.contrast_reference_d, "--contrast-reference-d")
     if name in ref_specs:
         rp = Path(ref_specs[name])
@@ -408,6 +408,9 @@ def main(argv=None) -> int:
         Xc, rinfo = mk.correct_by_reference(Xc, rs.to_numpy(float))
         steps.append(f"divided out assay reliability for "
                      f"{rinfo.get('n_corrected', 0)}/{len(M)} cells")
+    if args.contrast_center == "cell-median":
+        Xc = mk.center_cells(Xc)
+        steps.append("centred each cell on its median")
     cnt_specs = _named(args.pair_counts, "--pair-counts")
     if args.contrast_regress_coverage:
         if name not in cnt_specs:

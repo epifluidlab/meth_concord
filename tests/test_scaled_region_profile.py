@@ -542,3 +542,80 @@ def test_anchoring_alone_does_not_silence_the_normalisation_warning(tmp_path):
     M, ct = _residual_matrix()
     _, r = _profile(M, ct, tmp_path, extra=["--baseline", "flank"])
     assert "no normalisation applied" in r.stderr
+
+
+# --------------------- the reference correction only fits one kind of matrix --
+
+def _marker():
+    import importlib.util
+    from pathlib import Path
+    p = Path(__file__).resolve().parents[1] / "scripts" / "celltype_marker_bins.py"
+    spec = importlib.util.spec_from_file_location("_mk", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a_log_odds_matrix_is_refused_not_flattened():
+    """direction_logor is a log odds ratio centred near zero.  logit pins
+    everything outside (0, 1) to the floor, so the whole negative half --
+    about half the matrix -- would collapse onto one value.  That is a
+    silently destroyed signal, not a rough correction."""
+    import numpy as np
+    import pytest
+    mk = _marker()
+    rng = np.random.default_rng(0)
+    L = rng.normal(0.0, 0.4, (6, 400))
+    with pytest.raises(ValueError, match="logit-based"):
+        mk.correct_by_reference(L, np.full(6, 0.35))
+    # what it used to do instead: flatten every bin in a cell to one value
+    out, info = mk.correct_by_reference(np.abs(L) * 0 + 0.3, np.full(6, 0.35))
+    assert info["n_corrected"] == 6
+
+
+def test_the_refusal_says_what_the_right_operation_would_be():
+    import numpy as np
+    import pytest
+    mk = _marker()
+    with pytest.raises(ValueError) as e:
+        mk.correct_by_reference(np.array([[-0.5, 0.5]]), np.array([0.3]))
+    msg = str(e.value)
+    assert "DIVIDE by a reference C" in msg
+    assert "--contrast-center" in msg          # what still applies
+
+
+def test_a_signed_coordination_matrix_is_refused_too():
+    """Post --dm-prior shared, C reaches below zero -- which is the point of
+    the fix, and also what makes this correction inapplicable to it."""
+    import numpy as np
+    import pytest
+    mk = _marker()
+    C = np.array([[-0.0011, 0.0002, 0.0008, -0.0004]])
+    with pytest.raises(ValueError, match="outside that range"):
+        mk.correct_by_reference(C, np.array([0.35]))
+
+
+def test_a_reliability_matrix_still_passes():
+    """A Pearson r in (0, 1) is what the transform was built for, and a few
+    bins dipping to the floor from sampling noise must not trip the guard."""
+    import numpy as np
+    mk = _marker()
+    rng = np.random.default_rng(1)
+    D = np.clip(rng.normal(0.35, 0.08, (8, 500)), 0.0, 0.999)
+    out, info = mk.correct_by_reference(D, np.full(8, 0.35))
+    assert info["n_corrected"] == 8
+    assert np.isfinite(out).all()
+
+
+def test_the_reference_runs_before_the_centring_that_would_break_it():
+    """Centring puts the median at 0, and the reference correction takes
+    logit, which needs (0, 1).  Run in the old order the two together
+    flattened every bin in a cell while the run reported success -- so the
+    order is part of the contract, not an implementation detail."""
+    from pathlib import Path
+    for script in ("celltype_marker_bins.py", "scaled_region_profile.py"):
+        src = (Path(__file__).resolve().parents[1] / "scripts"
+               / script).read_text()
+        i_ref = src.index("correct_by_reference(")
+        i_cen = src.rindex("center_cells(Xc)")
+        assert i_ref < i_cen, f"{script}: centring must come after the reference"
