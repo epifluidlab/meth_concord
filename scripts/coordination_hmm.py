@@ -358,6 +358,49 @@ def plane_sample(X, sel, warp_centre=None, cap=300_000, seed=0,
     return (Xs, idx) if return_index else Xs
 
 
+def center_cells(C, dF):
+    """Subtract each cell's own median, per axis.
+
+    A state is a run of bins INSIDE a cell, so the spread an HMM can model
+    is the spread within cells.  Anything that slides a whole cell up or
+    down the plane -- coverage, GpC enzyme efficiency, how well that cell
+    connected in the RWR graph -- is between-cell variation, and Gaussian
+    components fit it as readily as they fit domains, which turns "states"
+    into a clustering of cells wearing a domain model's clothes.
+
+    Median rather than mean: a few extreme bins should not decide where a
+    cell sits.  Subtracting only a location leaves the shape along the
+    genome untouched, which a per-cell RANK (what the pipeline applies
+    before its UMAPs) would not.
+
+    It is compositional in principle -- a bin's centred value depends on the
+    others through the median -- and that is harmless while genuine
+    aberrations are a small share of the genome and wrong when they are not.
+    A cell whose coordination really differs everywhere has that difference
+    subtracted.
+    """
+    C, dF = np.asarray(C, float), np.asarray(dF, float)
+    with np.errstate(invalid="ignore"):
+        mc = np.nanmedian(C, axis=1)
+        mf = np.nanmedian(dF, axis=1)
+    mc = np.where(np.isfinite(mc), mc, 0.0)
+    mf = np.where(np.isfinite(mf), mf, 0.0)
+    return C - mc[:, None], dF - mf[:, None], {
+        "median_shift_C": float(np.median(np.abs(mc))),
+        "median_shift_dF": float(np.median(np.abs(mf))),
+        "spread_of_cell_centres_C": float(_robust_sd_1d(mc)),
+        "spread_of_cell_centres_dF": float(_robust_sd_1d(mf)),
+    }
+
+
+def _robust_sd_1d(x):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return float("nan")
+    return float(1.4826 * np.median(np.abs(x - np.median(x))))
+
+
 def cell_summaries(X, obs, n_cells, warp_centre=None, chunk=2_000_000):
     """Per-cell means on the plane, and the share of spread BETWEEN cells.
 
@@ -1224,6 +1267,21 @@ def main(argv=None) -> int:
                          "(batch, bin) by a shrunken variance ratio, which "
                          "on a non-negative quantity like C can push values "
                          "below zero; the run reports how many.")
+    ap.add_argument("--center-cells", choices=["none", "median"],
+                    default="none",
+                    help="Subtract each cell's own median, per axis, before "
+                         "fitting.  A state is a run of bins INSIDE a cell, "
+                         "so only within-cell spread is segmentable; "
+                         "anything that slides a whole cell across the plane "
+                         "-- coverage, GpC enzyme efficiency, RWR "
+                         "connectivity -- is between-cell variation that "
+                         "Gaussian components fit just as readily as "
+                         "domains.  Use it when the QC reports a high "
+                         "between-cell fraction.  It is compositional: a "
+                         "cell whose coordination genuinely differs "
+                         "everywhere has that difference subtracted, so it "
+                         "answers 'where are this cell's domains', not 'is "
+                         "this cell more coordinated'.")
     ap.add_argument("--colour-by", default=None, metavar="COLUMN",
                     help="Colour QC panel (a) by this --samples column "
                          "instead of point density.  A categorical column "
@@ -1300,6 +1358,16 @@ def main(argv=None) -> int:
               "what RWR imputes.", file=sys.stderr)
 
     C, dF = Cdf.to_numpy(float), Fdf.to_numpy(float)
+    if args.center_cells == "median":
+        C, dF, cinfo = center_cells(C, dF)
+        print(f"  centred each cell on its own median: typical shift "
+              f"{cinfo['median_shift_C']:.6f} (C) and "
+              f"{cinfo['median_shift_dF']:.6f} (F-F_exp); the cell centres "
+              f"themselves were spread over "
+              f"{cinfo['spread_of_cell_centres_C']:.6f} and "
+              f"{cinfo['spread_of_cell_centres_dF']:.6f} robust sd -- that "
+              f"is the between-cell variation now removed from the fit.",
+              file=sys.stderr)
 
     _mz = args.clip
     if isinstance(_mz, str) and _mz.lower() != "auto":

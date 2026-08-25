@@ -1331,3 +1331,77 @@ def test_the_run_names_between_cell_structure_as_unsegmentable(tmp_path):
     assert "fitting cell identity" in r.stderr
     tab = pd.read_csv(out / "hmm_qc_variance.tsv", sep="\t")
     assert float(tab["between_cell_fraction"].min()) > 0.9
+
+
+# ----------------------------------------- centring each cell on its own bulk --
+
+def test_centring_removes_the_between_cell_spread_it_names():
+    """The QC diagnoses a high between-cell fraction and names this as the
+    fix; the fix has to actually take that fraction down."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n_cells, n_bins = 20, 300
+    track = np.where(np.arange(n_bins) % 150 < 75, 4.0, -4.0)
+    off = rng.normal(0, 9.0, n_cells)
+    C = off[:, None] + np.tile(track, (n_cells, 1)) + rng.normal(
+        0, 0.3, (n_cells, n_bins))
+    F = -off[:, None] - np.tile(track, (n_cells, 1)) + rng.normal(
+        0, 0.3, (n_cells, n_bins))
+    bins = [f"chr1:{i * 250_000}" for i in range(n_bins)]
+
+    def frac(c, f):
+        X, _l, obs, _o, _sc = m.build_sequences(c, f, bins, clip=0)
+        return m.cell_summaries(X, obs, n_cells)[1]["C"]
+
+    before = frac(C, F)
+    Cc, Fc, info = m.center_cells(C, F)
+    after = frac(Cc, Fc)
+    assert before > 0.7               # most of the plane is between cells
+    assert after < 0.05               # and afterwards essentially none is
+    assert after < before / 10
+    assert info["spread_of_cell_centres_C"] > 5.0
+
+
+def test_centring_leaves_the_shape_along_the_genome_alone():
+    """Only a location per cell moves -- unlike a per-cell RANK, which
+    redistributes every value and would flatten the domains too."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    C = rng.normal(0, 1, (8, 200)) + np.arange(8)[:, None] * 3.0
+    F = rng.normal(0, 1, (8, 200))
+    Cc, _Fc, _i = m.center_cells(C, F)
+    for i in range(8):
+        np.testing.assert_allclose(np.diff(Cc[i]), np.diff(C[i]), atol=1e-12)
+
+
+def test_centring_is_per_axis_not_pooled():
+    m = _mod()
+    C = np.array([[10.0, 12.0, 14.0]])
+    F = np.array([[-5.0, -5.0, -5.0]])
+    Cc, Fc, _i = m.center_cells(C, F)
+    assert np.median(Cc) == pytest.approx(0.0)
+    assert np.median(Fc) == pytest.approx(0.0)
+
+
+def test_centring_survives_a_cell_with_no_observed_bins():
+    m = _mod()
+    C = np.array([[1.0, 2.0, 3.0], [np.nan] * 3])
+    F = np.array([[1.0, 2.0, 3.0], [np.nan] * 3])
+    Cc, _Fc, _i = m.center_cells(C, F)
+    assert np.isfinite(Cc[0]).all()
+    assert np.isnan(Cc[1]).all()
+
+
+def test_the_cli_reports_what_centring_removed(tmp_path):
+    m = _mod()
+    C, F, _st = _fixture(n_cells=8, n_bins=300)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--center-cells", "median",
+         "--output-dir", str(tmp_path / "o")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "centred each cell on its own median" in r.stderr
+    assert "between-cell variation now removed" in r.stderr
