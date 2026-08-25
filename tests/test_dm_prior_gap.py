@@ -106,3 +106,34 @@ def test_a_bad_dm_prior_is_an_error(tmp_path):
             baseline="distance-matched", dm_prior="pooled",
             save_outputs=False, use_rwr=False,
         )
+
+
+def test_the_same_gap_floors_the_log_odds_direction():
+    """L = log(O_o/O_c) - log(E_o/E_c) cancels the shared denominator rather
+    than sharing it, so the prior enters as the log-odds ratio of the two
+    priors' own open:closed splits.  Same defect, same n=0 limit."""
+    a_l = {"open": 30.00, "closed": 29.38, "mixed": 40.62}
+    a_d = {"open": 26.00, "closed": 32.25, "mixed": 41.75}
+    lor = lambda a, ko, kc: np.log((a["open"] + ko) / (a["closed"] + kc))
+    at_zero = lor(a_l, 0, 0) - lor(a_d, 0, 0)
+    assert at_zero == pytest.approx(
+        np.log(30.00 / 29.38) - np.log(26.00 / 32.25))
+    assert abs(at_zero) > 0.2                       # far from the null
+    # one prior, and the same limit is exactly zero
+    assert lor(a_l, 0, 0) - lor(a_l, 0, 0) == 0.0
+
+
+def test_the_logor_floor_is_reported_too(tmp_path):
+    import json
+    from tests.test_signed_concordance import _focal_active_paths
+    src, out = tmp_path / "src", tmp_path / "o"
+    src.mkdir(parents=True, exist_ok=True)
+    cc.compute_signed_concordance_matrix(
+        _focal_active_paths(src, n_cells=2),
+        bin_size=1000, min_distance=100, min_gch_sites=2,
+        baseline="distance-matched", dm_dist_bin=100, dm_prior="shared",
+        output_dir=str(out), save_outputs=True, use_rwr=False,
+    )
+    gap = json.load(open(out / "dirichlet_multinomial_prior.json"))["prior_gap"]
+    assert gap["implied_logor_floor_at_n0"] == pytest.approx(0.0, abs=1e-12)
+    assert gap["implied_C_floor_at_n0"] == pytest.approx(0.0, abs=1e-12)

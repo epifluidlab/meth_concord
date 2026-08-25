@@ -1700,11 +1700,19 @@ def compute_signed_concordance_matrix(
             _cl = ((alpha_l["open"] + alpha_l["closed"]) / sum(alpha_l.values()))
             _cd = ((alpha_dm["open"] + alpha_dm["closed"])
                    / sum(alpha_dm.values()))
+            # L = log(O_open/O_closed) - log(E_open/E_closed) cancels the
+            # shared DENOMINATOR rather than sharing it, so the prior enters
+            # as the log-odds ratio of the two priors' own open:closed
+            # splits.  Same defect, same n=0 limit, same cure: with one
+            # prior it is exactly 0.
+            _llor = float(np.log(alpha_l["open"] / alpha_l["closed"])
+                          - np.log(alpha_dm["open"] / alpha_dm["closed"]))
             fitted_priors["prior_gap"] = {
                 "concordant_linked": float(_cl),
                 "concordant_dm_expected": float(_cd),
                 "gap": float(_cl - _cd),
                 "implied_C_floor_at_n0": float(_cl - _cd),
+                "implied_logor_floor_at_n0": _llor,
                 "dm_prior": str(dm_prior),
             }
             if dm_prior == "shared":
