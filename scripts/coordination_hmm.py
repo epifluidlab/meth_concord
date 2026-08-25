@@ -358,6 +358,60 @@ def plane_sample(X, sel, warp_centre=None, cap=300_000, seed=0,
     return (Xs, idx) if return_index else Xs
 
 
+def cell_summaries(X, obs, n_cells, warp_centre=None, chunk=2_000_000):
+    """Per-cell means on the plane, and the share of spread BETWEEN cells.
+
+    The HMM segments the genome: a state is meant to be a run of bins
+    inside one cell.  That only makes sense if the spread it is modelling
+    is within cells.  Where most of the spread is between cells, the
+    Gaussian components fit CELL IDENTITY instead -- the fit becomes a
+    clustering of cells wearing a domain model's clothes, and the run
+    lengths that come out are an artefact of how the cells happen to be
+    ordered along the genome rather than a measurement of anything.
+
+    Structure on the plane that is between cells cannot be segmented away,
+    corrected away by a per-bin batch mean, or fixed by a different K.
+
+    One pass in row chunks, so nothing the size of X is duplicated.
+    """
+    X = np.asarray(X, float)
+    n = len(X)
+    n_bins = max(n // max(int(n_cells), 1), 1)
+    cnt = np.zeros(int(n_cells))
+    s1 = np.zeros((int(n_cells), 2))
+    s2 = np.zeros(2)
+    for a0 in range(0, n, chunk):
+        b0 = min(a0 + chunk, n)
+        m = np.asarray(obs[a0:b0], bool)
+        if not m.any():
+            continue
+        Z = X[a0:b0][m]
+        if warp_centre is not None:
+            Z = unwarp_log_radial(Z, np.asarray(warp_centre, float))
+        c = (np.arange(a0, b0)[m]) // n_bins
+        c = np.minimum(c, int(n_cells) - 1)
+        cnt += np.bincount(c, minlength=int(n_cells))
+        for j in range(2):
+            s1[:, j] += np.bincount(c, weights=Z[:, j],
+                                    minlength=int(n_cells))
+            s2[j] += float((Z[:, j] ** 2).sum())
+    tot = cnt.sum()
+    if tot <= 0:
+        return np.full((int(n_cells), 2), np.nan), {"C": float("nan"),
+                                                    "dF": float("nan")}
+    grand = s1.sum(0) / tot
+    ok = cnt > 0
+    mu = np.full((int(n_cells), 2), np.nan)
+    mu[ok] = s1[ok] / cnt[ok, None]
+    frac = {}
+    for j, name in enumerate(("C", "dF")):
+        ss_total = s2[j] - tot * grand[j] ** 2
+        ss_between = float((cnt[ok] * (mu[ok, j] - grand[j]) ** 2).sum())
+        frac[name] = (ss_between / ss_total if ss_total > 0
+                      else float("nan"))
+    return mu, frac
+
+
 def point_colour(tab, column, n_bins, max_levels=12):
     """A per-(cell, bin) colour spec from a per-cell column.
 
@@ -687,7 +741,8 @@ def genome_autocorrelation(X, lengths, obs, n_cells, max_lag=20):
 
 
 def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
-              labels, title, masked=None, warp_centre=None, colour=None):
+              labels, title, masked=None, warp_centre=None, colour=None,
+              cell_means=None):
     """Six panels that answer whether the fit means anything.
 
     Ordered by what would invalidate the result soonest: if the plane is one
@@ -714,7 +769,6 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
         ms = plane_sample(X, masked, warp_centre, cap=40_000, seed=1)
         a.scatter(ms[:, 0], ms[:, 1], s=1.5, c="#c0392b", alpha=0.25,
                   lw=0, zorder=1, label=f"masked ({masked.mean():.1%})")
-        a.legend(fontsize=6.5, frameon=False, loc="upper left")
     if colour is None:
         a.hexbin(sub[:, 0], sub[:, 1], gridsize=70, bins="log", cmap="Blues",
                  mincnt=1, zorder=2)
@@ -734,18 +788,28 @@ def qc_figure(path, X, obs, model, acf, mask_z, ladder, loglik_trace,
             med = np.median(sub[sel], axis=0)
             a.scatter([med[0]], [med[1]], s=85, marker="D", zorder=4,
                       facecolor=cm(i % 10), edgecolor="k", lw=1.0)
-        a.legend(fontsize=5.5, frameon=False, loc="best", markerscale=6,
-                 ncol=1 + len(colour["names"]) // 7)
     else:
         v = np.asarray(colour["values"], float)[sub_idx]
         sm = a.scatter(sub[:, 0], sub[:, 1], c=v, s=1.2, alpha=0.35, lw=0,
                        cmap="viridis", zorder=2)
         fig.colorbar(sm, ax=a, fraction=0.046, label=colour["column"])
+    if cell_means is not None:
+        cm_ = np.asarray(cell_means, float)
+        cm_ = cm_[np.isfinite(cm_).all(1)]
+        # One point per CELL.  If the arms are here too, they are between
+        # cells, and no segmentation of the genome reaches them.
+        a.scatter(cm_[:, 0], cm_[:, 1], s=7, c="#111111", alpha=0.55,
+                  lw=0, zorder=3, label=f"cell means (n={len(cm_):,})")
     a.scatter(model.means[:, 0], model.means[:, 1], s=110, marker="x",
               c="#1a1a1a", lw=2.4, zorder=5)
     for i, m in enumerate(model.means):
         a.annotate(str(i), m, fontsize=8, color="#c0392b",
                    xytext=(4, 4), textcoords="offset points", zorder=6)
+    if a.get_legend_handles_labels()[0]:
+        ncol = 1 + (len(colour["names"]) // 7
+                    if colour and colour.get("kind") == "cat" else 0)
+        a.legend(fontsize=5.5, frameon=False, loc="best", markerscale=6,
+                 ncol=ncol)
     a.set_title("a  is the plane multimodal?" if colour is None else
                 f"a  the plane, coloured by {colour['column']}",
                 fontsize=10, loc="left")
@@ -1440,6 +1504,25 @@ def main(argv=None) -> int:
         # points that show what the cut removed never appeared.
         masked_flag = sc.get("masked_rows",
                              np.zeros(X.shape[0], bool))
+        cell_mu, var_frac = cell_summaries(X, obs, n_cells,
+                                           sc.get("warp_centre"))
+        pd.DataFrame({"axis": ["C", "dF"],
+                      "between_cell_fraction": [var_frac["C"],
+                                                var_frac["dF"]]}).to_csv(
+            out / "hmm_qc_variance.tsv", sep="\t", index=False)
+        print(f"  QC: {var_frac['C']:.1%} of C's spread and "
+              f"{var_frac['dF']:.1%} of F-F_exp's is BETWEEN cells",
+              file=sys.stderr)
+        if max(var_frac["C"], var_frac["dF"]) > 0.5:
+            print("  QC: most of the plane is between-cell variation, so "
+                  "the components are fitting cell identity, not genomic "
+                  "domains.  A different K will not change that, and "
+                  "neither will a per-bin batch correction -- both act on "
+                  "the axis that is not carrying the structure.  Segment "
+                  "each cell against its OWN centre (subtract the per-cell "
+                  "median before fitting) if the question is domains, or "
+                  "cluster the cell means directly if the question is cell "
+                  "types.", file=sys.stderr)
         acf = genome_autocorrelation(X, lengths, obs, n_cells,
                                      max_lag=args.qc_max_lag)
         pd.DataFrame(acf).to_csv(out / "hmm_qc_autocorrelation.tsv",
@@ -1486,7 +1569,8 @@ def main(argv=None) -> int:
                       masked=masked_flag,
                       warp_centre=sc.get("warp_centre"),
                       colour=(point_colour(tab, args.colour_by, n_bins)
-                              if args.colour_by else None))
+                              if args.colour_by else None),
+                      cell_means=cell_mu)
             print(f"  QC figure -> {qc_path.name}", file=sys.stderr)
         except Exception as exc:
             print(f"  QC figure failed: {exc}", file=sys.stderr)

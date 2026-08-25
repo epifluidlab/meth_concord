@@ -1248,3 +1248,86 @@ def test_the_coloured_qc_renders_end_to_end(tmp_path):
              "--output-dir", str(out)], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         assert (out / "hmm_qc.png").exists()
+
+
+# ----------------------- is the structure between cells, or along the genome --
+
+def test_between_cell_fraction_is_near_one_when_cells_differ():
+    """Every bin in a cell the same, cells different from each other: all of
+    the spread is between cells and none of it is segmentable."""
+    m = _mod()
+    n_cells, n_bins = 20, 50
+    off = np.linspace(-10, 10, n_cells)
+    X = np.repeat(np.c_[off, -off], n_bins, axis=0)
+    obs = np.ones(len(X), bool)
+    mu, frac = m.cell_summaries(X, obs, n_cells)
+    assert frac["C"] > 0.999 and frac["dF"] > 0.999
+    np.testing.assert_allclose(mu[:, 0], off)
+
+
+def test_between_cell_fraction_is_near_zero_when_cells_agree():
+    """Domains along the genome, identical in every cell: nothing between
+    cells, everything within -- what the HMM is actually for."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n_cells, n_bins = 20, 400
+    track = np.where(np.arange(n_bins) % 200 < 100, 6.0, -6.0)
+    X = np.tile(np.c_[track, -track], (n_cells, 1))
+    X += rng.normal(0, 0.05, X.shape)
+    obs = np.ones(len(X), bool)
+    _mu, frac = m.cell_summaries(X, obs, n_cells)
+    assert frac["C"] < 0.01 and frac["dF"] < 0.01
+
+
+def test_cell_summaries_are_on_the_plane_after_a_warp():
+    m = _mod()
+    P = _offset_arms(n=40 * 60)
+    obs = np.ones(len(P), bool)
+    W, centre = m.warp_log_radial(P, obs)
+    flat, ff = m.cell_summaries(P, obs, 40)
+    warped, fw = m.cell_summaries(W, obs, 40, warp_centre=centre)
+    np.testing.assert_allclose(flat, warped, atol=1e-6)
+    assert abs(ff["C"] - fw["C"]) < 1e-9
+
+
+def test_cell_summaries_ignore_masked_bins():
+    m = _mod()
+    n_cells, n_bins = 6, 40
+    X = np.zeros((n_cells * n_bins, 2))
+    X[:, 0] = 1.0
+    X[:5, 0] = 1e6                       # masked, must not reach the mean
+    obs = np.ones(len(X), bool)
+    obs[:5] = False
+    mu, frac = m.cell_summaries(X, obs, n_cells)
+    np.testing.assert_allclose(mu[:, 0], 1.0)
+    assert frac["C"] < 1e-9 or not np.isfinite(frac["C"])
+
+
+def test_the_run_names_between_cell_structure_as_unsegmentable(tmp_path):
+    """A per-bin batch correction and a bigger K both act on the axis that
+    is not carrying the structure, and someone staring at collapsed states
+    will otherwise keep reaching for exactly those two."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    n_cells, n_bins = 12, 300
+    bins = [f"chr1:{i * 250_000}" for i in range(n_bins)]
+    off = rng.normal(0, 8.0, n_cells)
+    C = pd.DataFrame(off[:, None] + rng.normal(0, 0.2, (n_cells, n_bins)),
+                     index=[f"cell{i}" for i in range(n_cells)],
+                     columns=bins)
+    F = pd.DataFrame(-off[:, None] + rng.normal(0, 0.2, (n_cells, n_bins)),
+                     index=C.index, columns=bins)
+    C.to_parquet(tmp_path / "c.parquet")
+    F.to_parquet(tmp_path / "f.parquet")
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--coordination",
+         str(tmp_path / "c.parquet"), "--direction-excess",
+         str(tmp_path / "f.parquet"), "--k", "3", "--max-z", "0", "--qc",
+         "--plot-format", "png", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "BETWEEN cells" in r.stderr
+    assert "fitting cell identity" in r.stderr
+    tab = pd.read_csv(out / "hmm_qc_variance.tsv", sep="\t")
+    assert float(tab["between_cell_fraction"].min()) > 0.9
