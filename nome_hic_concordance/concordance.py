@@ -1264,6 +1264,7 @@ def compute_signed_concordance_matrix(
     rwr_max_iter: int = 30,
     rwr_tol: float = 1e-4,
     eb_min_obs: int = 50,
+    dm_prior: str = "separate",
     batch_labels: pd.Series | pd.DataFrame | None = None,
     batch_correction: str = "none",
     n_threads: int = 4,
@@ -1355,6 +1356,9 @@ def compute_signed_concordance_matrix(
     # short-range *contacts*, not non-contacts (the old name was a misnomer).
     if baseline == "unlinked":
         baseline = "short-range"
+    if dm_prior not in ("separate", "shared"):
+        raise ValueError(
+            f"dm_prior must be 'separate' or 'shared'; got {dm_prior!r}.")
     if baseline not in ("short-range", "distance-matched", "distance-pooled"):
         raise ValueError(
             f"baseline must be 'short-range' (alias 'unlinked'), "
@@ -1656,6 +1660,7 @@ def compute_signed_concordance_matrix(
 
         # Non-contact expected pool (distance-matched or distance-pooled).
         alpha_dm = None
+        long_dm = None
         if uses_expected and "k_dm_open" in imputed:
             long_dm = pd.DataFrame({
                 "k_open":   imputed["k_dm_open"].ravel(),
@@ -1668,6 +1673,66 @@ def compute_signed_concordance_matrix(
                 mixed_col="k_mixed", n_col="n_linked", min_obs=eb_min_obs,
             )
             fitted_priors["dm_expected"] = {"alpha": alpha_dm, "info": info_dm}
+
+        # THE PRIOR GAP, AND WHY IT IS A FLOOR UNDER C.
+        #
+        # O and E are both Dirichlet-Multinomial posterior means,
+        # (alpha_i + k_i) / (alpha_0 + n), and n_dm == n_linked by
+        # construction, so the two share a denominator and
+        #
+        #   C = (O_open + O_closed) - (E_open + E_closed)
+        #     = [ (a_l_conc - a_dm_conc) + (k_conc - k_dm_conc) ] / (a_0 + n)
+        #
+        # The first term does not depend on the data at all.  Fitting a
+        # separate EB prior per pool sets each pool's shrinkage TARGET to
+        # its own global mean, and those means differ by exactly the
+        # genome-wide average coordination -- so a bin with no information
+        # is handed the global average instead of zero, and C cannot reach
+        # zero however good the null is.  Post-RWR the imputed n is
+        # typically < 1, which makes the posterior ~99% prior for nearly
+        # every entry, so this term dominates: on a real run the gap was
+        # 0.0113 and the median C was 0.011293.
+        #
+        # dm_prior="shared" fits ONE prior on both pools.  The gap becomes
+        # exactly 0, the shared denominator cancels it at every n, and
+        # C = 0 means what it should: the two pools agree.
+        if alpha_dm is not None:
+            _cl = ((alpha_l["open"] + alpha_l["closed"]) / sum(alpha_l.values()))
+            _cd = ((alpha_dm["open"] + alpha_dm["closed"])
+                   / sum(alpha_dm.values()))
+            fitted_priors["prior_gap"] = {
+                "concordant_linked": float(_cl),
+                "concordant_dm_expected": float(_cd),
+                "gap": float(_cl - _cd),
+                "implied_C_floor_at_n0": float(_cl - _cd),
+                "dm_prior": str(dm_prior),
+            }
+            if dm_prior == "shared":
+                alpha_sh, info_sh = _fit_dirichlet_multinomial_eb_prior(
+                    pd.concat([long_linked, long_dm], ignore_index=True),
+                    open_col="k_open", closed_col="k_closed",
+                    mixed_col="k_mixed", n_col="n_linked",
+                    min_obs=eb_min_obs,
+                )
+                fitted_priors["shared"] = {"alpha": alpha_sh,
+                                           "info": info_sh}
+                alpha_l = alpha_dm = alpha_sh
+                logger.info(
+                    f"DM prior: SHARED between the linked and expected "
+                    f"pools (nu={sum(alpha_sh.values()):.1f}). The "
+                    f"separate fits differed by {_cl - _cd:+.6f} in "
+                    f"concordant mass, which was an additive floor under C."
+                )
+            elif abs(_cl - _cd) > 0:
+                logger.warning(
+                    f"DM prior: the linked and expected pools were fitted "
+                    f"SEPARATELY and their concordant masses differ by "
+                    f"{_cl - _cd:+.6f} ({_cl:.4f} vs {_cd:.4f}). That "
+                    f"difference is an additive floor under C at every "
+                    f"bin, and the whole of C where the imputed n is small "
+                    f"-- compare it against median(C) before reading C as "
+                    f"coordination. Use --dm-prior shared to remove it."
+                )
 
         # Compute the per-(cell, bin) Δ_signed.  Two estimators:
         #

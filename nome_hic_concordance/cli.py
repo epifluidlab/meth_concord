@@ -290,6 +290,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "end-pairs thin out.",
     )
     parser.add_argument(
+        "--dm-prior", choices=["separate", "shared"], default="separate",
+        help="Whether the observed (linked) and expected (non-contact) "
+             "pools get their own Dirichlet-Multinomial EB prior or one "
+             "between them.  Both sides are posterior means "
+             "(alpha_i + k_i)/(alpha_0 + n) and n_dm == n_linked, so they "
+             "share a denominator and C carries the term "
+             "(alpha_linked_concordant - alpha_expected_concordant)/"
+             "(alpha_0 + n), which does not depend on the data.  'separate' "
+             "(default, and what every existing run used) shrinks each pool "
+             "toward its OWN global mean, and those means differ by the "
+             "genome-wide average coordination -- so a bin with no "
+             "information is handed the global average rather than zero and "
+             "C cannot reach zero however good the null is.  Post-RWR the "
+             "imputed n is usually < 1, so that term is most of C: on a "
+             "mouse cortex run the gap was 0.0113 against a median C of "
+             "0.011293.  'shared' fits one prior on both pools; the term is "
+             "then exactly 0 at every n and C = 0 means the pools agree.  "
+             "The run reports the gap either way.",
+    )
+    parser.add_argument(
         "--dm-dist-bin-bp", type=int, default=10_000,
         help="Distance-bin width (bp) for the distance-matched expected "
              "(10 kb).",
@@ -1495,6 +1515,7 @@ def run_context(
                 concordance_combine=concordance_combine,
                 dm_window_mb=args.dm_window_mb,
                 dm_dist_bin=args.dm_dist_bin_bp,
+                dm_prior=args.dm_prior,
                 use_rwr=(args.impute == "rwr"),
                 rwr_k=args.rwr_k,
                 rwr_restart_prob=args.rwr_restart_prob,
@@ -1528,6 +1549,7 @@ def run_context(
                     concordance_combine=concordance_combine,
                     dm_window_mb=args.dm_window_mb,
                     dm_dist_bin=args.dm_dist_bin_bp,
+                dm_prior=args.dm_prior,
                     use_rwr=(args.impute == "rwr"), rwr_k=args.rwr_k,
                     rwr_restart_prob=args.rwr_restart_prob,
                     rwr_n_refine_passes=rwr_refine_passes,
