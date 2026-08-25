@@ -2818,16 +2818,18 @@ def main():
                           matrix=M)
         R_ser = None
         if name in ref_specs:
-            rpath = Path(ref_specs[name])
+            _rp, _, _rcol = str(ref_specs[name]).partition(":")
+            _rcol = _rcol or "reference_d"
+            rpath = Path(_rp)
             if not rpath.exists():
                 sys.exit(f"--contrast-reference-d {name}: no such file "
                          f"{rpath}")
             rdf = pd.read_csv(rpath, sep="\t")
-            if "cell" not in rdf.columns or "reference_d" not in rdf.columns:
+            if "cell" not in rdf.columns or _rcol not in rdf.columns:
                 sys.exit(f"--contrast-reference-d {name}: {rpath} needs "
-                         f"'cell' and 'reference_d' columns (write it with "
+                         f"'cell' and {_rcol!r} columns (write it with "
                          f"scripts/reference_concordance.py)")
-            R_ser = rdf.set_index("cell")["reference_d"]
+            R_ser = rdf.set_index("cell")[_rcol]
             shared = R_ser.index.intersection(M.index)
             if len(shared) < 0.5 * len(M.index):
                 sys.exit(

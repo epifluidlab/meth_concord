@@ -338,3 +338,45 @@ def test_both_columns_reach_the_table():
     assert np.isfinite(out["reference_c"]) and out["reference_c"] > 0
     assert np.isfinite(out["reference_logor"])
     assert np.isfinite(out["reference_d"])
+
+
+def test_the_chrM_co_open_share_is_a_usable_per_cell_null():
+    """A different use of chrM from the attenuation references: not a
+    magnitude to divide by, but where the concordant mass SITS in DNA with
+    no nucleosomes and no 3D structure.  F is a proportion, so the logit is
+    defined and the correction is a subtraction -- no division by something
+    that might be zero."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    f = {}
+    for skew in (0.0, -1.5, -3.0):
+        f[skew] = m._reference_f(*_pool(rng, 200_000, 1.0, skew))
+        assert 0.0 < f[skew] < 1.0
+    assert f[0.0] == pytest.approx(0.5, abs=0.02)     # symmetric -> no shift
+    assert f[-1.5] < 0.2 and f[-3.0] < f[-1.5]        # closed -> co-closed
+
+
+def test_the_chrM_null_moves_with_the_enzyme_which_is_the_point():
+    """It absorbs each cell's efficiency, which is what makes cells
+    comparable once it is subtracted."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    hi = m._reference_f(*_pool(rng, 200_000, 1.0, -1.5))
+    lo = m._reference_f(*_pool(rng, 200_000, 0.6, -1.5))
+    assert lo > hi + 0.05
+
+
+def test_the_chrM_null_cannot_track_a_per_bin_marginal():
+    """One number per cell, and F's null position moves with the bin's own
+    accessibility: p^2/(p^2 + (1-p)^2).  Heterochromatin is less accessible
+    by definition, so it reads co-closed against a single chrM baseline
+    whether or not anything is coordinated there."""
+    m = _mod()
+    indep = lambda p: p ** 2 / (p ** 2 + (1 - p) ** 2)
+    ref = 0.30
+    # two bins with NO coordination, differing only in accessibility
+    open_bin, closed_bin = indep(0.55), indep(0.20)
+    lg = lambda x: np.log(x / (1 - x))
+    assert lg(open_bin) - lg(ref) > 0        # reads co-open
+    assert lg(closed_bin) - lg(ref) < 0      # reads co-closed
+    assert abs(lg(closed_bin) - lg(ref)) > 1.0   # and not subtly

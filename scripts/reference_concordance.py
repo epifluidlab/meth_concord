@@ -103,6 +103,7 @@ def reference_d(df, cell, n_pairs, chrom="chrM", min_gch_sites=3,
     out = {"cell": cell, "n_pairs_available": n_avail,
            "n_pairs_used": 0, "reference_d": np.nan,
            "reference_logor": np.nan, "reference_c": np.nan,
+           "reference_f": np.nan,
            "median_sites_per_end": np.nan,
            "frac_repeated_coords": np.nan, "note": ""}
     if n_avail:
@@ -137,6 +138,7 @@ def reference_d(df, cell, n_pairs, chrom="chrM", min_gch_sites=3,
     out["reference_d"] = float(np.corrcoef(p1, p2)[0, 1])
     lo, c = _logor_and_c(p1, p2)
     out["reference_logor"], out["reference_c"] = lo, c
+    out["reference_f"] = _reference_f(p1, p2)
     return out
 
 
@@ -171,6 +173,36 @@ def _logor_and_c(p1, p2, eps=1e-9):
     logor = (np.log(o_open) - np.log(o_closed)
              - np.log(e_open) + np.log(e_closed))
     return float(logor), float((o_open + o_closed) - (e_open + e_closed))
+
+
+def _reference_f(p1, p2, eps=1e-9):
+    """chrM's own co-open share: F = O_open / (O_open + O_closed).
+
+    A different use of chrM from the attenuation references.  Those divide a
+    measured effect size; this is a per-cell NULL POSITION -- where the
+    concordant mass sits in DNA that has no nucleosomes and no 3D structure.
+    Subtracting its logit from a bin's asks whether that bin's mass sits
+    co-OPEN or co-CLOSED relative to structure-free DNA in the same cell,
+    which is a question the marginal-matched F_exp does not answer.
+
+    F is a proportion, so logit is defined on it and the correction is an
+    honest subtraction rather than a division by something that may be zero.
+
+    WHAT IT DOES NOT CONTROL is the per-bin marginal.  F's null position
+    depends on how accessible the bin is -- under independence at marginal p
+    the concordant mass already splits p^2/(p^2 + (1-p)^2) -- and one
+    per-cell number cannot track that from bin to bin.  Heterochromatin is
+    less accessible by definition, so it will read co-closed against a
+    chrM baseline whether or not anything is coordinated there.  That the
+    answer looks biologically right is not evidence either way: the marginal
+    artefact and the biology predict the same sign in exactly these regions.
+    """
+    p1, p2 = np.asarray(p1, float), np.asarray(p2, float)
+    o_open = float(np.mean(p1 * p2))
+    o_closed = float(np.mean((1.0 - p1) * (1.0 - p2)))
+    if o_open + o_closed < eps:
+        return float("nan")
+    return o_open / (o_open + o_closed)
 
 
 def suggest_n_pairs(available, keep_frac=0.9):

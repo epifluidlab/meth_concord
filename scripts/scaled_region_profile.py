@@ -322,10 +322,27 @@ def main(argv=None) -> int:
                          "meaningless.  The run refuses rather than dividing "
                          "by it.")
     ap.add_argument("--contrast-reference-d", action="append", default=[],
-                    metavar="NAME=PATH",
+                    metavar="NAME=PATH[:COLUMN]",
                     help="Per-cell reference from "
                          "scripts/reference_concordance.py, as in "
-                         "celltype_marker_bins.py.")
+                         "celltype_marker_bins.py (default column "
+                         "'reference_d').  The transform is logit, so the "
+                         "MATRIX has to be a proportion in (0, 1) too.  With "
+                         ":reference_f on a concordance_direction.parquet "
+                         "(raw F) this asks whether a bin's concordant mass "
+                         "sits co-open or co-closed relative to DNA with no "
+                         "nucleosomes and no 3D structure in the SAME cell, "
+                         "which makes cells comparable.  It does not control "
+                         "the per-bin marginal: F's null position depends on "
+                         "how accessible the bin is, so a less accessible "
+                         "region reads co-closed against a chrM baseline "
+                         "whether or not anything is coordinated -- and in "
+                         "heterochromatin the artefact and the biology "
+                         "predict the same sign, so agreeing with intuition "
+                         "is not evidence.  Profile "
+                         "concordance_marginal.parquet through the same "
+                         "flags to see how much of the shape is the "
+                         "marginal.")
     ap.add_argument("--contrast-regress-coverage", action="store_true",
                     help="Subtract the shared D-versus-depth curve, as in "
                          "celltype_marker_bins.py.  Needs --pair-counts.")
@@ -416,16 +433,18 @@ def main(argv=None) -> int:
     # which centring destroys.
     ref_specs = _named(args.contrast_reference_d, "--contrast-reference-d")
     if name in ref_specs:
-        rp = Path(ref_specs[name])
+        _rp, _, _rcol = str(ref_specs[name]).partition(":")
+        _rcol = _rcol or "reference_d"
+        rp = Path(_rp)
         if not rp.exists():
             sys.exit(f"--contrast-reference-d {name}: no such file {rp}")
         rdf = pd.read_csv(rp, sep="\t")
-        if "cell" not in rdf.columns or "reference_d" not in rdf.columns:
+        if "cell" not in rdf.columns or _rcol not in rdf.columns:
             sys.exit(f"--contrast-reference-d {name}: {rp} needs 'cell' and "
-                     f"'reference_d' columns")
-        rs = rdf.set_index("cell")["reference_d"].reindex(M.index)
+                     f"{_rcol!r} columns")
+        rs = rdf.set_index("cell")[_rcol].reindex(M.index)
         Xc, rinfo = mk.correct_by_reference(Xc, rs.to_numpy(float))
-        steps.append(f"divided out assay reliability for "
+        steps.append(f"referenced to {_rcol} for "
                      f"{rinfo.get('n_corrected', 0)}/{len(M)} cells")
     sc_specs = _named(args.contrast_reference_scale,
                       "--contrast-reference-scale")
