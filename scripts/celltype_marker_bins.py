@@ -687,6 +687,87 @@ def correct_by_reference(X, ref_d, eps=1e-4):
     return corrected, info
 
 
+def scale_by_reference(X, ref, min_frac=0.1, zero_floor=1e-6):
+    """Rescale each cell so its reference matches the cohort median.
+
+    For an EFFECT SIZE the attenuation is multiplicative, not additive on a
+    logit: C carries e^2 var_A, so C_cell / C_reference is free of the
+    enzyme term whatever the cell's marginal.  Measured on a simulated
+    reference pool, C fell by 0.49x and 0.16x as e went 1.0 -> 0.7 -> 0.4 --
+    exactly e^2 -- and it did so at every marginal skew tested, which is what
+    makes a reference taken at chrM's marginal valid for a genome at a
+    different one.
+
+    THE SAME IS NOT TRUE OF A LOG ODDS RATIO, and that is the whole reason
+    this function takes a column rather than assuming one.  L's attenuation
+    depends on the marginal as well as on e: at skew -1.5 it fell 0.29x for
+    the same enzyme drop that took it 0.12x at skew -3.  A reference measured
+    on chrM's marginal therefore does NOT cancel the nuclear L's attenuation,
+    and where chrM's marginal is near symmetric L_ref is ~0 (measured:
+    -0.0003) and dividing by it is meaningless rather than merely imprecise.
+
+    Cells whose reference is not distinguishable from zero are left alone.
+    Dividing by a noisy near-zero number does not just add variance, it flips
+    signs, so a bad reference is worse than none.  A cell whose reference is
+    under ``min_frac`` of the cohort median, or of the opposite sign, is left
+    as it came in and reported.
+    """
+    X = np.asarray(X, float)
+    ref = np.asarray(ref, float)
+    if ref.shape[0] != X.shape[0]:
+        raise ValueError(f"reference has {ref.shape[0]} cells, "
+                         f"matrix has {X.shape[0]}")
+    finite = np.isfinite(ref)
+    centre = float(np.median(ref[finite])) if finite.any() else float("nan")
+    info = {"n_cells": int(X.shape[0]), "reference_median": centre,
+            "min_frac_of_median": float(min_frac)}
+    # The cohort's SPREAD is the thing being divided out, so it is not the
+    # scale to judge "distinguishable from zero" against.  What matters is
+    # whether the reference has a definite magnitude and sign at all: a
+    # reference centred on zero -- which is what a log odds ratio on chrM is
+    # when the marginal is near symmetric, measured at -0.0003 -- makes the
+    # ratio meaningless rather than merely imprecise.
+    spread = _robust_sd(ref[finite]) if finite.sum() > 1 else float("nan")
+    info["reference_spread"] = float(spread)
+    # Two ways a reference is unusable, and both are the same failure: the
+    # denominator has no definite value.  Either it sits on zero outright, or
+    # its spread across cells swamps its own median -- a coefficient of
+    # variation at or above 1 means the sign of the next cell's reference is
+    # close to a coin flip.
+    if (not np.isfinite(centre) or abs(centre) < float(zero_floor)
+            or (np.isfinite(spread) and spread >= abs(centre))):
+        info["note"] = (f"the reference is centred on {centre:+.3g} with a "
+                        f"spread of {spread:.3g}, so it has no definite "
+                        f"magnitude or sign; dividing by it would amplify "
+                        f"noise and flip signs, and nothing was rescaled")
+        info.update(n_corrected=0, n_uncorrected=int(X.shape[0]))
+        return X, info
+    # Same sign as the cohort, and not a small fraction of it.  A cell whose
+    # reference is a tenth of everyone else's would be multiplied up tenfold,
+    # and one of the opposite sign would have its whole profile inverted.
+    usable = (finite & (np.sign(ref) == np.sign(centre))
+              & (np.abs(ref) >= float(min_frac) * abs(centre)))
+    info.update(n_corrected=int(usable.sum()),
+                n_uncorrected=int((~usable).sum()))
+    if not usable.any():
+        info["note"] = "no cell had a usable reference; nothing was rescaled"
+        return X, info
+    out = np.array(X, copy=True)
+    out[usable] = X[usable] * (centre / ref[usable, None])
+    info.update({"reference_min": float(np.min(ref[usable])),
+                 "reference_max": float(np.max(ref[usable]))})
+    return out, info
+
+
+def _robust_sd(x):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return float("nan")
+    mad = float(np.median(np.abs(x - np.median(x))))
+    return 1.4826 * mad if mad > 0 else float(np.std(x))
+
+
 def regress_out_coverage(X, counts, n_strata=24):
     """Subtract the shared relationship between D and sequencing depth.
 

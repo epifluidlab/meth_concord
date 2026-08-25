@@ -102,6 +102,7 @@ def reference_d(df, cell, n_pairs, chrom="chrM", min_gch_sites=3,
     n_avail = int(len(sub))
     out = {"cell": cell, "n_pairs_available": n_avail,
            "n_pairs_used": 0, "reference_d": np.nan,
+           "reference_logor": np.nan, "reference_c": np.nan,
            "median_sites_per_end": np.nan,
            "frac_repeated_coords": np.nan, "note": ""}
     if n_avail:
@@ -134,7 +135,42 @@ def reference_d(df, cell, n_pairs, chrom="chrM", min_gch_sites=3,
         out["note"] = "posteriors have no variance (var_A ~ 0)"
         return out
     out["reference_d"] = float(np.corrcoef(p1, p2)[0, 1])
+    lo, c = _logor_and_c(p1, p2)
+    out["reference_logor"], out["reference_c"] = lo, c
     return out
+
+
+def _logor_and_c(p1, p2, eps=1e-9):
+    """The same chrM pairs read as a log odds ratio and as a covariance.
+
+    A reference is only usable on the scale its statistic lives on, because
+    the attenuation it is meant to remove enters differently on each.  Under
+    incomplete GpC conversion some open sites read closed, and that
+    misclassification pulls any association toward the null MULTIPLICATIVELY:
+    to first order L_obs = lambda(e) * L_true.  So a log odds ratio is
+    corrected by DIVIDING by a reference log odds ratio, not by subtracting
+    one, and not by anything computed on a Pearson r -- corr and log-OR are
+    different functions of the same table and one does not stand in for the
+    other.
+
+    Same argument for C, which is 2*Cov and carries e^2 var_A: multiplicative
+    again, so it divides too.  Only a reliability coefficient D = S/(S+N),
+    which is a RATIO rather than an effect size, turns additive under logit.
+
+    Computed from soft counts on the same pool, matching the pipeline's
+    definition: F = O_open/(O_open + O_closed) against the marginal-matched
+    null built from the two ends' own means.
+    """
+    p1, p2 = np.asarray(p1, float), np.asarray(p2, float)
+    o_open = float(np.mean(p1 * p2))
+    o_closed = float(np.mean((1.0 - p1) * (1.0 - p2)))
+    m1, m2 = float(np.mean(p1)), float(np.mean(p2))
+    e_open, e_closed = m1 * m2, (1.0 - m1) * (1.0 - m2)
+    if min(o_open, o_closed, e_open, e_closed) < eps:
+        return float("nan"), float("nan")
+    logor = (np.log(o_open) - np.log(o_closed)
+             - np.log(e_open) + np.log(e_closed))
+    return float(logor), float((o_open + o_closed) - (e_open + e_closed))
 
 
 def suggest_n_pairs(available, keep_frac=0.9):

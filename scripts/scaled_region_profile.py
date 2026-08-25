@@ -302,6 +302,25 @@ def main(argv=None) -> int:
                          "celltype_marker_bins.py.  Without it the panel "
                          "shows the genome-wide offset between the arms and "
                          "the domain structure rides on top of it, invisible.")
+    ap.add_argument("--contrast-reference-scale", action="append",
+                    default=[], metavar="NAME=PATH[:COLUMN]",
+                    help="Divide out each cell's assay reliability on the "
+                         "scale an EFFECT SIZE lives on, using a column of "
+                         "the reference_concordance.py table (default "
+                         "'reference_c').  C carries e^2 var_A, so the ratio "
+                         "C_cell/C_reference is free of the enzyme term at "
+                         "any marginal -- measured, C fell by exactly e^2 at "
+                         "every marginal skew tested.  Use this for a "
+                         "coordination matrix, not --contrast-reference-d, "
+                         "which is logit-based and only fits a reliability "
+                         "coefficient in (0, 1).  A log odds ratio matrix "
+                         "fits NEITHER: L's attenuation depends on the "
+                         "marginal as well as on e, so a reference taken at "
+                         "chrM's marginal does not cancel the genome's, and "
+                         "where chrM's marginal is near symmetric "
+                         "reference_logor is ~0 and the ratio is "
+                         "meaningless.  The run refuses rather than dividing "
+                         "by it.")
     ap.add_argument("--contrast-reference-d", action="append", default=[],
                     metavar="NAME=PATH",
                     help="Per-cell reference from "
@@ -408,6 +427,26 @@ def main(argv=None) -> int:
         Xc, rinfo = mk.correct_by_reference(Xc, rs.to_numpy(float))
         steps.append(f"divided out assay reliability for "
                      f"{rinfo.get('n_corrected', 0)}/{len(M)} cells")
+    sc_specs = _named(args.contrast_reference_scale,
+                      "--contrast-reference-scale")
+    if name in sc_specs:
+        spec = sc_specs[name]
+        sp, _, col = spec.partition(":")
+        col = col or "reference_c"
+        if not Path(sp).exists():
+            sys.exit(f"--contrast-reference-scale {name}: no such file {sp}")
+        sdf = pd.read_csv(sp, sep="\t")
+        if "cell" not in sdf.columns or col not in sdf.columns:
+            sys.exit(f"--contrast-reference-scale {name}: {sp} needs 'cell' "
+                     f"and {col!r} columns; it has "
+                     f"{list(sdf.columns)[:8]}")
+        ss = sdf.set_index("cell")[col].reindex(M.index)
+        Xc, sinfo = mk.scale_by_reference(Xc, ss.to_numpy(float))
+        if sinfo.get("note"):
+            sys.exit(f"--contrast-reference-scale {name} ({col}): "
+                     f"{sinfo['note']}")
+        steps.append(f"rescaled by {col} for "
+                     f"{sinfo['n_corrected']}/{len(M)} cells")
     if args.contrast_center == "cell-median":
         Xc = mk.center_cells(Xc)
         steps.append("centred each cell on its median")

@@ -273,3 +273,68 @@ def test_reference_noise_falls_with_pairs_and_rises_as_r_approaches_zero():
     assert m.reference_noise(0.05, 1000) > m.reference_noise(0.4, 1000)
     assert np.isnan(m.reference_noise(0.0, 1000))
     assert np.isnan(m.reference_noise(0.3, 2))
+
+
+# ------------------------ a reference is only valid on its own scale --------
+
+def _pool(rng, n, e, skew=0.0):
+    """chrM-like pairs: a shared per-molecule state, read through an enzyme
+    of efficiency e."""
+    shared = rng.normal(0, 1, n)
+    A = 1.0 / (1.0 + np.exp(-(skew + 1.2 * shared)))
+    f = lambda: np.clip(e * A + (1 - e) * 0.5 + rng.normal(0, 0.05, n),
+                        1e-3, 1 - 1e-3)
+    return f(), f()
+
+
+def test_the_reference_C_falls_as_e_squared_whatever_the_marginal():
+    """This is what makes chrM valid for a genome at a different marginal:
+    the enzyme term is separable from var_A, so the RATIO cancels it."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    for skew in (0.0, -1.5, -3.0):
+        c = {}
+        for e in (1.0, 0.7, 0.4):
+            c[e] = m._logor_and_c(*_pool(rng, 200_000, e, skew))[1]
+        assert c[0.7] / c[1.0] == pytest.approx(0.49, abs=0.06)
+        assert c[0.4] / c[1.0] == pytest.approx(0.16, abs=0.04)
+
+
+def test_the_reference_log_odds_ratio_does_not():
+    """Its attenuation depends on the marginal as well as on the enzyme, so
+    a reference measured at chrM's marginal cannot cancel the genome's."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    drop = {}
+    for skew in (-1.5, -3.0):
+        lo = {e: m._logor_and_c(*_pool(rng, 200_000, e, skew))[0]
+              for e in (1.0, 0.7)}
+        drop[skew] = lo[0.7] / lo[1.0]
+    assert drop[-1.5] > 2 * drop[-3.0]
+
+
+def test_a_symmetric_marginal_leaves_no_log_odds_reference_at_all():
+    """chrM has no preferred direction, so with a symmetric marginal its log
+    odds ratio is zero however strong the molecule-level association -- the
+    denominator does not exist."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    lo, c = m._logor_and_c(*_pool(rng, 200_000, 1.0, 0.0))
+    assert abs(lo) < 0.01
+    assert c > 0.05                      # the association itself is strong
+
+
+def test_both_columns_reach_the_table():
+    m = _mod()
+    rng = np.random.default_rng(2)
+    p1, p2 = _pool(rng, 4_000, 0.8, -1.5)
+    df = pd.DataFrame({"chrom": ["chrM"] * 4_000,
+                       "pos1": rng.integers(0, 16_000, 4_000),
+                       "pos2": rng.integers(0, 16_000, 4_000),
+                       "n1": 5, "n2": 5,
+                       "posterior1": p1, "posterior2": p2,
+                       "distance": rng.integers(1, 16_000, 4_000)})
+    out = m.reference_d(df, "c0", 2_000, min_gch_sites=3)
+    assert np.isfinite(out["reference_c"]) and out["reference_c"] > 0
+    assert np.isfinite(out["reference_logor"])
+    assert np.isfinite(out["reference_d"])

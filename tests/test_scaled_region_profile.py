@@ -619,3 +619,40 @@ def test_the_reference_runs_before_the_centring_that_would_break_it():
         i_ref = src.index("correct_by_reference(")
         i_cen = src.rindex("center_cells(Xc)")
         assert i_ref < i_cen, f"{script}: centring must come after the reference"
+
+
+def test_rescaling_removes_an_e_squared_attenuation():
+    """C carries e^2 var_A, so dividing by a reference C leaves var_A."""
+    import numpy as np
+    mk = _marker()
+    rng = np.random.default_rng(0)
+    e = rng.uniform(0.4, 0.9, 40)
+    X = rng.normal(0, 1, (40, 100)) * (e ** 2)[:, None]
+    out, info = mk.scale_by_reference(X, 0.05 * e ** 2)
+    assert info["n_corrected"] == 40
+    spread = lambda M: float(np.std(np.std(M, axis=1)))
+    assert spread(out) < 0.25 * spread(X)
+
+
+def test_a_reference_centred_on_zero_is_refused_not_divided_by():
+    """A chrM log odds ratio at a symmetric marginal is ~0.  Dividing by it
+    does not add variance, it flips signs."""
+    import numpy as np
+    mk = _marker()
+    rng = np.random.default_rng(1)
+    X = rng.normal(0, 1, (40, 100))
+    _out, info = mk.scale_by_reference(X, rng.normal(-0.0003, 0.01, 40))
+    assert info["n_corrected"] == 0
+    assert "no definite magnitude or sign" in info["note"]
+
+
+def test_a_cell_far_below_the_cohort_is_left_alone_not_amplified():
+    import numpy as np
+    mk = _marker()
+    ref = np.full(20, 0.05)
+    ref[0] = 0.001                       # a fiftieth of everyone else
+    ref[1] = -0.05                       # and one of the wrong sign
+    X = np.ones((20, 10))
+    out, info = mk.scale_by_reference(X, ref)
+    assert info["n_corrected"] == 18
+    assert out[0, 0] == 1.0 and out[1, 0] == 1.0
