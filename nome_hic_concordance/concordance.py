@@ -741,11 +741,24 @@ def _dm_expected_for_bin(
     observed contact looks up the mean soft co-state of random end-pairs at
     the contact's distance bucket (falling back to the pooled mean when a
     bucket is empty).  Returns summed expected (k_dm_open, k_dm_closed,
-    k_dm_mixed, n_dm) over the contacts.
+    k_dm_mixed, n_dm) over the contacts, and how many of them took the
+    fallback.
+
+    THE FALLBACK IS NOT NEUTRAL.  A contact whose bucket is empty is scored
+    against the DISTANCE-POOLED mean -- the very baseline distance matching
+    was chosen instead of.  Empty buckets are not spread evenly: the end
+    pool is capped at ``max_ends`` and a bin's ends thin out with
+    separation, so the buckets that come up empty are the LONG ones, which
+    is where the analysis lives.  A run can therefore be distance-matched
+    for its short contacts and silently distance-pooled for its long ones,
+    and since contacts skew short within any bucket while re-paired ends do
+    not, that reintroduces a positive offset in exactly the bins the
+    long-range question is about.  The count is returned so the run can say
+    how much of itself was actually matched.
     """
     m = epos.shape[0]
     if m < 2 or contact_dists.size == 0:
-        return 0.0, 0.0, 0.0, 0
+        return 0.0, 0.0, 0.0, 0, 0
     if m > max_ends:                      # subsample the end pool for speed
         rng = np.random.default_rng(seed)
         idx = rng.choice(m, size=max_ends, replace=False)
@@ -769,12 +782,15 @@ def _dm_expected_for_bin(
 
     cb = (contact_dists // dist_bin).astype(np.int64)
     k_o = k_c = k_m = 0.0
+    n_fb = 0
     for b in cb:
         if b < nb and cnt[b] > 0:
             k_o += exp_o[b]; k_c += exp_c[b]; k_m += exp_m[b]
         else:                              # empty bucket → pooled fallback
             k_o += pooled_o; k_c += pooled_c; k_m += pooled_m
-    return float(k_o), float(k_c), float(k_m), int(contact_dists.size)
+            n_fb += 1
+    return (float(k_o), float(k_c), float(k_m), int(contact_dists.size),
+            int(n_fb))
 
 
 def _pooled_expected_for_bin(
@@ -922,6 +938,7 @@ def _compute_cell_dm_expected(
             p2c = og["pos2"].to_numpy(dtype=np.int64)
             contact_pairs = list(zip(np.minimum(p1c, p2c).tolist(),
                                      np.maximum(p1c, p2c).tolist()))
+            n_fb = 0
             k_o, k_c, k_m, n_dm = _pooled_expected_for_bin(
                 ep_df["pos"].to_numpy(dtype=np.int64),
                 ep_df["p"].to_numpy(dtype=np.float64),
@@ -930,7 +947,7 @@ def _compute_cell_dm_expected(
                 seed=seed_base + int(b), max_distance=int(max_distance),
             )
         else:
-            k_o, k_c, k_m, n_dm = _dm_expected_for_bin(
+            k_o, k_c, k_m, n_dm, n_fb = _dm_expected_for_bin(
                 ep_df["pos"].to_numpy(dtype=np.int64),
                 ep_df["p"].to_numpy(dtype=np.float64),
                 og["distance"].to_numpy(dtype=np.int64),
@@ -940,6 +957,10 @@ def _compute_cell_dm_expected(
         counts[f"{c}:{int(b) * bsz}"] = {
             "k_dm_open": k_o, "k_dm_closed": k_c, "k_dm_mixed": k_m,
             "n_dm": float(n_dm),
+            # Deliberately NOT in _DM_KEYS: it is a diagnostic, not a count
+            # to impute.  The matrix assembly takes only matrix_keys, so
+            # extra entries here ride along and are dropped there.
+            "n_dm_fallback": float(n_fb),
         }
     return cell_name, counts
 
@@ -1429,6 +1450,35 @@ def compute_signed_concordance_matrix(
             for cn, c in per_cell:
                 for bid, dm_entry in dm_by_cell.get(cn, {}).items():
                     c.setdefault(bid, {k: 0.0 for k in _SOFT_COUNT_KEYS}).update(dm_entry)
+            # How much of a distance-MATCHED run was actually matched.  A
+            # contact whose distance bucket held no re-paired ends is scored
+            # against the pooled mean instead, and empty buckets are the long
+            # ones -- so this fraction says whether the baseline the run
+            # claims is the baseline the long-range bins received.
+            if baseline == "distance-matched":
+                _fb = sum(e.get("n_dm_fallback", 0.0)
+                          for d in dm_by_cell.values() for e in d.values())
+                _nd = sum(e.get("n_dm", 0.0)
+                          for d in dm_by_cell.values() for e in d.values())
+                _frac = _fb / _nd if _nd > 0 else float("nan")
+                logger.info(
+                    f"Distance-matched null: {_fb:,.0f} of {_nd:,.0f} "
+                    f"contacts ({_frac:.1%}) had an empty distance bucket "
+                    f"and fell back to the distance-POOLED mean."
+                )
+                if _frac > 0.2:
+                    logger.warning(
+                        f"{_frac:.0%} of contacts were scored against the "
+                        f"pooled mean, so this run is only partly distance-"
+                        f"matched -- and the fallback concentrates at LONG "
+                        f"separations, where a bin's re-paired ends thin "
+                        f"out. Contacts skew short within a bucket while "
+                        f"re-paired ends do not, so those bins keep the "
+                        f"positive offset distance matching was meant to "
+                        f"remove. Raise --dm-dist-bin-bp (wider buckets "
+                        f"fill) or --dm-window-mb (pools ends from "
+                        f"neighbouring bins, which is what thin bins need)."
+                    )
 
         # ---- Step 2: assemble cells × bins soft-count matrices --------------
         all_bins: set[str] = set()

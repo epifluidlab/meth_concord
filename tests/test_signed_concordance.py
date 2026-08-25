@@ -328,9 +328,10 @@ def test_dm_expected_for_bin_known_values():
     ep = np.array([0.9, 0.9, 0.1], dtype=np.float64)
     # End-pairs: (0,1000) d=1000 po=0.81; (1000,2000) d=1000 po=0.09;
     # (0,2000) d=2000.  Bucket d=1000 → mean co-open = (0.81+0.09)/2 = 0.45.
-    k_o, k_c, k_m, n = concordance._dm_expected_for_bin(
+    k_o, k_c, k_m, n, n_fb = concordance._dm_expected_for_bin(
         epos, ep, np.array([1000]), dist_bin=1000, max_ends=400, seed=0)
     assert n == 1
+    assert n_fb == 0                       # the bucket was populated
     assert abs(k_o - 0.45) < 1e-9
     # co-closed at d=1000: ((1-.9)(1-.9)=0.01 + (1-.9)(1-.1)=0.09)/2 = 0.05
     assert abs(k_c - 0.05) < 1e-9
@@ -343,7 +344,7 @@ def test_compute_cell_dm_expected_returns_counts(tmp_path):
         dm_window_bins=0, dm_dist_bin=100)
     assert "chr1:0" in counts
     rec = counts["chr1:0"]
-    assert set(rec) == set(concordance._DM_KEYS)
+    assert set(rec) == set(concordance._DM_KEYS) | {"n_dm_fallback"}
     assert rec["n_dm"] > 0 and rec["k_dm_open"] >= 0
 
 
@@ -400,7 +401,8 @@ def test_compute_cell_dm_expected_pooled_mode(tmp_path):
         dm_window_bins=0, dm_dist_bin=100, dm_max_ends=400, mode="pooled")
     assert "chr1:0" in counts
     rec = counts["chr1:0"]
-    assert set(rec) == set(concordance._DM_KEYS)
+    assert set(rec) == set(concordance._DM_KEYS) | {"n_dm_fallback"}
+    assert rec["n_dm_fallback"] == 0       # pooled mode never falls back
     # 20 long-range contacts in bin chr1:0 → n_dm scaled to the contact count.
     assert rec["n_dm"] == 20
     assert rec["k_dm_open"] >= 0
@@ -1031,3 +1033,43 @@ def test_max_distance_caps_linked_pool(tmp_path):
     _, c1 = concordance._compute_cell_soft_counts(str(p), "c", 1000, 100, 2, 500)
     assert c1["chr1:0"]["n_linked"] == 3     # cap 500: d=800 dropped
     assert c1["chr1:0"]["n_unlinked"] == 2   # short-range unchanged
+
+
+def test_an_empty_distance_bucket_is_counted_as_a_fallback():
+    """A contact whose bucket holds no re-paired ends is scored against the
+    distance-POOLED mean -- the baseline distance matching was chosen
+    instead of.  A run that does that for most of its long contacts is
+    distance-matched in name only, so the count has to be visible."""
+    epos = np.array([0, 1000, 2000], dtype=np.int64)
+    ep = np.array([0.9, 0.9, 0.1], dtype=np.float64)
+    # Contacts at 1000 (a populated bucket) and at 500_000 (empty).
+    k_o, _k_c, _k_m, n, n_fb = concordance._dm_expected_for_bin(
+        epos, ep, np.array([1000, 500_000]), dist_bin=1000, max_ends=400,
+        seed=0)
+    assert n == 2 and n_fb == 1
+    # the fallen-back contact got the pooled mean over all three end-pairs
+    pooled = (0.81 + 0.09 + 0.09) / 3
+    assert abs(k_o - (0.45 + pooled)) < 1e-9
+
+
+def test_the_fallback_count_never_reaches_the_imputed_matrices():
+    """It is a diagnostic, not a count.  Sending it through RWR would make
+    it a smoothed quantity and put a meaningless extra channel in the
+    imputation."""
+    assert "n_dm_fallback" not in concordance._DM_KEYS
+    assert "n_dm_fallback" not in concordance._SOFT_COUNT_KEYS
+
+
+def test_the_run_reports_how_much_of_the_matching_actually_happened(
+        tmp_path, caplog):
+    import logging
+    paths = _focal_active_paths(tmp_path, n_cells=2)
+    with caplog.at_level(logging.INFO,
+                         logger="nome_hic_concordance.concordance"):
+        concordance.compute_signed_concordance_matrix(
+            paths, bin_size=1000, min_distance=100, min_gch_sites=2,
+            baseline="distance-matched", dm_dist_bin=100,
+            save_outputs=False, use_rwr=False,
+        )
+    assert any("Distance-matched null:" in r.message and "fell back"
+               in r.message for r in caplog.records)
