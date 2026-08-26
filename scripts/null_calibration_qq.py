@@ -56,6 +56,29 @@ def robust_sd(x):
     return 1.4826 * mad if mad > 0 else float(np.std(x))
 
 
+def body_sd(x):
+    """A scale read from the 10th-90th percentiles instead of the middle.
+
+    MAD is the width of the MIDDLE half, which is the wrong thing to divide
+    by when the distribution is a spike with tails.  A sparse context leaves
+    a large share of (cell, bin) entries with no reads at all, so the
+    statistic collapses to one value for all of them; MAD then measures the
+    width of that spike, and every entry that carries data lands thousands
+    of nominal 'sds' out.  An HCG run came back on a +-4000 axis for exactly
+    this reason, and nothing about it was large.
+
+    (p90 - p10) / 2.563 is the same quantity for a Gaussian and survives a
+    spike holding up to 80% of the mass.
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return float("nan")
+    lo, hi = np.percentile(x, [10.0, 90.0])
+    span = float(hi - lo)
+    return span / 2.5631 if span > 0 else float("nan")
+
+
 def load_pair(run_dir, stat, cap=4_000_000, seed=0):
     """The observed statistic and its drawn null, flattened and finite.
 
@@ -91,12 +114,19 @@ def calibration(obs, null):
     ns = robust_sd(null)
     os_ = robust_sd(obs)
     nm = float(np.median(null)) if null.size else float("nan")
+    nb = body_sd(null)
+    # How much tighter the middle is than the body.  Near 1 on a normal
+    # sample; large when the null is a spike, which is when the z-axis and
+    # everything divided by ns stop meaning anything.
+    ratio = float(nb / ns) if np.isfinite(ns) and ns > 0 else float("nan")
     out = {
         "n_obs": int(obs.size), "n_null": int(null.size),
         "null_median": nm, "null_madsd": float(ns),
         # THE calibration number: no coordination in, so zero out.
         "null_bias_z": float(nm / ns) if np.isfinite(ns) and ns > 0
         else float("nan"),
+        "null_bodysd": float(nb),
+        "spike_ratio": ratio,
         "obs_median": float(np.median(obs)) if obs.size else float("nan"),
         "obs_madsd": float(os_),
         "lambda": float(os_ / ns) if np.isfinite(ns) and ns > 0
@@ -256,24 +286,44 @@ def main(argv=None) -> int:
         print(f"  -> null_qq_{stat}.{args.plot_format}", file=sys.stderr)
 
     full = pd.DataFrame(rows)[
-        ["statistic", "run", "null_median", "null_madsd", "null_bias_z",
-         "obs_median", "obs_madsd", "lambda", "tail_excess",
-         "n_obs", "n_null"]]
+        ["statistic", "run", "null_median", "null_madsd", "null_bodysd",
+         "spike_ratio", "null_bias_z", "obs_median", "obs_madsd", "lambda",
+         "tail_excess", "n_obs", "n_null"]]
     full.to_csv(out / "null_calibration.tsv", sep="\t", index=False)
     for stat in stats:
         s = full[full["statistic"] == stat].sort_values(
             "null_bias_z", key=lambda c: c.abs())
         print(f"\n{stat}: ranked by |null_bias_z| (0 = the model's null is "
               f"where it says it is)", file=sys.stderr)
-        for r in s.itertuples():
-            flag = "" if abs(r.null_bias_z) < 1 else "   <- null displaced"
-            print(f"  {r.run:32s} null_bias_z={r.null_bias_z:+7.2f}  "
-                  f"lambda={getattr(r, '_8'):6.2f}  "
-                  f"tail_excess={r.tail_excess:+.4f}{flag}",
+        # BY NAME.  'lambda' is a keyword, so itertuples renames it by
+        # POSITION -- and reading it back as _8 broke the moment two columns
+        # were added ahead of it.
+        for _, r in s.iterrows():
+            flag = ("" if abs(r["null_bias_z"]) < 1
+                    else "   <- null displaced")
+            if r["spike_ratio"] > 5.0:
+                flag += "   <- null is a spike; see below"
+            print(f"  {r['run']:32s} null_bias_z={r['null_bias_z']:+7.2f}  "
+                  f"lambda={r['lambda']:6.2f}  "
+                  f"tail_excess={r['tail_excess']:+.4f}{flag}",
                   file=sys.stderr)
     print(f"\n  lambda is only readable where the null itself sits near "
           f"zero: inflation measured against a displaced null is not "
           f"evidence of signal.", file=sys.stderr)
+    bad = full[full["spike_ratio"] > 5.0]
+    for r in bad.itertuples():
+        print(f"\n  WARNING {r.run} / {r.statistic}: the drawn null's body "
+              f"is {r.spike_ratio:.0f}x wider than its middle, so it is a "
+              f"SPIKE with tails rather than a spread.  Its MAD-sd "
+              f"({r.null_madsd:.3g}) is measuring the width of the spike, "
+              f"not the noise -- which is why the axis runs to thousands of "
+              f"nominal sds, and why null_bias_z and lambda are not "
+              f"readable for it.  On a sparse context a large share of "
+              f"(cell, bin) entries carry no reads and the statistic "
+              f"collapses to one value for all of them.  Compare "
+              f"null_bodysd ({r.null_bodysd:.3g}) instead, and check the "
+              f"coverage of that context before reading anything else here.",
+              file=sys.stderr)
     return 0
 
 

@@ -185,3 +185,39 @@ def test_the_centring_keeps_the_excess_it_is_meant_to_show():
     qx, qy = m.qq_points(obs, null)
     nm, ns = float(np.median(qx)), m.robust_sd(qx)
     assert float(np.median((qy - nm) / ns)) == pytest.approx(0.8, abs=0.06)
+
+
+def test_a_spike_shaped_null_is_detected_not_reported_as_a_scale():
+    """A sparse context leaves a large share of (cell, bin) entries with no
+    reads, so the statistic collapses to one value for all of them.  MAD
+    then measures the width of that spike and every entry carrying data
+    lands thousands of nominal sds out -- an HCG run came back on a +-4000
+    axis for exactly that reason, and nothing about it was large."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    spike = np.full(80_000, 0.0) + rng.normal(0, 1e-6, 80_000)
+    body = rng.normal(0, 1.0, 20_000)
+    null = np.r_[spike, body]
+    c = m.calibration(rng.normal(0, 1.0, 100_000), null)
+    assert c["spike_ratio"] > 5.0
+    assert c["null_bodysd"] > 100 * c["null_madsd"]
+    # the nominal z it would put on the axis, which is the symptom
+    assert abs(np.percentile(null, 99.9) / c["null_madsd"]) > 1_000
+
+
+def test_a_well_behaved_null_is_not_flagged():
+    m = _mod()
+    rng = np.random.default_rng(1)
+    null = rng.normal(0, 1, 200_000)
+    c = m.calibration(rng.normal(0, 1.2, 200_000), null)
+    assert c["spike_ratio"] == pytest.approx(1.0, abs=0.05)
+
+
+def test_body_sd_matches_the_robust_sd_on_a_normal_sample():
+    """Same quantity for a Gaussian, so the two are comparable and their
+    ratio is a shape statistic rather than a units mismatch."""
+    m = _mod()
+    rng = np.random.default_rng(2)
+    x = rng.normal(0, 3.0, 400_000)
+    assert m.body_sd(x) == pytest.approx(3.0, rel=0.02)
+    assert m.robust_sd(x) == pytest.approx(3.0, rel=0.02)
