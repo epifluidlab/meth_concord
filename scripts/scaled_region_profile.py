@@ -68,15 +68,16 @@ def scaled_index(bins, domains, n_body, flank_bp, n_flank):
     """
     total = 2 * n_flank + n_body
     if not len(domains):
-        return np.array([], int), np.array([], int), total
-    bi, pi = [], []
+        return (np.array([], int), np.array([], int), total,
+                np.array([], int))
+    bi, pi, di = [], [], []
     step_f = flank_bp / float(n_flank) if n_flank else 1.0
     by_chrom = {}
     for c, sub in bins.groupby("chrom"):
         by_chrom[str(c)] = (sub.index.to_numpy(),
                             sub["start"].to_numpy(float),
                             sub["end"].to_numpy(float))
-    for _, d in domains.iterrows():
+    for _dom_no, (_, d) in enumerate(domains.iterrows()):
         got = by_chrom.get(str(d["chrom"]))
         if got is None:
             continue
@@ -99,9 +100,17 @@ def scaled_index(bins, domains, n_body, flank_bp, n_flank):
         q = np.clip(p.astype(int), 0, total - 1)
         bi.append(idx[sel])
         pi.append(q)
+        # WHICH domain each placement came from.  The scaled axis flattens
+        # thousands of domains onto one set of positions, which is what the
+        # panel wants and what a per-domain test cannot have: without this
+        # the only units left are cells, and cells from one donor are not
+        # replicates of anything.
+        di.append(np.full(q.size, _dom_no, int))
     if not bi:
-        return np.array([], int), np.array([], int), total
-    return np.concatenate(bi), np.concatenate(pi), total
+        return (np.array([], int), np.array([], int), total,
+                np.array([], int))
+    return (np.concatenate(bi), np.concatenate(pi), total,
+            np.concatenate(di))
 
 
 COUNT_KEYS = ("k_open", "k_closed", "k_mixed", "n_linked",
@@ -266,9 +275,16 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
                                        total)
     if baseline == "flank":
         P = anchor_to_flank(P, n_flank, n_body)
+    # One number per CELL: its mean over the body.  With --baseline flank
+    # that is the domain minus this cell's own flank, which is the contrast
+    # the panel is read for; without it, an absolute level dominated by the
+    # genome-wide offset.  Kept so a test can use exactly what is drawn
+    # rather than recomputing it a second, subtly different way.
+    body = (np.nanmean(P[:, n_flank:n_flank + n_body], axis=1)
+            if P.shape[0] and n_body else np.array([]))
     out = {"mean": np.full(total, np.nan), "lo": np.full(total, np.nan),
            "hi": np.full(total, np.nan), "n_bins": n_bins,
-           "n_cells": int(P.shape[0]),
+           "n_cells": int(P.shape[0]), "body": body, "cells": idx,
            "members": {g: int((ct.loc[idx] == g).sum()) for g in members}}
     if not P.shape[0]:
         return out
@@ -284,6 +300,129 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
             out["lo"][i] = out["mean"][i] - half
             out["hi"][i] = out["mean"][i] + half
     return out
+
+
+def per_domain_values(M, ct, members, bin_idx, pos_idx, dom_idx, n_flank,
+                      n_body, total, baseline="none", pooled=None):
+    """One value per DOMAIN: the group's mean over that domain's body,
+    minus its own flank when anchored.
+
+    The scaled panel flattens thousands of domains onto one axis, which is
+    what makes it readable and what leaves only cells to test on.  Cells
+    from one donor are not replicates, so that test answers "do these cells
+    differ" rather than "do these conditions differ".
+
+    A domain is a different unit and a better-powered one: with thousands
+    of PMDs, asking whether the tumour-minus-reference difference is
+    consistently non-zero ACROSS domains has thousands of degrees of
+    freedom.  It is not free of dependence either -- domains cluster and a
+    genome-wide offset would move every one of them the same way -- which
+    is exactly why the flank anchor matters here: each domain is measured
+    against its OWN flank, so a global shift cancels inside every domain
+    and what is left is local.
+    """
+    n_dom = int(dom_idx.max()) + 1 if dom_idx.size else 0
+    body_lo, body_hi = n_flank, n_flank + n_body
+    out = np.full(n_dom, np.nan)
+    if not n_dom:
+        return out
+    for d in range(n_dom):
+        sel = dom_idx == d
+        if not sel.any():
+            continue
+        r = group_profile(M, ct, members, bin_idx[sel], pos_idx[sel], total,
+                          baseline=baseline, n_flank=n_flank, n_body=n_body,
+                          pooled=pooled)
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            out[d] = np.nanmean(r["mean"][body_lo:body_hi])
+    return out
+
+
+def domain_paired_test(a_vals, b_vals):
+    """Is the difference between the arms consistent across domains?
+
+    Paired on the domain -- both arms are measured on the same one -- so a
+    Wilcoxon signed-rank on the per-domain differences.  Signed-rank rather
+    than a t because these differences are not normal, and paired rather
+    than two-sample because a domain's depth, size and compartment affect
+    both arms and cancel in the difference.
+    """
+    from scipy.stats import wilcoxon
+    d = np.asarray(a_vals, float) - np.asarray(b_vals, float)
+    d = d[np.isfinite(d)]
+    out = {"n_domains": int(d.size),
+           "median_diff": float(np.median(d)) if d.size else float("nan"),
+           "frac_positive": float(np.mean(d > 0)) if d.size else float("nan"),
+           "p_domain": float("nan")}
+    if d.size >= 6 and np.any(d != 0):
+        out["p_domain"] = float(wilcoxon(d, alternative="two-sided")[1])
+    return out
+
+
+def region_group_test(prof, ct, donor=None, baseline="none",
+                      domain_vals=None):
+    """Are the two arms different across this region set?
+
+    One value per CELL -- its mean over the domain body, which under
+    --baseline flank is that cell's domain-minus-flank -- then a two-sided
+    Mann-Whitney between the arms.  Rank-based because these values are not
+    normal and one outlying cell should not carry the result.
+
+    THE CELL-LEVEL p IS NOT A BIOLOGICAL REPLICATE TEST, and on this design
+    it cannot be made into one.  Cells from one donor share that donor's
+    biology, its library prep and its coverage, so with a few hundred cells
+    per arm the test has enough power to call any systematic difference --
+    including the donor itself.  It answers "do these cells differ", which
+    is nearly always yes, not "do these conditions differ".
+
+    Passing a donor column gives the test that does answer the second
+    question, by averaging each donor's cells first.  It is reported
+    alongside and it will usually be far less significant; that is the
+    honest arithmetic of two donors against three references, not a defect
+    in the test.  Where the donor-level n is too small to reach any p at
+    all, the smallest attainable one is reported so the reader can see the
+    ceiling rather than mistake it for a null result.
+    """
+    from itertools import combinations
+    from math import comb
+    from scipy.stats import mannwhitneyu
+
+    rows = []
+    labs = [g for g in prof if np.size(prof[g].get("body", ())) > 0]
+    for a, b in combinations(labs, 2):
+        rec = {"group_a": a, "group_b": b, "baseline": baseline}
+        for unit in ("cell", "donor"):
+            if unit == "donor" and donor is None:
+                continue
+            xs = []
+            for g in (a, b):
+                v = np.asarray(prof[g]["body"], float)
+                idx = prof[g]["cells"]
+                if unit == "donor":
+                    d = pd.Series(v, index=idx).groupby(
+                        donor.reindex(idx).astype(str)).mean()
+                    v = d.to_numpy(float)
+                xs.append(v[np.isfinite(v)])
+            na, nb = len(xs[0]), len(xs[1])
+            rec[f"n_{unit}_a"], rec[f"n_{unit}_b"] = na, nb
+            rec[f"mean_{unit}_a"] = float(np.mean(xs[0])) if na else np.nan
+            rec[f"mean_{unit}_b"] = float(np.mean(xs[1])) if nb else np.nan
+            rec[f"diff_{unit}"] = rec[f"mean_{unit}_a"] - rec[f"mean_{unit}_b"]
+            if na >= 1 and nb >= 1 and (na + nb) >= 3:
+                rec[f"p_{unit}"] = float(
+                    mannwhitneyu(xs[0], xs[1], alternative="two-sided")[1])
+            else:
+                rec[f"p_{unit}"] = float("nan")
+            # The smallest p this many units could ever produce, so a
+            # non-significant donor test is read as a ceiling and not as
+            # evidence of no difference.
+            rec[f"p_floor_{unit}"] = (2.0 / comb(na + nb, na)
+                                      if na and nb else float("nan"))
+        if domain_vals is not None and a in domain_vals and b in domain_vals:
+            rec.update(domain_paired_test(domain_vals[a], domain_vals[b]))
+        rows.append(rec)
+    return pd.DataFrame(rows)
 
 
 def member_curves(M, ct, members, bin_idx, pos_idx, total, baseline="none",
@@ -396,6 +535,36 @@ def main(argv=None) -> int:
                          "celltype_marker_bins.py.  Without it the panel "
                          "shows the genome-wide offset between the arms and "
                          "the domain structure rides on top of it, invisible.")
+    ap.add_argument("--domain-test", action="store_true",
+                    help="Also test across DOMAINS: each domain's "
+                         "tumour-minus-reference difference, then a "
+                         "Wilcoxon signed-rank on those.  With thousands of "
+                         "PMDs that has thousands of degrees of freedom "
+                         "where the per-cell test has none that are "
+                         "biological -- cells from one donor are not "
+                         "replicates.  Paired on the domain, since its "
+                         "depth, size and compartment affect both arms and "
+                         "cancel in the difference.  Domains are not "
+                         "independent either, and that is why --baseline "
+                         "flank matters here: each domain is measured "
+                         "against its OWN flank, so a genome-wide offset "
+                         "cancels inside every one and what is left is "
+                         "local.  Costs one profile pass per domain, so it "
+                         "is off by default.")
+    ap.add_argument("--donor-column", default=None, metavar="COLUMN",
+                    help="Column in --samples naming the biological "
+                         "replicate.  The per-cell test is reported either "
+                         "way, and it is not a replicate test: cells from "
+                         "one donor share that donor's biology, prep and "
+                         "coverage, so a few hundred per arm will call any "
+                         "systematic difference including the donor itself. "
+                         "Giving this averages each donor's cells first and "
+                         "reports the test that answers whether the "
+                         "CONDITIONS differ.  Expect it to be far less "
+                         "significant, and read p_floor_donor beside it -- "
+                         "with two donors against three references the "
+                         "smallest p attainable is 0.2, so a null result "
+                         "there is a ceiling, not evidence.")
     ap.add_argument("--from-counts", default=None, metavar="DIR",
                     help="Compute each axis position from the POOLED raw "
                          "counts of the bins landing there, instead of "
@@ -695,7 +864,13 @@ def main(argv=None) -> int:
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    results, members, rows = {}, {}, []
+    results, members, rows, tests = {}, {}, [], []
+    _donor = None
+    if args.donor_column:
+        if args.donor_column not in samples.columns:
+            sys.exit(f"--donor-column {args.donor_column!r} not in "
+                     f"--samples: {list(samples.columns)[:10]}")
+        _donor = samples.set_index("cell_name")[args.donor_column].astype(str)
     for rname, rspec in _named(args.region, "--region").items():
         rpath, _, rclass = rspec.partition("::")
         dom = bp.read_bed(rpath, merge=True, keep_class=rclass or None)
@@ -707,8 +882,8 @@ def main(argv=None) -> int:
             continue
         w = (dom["end"] - dom["start"]).to_numpy(float)
         thin = int((w < step_bp).sum())
-        bi, pi, total = scaled_index(bins, dom, args.body_bins, args.flank,
-                                     args.flank_bins)
+        bi, pi, total, dmi = scaled_index(bins, dom, args.body_bins,
+                                          args.flank, args.flank_bins)
         kw = dict(baseline=args.baseline, n_flank=args.flank_bins,
                   n_body=args.body_bins)
         if _pooled is not None:
@@ -716,6 +891,18 @@ def main(argv=None) -> int:
         prof = {lab: group_profile(M, ct, mem, bi, pi, total, args.conf, **kw)
                 for lab, mem in groups.items()}
         results[rname] = prof
+        _dv = None
+        if args.domain_test and len(groups) >= 2:
+            _dv = {lab: per_domain_values(M, ct, mem, bi, pi, dmi,
+                                          args.flank_bins, args.body_bins,
+                                          total, baseline=args.baseline,
+                                          pooled=_pooled)
+                   for lab, mem in groups.items()}
+        _t = region_group_test(prof, ct, donor=_donor,
+                               baseline=args.baseline, domain_vals=_dv)
+        if len(_t):
+            _t.insert(0, "region", rname)
+            tests.append(_t)
         members[rname] = {lab: member_curves(M, ct, mem, bi, pi, total, **kw)
                           for lab, mem in groups.items() if len(mem) > 1}
         print(f"  {rname}: {len(dom):,} of {n_all:,} domains "
@@ -754,6 +941,37 @@ def main(argv=None) -> int:
 
     tab = pd.DataFrame(rows)
     tab.to_csv(out / f"scaled_profile_{name}.tsv", sep="\t", index=False)
+
+    if tests:
+        tt = pd.concat(tests, ignore_index=True)
+        tt.to_csv(out / f"region_group_test_{name}.tsv", sep="\t",
+                  index=False)
+        _unit = ("domain minus flank" if args.baseline == "flank"
+                 else "absolute level")
+        print(f"\n  region test ({_unit} per cell, two-sided "
+              f"Mann-Whitney):", file=sys.stderr)
+        for r in tt.itertuples():
+            line = (f"  {r.region:>10s} {r.group_a} vs {r.group_b}: "
+                    f"diff={r.diff_cell:+.3g}  p_cell={r.p_cell:.3g} "
+                    f"({r.n_cell_a} vs {r.n_cell_b} cells)")
+            if "p_domain" in tt.columns and np.isfinite(r.p_domain):
+                line += (f"   |  p_domain={r.p_domain:.3g} "
+                         f"({r.n_domains} domains, median diff "
+                         f"{r.median_diff:+.3g}, {r.frac_positive:.0%} "
+                         f"positive)")
+            if "p_donor" in tt.columns and np.isfinite(r.p_donor):
+                line += (f"   |  p_donor={r.p_donor:.3g} "
+                         f"({r.n_donor_a} vs {r.n_donor_b}, floor "
+                         f"{r.p_floor_donor:.3g})")
+            print(line, file=sys.stderr)
+        if "p_donor" not in tt.columns:
+            print(f"  the per-cell p is NOT a replicate test -- cells from "
+                  f"one donor share its biology, prep and coverage, so a "
+                  f"few hundred per arm call any systematic difference "
+                  f"including the donor.  Pass --donor-column for the test "
+                  f"that answers whether the CONDITIONS differ.",
+                  file=sys.stderr)
+        print(f"  -> region_group_test_{name}.tsv", file=sys.stderr)
     fig = out / f"scaled_profile_{name}.{args.plot_format}"
     scaled_figure(results, fig, args.title or f"{name}: mean D across scaled "
                   f"domains", args.ylabel, args.body_bins, args.flank_bins,

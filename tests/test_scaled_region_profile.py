@@ -53,7 +53,7 @@ def test_domains_of_different_width_map_onto_the_same_body_axis():
     wide = _domains([(100 * BIN, 180 * BIN)])           # 20 Mb
     out = []
     for dom in (narrow, wide):
-        bi, pi, total = m.scaled_index(bins, dom, 40, 2_000_000, 20)
+        bi, pi, total, _dm = m.scaled_index(bins, dom, 40, 2_000_000, 20)
         body = pi[(pi >= 20) & (pi < 60)]
         out.append((body.min(), body.max(), np.unique(body).size, total))
     assert out[0][3] == out[1][3] == 80
@@ -78,7 +78,7 @@ def test_the_flanks_stay_in_base_pairs():
     bins = _bins(400)
     pos = []
     for span in ((100 * BIN, 104 * BIN), (100 * BIN, 200 * BIN)):
-        bi, pi, _ = m.scaled_index(bins, _domains([span]), 40, 2_000_000, 20)
+        bi, pi, _, _dm = m.scaled_index(bins, _domains([span]), 40, 2_000_000, 20)
         # the bin whose midpoint sits ~1 Mb upstream of the start
         want = int(np.where(bins.index == 96)[0][0])
         pos.append(pi[bi == want][0])
@@ -91,14 +91,14 @@ def test_a_bin_can_serve_two_nearby_domains():
     m = _mod()
     bins = _bins(400)
     dom = _domains([(40 * BIN, 50 * BIN), (56 * BIN, 66 * BIN)])
-    bi, pi, _ = m.scaled_index(bins, dom, 40, 2_000_000, 20)
+    bi, pi, _, _dm = m.scaled_index(bins, dom, 40, 2_000_000, 20)
     counts = pd.Series(bi).value_counts()
     assert (counts > 1).any()
 
 
 def test_no_domains_yields_an_empty_axis_not_a_crash():
     m = _mod()
-    bi, pi, total = m.scaled_index(_bins(50), _domains([]), 40, 2_000_000, 20)
+    bi, pi, total, _dm = m.scaled_index(_bins(50), _domains([]), 40, 2_000_000, 20)
     assert bi.size == 0 and pi.size == 0 and total == 80
 
 
@@ -106,7 +106,7 @@ def test_positions_never_escape_the_axis():
     m = _mod()
     bins = _bins(400)
     dom = _domains([(0, 3 * BIN), (390 * BIN, 400 * BIN)])   # at both edges
-    bi, pi, total = m.scaled_index(bins, dom, 40, 2_000_000, 20)
+    bi, pi, total, _dm = m.scaled_index(bins, dom, 40, 2_000_000, 20)
     assert pi.min() >= 0 and pi.max() < total
 
 
@@ -131,7 +131,7 @@ def test_the_group_mean_rises_inside_the_domain_and_not_outside():
     m = _mod()
     M, ct = _matrix()
     bins = _bins(400)
-    bi, pi, total = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
+    bi, pi, total, _dm = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
                                    40, 2_000_000, 20)
     tum = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
     ref = m.group_profile(M, ct, ["GM12878", "IMR90", "monocyte"],
@@ -150,7 +150,7 @@ def test_the_interval_is_across_cells_not_across_bins():
     m = _mod()
     M, ct = _matrix()
     bins = _bins(400)
-    bi, pi, total = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
+    bi, pi, total, _dm = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
                                    40, 2_000_000, 20)
     few = m.group_profile(M, ct, ["tumor1"], bi, pi, total)
     many = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
@@ -166,7 +166,7 @@ def test_a_single_cell_gets_a_mean_but_no_interval():
     ct = ct.copy()
     ct.iloc[1:12] = "other"                      # leave one tumor1 cell
     bins = _bins(400)
-    bi, pi, total = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
+    bi, pi, total, _dm = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
                                    40, 2_000_000, 20)
     r = m.group_profile(M, ct, ["tumor1"], bi, pi, total)
     assert r["n_cells"] == 1
@@ -188,7 +188,7 @@ def test_member_curves_expose_a_group_carried_by_one_donor():
                      columns=[f"chr1:{i * BIN}" for i in range(400)])
     ct = pd.Series(cts, index=cells)
     bins = _bins(400)
-    bi, pi, total = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
+    bi, pi, total, _dm = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
                                    40, 2_000_000, 20)
     curves = m.member_curves(M, ct, ["tumor1", "tumor2"], bi, pi, total)
     body = slice(20, 60)
@@ -201,7 +201,7 @@ def test_missing_bins_do_not_drag_the_mean():
     M, ct = _matrix()
     M.iloc[:, 100:120] = np.nan
     bins = _bins(400)
-    bi, pi, total = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
+    bi, pi, total, _dm = m.scaled_index(bins, _domains([(100 * BIN, 180 * BIN)]),
                                    40, 2_000_000, 20)
     r = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
     assert np.isfinite(r["mean"][20:60]).any()
@@ -446,7 +446,7 @@ def test_without_anchoring_the_flanks_stay_apart():
     """The reported problem."""
     m = _mod()
     M, ct = _residual_matrix()
-    bi, pi, total = _idx()
+    bi, pi, total, _dm = _idx()
     a = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
     b = m.group_profile(M, ct, ["GM12878", "IMR90", "monocyte"], bi, pi, total)
     gap = np.nanmean(a["mean"][:20]) - np.nanmean(b["mean"][:20])
@@ -456,7 +456,7 @@ def test_without_anchoring_the_flanks_stay_apart():
 def test_anchoring_puts_both_flanks_on_zero():
     m = _mod()
     M, ct = _residual_matrix()
-    bi, pi, total = _idx()
+    bi, pi, total, _dm = _idx()
     kw = dict(baseline="flank", n_flank=20, n_body=40)
     a = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total, **kw)
     b = m.group_profile(M, ct, ["GM12878", "IMR90", "monocyte"], bi, pi,
@@ -470,7 +470,7 @@ def test_anchoring_keeps_the_domain_effect_it_is_meant_to_reveal():
     """It must move the baseline, not the finding."""
     m = _mod()
     M, ct = _residual_matrix()
-    bi, pi, total = _idx()
+    bi, pi, total, _dm = _idx()
     plain = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
     anch = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total,
                            baseline="flank", n_flank=20, n_body=40)
@@ -486,7 +486,7 @@ def test_anchoring_is_per_cell_so_it_tightens_the_interval():
     level spread is removed and the band reports the change."""
     m = _mod()
     M, ct = _residual_matrix()
-    bi, pi, total = _idx()
+    bi, pi, total, _dm = _idx()
     plain = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total)
     anch = m.group_profile(M, ct, ["tumor1", "tumor2"], bi, pi, total,
                            baseline="flank", n_flank=20, n_body=40)
@@ -501,7 +501,7 @@ def test_anchoring_removes_a_genuine_global_difference_too():
     at all, anchoring makes two arms that really do differ look identical."""
     m = _mod()
     M, ct = _residual_matrix(structure=0.0)
-    bi, pi, total = _idx()
+    bi, pi, total, _dm = _idx()
     tum, ref = ["tumor1", "tumor2"], ["GM12878", "IMR90", "monocyte"]
     kw = dict(baseline="flank", n_flank=20, n_body=40)
     before = (np.nanmean(m.group_profile(M, ct, tum, bi, pi, total)["mean"])
@@ -520,7 +520,7 @@ def test_member_curves_are_anchored_the_same_way():
     be worse than not drawing them."""
     m = _mod()
     M, ct = _residual_matrix()
-    bi, pi, total = _idx()
+    bi, pi, total, _dm = _idx()
     cur = m.member_curves(M, ct, ["tumor1", "tumor2"], bi, pi, total,
                           baseline="flank", n_flank=20, n_body=40)
     for y in cur.values():
@@ -808,3 +808,211 @@ def test_member_curves_pools_when_the_group_does(tmp_path):
     for g in ("A", "B"):
         assert np.isfinite(curves[g]).all()
         assert np.any(np.abs(curves[g]) > 1e-9)
+
+
+# ------------------------------ is the difference across a region real? -----
+
+def _profile_fixture(tmp_path, n_bins=80, n_cells=24, shift=0.6, seed=0):
+    """A matrix with a planted domain effect, and the files to profile it."""
+    import numpy as np
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    cells = [f"c{i}" for i in range(n_cells)]
+    bins = [f"chr1:{i * 250_000}" for i in range(n_bins)]
+    X = rng.normal(0.0, 0.1, (n_cells, n_bins))
+    arm = np.arange(n_cells) < n_cells // 2
+    body = slice(30, 50)
+    X[np.ix_(arm, np.arange(30, 50))] += shift        # only inside the domain
+    d = tmp_path / "run"
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(
+        d / "concordance_coordination.parquet")
+    s = tmp_path / "samples.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n_cells,
+                  "cell_type": ["T" if a else "R" for a in arm],
+                  "donor": [f"{'t' if a else 'r'}{i % 2}"
+                            for i, a in enumerate(arm)]}
+                 ).to_csv(s, sep="\t", index=False)
+    bed = tmp_path / "dom.bed"
+    # many domains inside the planted stretch, so the per-domain test has
+    # something to count
+    bed.write_text("".join(f"chr1\t{7_500_000 + i * 500_000}\t"
+                           f"{7_750_000 + i * 500_000}\n"
+                           for i in range(10)))
+    return d, s, bed, X, cells, bins, arm
+
+
+def test_group_profile_hands_back_one_value_per_cell():
+    """The test has to use exactly what the panel draws, not a second
+    computation of it that could differ by a baseline or a slice."""
+    import numpy as np
+    import pandas as pd
+    m = _mod()
+    n_cells, n_bins = 10, 12
+    cells = [f"c{i}" for i in range(n_cells)]
+    M = pd.DataFrame(np.ones((n_cells, n_bins)), index=cells,
+                     columns=[f"chr1:{i * 250000}" for i in range(n_bins)])
+    ct = pd.Series(["A"] * n_cells, index=cells)
+    bi = np.arange(n_bins)
+    pi = np.repeat(np.arange(6), 2)
+    r = m.group_profile(M, ct, ["A"], bi, pi, 6, n_flank=1, n_body=4)
+    assert r["body"].shape == (n_cells,)
+    assert list(r["cells"]) == cells
+    np.testing.assert_allclose(r["body"], 1.0)
+
+
+def test_the_region_test_finds_a_planted_domain_difference(tmp_path):
+    import numpy as np
+    import pandas as pd
+    m = _mod()
+    d, s, _bed, X, cells, bins, arm = _profile_fixture(tmp_path)
+    M = pd.read_parquet(d / "concordance_coordination.parquet")
+    ct = pd.Series(["T" if a else "R" for a in arm], index=cells)
+    bi = np.arange(len(bins))
+    pi = np.clip((np.arange(len(bins)) - 20) // 10 + 1, 0, 5)
+    prof = {g: m.group_profile(M, ct, [g], bi, pi, 6, n_flank=1, n_body=4)
+            for g in ("T", "R")}
+    tt = m.region_group_test(prof, ct)
+    assert len(tt) == 1
+    assert tt["p_cell"].iloc[0] < 1e-3
+    assert abs(tt["diff_cell"].iloc[0]) > 0.1
+
+
+def test_the_donor_test_is_reported_with_its_own_ceiling(tmp_path):
+    """Two donors against three references cannot reach below p = 0.2 --
+    that is arithmetic, not a null result, so the floor is reported beside
+    the p."""
+    import numpy as np
+    import pandas as pd
+    m = _mod()
+    d, s, _bed, X, cells, bins, arm = _profile_fixture(tmp_path)
+    M = pd.read_parquet(d / "concordance_coordination.parquet")
+    ct = pd.Series(["T" if a else "R" for a in arm], index=cells)
+    donor = pd.Series([f"t{i % 2}" if a else f"r{i % 3}"
+                       for i, a in enumerate(arm)], index=cells)
+    bi = np.arange(len(bins))
+    pi = np.clip((np.arange(len(bins)) - 20) // 10 + 1, 0, 5)
+    prof = {g: m.group_profile(M, ct, [g], bi, pi, 6, n_flank=1, n_body=4)
+            for g in ("T", "R")}
+    tt = m.region_group_test(prof, ct, donor=donor)
+    r = tt.iloc[0]
+    assert r["n_donor_a"] == 2 and r["n_donor_b"] == 3
+    assert r["p_floor_donor"] == pytest.approx(0.2)
+    assert r["p_donor"] >= r["p_floor_donor"] - 1e-9
+    # the cell-level p is the one that looks impressive
+    assert r["p_cell"] < 0.01
+
+
+def test_the_cli_writes_the_region_test(tmp_path):
+    import subprocess
+    import sys as _sys
+    import pandas as pd
+    d, s, bed, _X, _c, _b, _a = _profile_fixture(tmp_path)
+    out = tmp_path / "prof"
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--matrix",
+         f"gch={d / 'concordance_coordination.parquet'}",
+         "--samples", str(s), "--group", "tum=T", "--group", "ref=R",
+         "--region", f"dom={bed}", "--cell-type-column", "cell_type",
+         "--donor-column", "donor", "--baseline", "flank",
+         "--body-bins", "10", "--flank", "5000000", "--flank-bins", "4",
+         "--plot-format", "png", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    tt = pd.read_csv(out / "region_group_test_gch.tsv", sep="\t")
+    assert {"region", "p_cell", "p_donor", "p_floor_donor",
+            "diff_cell"} <= set(tt.columns)
+    assert tt["p_cell"].iloc[0] < 0.01
+    assert "region test" in r.stderr
+
+
+def test_without_a_donor_column_the_run_says_what_the_p_is_not(tmp_path):
+    import subprocess
+    import sys as _sys
+    d, s, bed, _X, _c, _b, _a = _profile_fixture(tmp_path)
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--matrix",
+         f"gch={d / 'concordance_coordination.parquet'}",
+         "--samples", str(s), "--group", "tum=T", "--group", "ref=R",
+         "--region", f"dom={bed}", "--cell-type-column", "cell_type",
+         "--baseline", "flank", "--body-bins", "10", "--flank", "5000000",
+         "--flank-bins", "4", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "p2")], capture_output=True,
+        text=True)
+    assert r.returncode == 0, r.stderr
+    assert "NOT a replicate test" in r.stderr
+    assert "--donor-column" in r.stderr
+
+
+def test_the_domain_test_counts_domains_not_cells(tmp_path):
+    """With thousands of PMDs the domain is the better-powered unit: the
+    per-cell test has hundreds of observations and none of them biological
+    replicates, while the per-domain one asks whether the difference is
+    CONSISTENT across domains."""
+    import numpy as np
+    m = _mod()
+    rng = np.random.default_rng(0)
+    a = rng.normal(0.4, 0.2, 40)          # tumour, consistently higher
+    b = rng.normal(0.0, 0.2, 40)
+    r = m.domain_paired_test(a, b)
+    assert r["n_domains"] == 40
+    assert r["p_domain"] < 1e-5
+    assert r["frac_positive"] > 0.8
+    assert r["median_diff"] > 0.2
+
+
+def test_a_difference_that_is_not_consistent_does_not_clear_it():
+    """Half the domains up and half down is a real per-cell difference and
+    no domain-level result, which is the distinction the unit exists for."""
+    import numpy as np
+    m = _mod()
+    rng = np.random.default_rng(1)
+    d = np.r_[rng.normal(0.5, 0.1, 20), rng.normal(-0.5, 0.1, 20)]
+    r = m.domain_paired_test(d, np.zeros(40))
+    assert r["p_domain"] > 0.05
+    assert 0.4 < r["frac_positive"] < 0.6
+
+
+def test_too_few_domains_report_nan_rather_than_a_number():
+    import numpy as np
+    m = _mod()
+    r = m.domain_paired_test(np.array([1.0, 2.0]), np.array([0.0, 0.0]))
+    assert r["n_domains"] == 2 and not np.isfinite(r["p_domain"])
+
+
+def test_scaled_index_keeps_which_domain_each_placement_came_from():
+    import numpy as np
+    import pandas as pd
+    m = _mod()
+    bins = pd.DataFrame({"chrom": ["chr1"] * 20,
+                         "start": np.arange(20) * 250_000})
+    bins["end"] = bins.start + 250_000
+    dom = pd.DataFrame({"chrom": ["chr1", "chr1"],
+                        "start": [1_000_000, 3_000_000],
+                        "end": [2_000_000, 4_000_000]})
+    bi, pi, total, dmi = m.scaled_index(bins, dom, 4, 500_000, 2)
+    assert dmi.shape == bi.shape == pi.shape
+    assert set(np.unique(dmi)) == {0, 1}
+
+
+def test_the_cli_reports_the_domain_test(tmp_path):
+    import subprocess
+    import sys as _sys
+    import pandas as pd
+    d, s, bed, _X, _c, _b, _a = _profile_fixture(tmp_path)
+    out = tmp_path / "prof_dom"
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--matrix",
+         f"gch={d / 'concordance_coordination.parquet'}",
+         "--samples", str(s), "--group", "tum=T", "--group", "ref=R",
+         "--region", f"dom={bed}", "--cell-type-column", "cell_type",
+         "--donor-column", "donor", "--baseline", "flank", "--domain-test",
+         "--body-bins", "6", "--flank", "500000", "--flank-bins", "2",
+         "--plot-format", "png", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    tt = pd.read_csv(out / "region_group_test_gch.tsv", sep="\t")
+    assert {"p_domain", "n_domains", "median_diff",
+            "frac_positive"} <= set(tt.columns)
+    assert tt["n_domains"].iloc[0] >= 5
+    assert "p_domain" in r.stderr
