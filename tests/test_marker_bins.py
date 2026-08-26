@@ -3057,18 +3057,59 @@ def test_cell_type_aware_imputation_inflates_the_sparse_bins():
     assert (p < 0.05).mean() > 0.4          # measured 0.577
 
 
-def test_masking_on_raw_pair_counts_removes_it():
-    """--min-pairs marks them missing, and permute_within_cells then holds
-    them in place on its own.  The sparse bins mostly stop being testable,
-    which is the honest answer: they had almost no coverage."""
+def test_holding_the_imputed_entries_fixed_removes_it():
+    """The imputed value is still evidence and stays in the observed.  What
+    it must not do is MOVE: shuffled, a cell's imputed entries scatter their
+    arm signature across every bin position and the null carries the
+    genome-wide mix instead of the bin's own share.  Held in place, the
+    signature sits in the null exactly as in the observed, and a bin clears
+    only by differing more than the imputation explains."""
     m = _mod()
     X, cov, arm, sparse = _imputed_matrix()
-    r = m.permutation_null(np.where(cov, X, np.nan), arm, ~arm, min_cells=5,
-                           test="mwu", n_perm=300, seed=0)
+    r = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=300, seed=0, permutable=cov)
     p = np.asarray(r["p_empirical"])[sparse]
     ok = np.isfinite(p)
-    assert ok.sum() < 0.1 * len(sparse)
-    assert (p[ok] < 0.05).mean() < 0.1
+    assert ok.all()                          # every bin still testable
+    assert (p[ok] < 0.05).mean() < 0.15      # measured 0.077, from 0.577
+
+
+def test_holding_them_fixed_beats_dropping_them():
+    """Dropping the imputed entries also works, and costs almost every
+    sparse bin -- 6 of 300 still testable.  Holding them fixed keeps all of
+    them, which is why --min-pairs gates the null rather than the matrix."""
+    m = _mod()
+    X, cov, arm, sparse = _imputed_matrix()
+    held = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                              n_perm=300, seed=0, permutable=cov)
+    dropped = m.permutation_null(np.where(cov, X, np.nan), arm, ~arm,
+                                 min_cells=5, test="mwu", n_perm=300, seed=0)
+    n_held = int(np.isfinite(np.asarray(held["p_empirical"])[sparse]).sum())
+    n_drop = int(np.isfinite(
+        np.asarray(dropped["p_empirical"])[sparse]).sum())
+    assert n_held > 10 * n_drop
+
+
+def test_the_observed_statistic_is_untouched_by_the_gate():
+    """--min-pairs must not change what is being tested, only what the null
+    is built from.  A flag that quietly altered the estimate as well would
+    make the two runs incomparable."""
+    m = _mod()
+    X, cov, arm, _sparse = _imputed_matrix()
+    a = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=20, seed=0)
+    b = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=20, seed=0, permutable=cov)
+    np.testing.assert_allclose(a["stat"], b["stat"], equal_nan=True)
+
+
+def test_a_held_entry_does_not_move_and_the_rest_do():
+    m = _mod()
+    row = np.array([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
+    hold = np.array([[True, True, True, False, False, False]])
+    out = m.permute_within_cells(row, np.random.default_rng(0), hold)
+    np.testing.assert_array_equal(out[0, 3:], row[0, 3:])
+    assert sorted(out[0, :3]) == [1.0, 2.0, 3.0]
 
 
 def test_structural_zeros_alone_do_not_do_this():

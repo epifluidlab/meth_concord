@@ -889,7 +889,7 @@ def direction_skew(diff, sig):
             "frac_one_direction": max(up, n - up) / n}
 
 
-def permute_within_cells(X, rng):
+def permute_within_cells(X, rng, permutable=None):
     """Shuffle each cell's values across bins, keeping its NaN pattern.
 
     Destroys WHICH bin a value belongs to while preserving everything about
@@ -922,19 +922,31 @@ def permute_within_cells(X, rng):
     way came back at a nominal 0.040.  It is the cell-type tint that does
     the damage, not the fill.
 
-    Mask on the RAW pair counts first (--min-pairs) and this function holds
-    them in place on its own.
+    ``permutable`` restores the defence without discarding anything.  Pass
+    the entries that have read pairs of THEIR OWN and the imputed ones stay
+    where they are, in the null exactly as in the observed -- so a bin's
+    imputation-borne arm signature is present on both sides and the bin
+    only clears by differing MORE than the imputation explains.  That is
+    the same argument the whole function rests on, applied to a second
+    nuisance.  It also keeps every bin testable, which masking the imputed
+    entries outright does not: on the fixture above masking left 6 sparse
+    bins of 300, while holding them fixed left all of them and took the
+    false-positive rate from 0.577 to 0.077.
     """
     out = np.array(X, dtype=float, copy=True)
+    ok = np.isfinite(out)
+    if permutable is not None:
+        ok &= np.asarray(permutable, bool)
     for i in range(out.shape[0]):
-        idx = np.flatnonzero(np.isfinite(out[i]))
+        idx = np.flatnonzero(ok[i])
         if idx.size > 1:
             out[i, idx] = out[i, rng.permutation(idx)]
     return out
 
 
 def permutation_null(X, in_mask, out_mask, min_cells, test, n_perm,
-                     V=None, mode="none", strata=None, counts=None, seed=0):
+                     V=None, mode="none", strata=None, counts=None, seed=0,
+                     permutable=None):
     """Empirical p per bin against a within-cell permutation null.
 
     The parametric p asks whether the arms differ.  It cannot tell a
@@ -972,7 +984,7 @@ def permutation_null(X, in_mask, out_mask, min_cells, test, n_perm,
     obs, cs_obs = stat_of(np.asarray(X, float))
     null = []
     for _ in range(int(n_perm)):
-        v, _ = stat_of(permute_within_cells(X, rng))
+        v, _ = stat_of(permute_within_cells(X, rng, permutable))
         null.append(v[np.isfinite(v)])
     pooled = np.sort(np.concatenate(null)) if null else np.array([])
     if pooled.size == 0:
@@ -2478,20 +2490,27 @@ def main():
                          "(cell, bin) estimate.  Auto-discovered next to the "
                          "matrix when not given.  Enables --contrast-weight.")
     ap.add_argument("--min-pairs", type=int, default=0, metavar="N",
-                    help="Treat a (cell, bin) with fewer than N read pairs "
-                         "as MISSING rather than as a measurement.  An entry "
-                         "with no pairs has k = 0 on both sides, so under "
-                         "--dm-prior shared the statistic is exactly 0 "
-                         "there -- and a bin where one arm happens to have "
-                         "coverage and the other does not then separates "
-                         "perfectly, on coverage rather than on biology.  "
-                         "Under the old separate priors those entries "
-                         "carried the prior gap instead, which sat close to "
-                         "everything else and hid the problem; removing the "
-                         "gap exposed it.  A sparse context is where this "
-                         "bites: HCG differential calls went from ~100 to "
-                         "~5000 on the same data while dense GCH did not "
-                         "move.  Needs --pair-counts (auto-discovered).")
+                    help="Hold (cell, bin) entries with fewer than N read "
+                         "pairs of their own FIXED while the permutation "
+                         "null is built.  They are still used as "
+                         "observations: RWR filled them from cells the k-NN "
+                         "graph says are similar, which is evidence, and "
+                         "the component matrices carry 0%% NaN so every "
+                         "entry is finite whatever its real coverage.  The "
+                         "problem is only in the null -- that graph is "
+                         "cell-type aware, so an imputed entry carries its "
+                         "arm's signature by construction, and shuffling it "
+                         "scatters that signature across every bin position "
+                         "so the null holds each cell's genome-wide MIX "
+                         "rather than the bin's own share.  A sparsely "
+                         "covered bin then clears a null that no longer "
+                         "describes it.  Measured on a fixture with no "
+                         "signal at all: 57.7%% of sparse bins called at "
+                         "p < 0.05, 7.7%% once held fixed, and every bin "
+                         "still testable -- against 6 of 300 if the imputed "
+                         "entries are dropped instead.  Only acts when "
+                         "--contrast-permutations > 0.  Needs --pair-counts "
+                         "(auto-discovered from beside --matrix).")
     ap.add_argument("--pair-counts", action="append", default=None,
                     metavar="NAME=PATH",
                     help="pair_counts_per_bin.parquet for the matching "
@@ -3239,20 +3258,33 @@ def main():
                           f"signal at all: 57.7% of sparse bins called at "
                           f"p < 0.05, against 0% once masked.  Pass "
                           f"--min-pairs 1.", file=sys.stderr)
+            # HELD FIXED IN THE NULL, KEPT IN THE OBSERVED.  The imputed
+            # value is still evidence -- RWR borrowed it from cells the
+            # k-NN graph says are similar -- so it stays in the statistic.
+            # What it must not do is move during permutation: shuffled, a
+            # cell's imputed entries scatter their arm signature across
+            # every bin position and the null is diluted by the genome-wide
+            # MIX instead of carrying the bin's own share.  Held in place,
+            # the signature sits in the null exactly as it sits in the
+            # observed, and a bin clears only by differing MORE than the
+            # imputation explains.
+            _permutable = None
             if args.min_pairs > 0:
                 if Cc is None:
                     sys.exit(
                         f"--min-pairs needs the read-pair counts; pass "
                         f"--pair-counts {name}=<pair_counts_per_bin.parquet>")
-                _n_before = int(np.isfinite(Xc).sum())
-                Xc = np.where(Cc >= float(args.min_pairs), Xc, np.nan)
-                _n_after = int(np.isfinite(Xc).sum())
-                print(f"  {name}: dropped {_n_before - _n_after:,} "
-                      f"(cell, bin) entries with < {args.min_pairs} read "
-                      f"pairs ({1 - _n_after / max(_n_before, 1):.1%} of "
-                      f"the matrix); they measured nothing and were "
-                      f"carrying an exact value, not an estimate",
-                      file=sys.stderr)
+                _permutable = Cc >= float(args.min_pairs)
+                print(f"  {name}: {1 - _permutable.mean():.1%} of "
+                      f"(cell, bin) entries have < {args.min_pairs} read "
+                      f"pairs of their own; they stay in the observed "
+                      f"statistic and are held fixed while the null is "
+                      f"permuted", file=sys.stderr)
+                if args.contrast_permutations <= 0:
+                    print(f"  {name}: NOTE --min-pairs only acts on the "
+                          f"permutation null, and --contrast-permutations "
+                          f"is 0, so it is doing nothing here",
+                          file=sys.stderr)
             _rd = {}
             if R_ser is not None:
                 Xc, _rd = correct_by_reference(
@@ -3384,7 +3416,8 @@ def main():
                     Vc if args.contrast_weight != "none" else None,
                     args.contrast_weight,
                     strata=_lev if args.contrast_stratify else None,
-                    counts=(Cc if args.contrast_weight != "none" else None))
+                    counts=(Cc if args.contrast_weight != "none" else None),
+                    permutable=_permutable)
                 if pn is None:
                     print(f"  contrast {label!r}: permutation null produced "
                           f"no usable statistic -- keeping the parametric p",
