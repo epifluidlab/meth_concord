@@ -3078,9 +3078,32 @@ def main():
                         index=M.index, columns=M.columns)
                 expected = expected_directional(comps["marginal"],
                                                 comps["coordination"])
+                # C(2E[F]-1) is on D's scale, and only D's.  Handed a
+                # direction_logor matrix -- a log odds ratio of order 0.1 to
+                # 1 against a reference of order C, about 1e-3 -- it is not
+                # an approximation of the right reference, it is a different
+                # quantity that happens to be numerically small enough to
+                # look harmless.  Compared by robust scale rather than by
+                # name, because the matrix arrives as an arbitrary path.
+                _ms = _robust_sd(np.asarray(raw, float).ravel())
+                _es = _robust_sd(np.asarray(expected, float).ravel())
+                if (np.isfinite(_ms) and np.isfinite(_es) and _ms > 0
+                        and _es > 0 and not (0.05 < _es / _ms < 20.0)):
+                    sys.exit(
+                        f"--sign-reference expected builds C*(2E[F]-1), "
+                        f"which is on D's scale.  The reference's robust sd "
+                        f"is {_es:.3g} against the matrix's {_ms:.3g}, a "
+                        f"factor of {max(_es / _ms, _ms / _es):.0f}, so this "
+                        f"matrix is not D and the reference does not belong "
+                        f"to it.  For a log odds ratio the marginal is "
+                        f"already divided out inside the statistic -- "
+                        f"F_exp comes from the same bin's own ends -- so "
+                        f"use --sign-reference zero, which is the honest "
+                        f"reading there.")
                 print(f"  {name}: per-bin expected-D reference from "
                       f"{Path(path).parent}/concordance_{{marginal,"
-                      f"coordination}}.parquet", file=sys.stderr)
+                      f"coordination}}.parquet (robust sd {_es:.3g} against "
+                      f"the matrix's {_ms:.3g})", file=sys.stderr)
             sg = sign_summary(raw, ct_id, len(ct_u), args, expected)
             n_want = args.n_sign_bins or args.n_bins
             for key, rank_by, ascending in (

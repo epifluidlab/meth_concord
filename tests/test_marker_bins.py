@@ -3050,3 +3050,59 @@ def test_the_permutation_holds_nan_in_place_but_cannot_hold_a_zero():
     moved = any(m.permute_within_cells(row, np.random.default_rng(s))[0, 4]
                 != 0.0 for s in range(8))
     assert moved
+
+
+def test_the_expected_sign_reference_is_on_D_s_scale_only():
+    """C*(2E[F]-1) is D's reference.  Against a log odds ratio it is not a
+    rough approximation of the right thing, it is a different quantity that
+    happens to be small enough to look harmless: L runs to order 0.1-1
+    while the reference is order C, about 1e-3, so subtracting it moves L
+    by about a percent and quietly answers a different question."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    p_bar = rng.uniform(0.2, 0.6, 400)
+    C = np.abs(rng.normal(1e-3, 3e-4, 400))
+    ref = m.expected_directional(p_bar, C)
+    assert m._robust_sd(ref) < 1e-2                  # D scale
+    logor = rng.normal(0.0, 0.4, 400)                # a log odds ratio
+    assert m._robust_sd(logor) > 20 * m._robust_sd(ref)
+
+
+def test_a_scale_mismatched_sign_reference_is_refused(tmp_path):
+    """Compared by robust scale, because the matrix arrives as a path and
+    the script cannot know what statistic it holds.
+
+    --sign-split on is needed to reach it: on 'auto' the sign machinery
+    only runs when the filename contains 'directional', which
+    concordance_direction_logor.parquet does not, so --sign-reference is
+    inert there and was never the cause of anything."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    n, nb = 30, 200
+    cells = [f"cell{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    d = tmp_path / "ctx"
+    d.mkdir()
+    # a log-odds-ratio matrix, with D-scale companions beside it
+    pd.DataFrame(rng.normal(0, 0.4, (n, nb)), index=cells,
+                 columns=bins).to_parquet(d / "gch.parquet")
+    pd.DataFrame(np.tile(rng.uniform(0.2, 0.6, nb), (n, 1)), index=cells,
+                 columns=bins).to_parquet(d / "concordance_marginal.parquet")
+    pd.DataFrame(np.tile(np.abs(rng.normal(1e-3, 3e-4, nb)), (n, 1)),
+                 index=cells, columns=bins).to_parquet(
+        d / "concordance_coordination.parquet")
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{i % 3}" for i in range(n)],
+                  "batch": ["b0" if i % 2 else "b1" for i in range(n)]}
+                 ).to_csv(stab, sep="\t", index=False)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={d / 'gch.parquet'}",
+         "--samples", str(stab), "--cell-type-column", "cell_type",
+         "--n-bins", "20", "--sign-reference", "expected",
+         "--sign-split", "on", "--batch-column", "batch",
+         "--output-dir", str(tmp_path / "out"), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "on D's scale" in r.stderr
+    assert "--sign-reference zero" in r.stderr
