@@ -766,3 +766,45 @@ def test_pooling_gives_coordination_as_readily_as_the_log_odds_ratio():
     # pooled table
     assert got["coordination"][0] > got["coordination"][1]
     assert got["direction_logor"][0] > got["direction_logor"][1]
+
+
+def test_both_profile_callers_take_the_same_keywords():
+    """main builds ONE kw dict and passes it to group_profile and to
+    member_curves.  Adding a keyword to one of them and not the other is
+    invisible until a run that supplies it reaches the per-member curves,
+    which is after the group curves have already been computed and
+    printed -- so it fails late, on a real dataset, with everything
+    looking fine up to that point."""
+    import inspect
+    m = _mod()
+    a = set(inspect.signature(m.group_profile).parameters)
+    b = set(inspect.signature(m.member_curves).parameters)
+    shared = {"baseline", "n_flank", "n_body", "pooled"}
+    assert shared <= a, sorted(shared - a)
+    assert shared <= b, sorted(shared - b)
+
+
+def test_member_curves_pools_when_the_group_does(tmp_path):
+    """Otherwise the faint per-cell-type lines would be computed a
+    different way from the bold line they are meant to explain."""
+    import numpy as np
+    import pandas as pd
+    m = _mod()
+    n_cells, n_bins, total = 6, 6, 2
+    cells = [f"c{i}" for i in range(n_cells)]
+    bins = [f"chr1:{i * 250000}" for i in range(n_bins)]
+    M = pd.DataFrame(np.zeros((n_cells, n_bins)), index=cells, columns=bins)
+    ct = pd.Series(["A"] * 3 + ["B"] * 3, index=cells)
+    counts = {k: np.zeros((n_cells, n_bins)) for k in m.COUNT_KEYS}
+    counts["n_linked"][:] = counts["n_dm"][:] = 20.0
+    counts["k_open"][:] = 6.0; counts["k_closed"][:] = 6.0
+    counts["k_dm_open"][:] = 4.0; counts["k_dm_closed"][:] = 4.0
+    counts["k_open"][:, :3] = 9.0
+    pooled = {"counts": counts, "stat": "coordination",
+              "alpha": {"open": 10.0, "closed": 49.0, "mixed": 41.0}}
+    bi, pi = np.arange(n_bins), np.repeat([0, 1], 3)
+    curves = m.member_curves(M, ct, ["A", "B"], bi, pi, total, pooled=pooled)
+    # M is all zeros, so a non-zero curve can only have come from the counts
+    for g in ("A", "B"):
+        assert np.isfinite(curves[g]).all()
+        assert np.any(np.abs(curves[g]) > 1e-9)

@@ -287,7 +287,7 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
 
 
 def member_curves(M, ct, members, bin_idx, pos_idx, total, baseline="none",
-                  n_flank=0, n_body=0):
+                  n_flank=0, n_body=0, pooled=None):
     """Mean per axis position for each constituent cell type, no interval.
 
     Drawn behind the group line so a group mean carried by ONE of its
@@ -298,7 +298,7 @@ def member_curves(M, ct, members, bin_idx, pos_idx, total, baseline="none",
     """
     return {g: group_profile(M, ct, [g], bin_idx, pos_idx, total,
                              baseline=baseline, n_flank=n_flank,
-                             n_body=n_body)["mean"]
+                             n_body=n_body, pooled=pooled)["mean"]
             for g in members}
 
 
@@ -636,7 +636,7 @@ def main(argv=None) -> int:
               "baseline is now identical between groups by construction, so "
               "read the panel as change across the domain, not as level.",
               file=sys.stderr)
-    if not steps:
+    if not steps and not args.from_counts:
         print("  WARNING no normalisation applied.  If these regions came "
               "from a contrast, its bins were called on a matrix that had "
               "been centred and corrected, so a raw profile shows the "
@@ -669,6 +669,11 @@ def main(argv=None) -> int:
         _pooled = {"counts": load_counts(args.from_counts, M.index,
                                          M.columns),
                    "alpha": _alpha, "stat": _stat}
+        print(f"  the per-cell corrections do not apply here: the "
+              f"statistic is rebuilt from each position's own pooled pairs, "
+              f"so there is no genome-wide arm offset riding on it to "
+              f"remove.  --baseline flank still anchors each cell.",
+              file=sys.stderr)
         print(f"  pooling raw counts per axis position and computing "
               f"{_stat} from them (prior nu={sum(_alpha.values()):.1f}); "
               f"the per-bin values in --matrix are not used",
