@@ -130,18 +130,45 @@ def figure(path, table, curves, stat, title):
     cm = plt.get_cmap("tab10")
 
     a = ax[0]
+    # STANDARDISED ON EACH RUN'S OWN NULL: (q - null_median) / null_madsd.
+    #
+    # Raw quantiles do not work here.  Under --dm-prior separate the whole
+    # distribution is a needle parked on the prior floor -- observed and
+    # drawn null both at about -0.19, spread a small fraction of that -- so
+    # an axis wide enough to reach zero leaves the data as a sliver and the
+    # departure from the diagonal, which is the entire question, invisible.
+    # Runs at different offsets could not be shown together at all.
+    #
+    # Centring and scaling on the NULL, not on the observed, keeps the thing
+    # being measured: the observed's excess over its own null survives, and
+    # the diagonal means "observed distributed exactly like its null".  The
+    # absolute offset is not lost, it moves to panel (b), where it is the
+    # headline rather than a scaling nuisance.
     lim = 0.0
     for i, (name, (qx, qy)) in enumerate(curves.items()):
-        a.plot(qx, qy, "-", lw=1.5, color=cm(i % 10), label=name)
-        lim = max(lim, float(np.max(np.abs(np.r_[qx, qy]))))
+        nm = float(np.median(qx))
+        ns = robust_sd(qx)
+        if not (np.isfinite(ns) and ns > 0):
+            continue
+        zx, zy = (qx - nm) / ns, (qy - nm) / ns
+        a.plot(zx, zy, "-", lw=1.5, color=cm(i % 10), label=name)
+        lim = max(lim, float(np.max(np.abs(np.r_[zx, zy]))))
+    lim = lim * 1.05 if lim > 0 else 1.0
     a.plot([-lim, lim], [-lim, lim], "--", color="0.5", lw=1.0, zorder=0)
     a.axhline(0, color="0.85", lw=0.8, zorder=0)
     a.axvline(0, color="0.85", lw=0.8, zorder=0)
-    a.set_xlabel("drawn-null quantiles", fontsize=8)
-    a.set_ylabel("observed quantiles", fontsize=8)
+    a.set_xlim(-lim, lim)
+    a.set_ylim(-lim, lim)
+    a.set_xlabel("drawn-null quantiles  (null sd, about the null's median)",
+                 fontsize=8)
+    a.set_ylabel("observed quantiles  (same units)", fontsize=8)
     a.set_title("a  observed against the model's own null", fontsize=10,
                 loc="left")
-    a.legend(fontsize=6.5, frameon=False)
+    a.annotate("on the diagonal = distributed like its own null;\n"
+               "where the null itself SITS is panel (b)",
+               (0.03, 0.97), xycoords="axes fraction", fontsize=6.5,
+               color="0.35", va="top")
+    a.legend(fontsize=6.5, frameon=False, loc="lower right")
 
     a = ax[1]
     names = list(table["run"])

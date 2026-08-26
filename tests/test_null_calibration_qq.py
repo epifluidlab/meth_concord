@@ -153,3 +153,35 @@ def test_cli_runs_end_to_end(tmp_path):
     tab = pd.read_csv(out / "null_calibration.tsv", sep="\t")
     assert "null_bias_z" in tab.columns and len(tab) == 1
     assert "null_bias_z" in r.stderr
+
+
+def test_panel_a_is_standardised_on_each_run_s_own_null():
+    """Under --dm-prior separate the whole distribution is a needle on the
+    prior floor -- observed and drawn null both at about -0.19, with a
+    spread a small fraction of that.  Plotted raw, an axis wide enough to
+    reach zero leaves the data as a sliver and the departure from the
+    diagonal, which is the entire question, invisible; and two runs at
+    different offsets cannot share a panel at all."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    needle_null = -0.19 + rng.normal(0, 0.002, 50_000)
+    needle_obs = -0.19 + rng.normal(0, 0.0032, 50_000)
+    qx, qy = m.qq_points(needle_obs, needle_null)
+    nm, ns = float(np.median(qx)), m.robust_sd(qx)
+    zx, zy = (qx - nm) / ns, (qy - nm) / ns
+    # the standardised spread is order 1, not order 1e-3
+    assert np.ptp(zx) > 3.0
+    # and the slope recovers lambda, so the diagonal means what it says
+    assert np.polyfit(zx, zy, 1)[0] == pytest.approx(1.6, abs=0.15)
+
+
+def test_the_centring_keeps_the_excess_it_is_meant_to_show():
+    """Centred on the NULL, not on the observed: an observed shifted above
+    its null must still read as shifted."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    null = rng.normal(0, 1, 100_000)
+    obs = rng.normal(0.8, 1, 100_000)
+    qx, qy = m.qq_points(obs, null)
+    nm, ns = float(np.median(qx)), m.robust_sd(qx)
+    assert float(np.median((qy - nm) / ns)) == pytest.approx(0.8, abs=0.06)
