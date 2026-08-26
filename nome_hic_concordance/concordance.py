@@ -598,6 +598,12 @@ _SOFT_COUNT_KEYS = (
 # distance-matched to the observed contacts.
 _DM_KEYS = ("k_dm_open", "k_dm_closed", "k_dm_mixed", "n_dm")
 
+# The drawn null, carried through imputation alongside the real counts so it
+# meets the same prior, the same RWR smoothing and the same normalisation.
+# A null that skipped any of those would answer a question about a pipeline
+# nobody runs.
+_NULL_KEYS = ("k_null_open", "k_null_closed", "k_null_mixed", "n_null")
+
 
 def _compute_cell_soft_counts(
     posteriors_path: str,
@@ -793,6 +799,58 @@ def _dm_expected_for_bin(
             int(n_fb))
 
 
+def _null_observed_for_bin(epos, ep, n_contacts, min_distance, seed,
+                           max_distance=0):
+    """A synthetic O drawn from non-contact pairs: the pipeline's own null.
+
+    A Q-Q plot needs a sample from the null, and no parametric reference is
+    available here -- the counts are DM posterior soft counts, RWR has
+    already pooled evidence across the cell graph, and the effective n is
+    fractional.  Any N(0, 1) reference would be asserting a sampling theory
+    that does not hold.
+
+    So the null is drawn rather than assumed: exactly ``n_contacts`` random
+    NON-contact end-pairs, summed the same way the observed contacts are.
+    It carries no coordination by construction and the same sampling noise
+    as O, because it has the same count.  Run through the rest of the
+    pipeline -- prior, imputation, normalisation -- it is what the statistic
+    looks like when the answer is nothing.
+
+    It must be drawn from ends DISJOINT from the ones the expected is built
+    on.  Sharing them makes the two agree more than chance and the null
+    comes back too narrow, which reads as a calibrated model.
+    """
+    m = epos.shape[0]
+    if m < 2 or n_contacts <= 0:
+        return 0.0, 0.0, 0.0, 0
+    rng = np.random.default_rng(seed)
+    want = int(n_contacts)
+    got_o = got_c = got_m = 0.0
+    n_got = 0
+    # Rejection-sample pairs at or beyond min_distance.  Capped so a bin
+    # whose ends are all close together cannot spin here.
+    for _ in range(40):
+        if n_got >= want:
+            break
+        need = (want - n_got) * 4
+        i = rng.integers(0, m, need)
+        j = rng.integers(0, m, need)
+        ok = i != j
+        d = np.abs(epos[i] - epos[j])
+        ok &= d >= int(min_distance)
+        if max_distance and int(max_distance) > 0:
+            ok &= d <= int(max_distance)
+        if not ok.any():
+            continue
+        take = min(int(ok.sum()), want - n_got)
+        pa, pb = ep[i[ok]][:take], ep[j[ok]][:take]
+        got_o += float(np.sum(pa * pb))
+        got_c += float(np.sum((1.0 - pa) * (1.0 - pb)))
+        got_m += float(np.sum(pa * (1.0 - pb) + (1.0 - pa) * pb))
+        n_got += take
+    return got_o, got_c, got_m, n_got
+
+
 def _pooled_expected_for_bin(
     epos: np.ndarray, ep: np.ndarray,
     contact_pairs: list[tuple[int, int]], n_contacts: int,
@@ -856,6 +914,7 @@ def _compute_cell_dm_expected(
     mode: str = "matched",
     max_distance: int = 0,
     random_state: int = 42,
+    null_split: bool = False,
 ) -> tuple[str, dict[str, dict[str, float]]]:
     """Per-(cell, bin) expected soft counts (``_DM_KEYS``) from a non-contact
     end-pair null.
@@ -933,6 +992,20 @@ def _compute_cell_dm_expected(
             ep_df = ends_by_bin.get((c, int(b)))
         if ep_df is None or len(ep_df) < 2:
             continue
+        null_pos = null_p = None
+        if null_split:
+            # Disjoint halves.  The expected is built on A and the drawn
+            # null on B, so the two share no read end -- see
+            # _null_observed_for_bin for why sharing them silently makes the
+            # model look calibrated.
+            _rng = np.random.default_rng(seed_base + 977 + int(b))
+            _perm = _rng.permutation(len(ep_df))
+            _half = len(ep_df) // 2
+            if _half >= 2:
+                _a, _b = _perm[:_half], _perm[_half:]
+                null_pos = ep_df["pos"].to_numpy(dtype=np.int64)[_b]
+                null_p = ep_df["p"].to_numpy(dtype=np.float64)[_b]
+                ep_df = ep_df.iloc[_a]
         if mode == "pooled":
             p1c = og["pos1"].to_numpy(dtype=np.int64)
             p2c = og["pos2"].to_numpy(dtype=np.int64)
@@ -954,7 +1027,17 @@ def _compute_cell_dm_expected(
                 dist_bin=int(dm_dist_bin), max_ends=int(dm_max_ends),
                 seed=seed_base + int(b),
             )
+        _entry_null = {}
+        if null_split and null_pos is not None:
+            _no, _nc, _nm, _nn = _null_observed_for_bin(
+                null_pos, null_p, n_contacts=len(og),
+                min_distance=int(min_distance),
+                seed=seed_base + 5701 + int(b),
+                max_distance=int(max_distance))
+            _entry_null = {"k_null_open": _no, "k_null_closed": _nc,
+                           "k_null_mixed": _nm, "n_null": float(_nn)}
         counts[f"{c}:{int(b) * bsz}"] = {
+            **_entry_null,
             "k_dm_open": k_o, "k_dm_closed": k_c, "k_dm_mixed": k_m,
             "n_dm": float(n_dm),
             # Deliberately NOT in _DM_KEYS: it is a diagnostic, not a count
@@ -1281,6 +1364,7 @@ def compute_signed_concordance_matrix(
     rwr_tol: float = 1e-4,
     eb_min_obs: int = 50,
     dm_prior: str = "separate",
+    emit_null: bool = False,
     batch_labels: pd.Series | pd.DataFrame | None = None,
     batch_correction: str = "none",
     n_threads: int = 4,
@@ -1453,7 +1537,7 @@ def compute_signed_concordance_matrix(
                     delayed(_compute_cell_dm_expected)(
                         path, cell_name, bin_size, min_distance, min_gch_sites,
                         dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
-                        random_state,
+                        random_state, emit_null,
                     )
                     for cell_name, path in items
                 )
@@ -1462,7 +1546,7 @@ def compute_signed_concordance_matrix(
                     _compute_cell_dm_expected(
                         path, cell_name, bin_size, min_distance, min_gch_sites,
                         dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
-                        random_state,
+                        random_state, emit_null,
                     )
                     for cell_name, path in items
                 ]
@@ -1513,7 +1597,8 @@ def compute_signed_concordance_matrix(
         bin_to_col = {b: i for i, b in enumerate(sorted_bins)}
 
         matrix_keys = list(_SOFT_COUNT_KEYS) + (
-            list(_DM_KEYS) if uses_expected else [])
+            list(_DM_KEYS) if uses_expected else []) + (
+            list(_NULL_KEYS) if (uses_expected and emit_null) else [])
         raw_counts: dict[str, np.ndarray] = {
             k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in matrix_keys
         }
@@ -1833,14 +1918,19 @@ def compute_signed_concordance_matrix(
                 imputed["k_u_open"], imputed["k_u_closed"],
                 imputed["k_u_mixed"], imputed["n_unlinked"], alpha_u)
 
-        return o_open, o_closed, e_open, e_closed
+        null_rates = None
+        if "k_null_open" in imputed:
+            null_rates = _side_rates(
+                imputed["k_null_open"], imputed["k_null_closed"],
+                imputed["k_null_mixed"], imputed["n_null"], alpha_l)
+        return o_open, o_closed, e_open, e_closed, null_rates
 
 
     def _layer2(imputed: dict[str, np.ndarray]) -> pd.DataFrame:
         """Layer-2 callback used by run_rwr_pipeline (or called directly when
         use_rwr=False): fit the DM priors, then combine O and E into the
         headline Δ matrix."""
-        o_open, o_closed, e_open, e_closed = _fit_and_rates(imputed)
+        o_open, o_closed, e_open, e_closed, _ = _fit_and_rates(imputed)
 
         # Combine observed (O) and expected (E).
         if concordance_combine == "linked-only":
@@ -1944,11 +2034,22 @@ def compute_signed_concordance_matrix(
     # every combine mode: they are the axes to visualise (coordination C and
     # marginal p̄ are the two independent d.o.f.; directional D is their
     # signed combination), independent of which one is the headline Δ.
-    _o_o, _o_c, _e_o, _e_c = _fit_and_rates(imputed_counts)
+    _o_o, _o_c, _e_o, _e_c, _null_rates = _fit_and_rates(imputed_counts)
     components = {
         name: pd.DataFrame(arr, index=cell_names, columns=sorted_bins)
         for name, arr in decompose_components(_o_o, _o_c, _e_o, _e_c).items()
     }
+    # The same decomposition with the DRAWN null in place of the observed.
+    # Same E, same prior, same counts, no coordination -- so it is what each
+    # component looks like when the answer is nothing, and the only honest
+    # reference a Q-Q plot of these statistics has.
+    null_components = None
+    if _null_rates is not None:
+        null_components = {
+            name: pd.DataFrame(arr, index=cell_names, columns=sorted_bins)
+            for name, arr in decompose_components(
+                _null_rates[0], _null_rates[1], _e_o, _e_c).items()
+        }
     _pol = coordination_polar(components["coordination"].to_numpy(float),
                               components["direction_excess"].to_numpy(float))
     polar_info = {k: v for k, v in _pol.items()
@@ -2063,6 +2164,10 @@ def compute_signed_concordance_matrix(
         for _name, _df in components.items():
             _df.to_parquet(out_path / f"concordance_{_name}.parquet")
             _df.to_csv(out_path / f"concordance_{_name}.tsv", sep="\t")
+        if null_components is not None:
+            for _name, _df in null_components.items():
+                _df.to_parquet(
+                    out_path / f"concordance_{_name}_null.parquet")
 
         # Soft counts + priors for diagnostics / reproducibility.
         soft_long = []

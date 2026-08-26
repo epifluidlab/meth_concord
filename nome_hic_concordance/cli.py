@@ -304,6 +304,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "end-pairs thin out.",
     )
     parser.add_argument(
+        "--emit-null", action="store_true",
+        help="Also emit concordance_<component>_null.parquet: the same "
+             "statistics computed with a DRAWN null in place of the "
+             "observed contacts.  A Q-Q plot of C or the direction needs a "
+             "sample from the null, and no parametric reference is valid "
+             "here -- the counts are DM posterior soft counts, RWR has "
+             "already pooled evidence across the cell graph, and the "
+             "effective n is fractional, so an N(0,1) reference would "
+             "assert a sampling theory that does not hold.  This draws it "
+             "instead: exactly n_linked random NON-contact end-pairs per "
+             "(cell, bin), summed like the real contacts, carried through "
+             "the same prior, imputation and normalisation.  DIAGNOSTIC "
+             "RUNS ONLY -- the end pool is split in half so the expected "
+             "and the drawn null share no read end (sharing them makes the "
+             "two agree more than chance and the null comes back too "
+             "narrow), which means the expected here is built on half the "
+             "ends and is noisier than a production run's.  Compare runs "
+             "with scripts/null_calibration_qq.py.",
+    )
+    parser.add_argument(
         "--dm-prior", choices=["separate", "shared"], default="separate",
         help="Whether the observed (linked) and expected (non-contact) "
              "pools get their own Dirichlet-Multinomial EB prior or one "
@@ -1530,6 +1550,7 @@ def run_context(
                 dm_window_mb=args.dm_window_mb,
                 dm_dist_bin=args.dm_dist_bin_bp,
                 dm_prior=args.dm_prior,
+                emit_null=args.emit_null,
                 use_rwr=(args.impute == "rwr"),
                 rwr_k=args.rwr_k,
                 rwr_restart_prob=args.rwr_restart_prob,
@@ -1564,6 +1585,7 @@ def run_context(
                     dm_window_mb=args.dm_window_mb,
                     dm_dist_bin=args.dm_dist_bin_bp,
                 dm_prior=args.dm_prior,
+                emit_null=args.emit_null,
                     use_rwr=(args.impute == "rwr"), rwr_k=args.rwr_k,
                     rwr_restart_prob=args.rwr_restart_prob,
                     rwr_n_refine_passes=rwr_refine_passes,
