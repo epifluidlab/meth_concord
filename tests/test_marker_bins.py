@@ -3310,3 +3310,45 @@ def test_a_scale_mismatched_sign_reference_is_refused(tmp_path):
     assert r.returncode != 0
     assert "on D's scale" in r.stderr
     assert "--sign-reference zero" in r.stderr
+
+
+def test_a_threshold_can_be_global_or_named_per_matrix():
+    """GCH and HCG do not want the same cut: one is dense enough that a
+    coverage filter barely bites, the other is mostly imputed.  A single
+    scalar forces the looser of the two on both, and the looser one is the
+    one that lets imputation-driven bins through."""
+    m = _mod()
+    f = lambda specs, name: m.per_matrix(specs, name, int, 0, "--min-pairs")
+    assert f(["1"], "gch") == 1 and f(["1"], "hcg") == 1
+    assert f(["1", "hcg=5"], "gch") == 1
+    assert f(["1", "hcg=5"], "hcg") == 5
+    assert f(["gch=0", "hcg=3"], "gch") == 0
+    assert f(None, "anything") == 0
+    # a later NAME= wins over an earlier one
+    assert f(["hcg=2", "hcg=7"], "hcg") == 7
+
+
+def test_a_float_threshold_casts_and_a_bad_one_is_an_error():
+    m = _mod()
+    assert m.per_matrix(["0.5", "hcg=0.01"], "hcg", float, 0.0,
+                        "--min-bin-frac") == 0.01
+    with pytest.raises(SystemExit):
+        m.per_matrix(["half"], "gch", float, 0.0, "--min-bin-frac")
+
+
+def test_pair_counts_are_found_beside_a_matrix_that_was_not_named(tmp_path):
+    """--pair-counts hcg=... does NOT exempt gch: _companion falls back to
+    the file sitting beside each matrix, and step 5 writes one into every
+    context directory."""
+    m = _mod()
+    d = tmp_path / "ctx"
+    d.mkdir()
+    cells = [f"c{i}" for i in range(4)]
+    bins = [f"chr1:{i * 250000}" for i in range(6)]
+    mat = pd.DataFrame(np.zeros((4, 6)), index=cells, columns=bins)
+    mat.to_parquet(d / "gch.parquet")
+    pd.DataFrame(np.ones((4, 6), int), index=cells,
+                 columns=bins).to_parquet(d / "pair_counts_per_bin.parquet")
+    got = m._companion(str(d / "gch.parquet"), ["hcg=/elsewhere.parquet"],
+                       "gch", "pair_counts_per_bin.parquet", "--pair-counts")
+    assert got is not None and got.shape == (4, 6)

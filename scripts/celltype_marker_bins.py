@@ -1316,6 +1316,34 @@ def _check_companion(df, matrix, src, flag, min_overlap=0.95):
     return df
 
 
+def per_matrix(specs, name, cast, default, flag):
+    """A threshold that may be global or named per --matrix.
+
+    GCH and HCG do not want the same cut: one is dense enough that a
+    coverage filter barely bites, the other is mostly imputed.  A single
+    scalar forces the looser of the two on both, and the looser one is the
+    one that lets imputation-driven bins through.
+
+    A bare value applies to every matrix; NAME=VALUE overrides it for that
+    matrix.  The last matching NAME wins, and a bare value given after a
+    NAME= still only sets the default.
+    """
+    value = default
+    for spec in (specs or []):
+        text = str(spec)
+        if "=" in text:
+            k, v = text.split("=", 1)
+            if k.strip() == name:
+                value = cast(v.strip())
+        else:
+            try:
+                value = cast(text.strip())
+            except ValueError:
+                sys.exit(f"{flag} wants a number or NAME=number, got "
+                         f"{spec!r}")
+    return value
+
+
 def _companion(matrix_path, specs, name, filename, flag, matrix=None):
     """The named companion parquet, or the one sitting beside the matrix."""
     for spec in (specs or []):
@@ -2557,7 +2585,8 @@ def main():
                          "--matrix NAME, giving the sampling variance of every "
                          "(cell, bin) estimate.  Auto-discovered next to the "
                          "matrix when not given.  Enables --contrast-weight.")
-    ap.add_argument("--min-pairs", type=int, default=0, metavar="N",
+    ap.add_argument("--min-pairs", action="append", default=None,
+                    metavar="N|NAME=N",
                     help="Hold (cell, bin) entries with fewer than N read "
                          "pairs of their own FIXED while the permutation "
                          "null is built.  They are still used as "
@@ -2578,9 +2607,14 @@ def main():
                          "still testable -- against 6 of 300 if the imputed "
                          "entries are dropped instead.  Only acts when "
                          "--contrast-permutations > 0.  Needs --pair-counts "
-                         "(auto-discovered from beside --matrix).")
-    ap.add_argument("--min-bin-frac", type=float, default=0.0,
-                    metavar="F",
+                         "(auto-discovered from beside --matrix, so a matrix "
+                         "whose directory holds one is filtered even when "
+                         "--pair-counts named a different matrix).  A bare "
+                         "number applies to every --matrix; NAME=N sets it "
+                         "for one, since a dense context and a sparse one "
+                         "do not want the same cut.")
+    ap.add_argument("--min-bin-frac", action="append", default=None,
+                    metavar="F|NAME=F",
                     help="Mark a bin UNTESTABLE unless at least this "
                          "fraction of cells measured it with --min-pairs "
                          "read pairs of their own.  Such a bin's statistic "
@@ -2599,7 +2633,9 @@ def main():
                          "where they clear only by exceeding the tint that "
                          "every such bin carries -- calibrated, though what "
                          "it measures is the imputation rather than the "
-                         "concordance.  Needs --min-pairs.")
+                         "concordance.  Needs --min-pairs.  A bare number "
+                         "applies to every --matrix; NAME=F sets it for "
+                         "one.")
     ap.add_argument("--pair-counts", action="append", default=None,
                     metavar="NAME=PATH",
                     help="pair_counts_per_bin.parquet for the matching "
@@ -3357,25 +3393,29 @@ def main():
             # the signature sits in the null exactly as it sits in the
             # observed, and a bin clears only by differing MORE than the
             # imputation explains.
+            _min_pairs = per_matrix(args.min_pairs, name, int, 0,
+                                    "--min-pairs")
+            _min_bin_frac = per_matrix(args.min_bin_frac, name, float, 0.0,
+                                       "--min-bin-frac")
             _permutable = None
-            if args.min_pairs > 0:
+            if _min_pairs > 0:
                 if Cc is None:
                     sys.exit(
                         f"--min-pairs needs the read-pair counts; pass "
                         f"--pair-counts {name}=<pair_counts_per_bin.parquet>")
-                _permutable = Cc >= float(args.min_pairs)
+                _permutable = Cc >= float(_min_pairs)
                 print(f"  {name}: {1 - _permutable.mean():.1%} of "
-                      f"(cell, bin) entries have < {args.min_pairs} read "
+                      f"(cell, bin) entries have < {_min_pairs} read "
                       f"pairs of their own; they stay in the observed "
                       f"statistic and are held fixed while the null is "
                       f"permuted", file=sys.stderr)
                 _frac = _permutable.mean(axis=0)
-                if args.min_bin_frac > 0:
-                    _drop = _frac < float(args.min_bin_frac)
+                if _min_bin_frac > 0:
+                    _drop = _frac < float(_min_bin_frac)
                     Xc[:, _drop] = np.nan
                     print(f"  {name}: {int(_drop.sum()):,} of "
                           f"{len(_drop):,} bins are measured in under "
-                          f"{args.min_bin_frac:.0%} of cells and are marked "
+                          f"{_min_bin_frac:.0%} of cells and are marked "
                           f"UNTESTABLE -- so they neither contribute to the "
                           f"null nor receive a call.  Their statistic would "
                           f"be mostly what RWR borrowed from the k-NN "
