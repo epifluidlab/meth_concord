@@ -1063,3 +1063,19 @@ def test_no_warning_is_emitted_for_a_domain_that_gave_a_cell_nothing():
                             np.repeat([0, 1, 2], 2), np.zeros(6, int),
                             n_flank=1, n_body=1, total=3)
     assert not [w for w in got if issubclass(w.category, RuntimeWarning)]
+
+
+def test_the_mean_and_median_gap_is_reported_because_it_explains_a_split():
+    """When the two units disagree, the reason is usually that a minority
+    of domains carries the cell-level result: a per-cell test averages over
+    domains and follows the MEAN, while the signed-rank follows the middle.
+    Reporting only the median hides that."""
+    import numpy as np
+    m = _mod()
+    # 90% of domains barely move, 10% move a lot -- a real effect that is
+    # not typical of the class
+    d = np.r_[np.full(540, 0.001), np.full(60, 0.20)]
+    r = m.domain_paired_test(d, np.zeros(d.size))
+    assert r["median_diff"] == pytest.approx(0.001)
+    assert r["mean_diff"] > 15 * r["median_diff"]
+    assert r["q75_diff"] >= r["median_diff"] >= r["q25_diff"]

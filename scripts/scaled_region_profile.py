@@ -381,6 +381,15 @@ def domain_paired_test(a_vals, b_vals):
     d = d[np.isfinite(d)]
     out = {"n_domains": int(d.size),
            "median_diff": float(np.median(d)) if d.size else float("nan"),
+           # The MEAN beside the median, because their gap is the whole
+           # story when the two units disagree: a per-cell test averages
+           # over domains and so follows the mean, while the signed-rank
+           # follows the middle.  A mean several times the median means a
+           # minority of domains is carrying the cell-level result, and
+           # "PMDs differ" is then the wrong sentence for it.
+           "mean_diff": float(np.mean(d)) if d.size else float("nan"),
+           "q25_diff": float(np.percentile(d, 25)) if d.size else float("nan"),
+           "q75_diff": float(np.percentile(d, 75)) if d.size else float("nan"),
            "frac_positive": float(np.mean(d > 0)) if d.size else float("nan"),
            "p_domain": float("nan")}
     if d.size >= 6 and np.any(d != 0):
@@ -984,8 +993,9 @@ def main(argv=None) -> int:
                     f"({r.n_cell_a} vs {r.n_cell_b} cells)")
             if "p_domain" in tt.columns and np.isfinite(r.p_domain):
                 line += (f"   |  p_domain={r.p_domain:.3g} "
-                         f"({r.n_domains} domains, median diff "
-                         f"{r.median_diff:+.3g}, {r.frac_positive:.0%} "
+                         f"({r.n_domains} domains, median "
+                         f"{r.median_diff:+.3g}, mean "
+                         f"{r.mean_diff:+.3g}, {r.frac_positive:.0%} "
                          f"positive)")
             if "p_donor" in tt.columns and np.isfinite(r.p_donor):
                 line += (f"   |  p_donor={r.p_donor:.3g} "
