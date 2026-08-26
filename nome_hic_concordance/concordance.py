@@ -1365,6 +1365,7 @@ def compute_signed_concordance_matrix(
     eb_min_obs: int = 50,
     dm_prior: str = "separate",
     emit_null: bool = False,
+    emit_counts: bool = False,
     batch_labels: pd.Series | pd.DataFrame | None = None,
     batch_correction: str = "none",
     n_threads: int = 4,
@@ -2159,6 +2160,36 @@ def compute_signed_concordance_matrix(
 
         pair_counts_df.to_parquet(out_path / "pair_counts_per_bin.parquet")
         pair_counts_df.to_csv(out_path / "pair_counts_per_bin.tsv", sep="\t")
+
+        if emit_counts:
+            # RAW, PRE-IMPUTATION counts, one matrix per key.
+            #
+            # A statistic computed per 250 kb bin and then AVERAGED over a
+            # region is not the region's statistic.  C and the log odds
+            # ratio are ratios of aggregated counts, so they are not
+            # additive across bins, and a thin bin's value is mostly the
+            # prior: on a 20-bin region with 16 thin bins, the unweighted
+            # mean of the per-bin log odds ratio came to +0.043 against a
+            # true +0.350, while pooling the counts first gave +0.222.  The
+            # attenuation follows the share of thin bins, so a domain and
+            # its flank -- which differ in accessibility, hence in depth --
+            # are attenuated by different amounts, and the difference
+            # between them is not.
+            #
+            # Written raw rather than imputed so a caller can sum them
+            # inside an arbitrary region and fit the prior on the pooled
+            # counts, which is what makes the region estimate a measurement
+            # rather than an average of mostly-prior values.
+            _cdir = ensure_dir(str(out_path / "counts"))
+            for _k in list(_SOFT_COUNT_KEYS) + (list(_DM_KEYS)
+                                                if uses_expected else []):
+                if _k in raw_counts:
+                    pd.DataFrame(raw_counts[_k], index=cell_names,
+                                 columns=sorted_bins).to_parquet(
+                        _cdir / f"{_k}.parquet")
+            logger.info(
+                f"Raw per-(cell, bin) counts -> {_cdir} "
+                f"({len(list(_SOFT_COUNT_KEYS)) + (len(_DM_KEYS) if uses_expected else 0)} matrices)")
 
         # Component matrices — the axes for the companion UMAPs.
         for _name, _df in components.items():

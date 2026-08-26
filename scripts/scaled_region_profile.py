@@ -102,6 +102,84 @@ def scaled_index(bins, domains, n_body, flank_bp, n_flank):
     return np.concatenate(bi), np.concatenate(pi), total
 
 
+COUNT_KEYS = ("k_open", "k_closed", "k_mixed", "n_linked",
+              "k_dm_open", "k_dm_closed", "k_dm_mixed", "n_dm")
+
+
+def load_counts(counts_dir, index, columns):
+    """The raw per-(cell, bin) soft counts, aligned to the matrix."""
+    d = Path(counts_dir)
+    if (d / "counts").is_dir():
+        d = d / "counts"
+    out = {}
+    for k in COUNT_KEYS:
+        f = d / f"{k}.parquet"
+        if not f.exists():
+            sys.exit(f"--from-counts: {f} not found.  Re-run step 5 with "
+                     f"--emit-counts.")
+        out[k] = pd.read_parquet(f).reindex(
+            index=index, columns=columns).to_numpy(float)
+    return out
+
+
+def load_prior(counts_dir):
+    """The prior the run fitted, so a pooled estimate is shrunk like the
+    per-bin ones were rather than by something invented here."""
+    d = Path(counts_dir)
+    if d.name == "counts":
+        d = d.parent
+    f = d / "dirichlet_multinomial_prior.json"
+    if not f.exists():
+        return {"open": 1.0, "closed": 1.0, "mixed": 1.0}
+    import json
+    pri = json.load(open(f))
+    return pri.get("shared", pri.get("linked", {}))["alpha"]
+
+
+def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat):
+    """Sum the counts at each position, THEN compute the statistic once.
+
+    Averaging a per-bin statistic over a region is not the region's
+    statistic.  C and the log odds ratio are ratios of aggregated counts,
+    so they are not additive across bins, and a thin bin's value is mostly
+    the prior.  Measured on a 20-bin region with 16 thin bins: the
+    unweighted mean of the per-bin log odds ratio came to +0.043 against a
+    true +0.350, while pooling the counts first gave +0.222.
+
+    The attenuation follows the SHARE of thin bins, which is what makes it
+    a bias rather than a scale factor: a domain and its flank differ in
+    accessibility, hence in depth, so they are attenuated by different
+    amounts and the contrast between them is distorted.  Domains also vary
+    in size, so a small one is a single bin stretched across the axis while
+    a large one is forty averaged -- pooling makes both one estimate from
+    whatever pairs they contain.
+    """
+    import numpy as _np
+    from nome_hic_concordance.concordance import decompose_components
+    a0 = float(sum(alpha.values()))
+    ao, ac = float(alpha["open"]), float(alpha["closed"])
+    P = _np.full((len(rows), total), _np.nan)
+    n_bins = _np.zeros(total, int)
+    order = _np.argsort(pos_idx, kind="stable")
+    bi, pi = bin_idx[order], pos_idx[order]
+    starts = _np.searchsorted(pi, _np.arange(total), side="left")
+    ends = _np.searchsorted(pi, _np.arange(total), side="right")
+    for i in range(total):
+        cols = bi[starts[i]:ends[i]]
+        n_bins[i] = cols.size
+        if cols.size == 0:
+            continue
+        g = lambda k: _np.nansum(counts[k][:, cols], axis=1)
+        n_l, n_e = g("n_linked"), g("n_dm")
+        o_o = (ao + g("k_open")) / (a0 + n_l)
+        o_c = (ac + g("k_closed")) / (a0 + n_l)
+        e_o = (ao + g("k_dm_open")) / (a0 + n_e)
+        e_c = (ac + g("k_dm_closed")) / (a0 + n_e)
+        v = decompose_components(o_o, o_c, e_o, e_c)[stat]
+        P[:, i] = _np.where(n_l > 0, v, _np.nan)
+    return P, rows, n_bins
+
+
 def cell_profiles(M, ct, members, bin_idx, pos_idx, total):
     """One curve per CELL: mean D at each axis position.
 
@@ -160,7 +238,7 @@ def anchor_to_flank(P, n_flank, n_body):
 
 
 def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
-                  baseline="none", n_flank=0, n_body=0):
+                  baseline="none", n_flank=0, n_body=0, pooled=None):
     """Mean and interval per axis position for one group of cell types.
 
     The interval is across CELLS.  Bins inside one domain are heavily
@@ -169,7 +247,16 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
     """
     from scipy.stats import t as _t
 
-    P, idx, n_bins = cell_profiles(M, ct, members, bin_idx, pos_idx, total)
+    if pooled is not None:
+        cells = ct.index[ct.isin(members)]
+        keep = M.index.intersection(cells)
+        rows = M.index.get_indexer(keep)
+        sub = {k: v[rows] for k, v in pooled["counts"].items()}
+        P, idx, n_bins = pooled_profiles(sub, keep, bin_idx, pos_idx, total,
+                                         pooled["alpha"], pooled["stat"])
+    else:
+        P, idx, n_bins = cell_profiles(M, ct, members, bin_idx, pos_idx,
+                                       total)
     if baseline == "flank":
         P = anchor_to_flank(P, n_flank, n_body)
     out = {"mean": np.full(total, np.nan), "lo": np.full(total, np.nan),
@@ -302,6 +389,38 @@ def main(argv=None) -> int:
                          "celltype_marker_bins.py.  Without it the panel "
                          "shows the genome-wide offset between the arms and "
                          "the domain structure rides on top of it, invisible.")
+    ap.add_argument("--from-counts", default=None, metavar="DIR",
+                    help="Compute each axis position from the POOLED raw "
+                         "counts of the bins landing there, instead of "
+                         "averaging their per-bin statistics.  Point at the "
+                         "05_concordance directory (or its counts/ "
+                         "subdirectory) of a run made with --emit-counts.  "
+                         "A region's statistic is not the mean of its bins': "
+                         "C and the log odds ratio are ratios of aggregated "
+                         "counts, and a thin bin's value is mostly the "
+                         "prior.  Measured on a 20-bin region with 16 thin "
+                         "bins, the unweighted mean of the per-bin log odds "
+                         "ratio came to +0.043 against a true +0.350, while "
+                         "pooling gave +0.222 -- and the attenuation follows "
+                         "the SHARE of thin bins, so a domain and its flank "
+                         "are attenuated differently and the contrast "
+                         "between them is distorted.  Domains also vary in "
+                         "size, so a small one is one bin stretched across "
+                         "the axis while a large one is forty averaged; "
+                         "pooling makes both one estimate from whatever "
+                         "pairs they contain.  The per-cell corrections "
+                         "(--contrast-center, --contrast-reference-*, "
+                         "--contrast-regress-coverage) act on the statistic "
+                         "and cannot be applied to counts, so they are "
+                         "refused here; --baseline flank still applies, and "
+                         "is the per-cell control that matters for a "
+                         "profile.")
+    ap.add_argument("--from-counts-statistic", default=None,
+                    choices=["coordination", "direction_logor",
+                             "direction_excess", "direction",
+                             "directional_corrected", "marginal"],
+                    help="Which statistic to build from the pooled counts.  "
+                         "Default: read from the --matrix filename.")
     ap.add_argument("--contrast-reference-scale", action="append",
                     default=[], metavar="NAME=PATH[:COLUMN]",
                     help="Divide out each cell's assay reliability on the "
@@ -383,6 +502,23 @@ def main(argv=None) -> int:
     ap.add_argument("--plot-format", default="pdf",
                     choices=["pdf", "png", "svg"])
     args = ap.parse_args(argv)
+    # Checked before any I/O: a contradiction between flags should not wait
+    # on a file read to be reported.
+    if args.from_counts:
+        _clash = [f for f, on in (
+            ("--contrast-center", args.contrast_center != "none"),
+            ("--contrast-reference-d", bool(args.contrast_reference_d)),
+            ("--contrast-reference-scale",
+             bool(args.contrast_reference_scale)),
+            ("--contrast-regress-coverage", args.contrast_regress_coverage),
+        ) if on]
+        if _clash:
+            sys.exit(
+                f"--from-counts computes the statistic from pooled counts, "
+                f"so {', '.join(_clash)} cannot be applied -- they act on "
+                f"the statistic, not on counts.  Drop them; --baseline flank "
+                f"still works and is the per-cell control that matters for a "
+                f"profile.")
 
     bp = _bp_mod()
     name, mpath = (args.matrix.split("=", 1) if "=" in args.matrix
@@ -511,6 +647,27 @@ def main(argv=None) -> int:
                      f"  have: {sorted(set(ct))}")
         groups[lab] = mem
 
+    _pooled = None
+    if args.from_counts:
+        _stat = args.from_counts_statistic
+        if _stat is None:
+            _stem = Path(mpath).name
+            _stat = (_stem[len("concordance_"):-len(".parquet")]
+                     if _stem.startswith("concordance_") else None)
+            if _stat not in ("coordination", "direction_logor",
+                             "direction_excess", "direction",
+                             "directional_corrected", "marginal"):
+                sys.exit(f"--from-counts cannot tell which statistic "
+                         f"{_stem!r} holds; pass --from-counts-statistic.")
+        _alpha = load_prior(args.from_counts)
+        _pooled = {"counts": load_counts(args.from_counts, M.index,
+                                         M.columns),
+                   "alpha": _alpha, "stat": _stat}
+        print(f"  pooling raw counts per axis position and computing "
+              f"{_stat} from them (prior nu={sum(_alpha.values()):.1f}); "
+              f"the per-bin values in --matrix are not used",
+              file=sys.stderr)
+
     bins = pd.DataFrame({
         "chrom": [str(c).rsplit(":", 1)[0] for c in M.columns],
         "start": [int(str(c).rsplit(":", 1)[1]) for c in M.columns]})
@@ -543,6 +700,8 @@ def main(argv=None) -> int:
                                      args.flank_bins)
         kw = dict(baseline=args.baseline, n_flank=args.flank_bins,
                   n_body=args.body_bins)
+        if _pooled is not None:
+            kw["pooled"] = _pooled
         prof = {lab: group_profile(M, ct, mem, bi, pi, total, args.conf, **kw)
                 for lab, mem in groups.items()}
         results[rname] = prof

@@ -304,6 +304,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "end-pairs thin out.",
     )
     parser.add_argument(
+        "--emit-counts", action="store_true",
+        help="Write the RAW, pre-imputation per-(cell, bin) soft counts to "
+             "05_concordance/counts/.  Needed to compute a statistic over "
+             "an arbitrary region -- a PMD, a LAD, a late-RT domain -- "
+             "rather than averaging the per-bin values inside it.  C and "
+             "the log odds ratio are ratios of aggregated counts, so they "
+             "are not additive across bins, and a thin bin's value is "
+             "mostly the prior: measured on a 20-bin region with 16 thin "
+             "bins, the unweighted mean of the per-bin log odds ratio came "
+             "to +0.043 against a true +0.350, while pooling the counts "
+             "first gave +0.222.  The attenuation follows the share of thin "
+             "bins, so a domain and its flank are attenuated differently "
+             "and the contrast between them is distorted.  Used by "
+             "scripts/scaled_region_profile.py --from-counts.",
+    )
+    parser.add_argument(
         "--emit-null", action="store_true",
         help="Also emit concordance_<component>_null.parquet: the same "
              "statistics computed with a DRAWN null in place of the "
@@ -1551,6 +1567,7 @@ def run_context(
                 dm_dist_bin=args.dm_dist_bin_bp,
                 dm_prior=args.dm_prior,
                 emit_null=args.emit_null,
+                emit_counts=args.emit_counts,
                 use_rwr=(args.impute == "rwr"),
                 rwr_k=args.rwr_k,
                 rwr_restart_prob=args.rwr_restart_prob,
@@ -1586,6 +1603,7 @@ def run_context(
                     dm_dist_bin=args.dm_dist_bin_bp,
                 dm_prior=args.dm_prior,
                 emit_null=args.emit_null,
+                emit_counts=args.emit_counts,
                     use_rwr=(args.impute == "rwr"), rwr_k=args.rwr_k,
                     rwr_restart_prob=args.rwr_restart_prob,
                     rwr_n_refine_passes=rwr_refine_passes,

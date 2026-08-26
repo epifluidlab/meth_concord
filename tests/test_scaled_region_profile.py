@@ -656,3 +656,73 @@ def test_a_cell_far_below_the_cohort_is_left_alone_not_amplified():
     out, info = mk.scale_by_reference(X, ref)
     assert info["n_corrected"] == 18
     assert out[0, 0] == 1.0 and out[1, 0] == 1.0
+
+
+# ------------------------- a region's statistic is not the mean of its bins --
+
+def test_averaging_per_bin_statistics_attenuates_by_the_share_of_thin_bins():
+    """C and the log odds ratio are ratios of aggregated counts, so they are
+    not additive across bins, and a thin bin's value is mostly the prior.
+
+    That makes the error a BIAS rather than a scale factor: it follows the
+    share of thin bins, and a domain and its flank differ in accessibility
+    and so in depth.  They are attenuated by different amounts and the
+    contrast between them -- which is the whole figure -- is distorted."""
+    import numpy as np
+    from nome_hic_concordance.concordance import decompose_components as dc
+    rng = np.random.default_rng(0)
+    true_lor, nb, p_bar = 0.35, 20, 0.30
+    e_o, e_c = p_bar ** 2, (1 - p_bar) ** 2
+    depth = np.r_[rng.integers(1, 4, 16), rng.integers(200, 400, 4)]
+    odds = (e_o / e_c) * np.exp(true_lor)
+    ko = rng.binomial(depth, odds / (1 + odds)).astype(float)
+    kc = (depth - ko).astype(float)
+    a_o, a_c, a0 = 10.0, 49.0, 100.0
+    post = lambda k_o, k_c, n: ((a_o + k_o) / (a0 + n), (a_c + k_c) / (a0 + n))
+    per = dc(*post(ko, kc, depth),
+             *post(e_o * depth, e_c * depth, depth))["direction_logor"]
+    t = depth.sum()
+    pooled = dc(*[np.array([x]) for x in post(ko.sum(), kc.sum(), t)],
+                *[np.array([x]) for x in post(e_o * t, e_c * t, t)]
+                )["direction_logor"][0]
+    # measured: mean-of-bins is 0.307 from the truth, pooled 0.128
+    assert abs(np.mean(per) - true_lor) > 2 * abs(pooled - true_lor)
+    assert np.mean(per[depth < 4]) < 0.1 * np.mean(per[depth > 100])
+
+
+def test_pooled_profiles_uses_counts_not_the_per_bin_values():
+    import numpy as np
+    m = _mod()
+    n_cells, n_bins, total = 6, 8, 3
+    counts = {k: np.zeros((n_cells, n_bins)) for k in m.COUNT_KEYS}
+    for k in ("k_open", "k_dm_open"):
+        counts[k][:] = 3.0
+    for k in ("k_closed", "k_dm_closed"):
+        counts[k][:] = 5.0
+    counts["n_linked"][:] = counts["n_dm"][:] = 8.0
+    counts["k_open"][:, :4] = 7.0            # a real excess in the first half
+    bin_idx = np.arange(n_bins)
+    pos_idx = np.repeat(np.arange(total), [4, 2, 2])
+    P, rows, nb = m.pooled_profiles(
+        counts, np.arange(n_cells), bin_idx, pos_idx, total,
+        {"open": 10.0, "closed": 49.0, "mixed": 41.0}, "direction_logor")
+    assert P.shape == (n_cells, total)
+    assert list(nb) == [4, 2, 2]
+    assert P[0, 0] > P[0, 1]                 # the excess shows where it is
+    assert np.isfinite(P).all()
+
+
+def test_from_counts_refuses_the_corrections_it_cannot_apply(tmp_path):
+    """--contrast-center and the reference corrections act on the statistic,
+    not on counts.  Silently ignoring them would make two runs look
+    comparable when they are not."""
+    import subprocess
+    import sys as _sys
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--matrix", "gch=/nope.parquet",
+         "--samples", "/nope.tsv", "--group", "a=A", "--region", "r=/n.bed",
+         "--from-counts", "/nope", "--contrast-center", "cell-median",
+         "--output-dir", str(tmp_path)], capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "--contrast-center" in r.stderr
+    assert "--baseline flank still works" in r.stderr
