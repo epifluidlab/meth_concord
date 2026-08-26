@@ -2989,3 +2989,64 @@ def test_the_cli_refuses_min_pairs_without_the_counts(tmp_path):
         {"cell": s, "reference_d": np.linspace(0.2, 0.5, len(s))}),
         extra=["--min-pairs", "1", "--pair-counts", "gch=/nope.parquet"])
     assert r.returncode != 0
+
+
+def _sparse_zero_matrix(seed=0, n=40, nb=300, n_dense=100):
+    """Bin-structured coverage with NO signal at all.
+
+    The first n_dense bins are covered in every cell; the rest in a tenth of
+    them.  Uncovered entries are exactly 0, the way decompose_components
+    emits them.  The two arms are drawn identically, so every call is a
+    false positive by construction.
+    """
+    rng = np.random.default_rng(seed)
+    cov = np.zeros((n, nb), bool)
+    cov[:, :n_dense] = True
+    cov[:, n_dense:] = rng.random((n, nb - n_dense)) < 0.10
+    X = np.where(cov, rng.normal(0.0, 1.0, (n, nb)), 0.0)
+    arm = np.zeros(n, bool)
+    arm[: n // 2] = True
+    return X, cov.astype(float), arm, np.arange(n_dense)
+
+
+def test_zeros_are_shuffled_but_that_alone_did_not_inflate_anything():
+    """The sentinel defeats the docstring's stated intent, and that is a
+    real defect.  It is NOT a demonstrated cause of inflation, and this
+    test records the measurement rather than the theory.
+
+    The worry was that shuffling a cell's structural zeros into every bin
+    position compresses the null while the observed at a well-covered bin
+    stays uncompressed.  Measured across four fixtures -- equal cell
+    coverage, arm A thinner, arm A denser, and no coverage structure -- the
+    false-positive rate at dense bins came back at 0.040 every time, which
+    is nominal, and masking the zeros to NaN moved it to 0.02-0.03, very
+    slightly conservative.  A rank test is the reason: the zeros land
+    symmetrically in both arms, and ranks do not care how many there are.
+
+    So masking is worth doing because a non-observation is not a
+    measurement, not because it is known to fix a count."""
+    m = _mod()
+    X, cov, arm, dense = _sparse_zero_matrix()
+    rate = lambda M: (lambda p: float((p[np.isfinite(p)] < 0.05).mean()))(
+        np.asarray(m.permutation_null(M, arm, ~arm, min_cells=5, test="mwu",
+                                      n_perm=300, seed=0)["p_empirical"]
+                   )[dense])
+    with_zeros = rate(X)
+    masked = rate(np.where(cov >= 1, X, np.nan))
+    assert with_zeros < 0.10, with_zeros          # nominal, not inflated
+    assert masked <= with_zeros + 0.02
+
+
+def test_the_permutation_holds_nan_in_place_but_cannot_hold_a_zero():
+    """The exact property the sentinel defeats, pinned so the two stay
+    linked: a change to either one has to face this."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    row = np.array([[1.0, 2.0, np.nan, 3.0, 0.0, np.nan]])
+    out = m.permute_within_cells(row, rng)
+    assert np.isnan(out[0, 2]) and np.isnan(out[0, 5])
+    assert sorted(out[0, [0, 1, 3, 4]]) == [0.0, 1.0, 2.0, 3.0]
+    # the zero moved: it is finite, so it is treated as a measurement
+    moved = any(m.permute_within_cells(row, np.random.default_rng(s))[0, 4]
+                != 0.0 for s in range(8))
+    assert moved

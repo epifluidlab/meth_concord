@@ -901,6 +901,21 @@ def permute_within_cells(X, rng):
     coverage as well, and coverage differs between bins for reasons that have
     nothing to do with the contrast; holding it fixed keeps the null about bin
     IDENTITY alone.
+
+    THAT PROTECTION ONLY REACHES NON-OBSERVATIONS THAT ARRIVE AS NaN.  A
+    (cell, bin) with no read pairs comes out of decompose_components as
+    exactly 0.0, and under a shared prior so does C -- finite, so shuffled
+    like a measurement.  On a sparse context that scatters a cell's zeros
+    across every bin position, and the permuted column at a WELL-covered bin
+    then holds that cell's genome-wide average of zeros instead of the few
+    the bin really has.  Whether that inflates anything is a separate
+    question, and the answer measured so far is no: across four fixtures --
+    equal cell coverage, either arm thinner, no coverage structure -- the
+    false-positive rate at dense bins stayed at 0.040 with the zeros in
+    place, because a rank test does not care how many ties an arm carries.
+    The defect is simply that a non-observation is being shuffled as though
+    it were a measurement.  Mask them to NaN first (--min-pairs) and this
+    function holds them in place on its own.
     """
     out = np.array(X, dtype=float, copy=True)
     for i in range(out.shape[0]):
@@ -3174,6 +3189,23 @@ def main():
             if C_df is not None:
                 Cc = C_df.reindex(index=M.index,
                                   columns=M.columns).to_numpy()
+            _zero_frac = float(np.mean(Xc[np.isfinite(Xc)] == 0.0)) \
+                if np.isfinite(Xc).any() else 0.0
+            if args.min_pairs == 0 and _zero_frac > 0.05:
+                print(f"  {name}: WARNING {_zero_frac:.1%} of the finite "
+                      f"matrix is EXACTLY 0.  A (cell, bin) with no read "
+                      f"pairs scores exactly 0, and the within-cell "
+                      f"permutation only holds NaN in place -- zeros get "
+                      f"shuffled like measurements, which scatters them "
+                      f"into every bin position and compresses the null "
+                      f"toward 0 while the observed at a well-covered bin "
+                      f"is not.  On four synthetic fixtures that did NOT "
+                      f"inflate the false-positive rate -- a rank test does "
+                      f"not care how many ties there are -- so this is a "
+                      f"correctness warning, not a diagnosis of a count.  "
+                      f"Pass --min-pairs 1 (with --pair-counts) to mark "
+                      f"them missing instead of measured.",
+                      file=sys.stderr)
             if args.min_pairs > 0:
                 if Cc is None:
                     sys.exit(
