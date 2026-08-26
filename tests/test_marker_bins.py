@@ -3170,6 +3170,54 @@ def test_a_thin_stratum_falls_back_to_the_whole_pool():
     assert np.isfinite(np.asarray(r["p_empirical"])[:3]).all()
 
 
+def test_a_null_built_only_from_measured_bins_calls_the_sparse_ones():
+    """Restricting the null to bins that were really measured is right about
+    WHICH bins are trustworthy, and leaves the untrustworthy ones tested
+    against a null that does not describe them.  Their statistic is mostly
+    what RWR borrowed from a cell-type-aware graph, so it separates the arms
+    by construction and clears a null built from measured bins.
+
+    Measured across tint strengths, with nothing real in the sparse bins:
+    0.037 at tint 0, 0.730 at 0.2, 1.000 at 0.8.  The design is correct only
+    where the imputation carries no arm signature."""
+    m = _mod()
+
+    def measured_only_null(X, cov, arm, n_perm=300):
+        g = np.random.default_rng(1)
+        obs = np.abs(np.asarray(m.contrast_stats(X, arm, 5)["t"], float))
+        D = np.vstack([
+            np.abs(np.asarray(m.contrast_stats(
+                m.permute_within_cells(X, g, cov), arm, 5)["t"], float))
+            for _ in range(n_perm)])
+        well = cov.mean(axis=0) >= 0.5
+        pool = np.sort(D[:, well][np.isfinite(D[:, well])])
+        rank = np.searchsorted(pool, obs, side="left")
+        return (pool.size - rank + 1.0) / (pool.size + 1.0)
+
+    rates = {}
+    for tint in (0.0, 0.8):
+        X, cov, arm, sparse = _imputed_matrix(tint=tint)
+        p = measured_only_null(X, cov, arm)[sparse]
+        rates[tint] = float((p[np.isfinite(p)] < 0.05).mean())
+    assert rates[0.0] < 0.10          # measured 0.037
+    assert rates[0.8] > 0.90          # measured 1.000
+
+
+def test_marking_them_untestable_is_the_other_half_of_that_design():
+    """Drop them from the null AND from the calls, rather than from one
+    only.  Then nothing is reported that the imputation wrote."""
+    m = _mod()
+    X, cov, arm, sparse = _imputed_matrix(tint=0.8)
+    frac = cov.mean(axis=0)
+    Xc = X.copy()
+    Xc[:, frac < 0.5] = np.nan
+    r = m.permutation_null(Xc, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=300, seed=0, permutable=cov)
+    p = np.asarray(r["p_empirical"])
+    assert not np.isfinite(p[sparse]).any()      # no call at all
+    assert np.isfinite(p[:100]).all()            # the measured ones survive
+
+
 def test_a_held_entry_does_not_move_and_the_rest_do():
     m = _mod()
     row = np.array([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])

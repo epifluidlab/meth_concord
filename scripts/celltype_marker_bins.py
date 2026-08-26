@@ -2579,6 +2579,27 @@ def main():
                          "entries are dropped instead.  Only acts when "
                          "--contrast-permutations > 0.  Needs --pair-counts "
                          "(auto-discovered from beside --matrix).")
+    ap.add_argument("--min-bin-frac", type=float, default=0.0,
+                    metavar="F",
+                    help="Mark a bin UNTESTABLE unless at least this "
+                         "fraction of cells measured it with --min-pairs "
+                         "read pairs of their own.  Such a bin's statistic "
+                         "is mostly what RWR borrowed from the k-NN graph, "
+                         "and that graph is built from accessibility, so it "
+                         "is cell-type aware and the borrowed value carries "
+                         "the arm's signature by construction.  Measured on "
+                         "a fixture: with the null built only from measured "
+                         "bins, 73%% to 100%% of sparse bins came back "
+                         "significant with nothing real in them, the "
+                         "fraction rising with how strongly the imputation "
+                         "is tinted.  Setting this drops them from the null "
+                         "AND from the calls, which is the honest pair.  "
+                         "Left at 0 they are still tested, but against a "
+                         "null pooled within their own coverage class, "
+                         "where they clear only by exceeding the tint that "
+                         "every such bin carries -- calibrated, though what "
+                         "it measures is the imputation rather than the "
+                         "concordance.  Needs --min-pairs.")
     ap.add_argument("--pair-counts", action="append", default=None,
                     metavar="NAME=PATH",
                     help="pair_counts_per_bin.parquet for the matching "
@@ -3348,6 +3369,18 @@ def main():
                       f"pairs of their own; they stay in the observed "
                       f"statistic and are held fixed while the null is "
                       f"permuted", file=sys.stderr)
+                _frac = _permutable.mean(axis=0)
+                if args.min_bin_frac > 0:
+                    _drop = _frac < float(args.min_bin_frac)
+                    Xc[:, _drop] = np.nan
+                    print(f"  {name}: {int(_drop.sum()):,} of "
+                          f"{len(_drop):,} bins are measured in under "
+                          f"{args.min_bin_frac:.0%} of cells and are marked "
+                          f"UNTESTABLE -- so they neither contribute to the "
+                          f"null nor receive a call.  Their statistic would "
+                          f"be mostly what RWR borrowed from the k-NN "
+                          f"graph, and that graph is cell-type aware.",
+                          file=sys.stderr)
                 if args.contrast_permutations <= 0:
                     print(f"  {name}: NOTE --min-pairs only acts on the "
                           f"permutation null, and --contrast-permutations "
