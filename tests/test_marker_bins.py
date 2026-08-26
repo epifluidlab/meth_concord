@@ -3103,6 +3103,73 @@ def test_the_observed_statistic_is_untouched_by_the_gate():
     np.testing.assert_allclose(a["stat"], b["stat"], equal_nan=True)
 
 
+def _planted(n_real=5, seed=0, n=40, nb=400, n_dense=100):
+    """Real signal in a few DENSE bins, over the imputed-tint background."""
+    X, cov, arm, sparse = _imputed_matrix(seed=seed, n=n, nb=nb,
+                                          n_dense=n_dense)
+    real = np.arange(n_real)
+    X[np.ix_(arm, real)] += 1.5
+    return X, cov, arm, real, np.arange(n_real, n_dense), sparse
+
+
+def test_one_pooled_null_destroys_power_when_coverage_varies():
+    """Holding a sparse bin's imputed entries fixed makes its permuted
+    statistic close to its observed one -- which is the point -- but it also
+    makes it contribute enormous draws to a shared pool.  Measured: sparse
+    bins at |t| median 9.3 against a dense-only null whose 99.9th percentile
+    is 3.67.  Pooled together, a real effect at |t| 5.3 does not clear and
+    power goes to zero everywhere, while the run still reports thousands of
+    parametric calls."""
+    m = _mod()
+    X, cov, arm, real, _dn, _sp = _planted()
+    r = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=300, seed=0, permutable=cov)
+    p = np.asarray(r["p_empirical"])
+    assert (p[real] < 0.05).mean() == 0.0
+
+
+def test_stratifying_the_pool_by_coverage_restores_it():
+    m = _mod()
+    X, cov, arm, real, dense_null, sparse = _planted()
+    r = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=300, seed=0, permutable=cov,
+                           pool_strata=m.coverage_strata(cov))
+    p = np.asarray(r["p_empirical"])
+    assert (p[real] < 0.05).mean() == 1.0           # measured 1.00
+    assert (p[dense_null] < 0.05).mean() < 0.08     # measured 0.032
+    assert (p[sparse] < 0.05).mean() < 0.10         # measured 0.057
+    assert r["n_pool_strata"] >= 2
+
+
+def test_the_bands_have_to_separate_the_coverage_classes():
+    """Quantile edges over a mostly sparse genome fall INSIDE the sparse
+    class and put its better-covered bins in with the fully measured ones.
+    The pool is poisoned again and power measured 0.00, which is why the
+    bands are fixed."""
+    m = _mod()
+    X, cov, arm, real, _dn, _sp = _planted()
+    frac = cov.mean(axis=0)
+    leaky = np.clip(np.digitize(
+        frac, np.unique(np.quantile(frac, np.linspace(0, 1, 7)))[1:-1]),
+        0, 5)
+    r = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=300, seed=0, permutable=cov,
+                           pool_strata=leaky)
+    assert (np.asarray(r["p_empirical"])[real] < 0.05).mean() == 0.0
+
+
+def test_a_thin_stratum_falls_back_to_the_whole_pool():
+    """Conservative, rather than resolving a tail from a handful of draws."""
+    m = _mod()
+    X, cov, arm, _real, _dn, _sp = _planted()
+    strat = np.zeros(X.shape[1], int)
+    strat[:3] = 7                                   # 3 bins on their own
+    r = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=50, seed=0, permutable=cov,
+                           pool_strata=strat, min_pool=5_000)
+    assert np.isfinite(np.asarray(r["p_empirical"])[:3]).all()
+
+
 def test_a_held_entry_does_not_move_and_the_rest_do():
     m = _mod()
     row = np.array([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])

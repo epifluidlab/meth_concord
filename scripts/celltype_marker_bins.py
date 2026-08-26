@@ -944,9 +944,22 @@ def permute_within_cells(X, rng, permutable=None):
     return out
 
 
+# Fixed bands, not quantiles.  Over a mostly sparse genome the quantile
+# edges fall inside the sparse class and put its better-covered bins in with
+# the fully measured ones, which poisons the pool -- measured as power 0.00
+# where fixed bands gave 1.00.  These separate the classes by construction.
+COVERAGE_BANDS = (0.25, 0.5, 0.75, 0.999)
+
+
+def coverage_strata(permutable, bands=COVERAGE_BANDS):
+    """Bin each column by the fraction of cells that measured it."""
+    frac = np.asarray(permutable, bool).mean(axis=0)
+    return np.digitize(frac, list(bands))
+
+
 def permutation_null(X, in_mask, out_mask, min_cells, test, n_perm,
                      V=None, mode="none", strata=None, counts=None, seed=0,
-                     permutable=None):
+                     permutable=None, pool_strata=None, min_pool=5_000):
     """Empirical p per bin against a within-cell permutation null.
 
     The parametric p asks whether the arms differ.  It cannot tell a
@@ -961,6 +974,23 @@ def permutation_null(X, in_mask, out_mask, min_cells, test, n_perm,
     are exchangeable, so every permuted statistic is a draw from the same null
     and pooling buys n_bins x n_perm draws instead of n_perm.  That matters --
     a per-bin null of 100 permutations cannot resolve a p below 0.01.
+
+    ``pool_strata`` IS WHAT MAKES THAT EXCHANGEABILITY TRUE when coverage
+    varies.  With ``permutable`` holding a bin's imputed entries in place,
+    a sparsely covered bin's permuted statistic is close to its observed one
+    -- which is the point, it is how the bin stops clearing a null that does
+    not describe it -- but it also means such a bin contributes ENORMOUS
+    draws to a shared pool.  Measured: sparse bins at |t| median 9.3 against
+    a dense-only null whose 99.9th percentile is 3.67.  Pool them together
+    and a real effect at |t| 5.3 does not clear, so power goes to zero
+    everywhere while the run still reports thousands of parametric calls.
+
+    Pooling within a coverage stratum restores it: on the same fixture,
+    power 1.00 at the planted bins with false-positive rates of 0.032 and
+    0.057 in the two classes, against 0.00 / 0.000 / 0.057 unstratified.
+    The bands have to SEPARATE the classes -- quantile edges over a mostly
+    sparse genome put the better-covered sparse bins in with the dense ones
+    and the pool is poisoned again, which measured as power 0.00.
     """
     rng = np.random.default_rng(seed)
 
@@ -982,20 +1012,58 @@ def permutation_null(X, in_mask, out_mask, min_cells, test, n_perm,
             return np.abs(np.asarray(cs["t"], float)), cs
 
     obs, cs_obs = stat_of(np.asarray(X, float))
-    null = []
+    draws = []
     for _ in range(int(n_perm)):
         v, _ = stat_of(permute_within_cells(X, rng, permutable))
-        null.append(v[np.isfinite(v)])
-    pooled = np.sort(np.concatenate(null)) if null else np.array([])
-    if pooled.size == 0:
+        draws.append(np.asarray(v, float))
+    if not draws:
         return None
+    D = np.vstack(draws)                       # n_perm x n_bins, bins kept
+    if D[np.isfinite(D)].size == 0:
+        return None
+
     # +1 in numerator and denominator: an observed value beyond every draw
     # gets 1/(N+1), not zero, because N draws cannot evidence p = 0.
-    rank = np.searchsorted(pooled, obs, side="left")
-    emp = (pooled.size - rank + 1.0) / (pooled.size + 1.0)
+    def _p_from(pool, where):
+        pool = np.sort(pool[np.isfinite(pool)])
+        if pool.size == 0:
+            return None
+        rank = np.searchsorted(pool, obs[where], side="left")
+        return (pool.size - rank + 1.0) / (pool.size + 1.0), pool.size
+
+    emp = np.full(obs.shape, np.nan)
+    n_used, n_strat = 0, 0
+    if pool_strata is None:
+        r = _p_from(D.ravel(), slice(None))
+        if r is None:
+            return None
+        emp, n_used = r[0], r[1]
+        n_strat = 1
+    else:
+        ps = np.asarray(pool_strata)
+        globally = np.sort(D[np.isfinite(D)].ravel())
+        for s in np.unique(ps[np.isfinite(ps.astype(float))]
+                           if ps.dtype.kind == "f" else np.unique(ps)):
+            col = ps == s
+            if not col.any():
+                continue
+            r = _p_from(D[:, col].ravel(), col)
+            # A stratum too thin to resolve the tail falls back to the whole
+            # pool, which is conservative, rather than to a handful of draws.
+            if r is None or r[1] < min_pool:
+                rank = np.searchsorted(globally, obs[col], side="left")
+                emp[col] = ((globally.size - rank + 1.0)
+                            / (globally.size + 1.0))
+            else:
+                emp[col] = r[0]
+                n_used += r[1]
+                n_strat += 1
+        if n_used == 0:
+            n_used = int(globally.size)
     emp = np.where(np.isfinite(obs), emp, np.nan)
-    return {"stat": obs, "p_empirical": emp, "n_null": int(pooled.size),
-            "n_perm": int(n_perm), "cs": cs_obs}
+    return {"stat": obs, "p_empirical": emp, "n_null": int(n_used),
+            "n_perm": int(n_perm), "n_pool_strata": int(n_strat),
+            "cs": cs_obs}
 
 
 def batch_negative_control(X, ct, batch, min_cells, test, fdr_cut,
@@ -3417,7 +3485,9 @@ def main():
                     args.contrast_weight,
                     strata=_lev if args.contrast_stratify else None,
                     counts=(Cc if args.contrast_weight != "none" else None),
-                    permutable=_permutable)
+                    permutable=_permutable,
+                    pool_strata=(coverage_strata(_permutable)
+                                 if _permutable is not None else None))
                 if pn is None:
                     print(f"  contrast {label!r}: permutation null produced "
                           f"no usable statistic -- keeping the parametric p",
