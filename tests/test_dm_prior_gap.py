@@ -123,6 +123,79 @@ def test_the_same_gap_floors_the_log_odds_direction():
     assert lor(a_l, 0, 0) - lor(a_l, 0, 0) == 0.0
 
 
+def test_the_floors_are_arithmetic_on_the_priors_handed_in():
+    """The numbers from a real separate-prior run, so the formula is pinned
+    to something measured rather than to itself."""
+    a_l = {"open": 10.182, "closed": 49.196, "mixed": 40.622}
+    a_d = {"open": 11.281, "closed": 46.967, "mixed": 41.752}
+    c, l = cc._prior_floors(a_l, a_d)
+    assert c == pytest.approx(0.0113, abs=5e-4)
+    assert l == pytest.approx(-0.1489, abs=5e-4)
+    assert cc._prior_floors(a_l, a_l) == (0.0, 0.0)
+
+
+def test_the_floor_is_computed_from_the_priors_that_were_used(tmp_path):
+    """The report used to be written BEFORE the shared fit replaced the
+    priors, so a --dm-prior shared run published the floor it had just
+    removed -- 0.017841 and -0.191811 on a real run -- and read as though
+    the fix had not applied.  The rates were right and only the JSON was
+    wrong, which is the worst of the two to have.
+
+    Asserted as CONSISTENCY between the reported priors and the reported
+    floor.  The earlier version checked the floor against 0 on a fixture too
+    small for the EB fit, where every prior falls back to Dirichlet(1, 1, 1)
+    and every gap is 0 however the code is ordered -- so it passed on the
+    broken code."""
+    import json
+    from tests.test_signed_concordance import _focal_active_paths
+    for mode in ("separate", "shared"):
+        src, out = tmp_path / f"s_{mode}", tmp_path / f"o_{mode}"
+        src.mkdir(parents=True, exist_ok=True)
+        cc.compute_signed_concordance_matrix(
+            _focal_active_paths(src, n_cells=3),
+            bin_size=1000, min_distance=100, min_gch_sites=2,
+            baseline="distance-matched", dm_dist_bin=100, dm_prior=mode,
+            # Force the real method-of-moments fit.  At the default
+            # min_obs the fixture falls back to Dirichlet(1, 1, 1) for every
+            # pool, which makes every gap 0 whatever the code does.
+            eb_min_obs=1,
+            output_dir=str(out), save_outputs=True, use_rwr=False,
+        )
+        pri = json.load(open(out / "dirichlet_multinomial_prior.json"))
+        gap = pri["prior_gap"]
+        exp_c, exp_l = cc._prior_floors(pri["linked"]["alpha"],
+                                        pri["dm_expected"]["alpha"])
+        assert gap["implied_C_floor_at_n0"] == pytest.approx(exp_c)
+        assert gap["implied_logor_floor_at_n0"] == pytest.approx(exp_l)
+        assert gap["dm_prior"] == mode
+        if mode == "shared":
+            # what was used, and separately what was removed
+            assert pri["linked"]["alpha"] == pri["shared"]["alpha"]
+            assert pri["dm_expected"]["alpha"] == pri["shared"]["alpha"]
+            assert "separate_fit" in pri
+            assert "separate_fit_C_floor" in gap
+            assert "separate_fit" in pri
+            assert gap["implied_C_floor_at_n0"] == 0.0
+            assert gap["implied_logor_floor_at_n0"] == 0.0
+
+
+def test_the_report_is_written_after_the_prior_is_replaced():
+    """The bug was pure ordering, and no fixture here can catch it
+    behaviourally: the linked and expected pools come out with identical
+    concordant mass (0.9050 vs 0.9050), so the gap is 0 whichever priors the
+    report is taken from.  That is precisely how the two tests written with
+    the feature passed on the broken code -- at the default min_obs every
+    pool falls back to Dirichlet(1, 1, 1) as well.  So the invariant is
+    pinned where it lives, in the order of the two writes."""
+    import inspect
+    src = inspect.getsource(cc.compute_signed_concordance_matrix)
+    i_share = src.index('fitted_priors["shared"] =')
+    i_used = src.index('fitted_priors["linked"] = {"alpha": alpha_sh')
+    i_gap = src.index('fitted_priors["prior_gap"] =')
+    assert i_share < i_gap, "the shared fit must precede the gap report"
+    assert i_used < i_gap, "'linked' must name the prior actually used"
+
+
 def test_the_logor_floor_is_reported_too(tmp_path):
     import json
     from tests.test_signed_concordance import _focal_active_paths

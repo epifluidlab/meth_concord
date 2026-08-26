@@ -1106,6 +1106,22 @@ def _dm_posterior_variance_S(
     return (mu_o + mu_c - (mu_o - mu_c) ** 2) / (alpha_total + n + 1.0)
 
 
+def _prior_floors(alpha_a, alpha_b):
+    """The two data-free terms a pair of DM priors imposes.
+
+    C shares the posterior denominator, so the gap in concordant mass lands
+    on it additively.  L cancels that denominator, so what reaches it is the
+    log-odds ratio of the two priors' own open:closed splits.  Returned
+    together because they are the same defect read on two scales, and
+    because computing them anywhere other than from the priors actually in
+    use is how a shared run came to publish a floor it had removed.
+    """
+    conc = lambda a: (a["open"] + a["closed"]) / sum(a.values())
+    lor = lambda a: float(np.log(a["open"] / a["closed"]))
+    return float(conc(alpha_a) - conc(alpha_b)), float(lor(alpha_a)
+                                                       - lor(alpha_b))
+
+
 def decompose_components(
     o_open: np.ndarray, o_closed: np.ndarray,
     e_open: np.ndarray, e_closed: np.ndarray,
@@ -1708,14 +1724,11 @@ def compute_signed_concordance_matrix(
             # prior it is exactly 0.
             _llor = float(np.log(alpha_l["open"] / alpha_l["closed"])
                           - np.log(alpha_dm["open"] / alpha_dm["closed"]))
-            fitted_priors["prior_gap"] = {
-                "concordant_linked": float(_cl),
-                "concordant_dm_expected": float(_cd),
-                "gap": float(_cl - _cd),
-                "implied_C_floor_at_n0": float(_cl - _cd),
-                "implied_logor_floor_at_n0": _llor,
-                "dm_prior": str(dm_prior),
-            }
+            # Share FIRST, then report -- reporting first described the fits
+            # that were about to be replaced, so a shared run published the
+            # floor it had just removed and read as though the fix had not
+            # applied.  Everything below is measured off the priors the
+            # rates are actually computed with.
             if dm_prior == "shared":
                 alpha_sh, info_sh = _fit_dirichlet_multinomial_eb_prior(
                     pd.concat([long_linked, long_dm], ignore_index=True),
@@ -1725,6 +1738,17 @@ def compute_signed_concordance_matrix(
                 )
                 fitted_priors["shared"] = {"alpha": alpha_sh,
                                            "info": info_sh}
+                # The separate fits are kept, because "how much bookkeeping
+                # was removed" is the diagnostic -- but 'linked' and
+                # 'dm_expected' now name what was USED, not what was tried.
+                fitted_priors["separate_fit"] = {
+                    "linked": fitted_priors["linked"],
+                    "dm_expected": fitted_priors["dm_expected"],
+                }
+                fitted_priors["linked"] = {"alpha": alpha_sh,
+                                           "info": info_sh}
+                fitted_priors["dm_expected"] = {"alpha": alpha_sh,
+                                                "info": info_sh}
                 alpha_l = alpha_dm = alpha_sh
                 logger.info(
                     f"DM prior: SHARED between the linked and expected "
@@ -1732,7 +1756,23 @@ def compute_signed_concordance_matrix(
                     f"separate fits differed by {_cl - _cd:+.6f} in "
                     f"concordant mass, which was an additive floor under C."
                 )
-            elif abs(_cl - _cd) > 0:
+            _uc = _prior_floors(alpha_l, alpha_dm)
+            fitted_priors["prior_gap"] = {
+                "concordant_linked": float(
+                    (alpha_l["open"] + alpha_l["closed"])
+                    / sum(alpha_l.values())),
+                "concordant_dm_expected": float(
+                    (alpha_dm["open"] + alpha_dm["closed"])
+                    / sum(alpha_dm.values())),
+                "gap": _uc[0],
+                "implied_C_floor_at_n0": _uc[0],
+                "implied_logor_floor_at_n0": _uc[1],
+                # What the independently-fitted priors would have imposed.
+                "separate_fit_C_floor": float(_cl - _cd),
+                "separate_fit_logor_floor": _llor,
+                "dm_prior": str(dm_prior),
+            }
+            if dm_prior != "shared" and abs(_cl - _cd) > 0:
                 logger.warning(
                     f"DM prior: the linked and expected pools were fitted "
                     f"SEPARATELY and their concordant masses differ by "
