@@ -199,10 +199,24 @@ def test_a_spike_shaped_null_is_detected_not_reported_as_a_scale():
     body = rng.normal(0, 1.0, 20_000)
     null = np.r_[spike, body]
     c = m.calibration(rng.normal(0, 1.0, 100_000), null)
-    assert c["spike_ratio"] > 5.0
-    assert c["null_bodysd"] > 100 * c["null_madsd"]
+    assert c["spike_ratio"] > 1_000
     # the nominal z it would put on the axis, which is the symptom
     assert abs(np.percentile(null, 99.9) / c["null_madsd"]) > 1_000
+
+
+def test_an_exactly_degenerate_middle_is_not_rescued_by_the_fallback():
+    """robust_sd falls back to the plain sd when MAD is exactly 0, which
+    keeps the arithmetic finite and hides the spike: it hands back the sd
+    of the TAILS as though it were the width of the middle.  With more than
+    half the mass at one value -- an absence-filled matrix -- that is
+    exactly the situation, so the diagnostic reads the raw MAD."""
+    m = _mod()
+    rng = np.random.default_rng(5)
+    null = np.r_[np.zeros(80_000), rng.normal(0, 1.0, 20_000)]
+    c = m.calibration(null, null)
+    assert not np.isfinite(c["spike_ratio"])
+    # and the fallback is what would have hidden it
+    assert m.robust_sd(null) > 0.4 and m._mad_sd_raw(null) == 0.0
 
 
 def test_a_well_behaved_null_is_not_flagged():
@@ -213,11 +227,76 @@ def test_a_well_behaved_null_is_not_flagged():
     assert c["spike_ratio"] == pytest.approx(1.0, abs=0.05)
 
 
-def test_body_sd_matches_the_robust_sd_on_a_normal_sample():
+def test_tail_sd_matches_the_robust_sd_on_a_normal_sample():
     """Same quantity for a Gaussian, so the two are comparable and their
     ratio is a shape statistic rather than a units mismatch."""
     m = _mod()
     rng = np.random.default_rng(2)
     x = rng.normal(0, 3.0, 400_000)
-    assert m.body_sd(x) == pytest.approx(3.0, rel=0.02)
+    assert m.tail_sd(x) == pytest.approx(3.0, rel=0.02)
     assert m.robust_sd(x) == pytest.approx(3.0, rel=0.02)
+
+
+def _spiky_run(tmp_path, n_cells=40, n_bins=500, frac_empty=0.8, seed=0):
+    """A sparse context: most (cell, bin) entries measured nothing, so the
+    statistic is exactly 0 there on BOTH sides."""
+    rng = np.random.default_rng(seed)
+    d = tmp_path / "05"
+    d.mkdir(parents=True, exist_ok=True)
+    cells = [f"c{i}" for i in range(n_cells)]
+    bins = [f"chr1:{i * 250000}" for i in range(n_bins)]
+    counts = (rng.random((n_cells, n_bins)) > frac_empty).astype(int) * 7
+    obs = np.where(counts > 0, rng.normal(0.1, 1.0, counts.shape), 0.0)
+    null = np.where(counts > 0, rng.normal(0.0, 1.0, counts.shape), 0.0)
+    pd.DataFrame(obs, index=cells, columns=bins).to_parquet(
+        d / "concordance_coordination.parquet")
+    pd.DataFrame(null, index=cells, columns=bins).to_parquet(
+        d / "concordance_coordination_null.parquet")
+    pd.DataFrame(counts, index=cells, columns=bins).to_parquet(
+        d / "pair_counts_per_bin.parquet")
+    return d
+
+
+def test_structural_zeros_make_the_null_a_spike(tmp_path):
+    """The absences and the null draws are the same value, so the scale is
+    read off the absences."""
+    m = _mod()
+    d = _spiky_run(tmp_path)
+    obs, null, info = m.load_pair(d, "coordination")
+    c = m.calibration(obs, null)
+    assert info["frac_kept"] == 1.0
+    assert c["spike_ratio"] > 5.0
+
+
+def test_dropping_them_restores_a_readable_scale(tmp_path):
+    """Masked on the RAW pair counts, from both samples together so the
+    comparison stays like-for-like."""
+    m = _mod()
+    d = _spiky_run(tmp_path)
+    obs, null, info = m.load_pair(d, "coordination", min_pairs=1)
+    c = m.calibration(obs, null)
+    assert 0.15 < info["frac_kept"] < 0.25          # the 20% that measured
+    assert c["spike_ratio"] == pytest.approx(1.0, abs=0.1)
+    assert c["null_madsd"] == pytest.approx(1.0, rel=0.1)
+    # and the signal that was buried is now readable
+    assert c["null_bias_z"] == pytest.approx(0.0, abs=0.05)
+
+
+def test_the_mask_is_applied_to_both_samples_not_just_the_observed():
+    """Masking one side would compare a filtered observed against an
+    unfiltered null, which is a different distribution for a reason that
+    has nothing to do with the model."""
+    src = _SCRIPT.read_text()
+    i = src.index("keep = counts.to_numpy(float)")
+    block = src[i:i + 400]
+    assert "obs_df = obs_df.where(keep)" in block
+    assert "null_df = null_df.where(" in block
+
+
+def test_min_pairs_without_the_counts_file_says_where_it_lives(tmp_path):
+    m = _mod()
+    d = _spiky_run(tmp_path)
+    (d / "pair_counts_per_bin.parquet").unlink()
+    with pytest.raises(SystemExit) as e:
+        m.load_pair(d, "coordination", min_pairs=1)
+    assert "pair_counts_per_bin.parquet" in str(e.value)

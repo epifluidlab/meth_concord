@@ -56,35 +56,57 @@ def robust_sd(x):
     return 1.4826 * mad if mad > 0 else float(np.std(x))
 
 
-def body_sd(x):
-    """A scale read from the 10th-90th percentiles instead of the middle.
+def tail_sd(x):
+    """A scale read from the 0.5th-99.5th percentiles instead of the middle.
 
-    MAD is the width of the MIDDLE half, which is the wrong thing to divide
-    by when the distribution is a spike with tails.  A sparse context leaves
-    a large share of (cell, bin) entries with no reads at all, so the
-    statistic collapses to one value for all of them; MAD then measures the
-    width of that spike, and every entry that carries data lands thousands
-    of nominal 'sds' out.  An HCG run came back on a +-4000 axis for exactly
-    this reason, and nothing about it was large.
-
-    (p90 - p10) / 2.563 is the same quantity for a Gaussian and survives a
-    spike holding up to 80% of the mass.
+    (p99.5 - p0.5) / 5.152 is the same quantity as MAD-sd for a Gaussian,
+    so the ratio of the two is a shape statistic and not a units mismatch.
+    It survives a spike holding up to 99% of the mass, which the middle
+    half does not.
     """
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
     if x.size < 2:
         return float("nan")
-    lo, hi = np.percentile(x, [10.0, 90.0])
+    lo, hi = np.percentile(x, [0.5, 99.5])
     span = float(hi - lo)
-    return span / 2.5631 if span > 0 else float("nan")
+    return span / 5.1517 if span > 0 else float("nan")
 
 
-def load_pair(run_dir, stat, cap=4_000_000, seed=0):
+def _mad_sd_raw(x):
+    """MAD-sd with NO fallback, so a degenerate middle reads as zero.
+
+    robust_sd falls back to the plain sd when MAD is exactly 0, which keeps
+    downstream arithmetic finite -- and hides the very thing the spike
+    diagnostic is looking for.  An absence-filled matrix has more than half
+    its mass at one value, so its MAD is 0 and the fallback quietly hands
+    back the sd of the tails as though it were the width of the middle.
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return float("nan")
+    return 1.4826 * float(np.median(np.abs(x - np.median(x))))
+
+
+def load_pair(run_dir, stat, cap=4_000_000, seed=0, min_pairs=0):
     """The observed statistic and its drawn null, flattened and finite.
 
     Returned as two independent samples rather than paired per (cell, bin):
     the null is a different draw, so pairing them would invite a scatter
     that means nothing.  Only their DISTRIBUTIONS are comparable.
+
+    ``min_pairs`` DROPS ENTRIES THAT MEASURED NOTHING, and on a sparse
+    context that is the difference between a readable plot and a
+    meaningless one.  A (cell, bin) with no read pairs has k = 0 on both
+    sides, so under a shared prior the statistic is exactly 0 -- for the
+    observed AND for the drawn null.  Those are absences, not null draws,
+    and a matrix full of them is a spike at zero with the real values in
+    its tails: MAD-sd then measures the width of the spike and every entry
+    carrying data lands thousands of nominal sds out, which is what an HCG
+    run did.  Masking on the RAW n_linked (pair_counts_per_bin.parquet,
+    written pre-imputation) removes them from both samples together, so
+    the comparison stays like-for-like.
     """
     d = Path(run_dir)
     obs_p, null_p = (d / f"concordance_{stat}.parquet",
@@ -97,15 +119,29 @@ def load_pair(run_dir, stat, cap=4_000_000, seed=0):
             f"Without a drawn null there is nothing valid to plot against; "
             f"see this script's docstring for why N(0, 1) is not it.")
     rng = np.random.default_rng(seed)
+    obs_df, null_df = pd.read_parquet(obs_p), pd.read_parquet(null_p)
+    info = {"min_pairs": int(min_pairs), "frac_kept": 1.0}
+    if int(min_pairs) > 0:
+        cp = Path(run_dir) / "pair_counts_per_bin.parquet"
+        if not cp.exists():
+            raise SystemExit(
+                f"--min-pairs needs {cp}, which step 5 writes beside the "
+                f"component matrices")
+        counts = pd.read_parquet(cp).reindex(
+            index=obs_df.index, columns=obs_df.columns)
+        keep = counts.to_numpy(float) >= float(min_pairs)
+        info["frac_kept"] = float(np.mean(keep))
+        obs_df = obs_df.where(keep)
+        null_df = null_df.where(keep)
 
-    def _flat(p):
-        a = pd.read_parquet(p).to_numpy(float).ravel()
+    def _flat(df):
+        a = df.to_numpy(float).ravel()
         a = a[np.isfinite(a)]
         if a.size > cap:
             a = a[rng.choice(a.size, cap, replace=False)]
         return a
 
-    return _flat(obs_p), _flat(null_p)
+    return _flat(obs_df), _flat(null_df), info
 
 
 def calibration(obs, null):
@@ -114,18 +150,23 @@ def calibration(obs, null):
     ns = robust_sd(null)
     os_ = robust_sd(obs)
     nm = float(np.median(null)) if null.size else float("nan")
-    nb = body_sd(null)
-    # How much tighter the middle is than the body.  Near 1 on a normal
+    nb = tail_sd(null)
+    # How much wider the TAILS are than the MIDDLE.  Near 1 on a normal
     # sample; large when the null is a spike, which is when the z-axis and
-    # everything divided by ns stop meaning anything.
-    ratio = float(nb / ns) if np.isfinite(ns) and ns > 0 else float("nan")
+    # everything else divided by the middle stop meaning anything.  Measured
+    # against the raw MAD so an exactly-degenerate middle reads as infinite
+    # rather than being rescued by robust_sd's fallback.
+    _raw = _mad_sd_raw(null)
+    ratio = (float(nb / _raw) if np.isfinite(_raw) and _raw > 0
+             else float("inf") if np.isfinite(nb) and nb > 0
+             else float("nan"))
     out = {
         "n_obs": int(obs.size), "n_null": int(null.size),
         "null_median": nm, "null_madsd": float(ns),
         # THE calibration number: no coordination in, so zero out.
         "null_bias_z": float(nm / ns) if np.isfinite(ns) and ns > 0
         else float("nan"),
-        "null_bodysd": float(nb),
+        "null_tailsd": float(nb),
         "spike_ratio": ratio,
         "obs_median": float(np.median(obs)) if obs.size else float("nan"),
         "obs_madsd": float(os_),
@@ -262,6 +303,17 @@ def main(argv=None) -> int:
     ap.add_argument("--plot-format", default="pdf",
                     choices=["pdf", "png", "svg"])
     ap.add_argument("--title", default="Null calibration")
+    ap.add_argument("--min-pairs", type=int, default=0, metavar="N",
+                    help="Drop (cell, bin) entries with fewer than N RAW "
+                         "read pairs, from the observed and the drawn null "
+                         "TOGETHER.  An entry that measured nothing is "
+                         "exactly 0 on both sides under a shared prior, so "
+                         "a sparse context fills the matrix with structural "
+                         "zeros -- a spike with the real values in its "
+                         "tails.  That is an absence, not a null draw, and "
+                         "it is why an HCG run came back on a +-4000 axis.  "
+                         "Start at 1 and raise it until spike_ratio comes "
+                         "down; frac_kept says what it cost.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
 
@@ -274,9 +326,10 @@ def main(argv=None) -> int:
     for stat in stats:
         curves, sub = {}, []
         for name, d in runs.items():
-            obs, null = load_pair(d, stat, seed=args.seed)
+            obs, null, li = load_pair(d, stat, seed=args.seed,
+                                      min_pairs=args.min_pairs)
             m = calibration(obs, null)
-            m.update(run=name, statistic=stat)
+            m.update(run=name, statistic=stat, **li)
             sub.append(m)
             rows.append(m)
             curves[name] = qq_points(obs, null)
@@ -286,9 +339,10 @@ def main(argv=None) -> int:
         print(f"  -> null_qq_{stat}.{args.plot_format}", file=sys.stderr)
 
     full = pd.DataFrame(rows)[
-        ["statistic", "run", "null_median", "null_madsd", "null_bodysd",
-         "spike_ratio", "null_bias_z", "obs_median", "obs_madsd", "lambda",
-         "tail_excess", "n_obs", "n_null"]]
+        ["statistic", "run", "min_pairs", "frac_kept", "null_median",
+         "null_madsd", "null_tailsd", "spike_ratio", "null_bias_z",
+         "obs_median", "obs_madsd", "lambda", "tail_excess",
+         "n_obs", "n_null"]]
     full.to_csv(out / "null_calibration.tsv", sep="\t", index=False)
     for stat in stats:
         s = full[full["statistic"] == stat].sort_values(
@@ -319,11 +373,17 @@ def main(argv=None) -> int:
               f"not the noise -- which is why the axis runs to thousands of "
               f"nominal sds, and why null_bias_z and lambda are not "
               f"readable for it.  On a sparse context a large share of "
-              f"(cell, bin) entries carry no reads and the statistic "
-              f"collapses to one value for all of them.  Compare "
-              f"null_bodysd ({r.null_bodysd:.3g}) instead, and check the "
-              f"coverage of that context before reading anything else here.",
-              file=sys.stderr)
+              f"(cell, bin) entries carry no reads and the statistic is "
+              f"exactly 0 for all of them, on BOTH sides -- an absence, not "
+              f"a null draw.  "
+              + (f"Re-run with --min-pairs 1 to drop them from both samples "
+                 f"together; frac_kept will say what it cost."
+                 if int(r.min_pairs) == 0 else
+                 f"Already at --min-pairs {int(r.min_pairs)}, keeping "
+                 f"{r.frac_kept:.1%}; raise it further, or the bin size is "
+                 f"too small for this context.")
+              + f"  Meanwhile compare null_tailsd ({r.null_tailsd:.3g}), "
+                f"not null_madsd.", file=sys.stderr)
     return 0
 
 
