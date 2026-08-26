@@ -2926,3 +2926,66 @@ def test_the_extractor_output_feeds_the_contrast_unmodified(tmp_path):
     assert "divided out assay reliability" in r2.stderr
     # every cell had a reference, so nothing was left on the other scale
     assert "no usable reference" not in r2.stderr
+
+
+# ------------- structural zeros, and why removing the prior gap exposed them --
+
+def test_a_bin_where_only_one_arm_has_coverage_calls_on_coverage():
+    """An entry with no read pairs has k = 0 on both sides, so under a
+    shared prior the statistic is EXACTLY 0 there.  A bin where one arm
+    happens to be covered and the other is not then separates perfectly --
+    the covered arm sits wherever its biology puts it, the uncovered arm
+    sits on a pile of exact zeros -- and the test reports coverage.
+
+    Under the old separate priors those entries carried the prior gap
+    instead: uncovered got gap/alpha_0, covered got (gap + data)/(alpha_0 +
+    n) with a LARGER denominator, so the ordering between the two arms was
+    scrambled rather than consistent and the artefact stayed buried.
+    Removing the gap did not create this; it uncovered it."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n, nb = 40, 200
+    arm = np.zeros(n, bool)
+    arm[:20] = True
+    counts = np.full((n, nb), 8.0)
+    X = rng.normal(0.0, 0.2, (n, nb))
+    art = np.arange(120, 170)                 # only one arm is covered
+    counts[np.ix_(arm, art)] = 0.0
+    X[np.ix_(arm, art)] = 0.0                 # the exact-zero pile
+    X[np.ix_(~arm, art)] = rng.normal(0.5, 0.2, (20, len(art)))
+
+    raw = m.contrast_stats(X, arm, min_cells=5)
+    called = np.asarray(raw["p"]) < 0.001
+    assert called[art].mean() > 0.9           # essentially all of them
+
+    masked = m.contrast_stats(np.where(counts >= 1, X, np.nan), arm,
+                              min_cells=5)
+    p = np.asarray(masked["p"])
+    assert np.isfinite(p[art]).sum() == 0     # no arm left to compare
+
+
+def test_masking_leaves_the_real_bins_alone():
+    """The point of dropping non-observations is that the genuine calls
+    survive; a filter that took those too would be a worse trade than the
+    artefact."""
+    m = _mod()
+    rng = np.random.default_rng(1)
+    n, nb = 40, 200
+    arm = np.zeros(n, bool)
+    arm[:20] = True
+    counts = np.full((n, nb), 8.0)
+    X = rng.normal(0.0, 0.2, (n, nb))
+    real = np.arange(10, 30)
+    X[np.ix_(arm, real)] += 1.2
+    before = np.asarray(m.contrast_stats(X, arm, min_cells=5)["p"])
+    after = np.asarray(m.contrast_stats(
+        np.where(counts >= 1, X, np.nan), arm, min_cells=5)["p"])
+    assert (before[real] < 0.001).mean() > 0.9
+    assert (after[real] < 0.001).mean() > 0.9
+
+
+def test_the_cli_refuses_min_pairs_without_the_counts(tmp_path):
+    r = _ref_run(tmp_path, lambda s: pd.DataFrame(
+        {"cell": s, "reference_d": np.linspace(0.2, 0.5, len(s))}),
+        extra=["--min-pairs", "1", "--pair-counts", "gch=/nope.parquet"])
+    assert r.returncode != 0

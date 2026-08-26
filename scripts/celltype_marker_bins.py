@@ -2454,6 +2454,21 @@ def main():
                          "--matrix NAME, giving the sampling variance of every "
                          "(cell, bin) estimate.  Auto-discovered next to the "
                          "matrix when not given.  Enables --contrast-weight.")
+    ap.add_argument("--min-pairs", type=int, default=0, metavar="N",
+                    help="Treat a (cell, bin) with fewer than N read pairs "
+                         "as MISSING rather than as a measurement.  An entry "
+                         "with no pairs has k = 0 on both sides, so under "
+                         "--dm-prior shared the statistic is exactly 0 "
+                         "there -- and a bin where one arm happens to have "
+                         "coverage and the other does not then separates "
+                         "perfectly, on coverage rather than on biology.  "
+                         "Under the old separate priors those entries "
+                         "carried the prior gap instead, which sat close to "
+                         "everything else and hid the problem; removing the "
+                         "gap exposed it.  A sparse context is where this "
+                         "bites: HCG differential calls went from ~100 to "
+                         "~5000 on the same data while dense GCH did not "
+                         "move.  Needs --pair-counts (auto-discovered).")
     ap.add_argument("--pair-counts", action="append", default=None,
                     metavar="NAME=PATH",
                     help="pair_counts_per_bin.parquet for the matching "
@@ -3159,6 +3174,20 @@ def main():
             if C_df is not None:
                 Cc = C_df.reindex(index=M.index,
                                   columns=M.columns).to_numpy()
+            if args.min_pairs > 0:
+                if Cc is None:
+                    sys.exit(
+                        f"--min-pairs needs the read-pair counts; pass "
+                        f"--pair-counts {name}=<pair_counts_per_bin.parquet>")
+                _n_before = int(np.isfinite(Xc).sum())
+                Xc = np.where(Cc >= float(args.min_pairs), Xc, np.nan)
+                _n_after = int(np.isfinite(Xc).sum())
+                print(f"  {name}: dropped {_n_before - _n_after:,} "
+                      f"(cell, bin) entries with < {args.min_pairs} read "
+                      f"pairs ({1 - _n_after / max(_n_before, 1):.1%} of "
+                      f"the matrix); they measured nothing and were "
+                      f"carrying an exact value, not an estimate",
+                      file=sys.stderr)
             _rd = {}
             if R_ser is not None:
                 Xc, _rd = correct_by_reference(
