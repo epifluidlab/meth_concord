@@ -726,3 +726,43 @@ def test_from_counts_refuses_the_corrections_it_cannot_apply(tmp_path):
     assert r.returncode != 0
     assert "--contrast-center" in r.stderr
     assert "--baseline flank still works" in r.stderr
+
+
+def test_every_component_the_pipeline_emits_can_be_pooled():
+    """They are all functions of the same four pooled rates, so none is
+    privileged and the choices must not be a retyped subset that drifts
+    from what decompose_components actually returns -- direction_expected
+    was missing from a hand-written list while being a component people
+    profile as a diagnostic."""
+    import numpy as np
+    from nome_hic_concordance.concordance import decompose_components as dc
+    m = _mod()
+    emitted = set(dc(*(np.zeros(1),) * 4))
+    assert m.POOLABLE == emitted
+    assert {"coordination", "direction_logor", "direction_excess",
+            "direction_expected"} <= m.POOLABLE
+
+
+def test_pooling_gives_coordination_as_readily_as_the_log_odds_ratio():
+    import numpy as np
+    m = _mod()
+    n_cells, n_bins, total = 4, 6, 2
+    counts = {k: np.zeros((n_cells, n_bins)) for k in m.COUNT_KEYS}
+    counts["n_linked"][:] = counts["n_dm"][:] = 20.0
+    counts["k_open"][:] = 6.0
+    counts["k_closed"][:] = 6.0
+    counts["k_dm_open"][:] = 4.0
+    counts["k_dm_closed"][:] = 4.0
+    counts["k_open"][:, :3] = 9.0            # excess concordant mass, half 1
+    alpha = {"open": 10.0, "closed": 49.0, "mixed": 41.0}
+    bin_idx, pos_idx = np.arange(n_bins), np.repeat([0, 1], 3)
+    got = {}
+    for stat in ("coordination", "direction_logor"):
+        P, _r, _n = m.pooled_profiles(counts, np.arange(n_cells), bin_idx,
+                                      pos_idx, total, alpha, stat)
+        assert np.isfinite(P).all()
+        got[stat] = P[0]
+    # more concordant mass on the left for BOTH, since both read the same
+    # pooled table
+    assert got["coordination"][0] > got["coordination"][1]
+    assert got["direction_logor"][0] > got["direction_logor"][1]

@@ -40,6 +40,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from nome_hic_concordance.concordance import decompose_components as _dc
+
 _HERE = Path(__file__).resolve().parent
 
 
@@ -104,6 +106,11 @@ def scaled_index(bins, domains, n_body, flank_bp, n_flank):
 
 COUNT_KEYS = ("k_open", "k_closed", "k_mixed", "n_linked",
               "k_dm_open", "k_dm_closed", "k_dm_mixed", "n_dm")
+
+# Taken from decompose_components rather than retyped, so the two cannot
+# drift: every component is a function of the same four pooled rates, and
+# none of them is privileged by the pooling.
+POOLABLE = frozenset(_dc(*(np.zeros(1),) * 4))
 
 
 def load_counts(counts_dir, index, columns):
@@ -416,11 +423,12 @@ def main(argv=None) -> int:
                          "is the per-cell control that matters for a "
                          "profile.")
     ap.add_argument("--from-counts-statistic", default=None,
-                    choices=["coordination", "direction_logor",
-                             "direction_excess", "direction",
-                             "directional_corrected", "marginal"],
+                    choices=sorted(POOLABLE),
                     help="Which statistic to build from the pooled counts.  "
-                         "Default: read from the --matrix filename.")
+                         "Default: read from the --matrix filename.  Any "
+                         "component decompose_components emits works -- they "
+                         "are all functions of the same four pooled rates, "
+                         "so none is privileged.")
     ap.add_argument("--contrast-reference-scale", action="append",
                     default=[], metavar="NAME=PATH[:COLUMN]",
                     help="Divide out each cell's assay reliability on the "
@@ -654,9 +662,7 @@ def main(argv=None) -> int:
             _stem = Path(mpath).name
             _stat = (_stem[len("concordance_"):-len(".parquet")]
                      if _stem.startswith("concordance_") else None)
-            if _stat not in ("coordination", "direction_logor",
-                             "direction_excess", "direction",
-                             "directional_corrected", "marginal"):
+            if _stat not in POOLABLE:
                 sys.exit(f"--from-counts cannot tell which statistic "
                          f"{_stem!r} holds; pass --from-counts-statistic.")
         _alpha = load_prior(args.from_counts)
