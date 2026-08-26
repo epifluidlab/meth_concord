@@ -1,23 +1,45 @@
 #!/usr/bin/env python3
-"""Mechanistic scheme: where long-range epigenetic coordination goes in tumour.
+"""Mechanistic scheme: long-range coordination is LOST in tumour heterochromatin.
 
-A MODEL, not a measurement.  The panel it belongs beside reports what was
-observed -- GCH-GCH and HCG-HCG concordance rising inside cLADs,
-late-replicating domains and PMDs, and falling outside them.  This draws the
-arrangement that would produce that; nothing here is fitted and the arc
-weights are chosen, not measured.
+A MODEL, not a measurement.  What the accompanying profiles report, on the
+marginal-free coordination magnitude C against a distance-pooled non-contact
+null with a shared Dirichlet prior:
 
-WHAT IS DELIBERATELY NOT DRAWN.  No arc connects one heterochromatin domain
-to another.  The measurement is a concordance between two ends of a single
-read pair, so it speaks to loci within one bin -- kilobases to a few hundred
-kilobases apart, inside a domain.  It carries no information about whether
-two separate cLADs coordinate with each other, and an arc between them would
-be a claim the data cannot support.  Coordination is therefore drawn only
-along the fibre, within a single domain, in both panels.
+  inside cLADs, late-replicating domains and PMDs, C sits BELOW the flanking
+  euchromatin in every cell type, and further below it in meningioma.
 
-The two nuclei differ in exactly one respect -- which compartment carries the
-coordination -- because a schematic that changes several things at once lets a
-reader attribute the effect to whichever one they already believed.
+Nothing here is fitted; the arc weights are chosen to carry that ordering and
+nothing else.
+
+THIS REVERSES AN EARLIER VERSION OF THIS FIGURE, which drew coordination
+moving INTO heterochromatin in tumour.  That reading came from
+D = C(2F - 1), whose direction term centres at F = 0.5 -- correct only when
+the mean per-end openness is 0.5.  At the measured 0.4009 the term is -0.354,
+corr(D, -C) = 0.970, and D was an inverted, rescaled copy of C.  The sign of
+the whole claim came from that.
+
+WHAT IS DELIBERATELY NOT DRAWN, and why the two active compartments are
+IDENTICAL between the panels:
+
+  No arc connects one heterochromatin domain to another.  The measurement is
+  a concordance between the two ends of a single read pair, so it speaks to
+  loci within one bin.  It carries no information about whether two separate
+  cLADs coordinate, and an arc between them would be a claim the data cannot
+  support.
+
+  The profiles are baselined on each domain's own flank and each cell is
+  centred on its own median, so they measure domain-versus-flank and nothing
+  else.  Whether euchromatin itself differs between tumour and reference is
+  NOT answerable from them, and drawing a change there would invent a second
+  finding.  The panels therefore differ in one compartment only.
+
+DIRECTION IS A SEPARATE AXIS AND IS NOT ENCODED IN ARC WEIGHT.  On F - F_exp
+the concordant mass inside these domains sits co-OPEN of the marginal-matched
+null, less so in tumour -- orthogonal to the magnitude by construction, since
+scaling the concordant mass at a fixed co-open:co-closed ratio moves C and
+leaves the direction where it was.  It is stated in the caption rather than
+drawn, because a reader cannot be expected to separate two quantities encoded
+in one line.
 """
 
 from __future__ import annotations
@@ -33,6 +55,30 @@ LAMINA = "#7f8c8d"
 B_FILL = "#d5dbdb"
 A_FILL = "#fdf2e9"
 GENE = "#b9770e"
+
+
+# The whole claim, as two numbers per panel.  Module level so a test can
+# assert on what SHIPS rather than on values retyped beside it.
+#
+#   b < a in both panels        heterochromatin coordinates less than its
+#                               flanking euchromatin, which is the profile's
+#                               domain-versus-flank result
+#   b_tumour < b_reference      and less again in meningioma
+#   a identical                 euchromatin is NOT compared by a
+#                               flank-baselined profile, so the figure makes
+#                               no claim about it
+CAVEAT = (
+    "Direction is a separate axis and is not encoded in arc weight: on "
+    "F \u2212 F_exp the residual concordant mass inside these domains sits "
+    "co-open of the marginal-matched null, less so in tumour.  Euchromatin "
+    "is drawn alike in both panels because a flank-baselined, per-cell-"
+    "centred profile measures domain versus flank and cannot compare it.  "
+    "No arc joins two domains: the measurement sees the two ends of one "
+    "read pair."
+)
+
+PANEL_REFERENCE = {"b_strength": 0.55, "a_strength": 0.95}
+PANEL_TUMOUR = {"b_strength": 0.10, "a_strength": 0.95}
 
 
 def _arc(ax, p0, p1, bulge, color, lw, alpha=1.0, ls="-", zorder=5):
@@ -175,7 +221,7 @@ def _within_arcs(ax, x, y, runs, strength, color, n_per=3, span=0.42):
                  alpha=0.30 + 0.60 * strength, zorder=5)
 
 
-def draw(ax, title, tag, b_strength, a_strength, note, cross=False):
+def draw(ax, title, tag, b_strength, a_strength, note):
     """One nucleus.  b_strength / a_strength scale the arcs, nothing else."""
     cx, cy, rx, ry = 0.5, 0.50, 0.40, 0.35
     _envelope(ax, cx, cy, rx, ry)
@@ -211,8 +257,8 @@ def legend_panel(ax):
     items = [
         (0.015, "patch", B_FILL, "cLAD / late-RT / PMD"),
         (0.290, "line", LAMINA, "nuclear lamina"),
-        (0.490, "line", OTHER, "B-domain co-accessibility"),
-        (0.760, "line", GENE, "A-hub co-accessibility"),
+        (0.470, "line", OTHER, "coordination within a B domain"),
+        (0.760, "line", GENE, "coordination within an A domain"),
     ]
     for x, kind, col, lab in items:
         if kind == "patch":
@@ -244,24 +290,42 @@ def figure(path, title, subtitle):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig = plt.figure(figsize=(7.4, 4.3))
+    fig = plt.figure(figsize=(7.4, 4.9))
     gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 0.13], hspace=0.02,
                           wspace=0.01, left=0.01, right=0.99,
-                          top=0.855, bottom=0.02)
+                          top=0.855, bottom=0.10)
     ax0, ax1 = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
     axl = fig.add_subplot(gs[1, :])
 
-    draw(ax0, "Reference cell types", "a", b_strength=0.10, a_strength=0.95,
-         note="coordination held in the active\nregulatory compartment")
-    draw(ax1, "Meningioma", "b", b_strength=0.95, a_strength=0.14,
-         note="coordination shifts into heterochromatin;\n"
-              "the regulatory hub decoheres", cross=True)
-    _direction(ax1, (0.300, 0.815), "D \u2191", OTHER)
-    _direction(ax1, (0.560, 0.470), "D \u2193", GENE)
+    # A_STRENGTH IS THE SAME IN BOTH PANELS, deliberately.  The profiles are
+    # baselined on each domain's own flank, so they cannot compare
+    # euchromatin between the groups; drawing a difference there would be a
+    # second finding the measurement does not contain.  Only b_strength
+    # moves, and it moves DOWN -- heterochromatin already carries less
+    # coordination than its flank in reference cells, and less again in
+    # tumour.
+    draw(ax0, "Reference cell types", "a", **PANEL_REFERENCE,
+         note="heterochromatin already coordinates\n"
+              "less than its flanking euchromatin")
+    draw(ax1, "Meningioma", "b", **PANEL_TUMOUR,
+         note="the residual coordination inside\n"
+              "heterochromatin is lost further")
+    # Just outside the envelope, beside an upper-left B sector: inside it
+    # the badge sits on the fibre it is labelling.
+    _direction(ax0, (0.185, 0.915), "C < flank", OTHER)
+    _direction(ax1, (0.185, 0.915), "C \u226a flank", OTHER)
     legend_panel(axl)
 
     fig.suptitle(title, fontsize=11.5, y=0.985)
-    fig.text(0.5, 0.905, subtitle, ha="center", fontsize=7.8, color="0.32")
+    # WRAPPED.  A one-line caption at this length makes bbox_inches="tight"
+    # widen the whole figure to fit it, and the nuclei end up as two small
+    # marks adrift in white space.
+    import textwrap
+    fig.text(0.5, 0.945, textwrap.fill(subtitle, 104), ha="center",
+             va="top", fontsize=7.6, color="0.32", linespacing=1.45)
+    # What the figure does NOT claim, kept clear of what it does.
+    fig.text(0.5, 0.012, textwrap.fill(CAVEAT, 132), ha="center",
+             va="bottom", fontsize=6.5, color="0.45", linespacing=1.4)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
@@ -274,12 +338,13 @@ def main(argv=None) -> int:
                     help="Output figure (.pdf keeps it vector for the "
                          "journal; .png only for a draft).")
     ap.add_argument("--title",
-                    default="A compartment-scale redistribution of long-range "
-                            "epigenetic coordination")
+                    default="Long-range epigenetic coordination is lost in "
+                            "tumour heterochromatin")
     ap.add_argument("--subtitle",
-                    default="Model consistent with GCH-GCH and HCG-HCG "
-                            "concordance rising inside cLADs, late-replicating "
-                            "domains and PMDs, and falling outside them")
+                    default="Model consistent with the coordination magnitude C "
+                            "sitting below the flanking euchromatin inside "
+                            "cLADs, late-replicating domains and PMDs, and "
+                            "further below it in meningioma")
     args = ap.parse_args(argv)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

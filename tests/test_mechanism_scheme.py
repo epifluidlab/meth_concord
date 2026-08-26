@@ -49,34 +49,62 @@ def _arc_widths(ax, color):
     return [w for c, w in out if c == want]
 
 
-def test_the_two_panels_differ_in_arc_weight_not_in_geometry():
-    """The one claim the drawing makes."""
-    m = _mod()
+def _panels(m):
     fig_a, ax_a = _axes()
     fig_b, ax_b = _axes()
-    m.draw(ax_a, "ref", "a", b_strength=0.10, a_strength=0.95, note="")
-    m.draw(ax_b, "tum", "b", b_strength=0.95, a_strength=0.14, note="",
-           cross=True)
-    # heterochromatin coordination is heavier in the tumour panel
+    m.draw(ax_a, "ref", "a", note="", **m.PANEL_REFERENCE)
+    m.draw(ax_b, "tum", "b", note="", **m.PANEL_TUMOUR)
+    return ax_a, ax_b
+
+
+def test_heterochromatin_coordination_is_lighter_in_the_tumour_panel():
+    """The claim, and the reverse of what this figure drew before.  That
+    version came from D = C(2F-1), whose direction term centres at F = 0.5
+    -- right only at a mean openness of 0.5.  At the measured 0.4009 the
+    term is -0.354 and corr(D, -C) = 0.970, so D was an inverted copy of C
+    and the sign of the whole claim came from it."""
+    m = _mod()
+    ax_a, ax_b = _panels(m)
     assert (np.mean(_arc_widths(ax_b, m.OTHER))
-            > 2 * np.mean(_arc_widths(ax_a, m.OTHER)))
-    # and the regulatory hub is lighter
-    assert (np.mean(_arc_widths(ax_b, m.GENE))
-            < 0.6 * np.mean(_arc_widths(ax_a, m.GENE)))
-    # same number of loci and domains in both -- only the weights moved
+            < 0.6 * np.mean(_arc_widths(ax_a, m.OTHER)))
+    # same loci and domains in both -- only the weights moved
     assert len(ax_a.patches) == len(ax_b.patches)
 
 
-def test_the_decohered_hub_is_still_drawn():
-    """'Weakened' is the claim, not 'gone'.  Arcs at zero alpha would say
-    the regulatory compartment stops existing, which is a different and
-    much stronger statement than the data supports."""
+def test_heterochromatin_coordinates_less_than_euchromatin_in_both_panels():
+    """The profiles are baselined on each domain's own flank, and C sits
+    below that flank inside the domain for every cell type -- not only in
+    tumour.  A figure that showed the deficit in tumour alone would report
+    half the result."""
+    m = _mod()
+    ax_a, ax_b = _panels(m)
+    for ax in (ax_a, ax_b):
+        assert (np.mean(_arc_widths(ax, m.OTHER))
+                < np.mean(_arc_widths(ax, m.GENE)))
+
+
+def test_euchromatin_is_drawn_identically_because_it_was_not_compared():
+    """A flank-baselined, per-cell-centred profile measures domain versus
+    flank and nothing else.  Whether euchromatin itself differs between the
+    groups is not answerable from it, and drawing a difference there would
+    invent a second finding -- which is what the previous version did."""
+    m = _mod()
+    assert (m.PANEL_REFERENCE["a_strength"]
+            == m.PANEL_TUMOUR["a_strength"])
+    ax_a, ax_b = _panels(m)
+    np.testing.assert_allclose(sorted(_arc_widths(ax_a, m.GENE)),
+                               sorted(_arc_widths(ax_b, m.GENE)))
+
+
+def test_the_weakened_domain_is_still_drawn():
+    """'Reduced' is the claim, not 'gone'.  Arcs at zero alpha would say
+    heterochromatin stops coordinating at all, which is a different and much
+    stronger statement than the data supports."""
     m = _mod()
     fig, ax = _axes()
-    m.draw(ax, "tum", "b", b_strength=0.95, a_strength=0.14, note="",
-           cross=True)
+    m.draw(ax, "tum", "b", note="", **m.PANEL_TUMOUR)
     import matplotlib.colors as mc
-    want = tuple(np.round(mc.to_rgb(m.GENE), 3))
+    want = tuple(np.round(mc.to_rgb(m.OTHER), 3))
     alphas = [p.get_alpha() for p in ax.patches
               if tuple(np.round(p.get_edgecolor()[:3], 3)) == want
               and p.get_facecolor()[3] == 0]
