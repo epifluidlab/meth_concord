@@ -280,8 +280,14 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
     # the panel is read for; without it, an absolute level dominated by the
     # genome-wide offset.  Kept so a test can use exactly what is drawn
     # rather than recomputing it a second, subtly different way.
-    body = (np.nanmean(P[:, n_flank:n_flank + n_body], axis=1)
-            if P.shape[0] and n_body else np.array([]))
+    # A cell with no finite value anywhere in the body is a legitimate
+    # outcome, not a problem: it means this domain gave that cell nothing.
+    # nanmean says so with a RuntimeWarning per cell per domain, which over
+    # thousands of domains buries the run's actual output.
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        body = (np.nanmean(P[:, n_flank:n_flank + n_body], axis=1)
+                if P.shape[0] and n_body else np.array([]))
     out = {"mean": np.full(total, np.nan), "lo": np.full(total, np.nan),
            "hi": np.full(total, np.nan), "n_bins": n_bins,
            "n_cells": int(P.shape[0]), "body": body, "cells": idx,
@@ -322,20 +328,42 @@ def per_domain_values(M, ct, members, bin_idx, pos_idx, dom_idx, n_flank,
     and what is left is local.
     """
     n_dom = int(dom_idx.max()) + 1 if dom_idx.size else 0
-    body_lo, body_hi = n_flank, n_flank + n_body
     out = np.full(n_dom, np.nan)
     if not n_dom:
         return out
-    for d in range(n_dom):
-        sel = dom_idx == d
-        if not sel.any():
-            continue
-        r = group_profile(M, ct, members, bin_idx[sel], pos_idx[sel], total,
-                          baseline=baseline, n_flank=n_flank, n_body=n_body,
-                          pooled=pooled)
-        with np.errstate(invalid="ignore"), warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            out[d] = np.nanmean(r["mean"][body_lo:body_hi])
+    body_lo, body_hi = n_flank, n_flank + n_body
+    cells = ct.index[ct.isin(members)]
+    keep = M.index.intersection(cells)
+    rows = M.index.get_indexer(keep) if pooled is not None else None
+    sub = ({k: v[rows] for k, v in pooled["counts"].items()}
+           if pooled is not None else None)
+    # TWO positions, not the full scaled axis: this domain's flank and its
+    # body.  The scaled axis exists to draw a shape, and a shape is not
+    # what a per-domain value is -- collapsing it also avoids recomputing
+    # the confidence interval at every one of `total` positions for every
+    # one of thousands of domains.
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for d in range(n_dom):
+            sel = dom_idx == d
+            if not sel.any():
+                continue
+            bi_d, pi_d = bin_idx[sel], pos_idx[sel]
+            two = np.where((pi_d >= body_lo) & (pi_d < body_hi), 1,
+                           0).astype(int)
+            if pooled is not None:
+                P, _r, _n = pooled_profiles(sub, keep, bi_d, two, 2,
+                                            pooled["alpha"], pooled["stat"])
+            else:
+                P, _r, _n = cell_profiles(M, ct, members, bi_d, two, 2)
+            if not P.shape[0]:
+                continue
+            # Anchored on THIS domain's own flank, which is what makes the
+            # per-domain difference local: a genome-wide offset sits in
+            # both terms and cancels inside every domain.
+            v = P[:, 1] - P[:, 0] if baseline == "flank" else P[:, 1]
+            if np.isfinite(v).any():
+                out[d] = float(np.nanmean(v))
     return out
 
 

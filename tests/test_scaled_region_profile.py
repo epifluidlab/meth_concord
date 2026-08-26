@@ -1016,3 +1016,50 @@ def test_the_cli_reports_the_domain_test(tmp_path):
             "frac_positive"} <= set(tt.columns)
     assert tt["n_domains"].iloc[0] >= 5
     assert "p_domain" in r.stderr
+
+
+def test_a_domain_value_is_its_body_minus_its_own_flank():
+    """That is what makes the per-domain difference LOCAL: a genome-wide
+    offset sits in both terms and cancels inside every domain, so what the
+    signed-rank sees across thousands of them is not the global shift
+    re-detected a thousand times."""
+    import numpy as np
+    import pandas as pd
+    m = _mod()
+    n_cells, n_bins = 6, 12
+    cells = [f"c{i}" for i in range(n_cells)]
+    cols = [f"chr1:{i * 250000}" for i in range(n_bins)]
+    X = np.zeros((n_cells, n_bins))
+    X[:, 2:4] = 1.0            # domain 0 body
+    X[:, 8:10] = 3.0           # domain 1 body, three times as high
+    X += 10.0                  # a large genome-wide offset in BOTH
+    M = pd.DataFrame(X, index=cells, columns=cols)
+    ct = pd.Series(["A"] * n_cells, index=cells)
+    bin_idx = np.arange(n_bins)
+    pos_idx = np.array([0, 0, 2, 2, 0, 0, 0, 0, 2, 2, 0, 0])
+    dom_idx = np.array([0] * 6 + [1] * 6)
+    v = m.per_domain_values(M, ct, ["A"], bin_idx, pos_idx, dom_idx,
+                            n_flank=1, n_body=2, total=4, baseline="flank")
+    assert v.shape == (2,)
+    np.testing.assert_allclose(v, [1.0, 3.0])      # the offset is gone
+
+
+def test_no_warning_is_emitted_for_a_domain_that_gave_a_cell_nothing():
+    """A legitimate outcome, and nanmean says so once per cell per domain --
+    which over thousands of domains buries the run's actual output."""
+    import warnings as _w
+    import numpy as np
+    import pandas as pd
+    m = _mod()
+    cells = [f"c{i}" for i in range(4)]
+    cols = [f"chr1:{i * 250000}" for i in range(6)]
+    M = pd.DataFrame(np.full((4, 6), np.nan), index=cells, columns=cols)
+    ct = pd.Series(["A"] * 4, index=cells)
+    with _w.catch_warnings(record=True) as got:
+        _w.simplefilter("always")
+        m.group_profile(M, ct, ["A"], np.arange(6),
+                        np.repeat([0, 1, 2], 2), 3, n_flank=1, n_body=1)
+        m.per_domain_values(M, ct, ["A"], np.arange(6),
+                            np.repeat([0, 1, 2], 2), np.zeros(6, int),
+                            n_flank=1, n_body=1, total=3)
+    assert not [w for w in got if issubclass(w.category, RuntimeWarning)]
