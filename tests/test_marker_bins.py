@@ -3009,32 +3009,80 @@ def _sparse_zero_matrix(seed=0, n=40, nb=300, n_dense=100):
     return X, cov.astype(float), arm, np.arange(n_dense)
 
 
-def test_zeros_are_shuffled_but_that_alone_did_not_inflate_anything():
-    """The sentinel defeats the docstring's stated intent, and that is a
-    real defect.  It is NOT a demonstrated cause of inflation, and this
-    test records the measurement rather than the theory.
+def _imputed_matrix(seed=0, n=40, nb=400, n_dense=100, tint=0.8):
+    """A post-RWR matrix: every entry filled, none NaN.
 
-    The worry was that shuffling a cell's structural zeros into every bin
-    position compresses the null while the observed at a well-covered bin
-    stays uncompressed.  Measured across four fixtures -- equal cell
-    coverage, arm A thinner, arm A denser, and no coverage structure -- the
-    false-positive rate at dense bins came back at 0.040 every time, which
-    is nominal, and masking the zeros to NaN moved it to 0.02-0.03, very
-    slightly conservative.  A rank test is the reason: the zeros land
-    symmetrically in both arms, and ranks do not care how many there are.
+    Measured entries are identical in both arms -- there is no signal here.
+    The entries with no read pairs of their own are what RWR put there, and
+    RWR borrows across a k-NN graph built from accessibility, so they carry
+    the arm's signature by construction.
+    """
+    rng = np.random.default_rng(seed)
+    arm = np.zeros(n, bool)
+    arm[: n // 2] = True
+    cov = np.zeros((n, nb), bool)
+    cov[:, :n_dense] = True
+    cov[:, n_dense:] = rng.random((n, nb - n_dense)) < 0.15
+    sig = np.where(arm, tint, -tint)[:, None]
+    X = np.where(cov, rng.normal(0.0, 1.0, (n, nb)),
+                 sig + rng.normal(0.0, 0.05, (n, nb)))
+    return X, cov, arm, np.arange(n_dense, nb)
 
-    So masking is worth doing because a non-observation is not a
-    measurement, not because it is known to fix a count."""
+
+def test_rwr_leaves_no_nan_so_the_permutation_has_nothing_to_hold():
+    """permute_within_cells defends the null by keeping non-observations in
+    place, and it recognises them by NaN.  A post-RWR component matrix has
+    none: every (cell, bin) is filled whatever its real coverage."""
     m = _mod()
-    X, cov, arm, dense = _sparse_zero_matrix()
-    rate = lambda M: (lambda p: float((p[np.isfinite(p)] < 0.05).mean()))(
-        np.asarray(m.permutation_null(M, arm, ~arm, min_cells=5, test="mwu",
-                                      n_perm=300, seed=0)["p_empirical"]
-                   )[dense])
-    with_zeros = rate(X)
-    masked = rate(np.where(cov >= 1, X, np.nan))
-    assert with_zeros < 0.10, with_zeros          # nominal, not inflated
-    assert masked <= with_zeros + 0.02
+    X, _cov, _arm, _sparse = _imputed_matrix()
+    assert np.isfinite(X).all()
+    out = m.permute_within_cells(X, np.random.default_rng(0))
+    assert not np.allclose(out, X)          # everything moved
+
+
+def test_cell_type_aware_imputation_inflates_the_sparse_bins():
+    """The filled values are not neutral.  A sparsely covered bin is mostly
+    arm signature; the permuted column at that position holds each cell's
+    genome-wide MIX of measured and imputed, which dilutes it -- so the
+    observed clears a null that no longer describes it.
+
+    Nothing in this fixture is real: the measured entries are drawn
+    identically in both arms."""
+    m = _mod()
+    X, _cov, arm, sparse = _imputed_matrix()
+    r = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=300, seed=0)
+    p = np.asarray(r["p_empirical"])[sparse]
+    p = p[np.isfinite(p)]
+    assert (p < 0.05).mean() > 0.4          # measured 0.577
+
+
+def test_masking_on_raw_pair_counts_removes_it():
+    """--min-pairs marks them missing, and permute_within_cells then holds
+    them in place on its own.  The sparse bins mostly stop being testable,
+    which is the honest answer: they had almost no coverage."""
+    m = _mod()
+    X, cov, arm, sparse = _imputed_matrix()
+    r = m.permutation_null(np.where(cov, X, np.nan), arm, ~arm, min_cells=5,
+                           test="mwu", n_perm=300, seed=0)
+    p = np.asarray(r["p_empirical"])[sparse]
+    ok = np.isfinite(p)
+    assert ok.sum() < 0.1 * len(sparse)
+    assert (p[ok] < 0.05).mean() < 0.1
+
+
+def test_structural_zeros_alone_do_not_do_this():
+    """The same argument does NOT go through for exact zeros: ties do not
+    move a Mann-Whitney.  Recorded so the two are not conflated -- it is the
+    cell-type tint that does the damage, not the fill."""
+    m = _mod()
+    X, cov, arm, sparse = _imputed_matrix(tint=0.0)
+    X = np.where(cov, X, 0.0)
+    r = m.permutation_null(X, arm, ~arm, min_cells=5, test="mwu",
+                           n_perm=300, seed=0)
+    p = np.asarray(r["p_empirical"])[sparse]
+    p = p[np.isfinite(p)]
+    assert (p < 0.05).mean() < 0.12
 
 
 def test_the_permutation_holds_nan_in_place_but_cannot_hold_a_zero():

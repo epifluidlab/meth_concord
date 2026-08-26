@@ -902,20 +902,28 @@ def permute_within_cells(X, rng):
     nothing to do with the contrast; holding it fixed keeps the null about bin
     IDENTITY alone.
 
-    THAT PROTECTION ONLY REACHES NON-OBSERVATIONS THAT ARRIVE AS NaN.  A
-    (cell, bin) with no read pairs comes out of decompose_components as
-    exactly 0.0, and under a shared prior so does C -- finite, so shuffled
-    like a measurement.  On a sparse context that scatters a cell's zeros
-    across every bin position, and the permuted column at a WELL-covered bin
-    then holds that cell's genome-wide average of zeros instead of the few
-    the bin really has.  Whether that inflates anything is a separate
-    question, and the answer measured so far is no: across four fixtures --
-    equal cell coverage, either arm thinner, no coverage structure -- the
-    false-positive rate at dense bins stayed at 0.040 with the zeros in
-    place, because a rank test does not care how many ties an arm carries.
-    The defect is simply that a non-observation is being shuffled as though
-    it were a measurement.  Mask them to NaN first (--min-pairs) and this
-    function holds them in place on its own.
+    THAT PROTECTION REACHES NOTHING ON A POST-RWR MATRIX.  RWR fills every
+    (cell, bin), so concordance_direction_logor.parquet and its siblings
+    carry 0% NaN whatever a cell's real coverage was -- there is no pattern
+    left to hold, and every entry is shuffled as a measurement.
+
+    And the filled values are not neutral.  RWR borrows across the k-NN
+    graph, which is built from accessibility and is therefore cell-type
+    aware, so an imputed entry carries its arm's signature BY CONSTRUCTION.
+    A sparsely covered bin is then mostly arm signature; the permuted
+    column at that position holds each cell's genome-wide MIX of measured
+    and imputed instead, which dilutes it.  The observed clears a null that
+    no longer describes it.  Measured on a fixture with no signal at all:
+    57.7% of sparse bins called at p < 0.05, and 0% once the entries with
+    no read pairs of their own were masked.
+
+    A rank test is why the same argument does NOT go through for structural
+    zeros -- ties do not move a Mann-Whitney, and four fixtures built that
+    way came back at a nominal 0.040.  It is the cell-type tint that does
+    the damage, not the fill.
+
+    Mask on the RAW pair counts first (--min-pairs) and this function holds
+    them in place on its own.
     """
     out = np.array(X, dtype=float, copy=True)
     for i in range(out.shape[0]):
@@ -3212,23 +3220,25 @@ def main():
             if C_df is not None:
                 Cc = C_df.reindex(index=M.index,
                                   columns=M.columns).to_numpy()
-            _zero_frac = float(np.mean(Xc[np.isfinite(Xc)] == 0.0)) \
-                if np.isfinite(Xc).any() else 0.0
-            if args.min_pairs == 0 and _zero_frac > 0.05:
-                print(f"  {name}: WARNING {_zero_frac:.1%} of the finite "
-                      f"matrix is EXACTLY 0.  A (cell, bin) with no read "
-                      f"pairs scores exactly 0, and the within-cell "
-                      f"permutation only holds NaN in place -- zeros get "
-                      f"shuffled like measurements, which scatters them "
-                      f"into every bin position and compresses the null "
-                      f"toward 0 while the observed at a well-covered bin "
-                      f"is not.  On four synthetic fixtures that did NOT "
-                      f"inflate the false-positive rate -- a rank test does "
-                      f"not care how many ties there are -- so this is a "
-                      f"correctness warning, not a diagnosis of a count.  "
-                      f"Pass --min-pairs 1 (with --pair-counts) to mark "
-                      f"them missing instead of measured.",
-                      file=sys.stderr)
+            if args.min_pairs == 0 and Cc is not None:
+                _imp = float(np.mean(Cc == 0))
+                if _imp > 0.05:
+                    print(f"  {name}: WARNING {_imp:.1%} of (cell, bin) "
+                          f"entries have NO read pairs of their own.  RWR "
+                          f"filled every one of them, so the matrix carries "
+                          f"0% NaN and the within-cell permutation -- which "
+                          f"defends the null by holding NaN in place -- has "
+                          f"nothing to hold.  Worse, RWR borrows from the "
+                          f"k-NN graph, which is cell-type aware, so an "
+                          f"imputed entry carries the arm's signature by "
+                          f"construction.  A sparsely covered bin is then "
+                          f"mostly arm signature, while the permuted column "
+                          f"holds each cell's genome-wide MIX and dilutes "
+                          f"it -- the bin clears a null that no longer "
+                          f"describes it.  Measured on a fixture with no "
+                          f"signal at all: 57.7% of sparse bins called at "
+                          f"p < 0.05, against 0% once masked.  Pass "
+                          f"--min-pairs 1.", file=sys.stderr)
             if args.min_pairs > 0:
                 if Cc is None:
                     sys.exit(
