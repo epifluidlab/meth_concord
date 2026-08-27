@@ -1079,3 +1079,94 @@ def test_the_mean_and_median_gap_is_reported_because_it_explains_a_split():
     assert r["median_diff"] == pytest.approx(0.001)
     assert r["mean_diff"] > 15 * r["median_diff"]
     assert r["q75_diff"] >= r["median_diff"] >= r["q25_diff"]
+
+
+def test_the_axis_names_the_statistic_that_was_plotted():
+    """A panel labelled D while it draws C is not cosmetic: at this data's
+    marginals D = C(2F-1) is an inverted, rescaled copy of C, so the label
+    names a quantity whose sign convention is the opposite of the one on
+    the axis."""
+    m = _mod()
+    assert m.statistic_of("x/concordance_coordination.parquet") == \
+        "coordination"
+    assert m.statistic_of("x/concordance_direction_logor.parquet") == \
+        "direction_logor"
+    assert m.statistic_of("x/whatever.parquet") is None
+    assert "coordination C" in m.STAT_LABEL["coordination"]
+    assert "D = C" in m.STAT_LABEL["directional"]
+    # every poolable component has a label, or a run could fall back to a
+    # bare key on the axis
+    assert m.POOLABLE <= set(m.STAT_LABEL)
+
+
+def test_the_default_ylabel_follows_the_matrix(tmp_path):
+    import subprocess
+    import sys as _sys
+    d, s, bed, _X, _c, _b, _a = _profile_fixture(tmp_path)
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--matrix",
+         f"gch={d / 'concordance_coordination.parquet'}",
+         "--samples", str(s), "--group", "tum=T", "--group", "ref=R",
+         "--region", f"dom={bed}", "--cell-type-column", "cell_type",
+         "--baseline", "flank", "--body-bins", "6", "--flank", "500000",
+         "--flank-bins", "2", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "lbl")], capture_output=True,
+        text=True)
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "lbl" / "scaled_profile_gch.png").exists()
+
+
+def test_members_can_be_hidden_for_a_final_panel(tmp_path):
+    """They are the pseudo-replication check, so hiding them is for after
+    that check, not instead of it."""
+    import subprocess
+    import sys as _sys
+    d, s, bed, _X, _c, _b, _a = _profile_fixture(tmp_path)
+    # grouped on DONOR so each arm has two members and the faint lines
+    # actually exist to hide
+    common = [_sys.executable, str(_SCRIPT), "--matrix",
+              f"gch={d / 'concordance_coordination.parquet'}",
+              "--samples", str(s), "--group", "tum=t0,t1",
+              "--group", "ref=r0,r1",
+              "--region", f"dom={bed}", "--cell-type-column", "donor",
+              "--baseline", "flank", "--body-bins", "6", "--flank",
+              "500000", "--flank-bins", "2", "--plot-format", "png"]
+    a = subprocess.run(common + ["--output-dir", str(tmp_path / "shown")],
+                       capture_output=True, text=True)
+    b = subprocess.run(common + ["--members", "hide", "--output-dir",
+                                 str(tmp_path / "hidden")],
+                       capture_output=True, text=True)
+    assert a.returncode == 0 and b.returncode == 0, (a.stderr, b.stderr)
+    sa = (tmp_path / "shown" / "scaled_profile_gch.png").stat().st_size
+    sb = (tmp_path / "hidden" / "scaled_profile_gch.png").stat().st_size
+    assert sb < sa            # fewer lines drawn
+
+
+def test_from_counts_says_which_files_it_read(tmp_path):
+    """The run says the --matrix values are unused, which invites the
+    question of what WAS read."""
+    import subprocess
+    import sys as _sys
+    import numpy as np
+    import pandas as pd
+    d, s, bed, X, cells, bins, _a = _profile_fixture(tmp_path)
+    cdir = d / "counts"
+    cdir.mkdir()
+    m = _mod()
+    for k in m.COUNT_KEYS:
+        v = np.full(X.shape, 8.0 if k.startswith("n_") else 2.0)
+        pd.DataFrame(v, index=cells, columns=bins).to_parquet(
+            cdir / f"{k}.parquet")
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--matrix",
+         f"gch={d / 'concordance_coordination.parquet'}",
+         "--samples", str(s), "--group", "tum=T", "--group", "ref=R",
+         "--region", f"dom={bed}", "--cell-type-column", "cell_type",
+         "--from-counts", str(d), "--baseline", "flank", "--body-bins", "6",
+         "--flank", "500000", "--flank-bins", "2", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "fc")], capture_output=True,
+        text=True)
+    assert r.returncode == 0, r.stderr
+    assert "k_open" in r.stderr and "n_dm" in r.stderr
+    assert "dirichlet_multinomial_prior.json" in r.stderr
+    assert "only the cell x bin grid" in r.stderr

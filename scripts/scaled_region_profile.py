@@ -113,6 +113,31 @@ def scaled_index(bins, domains, n_body, flank_bp, n_flank):
             np.concatenate(di))
 
 
+# What each component IS, for the axis.  A panel labelled D while it draws
+# C is not a cosmetic problem: D = C(2F-1) is an inverted, rescaled copy of
+# C at the marginals this data has, so the label names a quantity whose sign
+# convention is the opposite of the one plotted.
+STAT_LABEL = {
+    "coordination": "coordination C (marginal-free)",
+    "direction": "direction F (co-open share)",
+    "direction_expected": "expected direction F_exp",
+    "direction_excess": "direction excess F \u2212 F_exp",
+    "direction_logor": "direction log-OR  logit(F) \u2212 logit(F_exp)",
+    "directional": "directional D = C\u00b7(2F\u22121) (legacy)",
+    "directional_corrected": "directional D' = C\u00b7(F\u2212F_exp)",
+    "marginal": "marginal p\u0304 (mean openness)",
+}
+
+
+def statistic_of(matrix_path):
+    """The component a concordance_<name>.parquet holds, or None."""
+    stem = Path(matrix_path).name
+    if not (stem.startswith("concordance_") and stem.endswith(".parquet")):
+        return None
+    got = stem[len("concordance_"):-len(".parquet")]
+    return got if got in STAT_LABEL else None
+
+
 COUNT_KEYS = ("k_open", "k_closed", "k_mixed", "n_linked",
               "k_dm_open", "k_dm_closed", "k_dm_mixed", "n_dm")
 
@@ -710,7 +735,16 @@ def main(argv=None) -> int:
                          "leave every cell's own level intact and the "
                          "interval would still be dominated by it.")
     ap.add_argument("--conf", type=float, default=0.95)
-    ap.add_argument("--ylabel", default="GCH-GCH concordance (D)")
+    ap.add_argument("--ylabel", default=None,
+                    help="Default: read from the --matrix filename, so a "
+                         "panel drawing C is not labelled D.")
+    ap.add_argument("--members", choices=["show", "hide"], default="show",
+                    help="The faint per-cell-type lines.  They exist as the "
+                         "pseudo-replication check -- a group difference "
+                         "carried by one member is not a group difference, "
+                         "and no interval across cells can show that -- so "
+                         "'hide' is for a final panel after that check has "
+                         "been made, not instead of making it.")
     ap.add_argument("--title", default=None)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--plot-format", default="pdf",
@@ -863,14 +897,11 @@ def main(argv=None) -> int:
 
     _pooled = None
     if args.from_counts:
-        _stat = args.from_counts_statistic
-        if _stat is None:
-            _stem = Path(mpath).name
-            _stat = (_stem[len("concordance_"):-len(".parquet")]
-                     if _stem.startswith("concordance_") else None)
-            if _stat not in POOLABLE:
-                sys.exit(f"--from-counts cannot tell which statistic "
-                         f"{_stem!r} holds; pass --from-counts-statistic.")
+        _stat = args.from_counts_statistic or statistic_of(mpath)
+        if _stat not in POOLABLE:
+            sys.exit(f"--from-counts cannot tell which statistic "
+                     f"{Path(mpath).name!r} holds; pass "
+                     f"--from-counts-statistic.")
         _alpha = load_prior(args.from_counts)
         _pooled = {"counts": load_counts(args.from_counts, M.index,
                                          M.columns),
@@ -880,10 +911,16 @@ def main(argv=None) -> int:
               f"so there is no genome-wide arm offset riding on it to "
               f"remove.  --baseline flank still anchors each cell.",
               file=sys.stderr)
+        _cdir = (Path(args.from_counts) / "counts"
+                 if (Path(args.from_counts) / "counts").is_dir()
+                 else Path(args.from_counts))
         print(f"  pooling raw counts per axis position and computing "
-              f"{_stat} from them (prior nu={sum(_alpha.values()):.1f}); "
-              f"the per-bin values in --matrix are not used",
+              f"{_stat} from them (prior nu={sum(_alpha.values()):.1f})",
               file=sys.stderr)
+        print(f"  read: {_cdir}/{{{','.join(COUNT_KEYS)}}}.parquet "
+              f"and dirichlet_multinomial_prior.json.  --matrix supplies "
+              f"only the cell x bin grid and the statistic's NAME; none of "
+              f"its values are read.", file=sys.stderr)
 
     bins = pd.DataFrame({
         "chrom": [str(c).rsplit(":", 1)[0] for c in M.columns],
@@ -901,6 +938,7 @@ def main(argv=None) -> int:
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    _stat_name = (_stat if args.from_counts else statistic_of(mpath))
     results, members, rows, tests = {}, {}, [], []
     _donor = None
     if args.donor_column:
@@ -940,8 +978,10 @@ def main(argv=None) -> int:
         if len(_t):
             _t.insert(0, "region", rname)
             tests.append(_t)
-        members[rname] = {lab: member_curves(M, ct, mem, bi, pi, total, **kw)
-                          for lab, mem in groups.items() if len(mem) > 1}
+        members[rname] = ({} if args.members == "hide" else
+                          {lab: member_curves(M, ct, mem, bi, pi, total,
+                                              **kw)
+                           for lab, mem in groups.items() if len(mem) > 1})
         print(f"  {rname}: {len(dom):,} of {n_all:,} domains "
               f"(median width {np.median(w) / 1e6:.2f} Mb), "
               f"{bi.size:,} bin placements", file=sys.stderr)
@@ -1011,8 +1051,12 @@ def main(argv=None) -> int:
                   file=sys.stderr)
         print(f"  -> region_group_test_{name}.tsv", file=sys.stderr)
     fig = out / f"scaled_profile_{name}.{args.plot_format}"
-    scaled_figure(results, fig, args.title or f"{name}: mean D across scaled "
-                  f"domains", args.ylabel, args.body_bins, args.flank_bins,
+    _stat_lbl = STAT_LABEL.get(_stat_name, _stat_name or "concordance")
+    scaled_figure(results, fig,
+                  args.title or f"{name}: mean {_stat_lbl} across scaled "
+                  f"domains",
+                  args.ylabel or f"{name.upper()} {_stat_lbl}",
+                  args.body_bins, args.flank_bins,
                   args.flank, colors, args.conf, members)
     print(f"  -> {fig.name}, scaled_profile_{name}.tsv", file=sys.stderr)
     return 0
