@@ -177,6 +177,45 @@ def load_prior(counts_dir):
     return pri.get("shared", pri.get("linked", {}))["alpha"]
 
 
+def which_statistic_matches(M, counts, alpha, cap=200_000, seed=0):
+    """Which component the --matrix values actually look like.
+
+    Under --from-counts the statistic is chosen by the --matrix FILENAME
+    and the file's values are never read, so a rename, a symlink or a stale
+    path picks a different quantity in silence.  Recomputing every
+    component per (cell, bin) from the raw counts and ranking them by
+    agreement with the matrix says whether the name is telling the truth.
+
+    Correlation, not equality: the matrix is post-RWR and the counts are
+    raw, so even the right component will not match exactly.  What
+    identifies it is being the BEST match, by a clear margin.
+    """
+    from scipy.stats import spearmanr
+    a0 = float(sum(alpha.values()))
+    ao, ac = float(alpha["open"]), float(alpha["closed"])
+    n_l, n_e = counts["n_linked"], counts["n_dm"]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        comp = _dc((ao + counts["k_open"]) / (a0 + n_l),
+                   (ac + counts["k_closed"]) / (a0 + n_l),
+                   (ao + counts["k_dm_open"]) / (a0 + n_e),
+                   (ac + counts["k_dm_closed"]) / (a0 + n_e))
+    target = np.asarray(M, float).ravel()
+    ok = np.isfinite(target)
+    if ok.sum() > cap:
+        idx = np.random.default_rng(seed).choice(np.flatnonzero(ok), cap,
+                                                 replace=False)
+    else:
+        idx = np.flatnonzero(ok)
+    out = {}
+    for k, v in comp.items():
+        w = np.asarray(v, float).ravel()[idx]
+        t = target[idx]
+        m = np.isfinite(w) & np.isfinite(t)
+        if m.sum() > 10 and np.ptp(w[m]) > 0 and np.ptp(t[m]) > 0:
+            out[k] = float(abs(spearmanr(w[m], t[m])[0]))
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
 def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat):
     """Sum the counts at each position, THEN compute the statistic once.
 
@@ -917,10 +956,28 @@ def main(argv=None) -> int:
         print(f"  pooling raw counts per axis position and computing "
               f"{_stat} from them (prior nu={sum(_alpha.values()):.1f})",
               file=sys.stderr)
+        _how = ("--from-counts-statistic" if args.from_counts_statistic
+                else f"the --matrix filename {Path(mpath).name!r}")
         print(f"  read: {_cdir}/{{{','.join(COUNT_KEYS)}}}.parquet "
               f"and dirichlet_multinomial_prior.json.  --matrix supplies "
               f"only the cell x bin grid and the statistic's NAME; none of "
               f"its values are read.", file=sys.stderr)
+        print(f"  the statistic came from {_how}", file=sys.stderr)
+        _rank = which_statistic_matches(M, _pooled["counts"], _alpha)
+        if _rank:
+            _best = next(iter(_rank))
+            _line = "  ".join(f"{k}={v:.2f}" for k, v in
+                              list(_rank.items())[:4])
+            print(f"  --matrix values look most like {_best!r} "
+                  f"(|rho| {_line})", file=sys.stderr)
+            if _best != _stat:
+                print(f"  WARNING the name says {_stat!r} but the values in "
+                      f"{Path(mpath).name} rank {_best!r} higher.  Nothing "
+                      f"reads those values, so a renamed, symlinked or "
+                      f"stale --matrix would change the plotted quantity in "
+                      f"silence -- check the path, or state the statistic "
+                      f"outright with --from-counts-statistic.",
+                      file=sys.stderr)
 
     bins = pd.DataFrame({
         "chrom": [str(c).rsplit(":", 1)[0] for c in M.columns],

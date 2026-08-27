@@ -1170,3 +1170,79 @@ def test_from_counts_says_which_files_it_read(tmp_path):
     assert "k_open" in r.stderr and "n_dm" in r.stderr
     assert "dirichlet_multinomial_prior.json" in r.stderr
     assert "only the cell x bin grid" in r.stderr
+
+
+def _counts_and_components(seed=0, nc=40, nb=300):
+    import numpy as np
+    from nome_hic_concordance.concordance import decompose_components as dc
+    rng = np.random.default_rng(seed)
+    alpha, a0 = {"open": 10.0, "closed": 49.0, "mixed": 41.0}, 100.0
+    n = rng.integers(5, 200, (nc, nb)).astype(float)
+    ko = rng.binomial(n.astype(int), 0.25).astype(float)
+    kc = rng.binomial((n - ko).astype(int), 0.5).astype(float)
+    counts = {"k_open": ko, "k_closed": kc, "k_mixed": n - ko - kc,
+              "n_linked": n, "k_dm_open": ko * 0.8, "k_dm_closed": kc * 1.1,
+              "k_dm_mixed": n - ko * 0.8 - kc * 1.1, "n_dm": n}
+    comp = dc((alpha["open"] + ko) / (a0 + n),
+              (alpha["closed"] + kc) / (a0 + n),
+              (alpha["open"] + counts["k_dm_open"]) / (a0 + n),
+              (alpha["closed"] + counts["k_dm_closed"]) / (a0 + n))
+    return counts, comp, alpha
+
+
+def test_the_matrix_values_identify_which_component_they_are():
+    """Under --from-counts the statistic is chosen by the --matrix FILENAME
+    and the file's values are never read, so a rename, a symlink or a stale
+    path picks a different quantity in silence.  Ranking every component by
+    agreement with the matrix says whether the name is telling the truth."""
+    import pandas as pd
+    m = _mod()
+    counts, comp, alpha = _counts_and_components()
+    for truth in ("coordination", "direction_logor", "marginal"):
+        rank = m.which_statistic_matches(pd.DataFrame(comp[truth]), counts,
+                                         alpha)
+        assert next(iter(rank)) == truth, (truth, list(rank)[:3])
+
+
+def test_a_mislabelled_matrix_is_called_out(tmp_path):
+    """Coordination values sitting under a direction_logor name: nothing
+    reads them, so only this check can notice."""
+    import subprocess
+    import sys as _sys
+    import numpy as np
+    import pandas as pd
+    m = _mod()
+    counts, comp, alpha = _counts_and_components(nc=20, nb=200)
+    d = tmp_path / "run"
+    (d / "counts").mkdir(parents=True)
+    cells = [f"c{i}" for i in range(20)]
+    cols = [f"chr1:{i * 250000}" for i in range(200)]
+    for k, v in counts.items():
+        pd.DataFrame(v, index=cells, columns=cols).to_parquet(
+            d / "counts" / f"{k}.parquet")
+    import json
+    json.dump({"shared": {"alpha": alpha}},
+              open(d / "dirichlet_multinomial_prior.json", "w"))
+    # the LIE: coordination values written under a direction_logor name
+    pd.DataFrame(comp["coordination"], index=cells,
+                 columns=cols).to_parquet(
+        d / "concordance_direction_logor.parquet")
+    s = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * 20,
+                  "cell_type": ["T"] * 10 + ["R"] * 10}).to_csv(
+        s, sep="\t", index=False)
+    bed = tmp_path / "d.bed"
+    bed.write_text("chr1\t10000000\t20000000\n")
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--matrix",
+         f"gch={d / 'concordance_direction_logor.parquet'}",
+         "--samples", str(s), "--group", "t=T", "--group", "o=R",
+         "--region", f"dom={bed}", "--cell-type-column", "cell_type",
+         "--from-counts", str(d), "--baseline", "flank", "--body-bins", "6",
+         "--flank", "2000000", "--flank-bins", "2", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "out")], capture_output=True,
+        text=True)
+    assert r.returncode == 0, r.stderr
+    assert "look most like 'coordination'" in r.stderr
+    assert "WARNING the name says 'direction_logor'" in r.stderr
+    assert "the statistic came from the --matrix filename" in r.stderr
