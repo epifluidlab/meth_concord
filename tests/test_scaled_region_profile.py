@@ -1246,3 +1246,78 @@ def test_a_mislabelled_matrix_is_called_out(tmp_path):
     assert "look most like 'coordination'" in r.stderr
     assert "WARNING the name says 'direction_logor'" in r.stderr
     assert "the statistic came from the --matrix filename" in r.stderr
+
+
+def _counts_run(tmp_path, nc=20, nb=200, seed=0):
+    """A step-5 output with counts and a prior, and no matrix at all."""
+    import json
+    import numpy as np
+    import pandas as pd
+    counts, _comp, alpha = _counts_and_components(seed=seed, nc=nc, nb=nb)
+    d = tmp_path / "run"
+    (d / "counts").mkdir(parents=True)
+    cells = [f"c{i}" for i in range(nc)]
+    cols = [f"chr1:{i * 250000}" for i in range(nb)]
+    for k, v in counts.items():
+        pd.DataFrame(v, index=cells, columns=cols).to_parquet(
+            d / "counts" / f"{k}.parquet")
+    json.dump({"shared": {"alpha": alpha}},
+              open(d / "dirichlet_multinomial_prior.json", "w"))
+    s = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * nc,
+                  "cell_type": ["T"] * (nc // 2) + ["R"] * (nc - nc // 2)}
+                 ).to_csv(s, sep="\t", index=False)
+    bed = tmp_path / "d.bed"
+    bed.write_text("chr1\t10000000\t20000000\n")
+    return d, s, bed
+
+
+def test_from_counts_needs_no_matrix_at_all(tmp_path):
+    """--matrix supplies only the grid and the statistic's name, and the
+    count matrices carry the same cells and bins -- so requiring it was
+    asking for a file whose values are never read."""
+    import subprocess
+    import sys as _sys
+    d, s, bed = _counts_run(tmp_path)
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--from-counts", str(d),
+         "--from-counts-statistic", "coordination", "--samples", str(s),
+         "--group", "t=T", "--group", "o=R", "--region", f"dom={bed}",
+         "--cell-type-column", "cell_type", "--baseline", "flank",
+         "--body-bins", "6", "--flank", "2000000", "--flank-bins", "2",
+         "--plot-format", "png", "--output-dir", str(tmp_path / "out")],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "out" / "scaled_profile_coordination.png").exists()
+    assert "grid taken from n_linked.parquet" in r.stderr
+    assert "nothing to cross-check" in r.stderr
+
+
+def test_no_matrix_needs_the_statistic_named(tmp_path):
+    """With no matrix there is no filename to read it from, and guessing
+    would decide the panel silently."""
+    import subprocess
+    import sys as _sys
+    d, s, bed = _counts_run(tmp_path)
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--from-counts", str(d),
+         "--samples", str(s), "--group", "t=T", "--region", f"dom={bed}",
+         "--cell-type-column", "cell_type",
+         "--output-dir", str(tmp_path / "out")], capture_output=True,
+        text=True)
+    assert r.returncode != 0
+    assert "--from-counts-statistic" in r.stderr
+
+
+def test_neither_matrix_nor_counts_is_an_error(tmp_path):
+    import subprocess
+    import sys as _sys
+    d, s, bed = _counts_run(tmp_path)
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--samples", str(s),
+         "--group", "t=T", "--region", f"dom={bed}",
+         "--cell-type-column", "cell_type",
+         "--output-dir", str(tmp_path / "out")], capture_output=True,
+        text=True)
+    assert r.returncode != 0
+    assert "one of --matrix or --from-counts" in r.stderr

@@ -147,11 +147,14 @@ COUNT_KEYS = ("k_open", "k_closed", "k_mixed", "n_linked",
 POOLABLE = frozenset(_dc(*(np.zeros(1),) * 4))
 
 
+def _counts_dir(d):
+    d = Path(d)
+    return d / "counts" if (d / "counts").is_dir() else d
+
+
 def load_counts(counts_dir, index, columns):
     """The raw per-(cell, bin) soft counts, aligned to the matrix."""
-    d = Path(counts_dir)
-    if (d / "counts").is_dir():
-        d = d / "counts"
+    d = _counts_dir(counts_dir)
     out = {}
     for k in COUNT_KEYS:
         f = d / f"{k}.parquet"
@@ -601,8 +604,19 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--matrix", required=True, metavar="NAME=PATH",
-                    help="Concordance matrix (cells x bins) parquet.")
+    ap.add_argument("--matrix", default=None, metavar="NAME=PATH",
+                    help="Concordance matrix (cells x bins) parquet.  "
+                         "Optional under --from-counts, which reads none of "
+                         "its values -- give --from-counts-statistic "
+                         "instead and the grid comes from the count "
+                         "matrices themselves, which carry the same cells "
+                         "and bins.  Naming a matrix there is still useful: "
+                         "the run cross-checks the statistic against its "
+                         "values.")
+    ap.add_argument("--name", default=None,
+                    help="Label for the outputs.  Default: the --matrix "
+                         "NAME, or the statistic when there is no "
+                         "--matrix.")
     ap.add_argument("--samples", required=True)
     ap.add_argument("--cell-type-column", default="cell_type")
     ap.add_argument("--color-column", default=None)
@@ -808,9 +822,31 @@ def main(argv=None) -> int:
                 f"profile.")
 
     bp = _bp_mod()
-    name, mpath = (args.matrix.split("=", 1) if "=" in args.matrix
-                   else ("gch", args.matrix))
-    M = pd.read_parquet(mpath)
+    if args.matrix is None and not args.from_counts:
+        sys.exit("one of --matrix or --from-counts is required")
+    if args.matrix is None and not args.from_counts_statistic:
+        sys.exit("--from-counts without --matrix needs "
+                 "--from-counts-statistic: with no matrix there is no "
+                 "filename to read the statistic from, and guessing one "
+                 "would decide the panel silently")
+    if args.matrix is not None:
+        name, mpath = (args.matrix.split("=", 1) if "=" in args.matrix
+                       else ("gch", args.matrix))
+        M = pd.read_parquet(mpath)
+    else:
+        # The grid, from the counts themselves.  They carry the same cells
+        # and bins, so a matrix whose values are never read is not needed
+        # to supply it -- only to be cross-checked against.
+        name, mpath = args.from_counts_statistic, None
+        _g = _counts_dir(args.from_counts) / "n_linked.parquet"
+        if not _g.exists():
+            sys.exit(f"--from-counts without --matrix needs {_g} for the "
+                     f"cell x bin grid; re-run step 5 with --emit-counts")
+        _gr = pd.read_parquet(_g)
+        M = pd.DataFrame(np.nan, index=_gr.index, columns=_gr.columns)
+        print(f"  no --matrix: cell x bin grid taken from {_g.name} "
+              f"({len(M):,} cells x {M.shape[1]:,} bins)", file=sys.stderr)
+    name = args.name or name
     samples = pd.read_csv(args.samples, sep="\t")
     if args.cell_type_column not in samples.columns:
         sys.exit(f"--cell-type-column {args.cell_type_column!r} not in "
@@ -937,6 +973,8 @@ def main(argv=None) -> int:
     _pooled = None
     if args.from_counts:
         _stat = args.from_counts_statistic or statistic_of(mpath)
+        if mpath is None:
+            _stat = args.from_counts_statistic
         if _stat not in POOLABLE:
             sys.exit(f"--from-counts cannot tell which statistic "
                      f"{Path(mpath).name!r} holds; pass "
@@ -950,20 +988,23 @@ def main(argv=None) -> int:
               f"so there is no genome-wide arm offset riding on it to "
               f"remove.  --baseline flank still anchors each cell.",
               file=sys.stderr)
-        _cdir = (Path(args.from_counts) / "counts"
-                 if (Path(args.from_counts) / "counts").is_dir()
-                 else Path(args.from_counts))
         print(f"  pooling raw counts per axis position and computing "
               f"{_stat} from them (prior nu={sum(_alpha.values()):.1f})",
               file=sys.stderr)
         _how = ("--from-counts-statistic" if args.from_counts_statistic
                 else f"the --matrix filename {Path(mpath).name!r}")
+        _cdir = _counts_dir(args.from_counts)
         print(f"  read: {_cdir}/{{{','.join(COUNT_KEYS)}}}.parquet "
               f"and dirichlet_multinomial_prior.json.  --matrix supplies "
               f"only the cell x bin grid and the statistic's NAME; none of "
               f"its values are read.", file=sys.stderr)
         print(f"  the statistic came from {_how}", file=sys.stderr)
-        _rank = which_statistic_matches(M, _pooled["counts"], _alpha)
+        _rank = ({} if mpath is None
+                 else which_statistic_matches(M, _pooled["counts"], _alpha))
+        if mpath is None:
+            print(f"  no --matrix, so nothing to cross-check the statistic "
+                  f"against; it is whatever --from-counts-statistic said",
+                  file=sys.stderr)
         if _rank:
             _best = next(iter(_rank))
             _line = "  ".join(f"{k}={v:.2f}" for k, v in
