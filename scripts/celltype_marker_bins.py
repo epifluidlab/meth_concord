@@ -1643,8 +1643,98 @@ def shared_grid(mats, keys):
                              "cells_dropped": n_union - len(kept)}
 
 
+# What each component IS, for an axis.  A panel labelled D while it draws
+# C names a quantity whose sign convention is the opposite of the one
+# plotted, since D = C(2F-1) is an inverted copy of C at these marginals.
+JOINT_STAT_LABEL = {
+    "coordination": "C",
+    "direction": "F",
+    "direction_expected": "F_exp",
+    "direction_excess": "F \u2212 F_exp",
+    "direction_logor": "log-OR",
+    "directional": "D = C\u00b7(2F\u22121)",
+    "directional_corrected": "D' = C\u00b7(F\u2212F_exp)",
+    "marginal": "p\u0304",
+}
+
+
+def statistic_label(matrix_path):
+    """The short name of the component a concordance_<name>.parquet holds."""
+    stem = Path(matrix_path).name if matrix_path else ""
+    if stem.startswith("concordance_") and stem.endswith(".parquet"):
+        got = stem[len("concordance_"):-len(".parquet")]
+        if got in JOINT_STAT_LABEL:
+            return JOINT_STAT_LABEL[got]
+    return None
+
+
+def joint_scatter(ax, tab, a, b, stats, label, stat_labels=None):
+    """Every bin as a dot: the two mean differences against each other.
+
+    RED is significant in BOTH modalities, grey is everything else.  Two
+    colours rather than four because the question the panel answers is
+    whether a bin is aberrant in both -- a single-modality bin belongs with
+    the background it is being distinguished from, not with a category of
+    its own that competes for the eye.
+
+    The fit is ordinary least squares over EVERY bin, not the red ones: a
+    line through the significant subset would be fitted to the points
+    selected for being extreme, and its slope would measure that selection.
+
+    Its slope is ATTENUATED and the annotation says so.  Both axes are
+    estimated with error, and error on x biases a least-squares slope
+    toward zero -- so the slope is descriptive of the cloud and the
+    correlation, which is what the association claim rests on, is reported
+    beside it.
+    """
+    from scipy.stats import pearsonr, spearmanr
+
+    sl = stat_labels or {}
+    x, y = tab[f"{a}_diff"].to_numpy(float), tab[f"{b}_diff"].to_numpy(float)
+    both = (tab["category"] == "both").to_numpy()
+    ok = np.isfinite(x) & np.isfinite(y)
+
+    ax.scatter(x[ok & ~both], y[ok & ~both], s=4, c="#BFC4C9", lw=0,
+               alpha=0.45, rasterized=True,
+               label=f"not both ({int((ok & ~both).sum()):,})")
+    ax.scatter(x[ok & both], y[ok & both], s=11, c="#D7263D", lw=0,
+               alpha=0.85, rasterized=True,
+               label=f"significant in both ({int((ok & both).sum()):,})")
+    ax.axhline(0, color="#9AA0A6", lw=0.8, zorder=0)
+    ax.axvline(0, color="#9AA0A6", lw=0.8, zorder=0)
+
+    fit = {}
+    if ok.sum() >= 3 and np.ptp(x[ok]) > 0:
+        m, c = np.polyfit(x[ok], y[ok], 1)
+        xs = np.array([x[ok].min(), x[ok].max()])
+        ax.plot(xs, m * xs + c, "-", color="#1A1A1A", lw=1.3, zorder=5)
+        fit = {"slope": float(m), "intercept": float(c),
+               "pearson_r": float(pearsonr(x[ok], y[ok])[0]),
+               "spearman_rho": float(spearmanr(x[ok], y[ok])[0]),
+               "n_fit": int(ok.sum())}
+        ax.annotate(f"slope {m:+.3g} (attenuated by error on x)\n"
+                    f"r = {fit['pearson_r']:+.3f}   "
+                    f"\u03c1 = {fit['spearman_rho']:+.3f}   "
+                    f"n = {fit['n_fit']:,}",
+                    (0.03, 0.97), xycoords="axes fraction", fontsize=7.5,
+                    va="top", color="#1A1A1A")
+
+    xa = f"{a} mean difference" + (f"  ({sl[a]})" if sl.get(a) else "")
+    yb = f"{b} mean difference" + (f"  ({sl[b]})" if sl.get(b) else "")
+    ax.set_xlabel(f"{xa}, contrast \u2212 reference")
+    ax.set_ylabel(f"{yb}, contrast \u2212 reference")
+    same = stats.get("frac_both_same_direction")
+    note = (f"{stats['n_both']:,} significant in both, {same:.0%} same "
+            f"direction" if stats["n_both"] else "no bin significant in both")
+    ax.set_title(f"{label}: {note}", fontsize=10)
+    ax.legend(frameon=False, fontsize=8, loc="lower right")
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    return fit
+
+
 def joint_figure(tab, a, b, stats, mats, cell_types, path, label,
-                 ct_colors=None):
+                 ct_colors=None, stat_labels=None):
     """One PDF: the two mean differences against each other, then a clustered
     heatmap per modality over the union of significant bins.
 
@@ -1669,25 +1759,8 @@ def joint_figure(tab, a, b, stats, mats, cell_types, path, label,
     with PdfPages(path) as pdf:
         # (1) scatter of the two effects
         fig, ax = plt.subplots(figsize=(5.4, 5.2))
-        for cat in ("neither", f"{a}_only", f"{b}_only", "both"):
-            sub = tab[tab["category"] == cat]
-            if not len(sub):
-                continue
-            ax.scatter(sub[f"{a}_diff"], sub[f"{b}_diff"], s=9 if cat != "neither" else 4,
-                       c=colour[cat], lw=0, alpha=0.75 if cat != "neither" else 0.4,
-                       rasterized=True, label=f"{cat} ({len(sub):,})")
-        ax.axhline(0, color="#9AA0A6", lw=0.8, zorder=0)
-        ax.axvline(0, color="#9AA0A6", lw=0.8, zorder=0)
-        ax.set_xlabel(f"{a} mean difference (contrast - reference)")
-        ax.set_ylabel(f"{b} mean difference (contrast - reference)")
-        sub = stats.get("frac_both_same_direction")
-        note = (f"{stats['n_both']:,} significant in both, "
-                f"{sub:.0%} same direction" if stats["n_both"] else
-                "no bin significant in both")
-        ax.set_title(f"{label}: {note}", fontsize=10)
-        ax.legend(frameon=False, fontsize=8, loc="best")
-        for sp in ("top", "right"):
-            ax.spines[sp].set_visible(False)
+        fit = joint_scatter(ax, tab, a, b, stats, label, stat_labels)
+        stats.update({f"scatter_{k}": v for k, v in fit.items()})
         fig.tight_layout()
         pdf.savefig(fig)
         plt.close(fig)
@@ -2926,6 +2999,7 @@ def main():
     # {contrast label: {context: frame(diff, fdr, sig) indexed by bin key}}
     joint = {}
     joint_mats = {}
+    joint_stat = {}
     for mi, spec in enumerate(args.matrix):
         if "=" not in spec:
             sys.exit(f"--matrix must be NAME=PATH, got {spec!r}")
@@ -3771,6 +3845,7 @@ def main():
                 {"diff": cs["diff"], "fdr": q, "sig": mask},
                 index=pd.Index(M.columns, name="bin"))
             joint_mats[name] = M
+            joint_stat[name] = statistic_label(path)
             scores_df[f"{pre}_diff"] = cs["diff"]
             scores_df[f"{pre}_cohens_d"] = cs["d"]
             scores_df[f"{pre}_pvalue"] = cs["p"]
@@ -4098,7 +4173,8 @@ def main():
             joint_figure(tab, a, b, stats,
                          {k: joint_mats[k] for k in (a, b)},
                          ct_of, out_dir / f"contrast_joint_{label}.pdf",
-                         label, ct_colors=ct_colors)
+                         label, ct_colors=ct_colors,
+                         stat_labels={k: joint_stat.get(k) for k in (a, b)})
             summary.setdefault("contrast_joint", {})[label] = stats
             print(f"  contrast-joint {label!r}: {stats['n_both']:,} in both, "
                   f"{stats[f'n_{a}_only']:,} {a} only, "

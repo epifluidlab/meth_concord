@@ -3352,3 +3352,104 @@ def test_pair_counts_are_found_beside_a_matrix_that_was_not_named(tmp_path):
     got = m._companion(str(d / "gch.parquet"), ["hcg=/elsewhere.parquet"],
                        "gch", "pair_counts_per_bin.parquet", "--pair-counts")
     assert got is not None and got.shape == (4, 6)
+
+
+# ---------------------------------------- the joint scatter across contexts --
+
+def _joint_tab(n=800, n_both=60, slope=0.7, seed=0):
+    rng = np.random.default_rng(seed)
+    x = rng.normal(0, 1.0, n)
+    y = slope * x + rng.normal(0, 0.6, n)
+    cat = np.array(["neither"] * n, dtype=object)
+    strong = np.argsort(-(np.abs(x) + np.abs(y)))
+    cat[strong[:n_both]] = "both"
+    cat[strong[n_both:n_both + 40]] = "gch_only"
+    cat[strong[n_both + 40:n_both + 80]] = "hcg_only"
+    return pd.DataFrame({"gch_diff": x, "hcg_diff": y, "category": cat},
+                        index=[f"chr1:{i * 250000}" for i in range(n)])
+
+
+def _ax():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt.subplots(figsize=(5, 5))
+
+
+def test_the_joint_scatter_is_two_colours_and_red_is_both():
+    """The question the panel answers is whether a bin is aberrant in BOTH
+    modalities.  A single-modality bin belongs with the background it is
+    being distinguished from, not with a category competing for the eye."""
+    m = _mod()
+    tab = _joint_tab()
+    fig, ax = _ax()
+    m.joint_scatter(ax, tab, "gch", "hcg",
+                    {"n_both": 60, "frac_both_same_direction": 0.9}, "lab")
+    import matplotlib.colors as mc
+    cols = [tuple(np.round(c.get_facecolor()[0][:3], 3))
+            for c in ax.collections]
+    assert len(cols) == 2
+    assert tuple(np.round(mc.to_rgb("#D7263D"), 3)) in cols
+    assert tuple(np.round(mc.to_rgb("#BFC4C9"), 3)) in cols
+    # the red layer holds exactly the bins called in both
+    red = [c for c in ax.collections
+           if tuple(np.round(c.get_facecolor()[0][:3], 3))
+           == tuple(np.round(mc.to_rgb("#D7263D"), 3))][0]
+    assert red.get_offsets().shape[0] == 60
+
+
+def test_the_fit_is_over_every_bin_not_the_significant_ones():
+    """A line through the significant subset would be fitted to the points
+    selected for being extreme, and its slope would measure that
+    selection."""
+    m = _mod()
+    tab = _joint_tab(slope=0.7)
+    fig, ax = _ax()
+    fit = m.joint_scatter(ax, tab, "gch", "hcg",
+                          {"n_both": 60, "frac_both_same_direction": 0.9},
+                          "lab")
+    assert fit["n_fit"] == len(tab)
+    assert fit["slope"] == pytest.approx(0.7, abs=0.1)
+    both = tab[tab["category"] == "both"]
+    only_both = np.polyfit(both["gch_diff"], both["hcg_diff"], 1)[0]
+    assert abs(only_both - 0.7) > abs(fit["slope"] - 0.7)
+
+
+def test_the_fit_reports_the_correlation_beside_the_slope():
+    """The slope is attenuated -- both axes are estimated with error, and
+    error on x biases a least-squares slope toward zero -- so it is
+    descriptive and the association claim rests on the correlation."""
+    m = _mod()
+    fig, ax = _ax()
+    fit = m.joint_scatter(ax, _joint_tab(), "gch", "hcg",
+                          {"n_both": 60, "frac_both_same_direction": 0.9},
+                          "lab")
+    assert {"slope", "pearson_r", "spearman_rho", "n_fit"} <= set(fit)
+    assert fit["pearson_r"] > 0.5
+    txt = " ".join(t.get_text() for t in ax.texts)
+    assert "attenuated" in txt and "ρ" in txt
+
+
+def test_the_axis_names_the_statistic_the_matrix_held():
+    m = _mod()
+    assert m.statistic_label("x/concordance_coordination.parquet") == "C"
+    assert m.statistic_label("x/concordance_direction_logor.parquet") == \
+        "log-OR"
+    assert "D = C" in m.statistic_label("x/concordance_directional.parquet")
+    assert m.statistic_label("x/anything.parquet") is None
+    fig, ax = _ax()
+    m.joint_scatter(ax, _joint_tab(), "gch", "hcg",
+                    {"n_both": 0, "frac_both_same_direction": np.nan}, "lab",
+                    stat_labels={"gch": "C", "hcg": "log-OR"})
+    assert "(C)" in ax.get_xlabel() and "(log-OR)" in ax.get_ylabel()
+
+
+def test_a_scatter_with_nothing_in_both_still_draws(tmp_path):
+    m = _mod()
+    tab = _joint_tab(n_both=0)
+    fig, ax = _ax()
+    fit = m.joint_scatter(ax, tab, "gch", "hcg",
+                          {"n_both": 0, "frac_both_same_direction": np.nan},
+                          "lab")
+    assert fit["n_fit"] == len(tab)
+    assert "no bin significant in both" in ax.get_title()
