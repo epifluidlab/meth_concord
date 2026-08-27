@@ -2840,7 +2840,15 @@ def main():
     ap.add_argument("--max-batch-icc", type=float, default=0.1,
                     help="Drop a candidate bin whose within-cell-type between-"
                          "batch ICC exceeds this — it is sample-driven.")
-    ap.add_argument("--min-cells-per-group", type=int, default=3)
+    ap.add_argument("--min-cells-per-group", action="append", default=None,
+                    metavar="N|NAME=N",
+                    help="Cells a group needs in a bin before that bin is "
+                         "used.  Default 3.  A bare number applies to every "
+                         "--matrix; NAME=N sets it for one, since a dense "
+                         "context and a sparse one do not want the same "
+                         "cut -- GCH keeps most bins at any setting while "
+                         "HCG is mostly imputed, and a single scalar forces "
+                         "the looser of the two on both.")
     ap.add_argument("--min-groups", type=int, default=3)
     ap.add_argument("--max-legend-levels", type=int, default=40,
                     help="A batch strip with more levels than this (e.g. "
@@ -3000,11 +3008,22 @@ def main():
     joint = {}
     joint_mats = {}
     joint_stat = {}
-    for mi, spec in enumerate(args.matrix):
+    base_args = args
+    for mi, spec in enumerate(base_args.matrix):
         if "=" not in spec:
             sys.exit(f"--matrix must be NAME=PATH, got {spec!r}")
         name, path = spec.split("=", 1)
         name = name.strip()
+        # A PER-MATRIX view of the settings that a dense and a sparse
+        # context do not want to share.  --min-cells-per-group is read by a
+        # dozen call sites and by helpers that take `args` whole, so it is
+        # resolved here and shadowed for this iteration rather than threaded
+        # through each one.  Rebuilt from base_args every time, so one
+        # matrix's value cannot leak into the next.
+        args = argparse.Namespace(**vars(base_args))
+        args.min_cells_per_group = per_matrix(
+            base_args.min_cells_per_group, name, int, 3,
+            "--min-cells-per-group")
         if not Path(path).exists():
             sys.exit(f"no such matrix: {path}")
         # Resolve the mean-signal matrix for the companion heatmaps: explicit
@@ -4145,6 +4164,10 @@ def main():
                   f"cell types (silhouette={sil:.3f}, perm p={perm_p:.3f}) — "
                   f"see the nome_hic_concordance/compare UMAP for the figure")
 
+    # Back to the un-shadowed settings: everything after the loop is
+    # cross-matrix, and leaving the LAST matrix's per-matrix value bound
+    # would apply it to work that belongs to neither.
+    args = base_args
     if not summary:
         sys.exit("no matrix produced output.")
 

@@ -3453,3 +3453,75 @@ def test_a_scatter_with_nothing_in_both_still_draws(tmp_path):
                           "lab")
     assert fit["n_fit"] == len(tab)
     assert "no bin significant in both" in ax.get_title()
+
+
+def test_min_cells_per_group_is_per_matrix_too():
+    """GCH keeps most bins at any setting while HCG is mostly imputed, so a
+    single scalar forces the looser of the two on both -- and the looser one
+    is what lets imputation-driven bins through."""
+    m = _mod()
+    f = lambda sp, n: m.per_matrix(sp, n, int, 3, "--min-cells-per-group")
+    assert f(None, "gch") == 3                    # the documented default
+    assert f(["20"], "gch") == 20 and f(["20"], "hcg") == 20
+    assert f(["hcg=20"], "gch") == 3              # untouched
+    assert f(["hcg=20"], "hcg") == 20
+    assert f(["5", "hcg=20"], "gch") == 5
+
+
+def test_a_per_matrix_setting_does_not_leak_into_the_next(tmp_path):
+    """It is resolved by shadowing `args` for one iteration, so the rebuild
+    from the untouched base has to actually happen -- otherwise the second
+    matrix silently inherits the first's cut."""
+    src = _SCRIPT.read_text()
+    i = src.index("for mi, spec in enumerate(base_args.matrix):")
+    block = src[i:i + 1400]
+    assert "args = argparse.Namespace(**vars(base_args))" in block
+    # and the loop reads the ORIGINAL list, not the shadowed scalar
+    assert "enumerate(base_args.matrix)" in src
+    assert "per_matrix(\n            base_args.min_cells_per_group" in block
+    # restored afterwards, since everything past the loop is cross-matrix
+    j = src.index("if not summary:\n        sys.exit(\"no matrix produced")
+    assert "args = base_args" in src[j - 400:j]
+
+
+def test_two_matrices_get_their_own_cut(tmp_path):
+    """End to end: a dense matrix with the default and a sparse one raised,
+    in one run."""
+    m = _mod()
+    X, ct, batch, classes = _data(seed=1, n_per=30)
+    X = 1.0 / (1.0 + np.exp(-(X - 1.0)))
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    d = tmp_path / "mats"
+    d.mkdir()
+    for nm in ("gch", "hcg"):
+        pd.DataFrame(X, index=samples, columns=bins).to_parquet(
+            d / f"{nm}.parquet")
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b0" if b == 0 else "b1" for b in batch]}
+                 ).to_csv(stab, sep="\t", index=False)
+    def run(cut, out):
+        return subprocess.run(
+            [sys.executable, str(_SCRIPT),
+             "--matrix", f"gch={d / 'gch.parquet'}",
+             "--matrix", f"hcg={d / 'hcg.parquet'}",
+             "--samples", str(stab), "--cell-type-column", "cell_type",
+             "--batch-column", "sample", "--n-bins", "20",
+             "--min-cells-per-group", cut,
+             "--output-dir", str(tmp_path / out), "--plot-format", "png"],
+            capture_output=True, text=True)
+
+    # 120 cells: a cut of 25 needs 2*25*3 = 150 and skips the matrix, a cut
+    # of 3 needs 18 and does not.
+    named = run("hcg=25", "named")
+    assert named.returncode == 0, named.stderr
+    assert "hcg: only 120 matched cells" in named.stderr
+    assert "gch: only 120 matched cells" not in named.stderr
+
+    # the same number as a bare scalar reaches BOTH, which is what the
+    # per-matrix form exists to avoid
+    both = run("25", "both")
+    assert "hcg: only 120 matched cells" in both.stderr
+    assert "gch: only 120 matched cells" in both.stderr
