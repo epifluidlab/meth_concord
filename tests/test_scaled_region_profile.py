@@ -1321,3 +1321,29 @@ def test_neither_matrix_nor_counts_is_an_error(tmp_path):
         text=True)
     assert r.returncode != 0
     assert "one of --matrix or --from-counts" in r.stderr
+
+
+def test_frac_positive_is_scored_against_the_half_it_should_sit_at():
+    """'53% positive' reads as a majority and is not one.  With 596 domains
+    the standard error of that fraction is 0.5/sqrt(596) = 0.020, so 0.53
+    is 1.5 sd from half; with 152 it is 0.8.  The z says which, without the
+    reader computing it."""
+    import numpy as np
+    m = _mod()
+    for n, frac, want in ((596, 0.53, 1.5), (152, 0.53, 0.8)):
+        k = int(round(n * frac))
+        d = np.r_[np.full(k, 0.002), np.full(n - k, -0.002)]
+        r = m.domain_paired_test(d, np.zeros(n))
+        assert r["frac_positive"] == pytest.approx(frac, abs=0.005)
+        assert r["frac_positive_z"] == pytest.approx(want, abs=0.15)
+
+
+def test_a_consistent_effect_scores_far_from_half():
+    import numpy as np
+    m = _mod()
+    n = 600
+    d = np.r_[np.full(510, 0.002), np.full(90, -0.002)]     # 85% positive
+    r = m.domain_paired_test(d, np.zeros(n))
+    assert r["frac_positive"] == pytest.approx(0.85, abs=0.01)
+    assert r["frac_positive_z"] > 15
+    assert r["p_domain"] < 1e-10

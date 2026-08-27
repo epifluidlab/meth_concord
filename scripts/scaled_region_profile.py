@@ -457,8 +457,18 @@ def domain_paired_test(a_vals, b_vals):
            "mean_diff": float(np.mean(d)) if d.size else float("nan"),
            "q25_diff": float(np.percentile(d, 25)) if d.size else float("nan"),
            "q75_diff": float(np.percentile(d, 75)) if d.size else float("nan"),
+           # Consistency, ignoring magnitude: one huge domain counts the
+           # same as one that barely moved.  Under no difference it is 0.5,
+           # with a standard error of 0.5/sqrt(n_domains) -- so the z beside
+           # it says how far 0.53 actually is, which at 596 domains is 1.5
+           # and at 152 is 0.7.  Reported because "53% positive" reads as a
+           # majority and is not one.
            "frac_positive": float(np.mean(d > 0)) if d.size else float("nan"),
+           "frac_positive_z": float("nan"),
            "p_domain": float("nan")}
+    if d.size:
+        out["frac_positive_z"] = float(
+            (out["frac_positive"] - 0.5) / (0.5 / np.sqrt(d.size)))
     if d.size >= 6 and np.any(d != 0):
         out["p_domain"] = float(wilcoxon(d, alternative="two-sided")[1])
     return out
@@ -1134,7 +1144,8 @@ def main(argv=None) -> int:
                          f"({r.n_domains} domains, median "
                          f"{r.median_diff:+.3g}, mean "
                          f"{r.mean_diff:+.3g}, {r.frac_positive:.0%} "
-                         f"positive)")
+                         f"positive = {r.frac_positive_z:+.1f} sd from "
+                         f"half)")
             if "p_donor" in tt.columns and np.isfinite(r.p_donor):
                 line += (f"   |  p_donor={r.p_donor:.3g} "
                          f"({r.n_donor_a} vs {r.n_donor_b}, floor "
