@@ -10,6 +10,7 @@ bins that were NOT selected -- if those separate cell types too, it is real.
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -3525,3 +3526,200 @@ def test_two_matrices_get_their_own_cut(tmp_path):
     both = run("25", "both")
     assert "hcg: only 120 matched cells" in both.stderr
     assert "gch: only 120 matched cells" in both.stderr
+
+
+# ---------------------------------------------------------------------------
+# --null-rank: does either arm depart from its own null?
+# ---------------------------------------------------------------------------
+
+
+def _rank_fixture(tmp_path, seed=0, n=60):
+    """Three blocks of bins, and only the first is a real finding.
+
+      0-19   arms differ AND both depart strongly from their own null
+      20-39  arms differ by a small constant, NEITHER departs from its null
+      40-59  nothing
+
+    Block 20-39 is the failure this flag exists for: at tens of cells per arm
+    a constant offset clears FDR comfortably, and the contrast has no way to
+    ask whether either arm was doing anything at all.
+    """
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    nb = 60
+    ct = np.repeat(np.arange(4), n // 4)
+    tum = ct < 2
+    X = np.zeros((n, nb))
+    X[:, :20] = np.where(tum[:, None], 1.5, -1.5) + rng.normal(0, .3, (n, 20))
+    X[:, 20:40] = (np.where(tum[:, None], 0.10, -0.10)
+                   + rng.normal(0, .05, (n, 20)))
+    X[:, 40:] = rng.normal(0, .05, (n, 20))
+    R = np.zeros((n, nb))
+    R[:, :20] = (np.abs(rng.normal(3.5, .5, (n, 20)))
+                 * np.where(tum[:, None], 1.0, -1.0))
+    R[:, 20:] = rng.normal(0, .4, (n, 40))
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    mat = tmp_path / "concordance_coordination.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    pd.DataFrame(R, index=cells, columns=bins).to_parquet(
+        tmp_path / "concordance_coordination_rank.parquet")
+    s = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        s, sep="\t", index=False)
+    return mat, s
+
+
+def _run_rank(tmp_path, mat, s, tag, *extra):
+    out = tmp_path / f"out_{tag}"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "20",
+         "--n-permutations", "30", "--contrast", "tumour=CT0,CT1",
+         "--volcano", "--output-dir", str(out), "--plot-format", "png",
+         *extra], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2500:]
+    return out, r.stdout + r.stderr
+
+
+def test_the_rank_matrix_is_found_beside_the_matrix_it_belongs_to(tmp_path):
+    mod = _mod()
+    assert mod.rank_filename_for("/x/concordance_direction_logor.parquet") == \
+        "concordance_direction_logor_rank.parquet"
+    assert mod.rank_filename_for("/x/concordance_coordination.parquet") == \
+        "concordance_coordination_rank.parquet"
+    # Pairing a coordination matrix with a direction rank would gate one
+    # statistic on another's evidence, so the name is derived, not fixed.
+    assert mod.rank_filename_for("/x/concordance_coordination.parquet") != \
+        mod.rank_filename_for("/x/concordance_direction_logor.parquet")
+
+
+def test_departure_is_per_arm_and_ignores_unmeasured_cells(tmp_path):
+    """An unmeasured cell is not evidence of absence.  Counting it as
+    non-departing would penalise exactly the sparse bins that most need an
+    honest answer."""
+    mod = _mod()
+    R = np.array([[3.0, 0.1, np.nan],
+                  [2.0, 0.2, 4.0],
+                  [0.5, 0.0, 5.0],
+                  [np.nan, 0.1, 0.3]])
+    a = np.array([True, True, False, False])
+    d = mod.rank_departure(R, a, ~a, 1.3)
+    np.testing.assert_allclose(d["rank_frac_a"], [1.0, 0.0, 1.0])
+    np.testing.assert_allclose(d["rank_frac_b"], [0.0, 0.0, 0.5])
+    np.testing.assert_array_equal(d["rank_n_a"], [2, 2, 1])
+    # max over arms, not min: a bin coordinated in the reference and flat in
+    # the tumour is the finding, not a failure of it.
+    np.testing.assert_allclose(d["rank_frac_max"], [1.0, 0.0, 1.0])
+
+
+def test_the_gate_drops_bins_where_neither_arm_departs_from_null(tmp_path):
+    """Without it the run calls twice as many bins, and half of them are a
+    difference in nothing."""
+    mat, s = _rank_fixture(tmp_path)
+    _, log_off = _run_rank(tmp_path, mat, s, "off", "--null-rank-min-frac", "0")
+    _, log_on = _run_rank(tmp_path, mat, s, "on", "--null-rank-min-frac", "0.5")
+
+    def called(log):
+        line = [l for l in log.splitlines() if "up /" in l and "down ->" in l]
+        assert line, log
+        return int(line[0].split()[2].replace(",", ""))
+
+    assert called(log_off) == 40
+    assert called(log_on) == 20
+    assert "no arm departs from its own drawn null" in log_on
+    assert "no arm departs" not in log_off
+
+
+def test_the_dropped_bins_stay_visible_rather_than_being_hidden(tmp_path):
+    """Applied to `sig`, not by NaN-ing the column, so a bin that cleared FDR
+    and failed the gate shows on the volcano as 'FDR only, not kept'.  How
+    many calls rested on nothing is worth seeing."""
+    mat, s = _rank_fixture(tmp_path)
+    out, log = _run_rank(tmp_path, mat, s, "vis", "--null-rank-min-frac", "0.5")
+    assert "significant but filtered" in log
+    tested = pd.read_csv(out / "bin_scores_gch.contrast_tumour.tested.bed",
+                         sep="\t")
+    assert len(tested) == 60          # still tested, just not called
+
+
+def test_the_departure_rates_are_reported_even_when_nothing_is_gated(
+        tmp_path):
+    """'The arms differ' and 'either arm is doing something' are separate
+    claims; a table carrying only the first invites the second to be
+    assumed."""
+    mat, s = _rank_fixture(tmp_path)
+    out, log = _run_rank(tmp_path, mat, s, "rep", "--null-rank-min-frac", "0")
+    t = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
+    for c in ("contrast_tumour_rank_frac_a", "contrast_tumour_rank_frac_b",
+              "contrast_tumour_rank_frac_max", "contrast_tumour_rank_mean_a",
+              "contrast_tumour_rank_mean_b"):
+        assert c in t.columns, c
+    idx = t["bin"].str.split(":").str[1].astype(int) // 250_000
+    real = t.loc[idx < 20, "contrast_tumour_rank_frac_max"]
+    hollow = t.loc[(idx >= 20) & (idx < 40), "contrast_tumour_rank_frac_max"]
+    assert real.mean() > 0.9
+    assert hollow.mean() < 0.2
+    assert "departs from its own drawn null" in log
+
+
+def test_the_rank_companion_heatmap_uses_the_concordance_layout(tmp_path):
+    """It answers what the main heatmap cannot: is the block structure a
+    departure from the null, or the raw statistic's scale tracking depth and
+    openness across cell types."""
+    mat, s = _rank_fixture(tmp_path)
+    out, log = _run_rank(tmp_path, mat, s, "hm")
+    made = {p.name for p in out.glob("*nullrank*")}
+    assert "marker_heatmap_gch_nullrank_fixedorder.png" in made
+    assert "marker_heatmap_gch_nullrank_reclustered.png" in made
+    assert "null-rank companions" in log
+
+
+def test_the_rank_heatmap_is_never_z_scored(tmp_path):
+    """The rank already has a calibrated zero -- 'at its own null'.  Z-scoring
+    each bin across cells would discard it and manufacture contrast in a bin
+    where every cell sits at the null, which is the one thing this panel
+    exists to rule out."""
+    import inspect
+    src = inspect.getsource(_mod().main)
+    i = src.index('"nullrank"')
+    call = src[i:i + 260]
+    assert "symmetric=True" in call
+    assert "zscore=True" not in call
+
+
+def test_asking_for_a_rank_that_is_not_there_is_an_error_not_a_skip(tmp_path):
+    mat, s = _rank_fixture(tmp_path)
+    (tmp_path / "concordance_coordination_rank.parquet").unlink()
+    out = tmp_path / "out_missing"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "10",
+         "--n-permutations", "20", "--contrast", "tumour=CT0,CT1",
+         "--null-rank-heatmaps", "on",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "--null-rank" in r.stderr
+
+
+def test_the_rank_is_not_put_through_the_per_cell_corrections(tmp_path):
+    """It is already referenced to each cell's own null, which is what
+    --contrast-center cell-median approximates; centring it again would
+    subtract an offset that is not there."""
+    import inspect
+    src = inspect.getsource(_mod().main)
+    nrc = src.index("NRc = NR_df.reindex")
+    centre = src.index("Xc = center_cells(Xc)")
+    assert nrc < centre
+    # center_cells / correct_by_reference / regress_out_coverage all act on
+    # Xc; none of them may touch NRc.
+    for fn in ("center_cells(", "correct_by_reference(",
+               "regress_out_coverage("):
+        for m in re.finditer(re.escape(fn), src):
+            seg = src[max(0, m.start() - 120):m.start()]
+            assert "NRc" not in seg.split("\n")[-1], fn

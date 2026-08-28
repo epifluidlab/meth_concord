@@ -96,6 +96,7 @@ import argparse
 import importlib.util
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -1363,6 +1364,57 @@ def _companion(matrix_path, specs, name, filename, flag, matrix=None):
     df = pd.read_parquet(beside)
     return (_check_companion(df, matrix, str(beside), flag)
             if matrix is not None else df)
+
+
+def rank_filename_for(matrix_path):
+    """The rank matrix that belongs beside ``matrix_path``.
+
+    Derived from the matrix's own name rather than hardcoded, because the
+    rank is per statistic: concordance_coordination.parquet is answered by
+    concordance_coordination_rank.parquet and the log odds ratio by its
+    own.  Pairing a coordination matrix with a direction rank would gate
+    one statistic on another's evidence.
+    """
+    stem = Path(matrix_path).name
+    if stem.startswith("concordance_") and stem.endswith(".parquet"):
+        return f"{stem[:-len('.parquet')]}_rank.parquet"
+    return "concordance_coordination_rank.parquet"
+
+
+def rank_departure(R, in_mask, out_mask, min_score):
+    """Per bin: does either arm depart from its own drawn null, and by how
+    much.
+
+    The contrast asks whether the arms DIFFER.  It has no way to ask whether
+    either is doing anything, and at a few hundred cells per arm a small
+    consistent offset between two arms that both sit at their own null
+    clears FDR comfortably -- a difference in nothing.  This is the missing
+    half: the fraction of each arm's cells whose bin departs from the null
+    the pipeline produces at that depth and that marginal.
+
+    ONE ARM IS ENOUGH.  A bin coordinated in the reference and flat in the
+    tumour is the finding, not a failure of it, so the gate takes the max
+    over arms rather than the min.
+
+    Cells with no finite rank are excluded from their arm's denominator, not
+    counted as non-departing: an unmeasured cell is not evidence of absence,
+    and treating it as one would penalise exactly the sparse bins that most
+    need an honest answer.
+    """
+    R = np.asarray(R, float)
+    hit = np.isfinite(R) & (np.abs(R) >= float(min_score))
+    out = {}
+    for tag, m in (("a", in_mask), ("b", out_mask)):
+        sub, hs = R[m], hit[m]
+        n = np.isfinite(sub).sum(axis=0)
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            out[f"rank_frac_{tag}"] = np.where(n > 0, hs.sum(axis=0) / n,
+                                               np.nan)
+            out[f"rank_mean_{tag}"] = np.nanmean(sub, axis=0)
+        out[f"rank_n_{tag}"] = n
+    out["rank_frac_max"] = np.fmax(out["rank_frac_a"], out["rank_frac_b"])
+    return out
 
 
 def global_shift_report(diff, sig=None):
@@ -2709,6 +2761,54 @@ def main():
                          "concordance.  Needs --min-pairs.  A bare number "
                          "applies to every --matrix; NAME=F sets it for "
                          "one.")
+    ap.add_argument("--null-rank", action="append", default=None,
+                    metavar="NAME=PATH",
+                    help="concordance_<stat>_rank.parquet for the matching "
+                         "--matrix NAME: each cell-bin's signed -log10(p) "
+                         "against a null drawn from that bin's own ends "
+                         "(step 5 --null-rank).  Auto-discovered from the "
+                         "matrix filename.  WHAT IT ADDS THAT THE CONTRAST "
+                         "CANNOT SEE.  A two-arm test asks whether the arms "
+                         "DIFFER; it cannot ask whether either of them is "
+                         "doing anything.  Two arms both sitting at their "
+                         "own null, separated by a small consistent offset, "
+                         "clear FDR at a few hundred cells per arm -- a "
+                         "difference in nothing.  The rank says, per cell "
+                         "and per bin, whether that bin departs from what "
+                         "the pipeline produces with no coordination at that "
+                         "depth and that marginal, so it gates on presence "
+                         "where --min-pairs gates on coverage.  Used for the "
+                         "gate, for the reported per-arm departure rates, "
+                         "and for a companion heatmap in the concordance "
+                         "heatmap's own layout.")
+    ap.add_argument("--null-rank-min", type=float, default=1.30103,
+                    metavar="S",
+                    help="How far from its own null a cell-bin has to be to "
+                         "count as departing, as |signed -log10(p)|.  "
+                         "Default 1.30103 = p 0.05.  Note the score is "
+                         "CENSORED at -log10(2/(pool+1)) -- about 4.4 for a "
+                         "50,000-draw pool -- so it saturates in "
+                         "well-measured bins and is a poor effect size; that "
+                         "is why it gates and annotates here rather than "
+                         "replacing the tested value.")
+    ap.add_argument("--null-rank-min-frac", type=float, default=0.0,
+                    metavar="F",
+                    help="Require at least this fraction of ONE arm's cells "
+                         "to depart from the null before a bin can be "
+                         "called.  0 (default) reports the rates without "
+                         "gating.  One arm, not both: a bin that is "
+                         "coordinated in the reference and flat in the "
+                         "tumour is exactly the finding, and requiring both "
+                         "would discard it.")
+    ap.add_argument("--null-rank-heatmaps", choices=["auto", "on", "off"],
+                    default="auto",
+                    help="Companion heatmap of the rank over the selected "
+                         "bins, in the concordance heatmap's EXACT layout.  "
+                         "It answers a question the main heatmap cannot: is "
+                         "the block structure there a departure from the "
+                         "null, or the raw statistic's own scale tracking "
+                         "depth and openness across cell types.  'auto' "
+                         "draws it when a rank matrix is available.")
     ap.add_argument("--pair-counts", action="append", default=None,
                     metavar="NAME=PATH",
                     help="pair_counts_per_bin.parquet for the matching "
@@ -3091,6 +3191,13 @@ def main():
         C_df = _companion(path, args.pair_counts, name,
                           "pair_counts_per_bin.parquet", "--pair-counts",
                           matrix=M)
+        # Named after the MATRIX's statistic, so a coordination matrix is
+        # never gated on the direction's evidence.
+        NR_df = _companion(path, args.null_rank, name,
+                           rank_filename_for(path), "--null-rank", matrix=M)
+        if NR_df is None and args.null_rank:
+            sys.exit(f"--null-rank was given but nothing matched {name!r}; "
+                     f"pass --null-rank {name}=<path>")
         R_ser = None
         if name in ref_specs:
             _rp, _, _rcol = str(ref_specs[name]).partition(":")
@@ -3219,6 +3326,25 @@ def main():
                 comp_made = _companion_group(
                     comp, "compartment", comp_cmap, "compartment score",
                     symmetric=True, **cg)
+        rank_made = []
+        if args.null_rank_heatmaps != "off" and NR_df is not None:
+            # Raw and SYMMETRIC, never z-scored.  The rank is already on a
+            # calibrated per-cell scale with a meaningful zero -- "at its own
+            # null" -- and z-scoring each bin across cells would throw that
+            # away and manufacture contrast in a bin where every cell sits at
+            # the null.  That is the one thing this panel exists to rule out.
+            nrs = _align_signal(NR_df, list(M.index), sel_bins, name,
+                                "null-rank", grid_align=False)
+            if nrs is not None:
+                rank_made = _companion_group(
+                    nrs, "nullrank", "RdBu_r",
+                    "signed -log10(p) vs drawn null", symmetric=True, **cg)
+        if rank_made:
+            print(f"  null-rank companions -> {', '.join(rank_made)}")
+        elif args.null_rank_heatmaps == "on":
+            sys.exit(f"--null-rank-heatmaps on but no rank matrix for "
+                     f"{name!r}: pass --null-rank {name}=<path>, or re-run "
+                     f"step 5 with --null-rank")
         if comp_made:
             print(f"  compartment companions -> {', '.join(comp_made)}")
         elif args.compartment_heatmaps == "on":
@@ -3450,13 +3576,21 @@ def main():
             # the order is free to be the correct one: divide out the
             # measured reliability on the scale it was measured on, then
             # centre whatever location is left.
-            Vc = Cc = None
+            Vc = Cc = NRc = None
             if V_df is not None:
                 Vc = V_df.reindex(index=M.index,
                                   columns=M.columns).to_numpy()
             if C_df is not None:
                 Cc = C_df.reindex(index=M.index,
                                   columns=M.columns).to_numpy()
+            if NR_df is not None:
+                # Deliberately NOT put through the per-cell corrections
+                # below.  The rank is already referenced to each cell's own
+                # null, which is what --contrast-center cell-median and
+                # --contrast-reference-d approximate; centring it a second
+                # time would subtract a per-cell offset that is not there.
+                NRc = NR_df.reindex(index=M.index,
+                                    columns=M.columns).to_numpy(float)
             if args.min_pairs == 0 and Cc is not None:
                 _imp = float(np.mean(Cc == 0))
                 if _imp > 0.05:
@@ -3749,6 +3883,16 @@ def main():
                               file=sys.stderr)
             # Rank on the chosen test's p, not on |t|: under mwu the t is not
             # the statistic that produced the p-value.
+            rank_stats = (rank_departure(NRc, in_mask, out_mask,
+                                         args.null_rank_min)
+                          if NRc is not None else None)
+            if rank_stats is not None:
+                _fa = np.nanmean(rank_stats["rank_frac_a"])
+                _fb = np.nanmean(rank_stats["rank_frac_b"])
+                print(f"  contrast {label!r}: departs from its own drawn "
+                      f"null (|score| >= {args.null_rank_min:.2f}) in "
+                      f"{_fa:.1%} of contrast cell-bins and {_fb:.1%} of "
+                      f"reference ones", file=sys.stderr)
             rank = np.where(np.isfinite(cs["p"]),
                             -np.log10(np.maximum(cs["p"], 1e-300)), -np.inf)
             mask = np.zeros(M.shape[1], bool)
@@ -3764,6 +3908,26 @@ def main():
                 if args.cnv_max_delta > 0 and cnv is not None:
                     sig &= ~(np.isfinite(cnv)
                              & (np.abs(cnv) > args.cnv_max_delta))
+                # DOES EITHER ARM DEPART FROM ITS OWN NULL.  The test above
+                # asks only whether the arms differ, and at a few hundred
+                # cells per arm a small consistent offset between two arms
+                # that both sit at their null clears FDR -- a difference in
+                # nothing.  Applied here rather than by NaN-ing the column
+                # so a bin that cleared FDR and failed this shows on the
+                # volcano as "FDR only, not kept": how many calls rested on
+                # nothing is worth seeing, not hiding.
+                if rank_stats is not None and args.null_rank_min_frac > 0:
+                    _dep = (np.isfinite(rank_stats["rank_frac_max"])
+                            & (rank_stats["rank_frac_max"]
+                               >= float(args.null_rank_min_frac)))
+                    _lost = int((sig & ~_dep).sum())
+                    sig &= _dep
+                    print(f"  contrast {label!r}: {_lost:,} bins cleared "
+                          f"FDR but no arm departs from its own drawn null "
+                          f"in {args.null_rank_min_frac:.0%} of its cells "
+                          f"(|score| >= {args.null_rank_min:.2f}); dropped, "
+                          f"and drawn on the volcano as 'FDR only, not "
+                          f"kept'", file=sys.stderr)
                 mask = sig
             else:
                 keep_rank = np.argsort(rank)[::-1][: args.n_contrast_bins
@@ -3872,6 +4036,15 @@ def main():
             scores_df[pre] = mask
             extra_cols += [f"{pre}_diff", f"{pre}_cohens_d", f"{pre}_pvalue",
                            f"{pre}_fdr", pre]
+            # Reported whether or not they gated anything: "the arms differ"
+            # and "either arm is doing something" are separate claims, and a
+            # table that carries only the first invites the second to be
+            # assumed.
+            if rank_stats is not None:
+                for _k in ("rank_frac_a", "rank_frac_b", "rank_frac_max",
+                           "rank_mean_a", "rank_mean_b"):
+                    scores_df[f"{pre}_{_k}"] = rank_stats[_k]
+                    extra_cols.append(f"{pre}_{_k}")
             subsets[pre] = mask
             # Confounding check: if the contrast IS a batch, the bins that
             # separate the groups are the bins that separate the batches.
