@@ -3723,3 +3723,59 @@ def test_the_rank_is_not_put_through_the_per_cell_corrections(tmp_path):
         for m in re.finditer(re.escape(fn), src):
             seg = src[max(0, m.start() - 120):m.start()]
             assert "NRc" not in seg.split("\n")[-1], fn
+
+
+def test_a_null_z_matrix_still_finds_its_statistic_s_rank(tmp_path):
+    """A _z matrix is the same statistic already referenced to its own draws.
+    Its evidence lives in that statistic's rank file, not in a '_z_rank' that
+    was never written."""
+    mod = _mod()
+    assert mod.rank_filename_for("/x/concordance_coordination_z.parquet") == \
+        "concordance_coordination_rank.parquet"
+    assert mod.rank_filename_for(
+        "/x/concordance_direction_logor_z.parquet") == \
+        "concordance_direction_logor_rank.parquet"
+
+
+def test_a_null_z_matrix_runs_through_heatmap_contrast_and_volcano(tmp_path):
+    """The z is a plain cells x bins matrix on a per-cell calibrated scale,
+    so it needs no new plumbing here -- it is passed as --matrix.  Being
+    uncensored is what makes it usable as the volcano's x-axis, which the
+    rank is not."""
+    import pandas as pd
+    rng = np.random.default_rng(3)
+    n, nb = 60, 40
+    ct = np.repeat(np.arange(4), n // 4)
+    tum = ct < 2
+    Z = rng.normal(0, 1, (n, nb))
+    Z[:, :10] += np.where(tum[:, None], 6.0, 0.5)     # real, large
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    mat = tmp_path / "concordance_coordination_z.parquet"
+    pd.DataFrame(Z, index=cells, columns=bins).to_parquet(mat)
+    s = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        s, sep="\t", index=False)
+    out = tmp_path / "zout"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "10",
+         "--n-permutations", "30", "--contrast", "tumour=CT0,CT1",
+         "--volcano", "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert (out / "volcano_gch_tumour.pdf").exists()
+    assert (out / "marker_heatmap_gch.png").exists()
+    t = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
+    idx = t["bin"].str.split(":").str[1].astype(int) // 250_000
+    # The volcano's x-axis is a difference of z, so it carries the effect
+    # size rather than saturating: the planted bins sit near the 5.5 sd they
+    # were built with.
+    d = t.loc[idx < 10, "contrast_tumour_diff"]
+    assert d.mean() > 4.0
+    assert t.loc[idx >= 10, "contrast_tumour_diff"].abs().mean() < 1.0
+    # No rank file beside it, so the gate simply does not engage.
+    assert "contrast_tumour_rank_frac_max" not in t.columns

@@ -1377,7 +1377,13 @@ def rank_filename_for(matrix_path):
     """
     stem = Path(matrix_path).name
     if stem.startswith("concordance_") and stem.endswith(".parquet"):
-        return f"{stem[:-len('.parquet')]}_rank.parquet"
+        base = stem[:-len(".parquet")]
+        # A _z matrix is the same statistic already referenced to its own
+        # draws; its evidence still lives in that statistic's rank file, not
+        # in a "_z_rank" that was never written.
+        if base.endswith("_z"):
+            base = base[:-2]
+        return f"{base}_rank.parquet"
     return "concordance_coordination_rank.parquet"
 
 

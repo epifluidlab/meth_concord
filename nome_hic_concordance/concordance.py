@@ -1529,6 +1529,108 @@ _Q_LEVELS = np.unique(np.concatenate([
     np.logspace(-4, -1, 16), np.linspace(0.1, 1.0, 25)]))
 
 
+def null_z_matrix(
+    obs: np.ndarray,
+    null_draws: list[np.ndarray],
+    strata: np.ndarray,
+    testable: np.ndarray,
+    prior_dof: float | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Each cell-bin in units of ITS OWN draws' spread.
+
+        z = (obs - mean_d null_d) / sd_d(null_d)
+
+    A DIFFERENT STATISTIC FROM ``empirical_rank``, and better for some jobs.
+    The rank borrows a stratum's draws to buy p-resolution, which costs an
+    exchangeability assumption and returns a CENSORED value -- it cannot
+    exceed -log10(2/(pool+1)), so it saturates in exactly the well-measured
+    bins and makes a poor effect size.  This uses only the bin's own draws:
+    no exchangeability assumption at all, no ceiling, and a scale that is
+    still comparable across bins because each one is divided by what the
+    pipeline's noise actually is at that depth and that marginal.  That is
+    what a volcano's x-axis needs and the rank cannot supply.
+
+    What it costs is the denominator.  An sd from K draws has a relative
+    standard error of about 1/sqrt(2(K-1)) -- 24% at K = 10 -- and across
+    millions of cell-bins some draws will agree by chance, sd will land near
+    zero and z will explode.  So the per-bin variance is MODERATED toward
+    the typical variance of its stratum, the same move limma makes for
+    small-n variances:
+
+        s^2 = (d0 * s0^2 + (K-1) * s_bin^2) / (d0 + K - 1)
+
+    with s0^2 the stratum's median null variance and d0 = K - 1 by default,
+    i.e. equal weight to the bin and to its stratum.  A bin whose own draws
+    are informative keeps its own scale; one whose draws collapsed borrows
+    its neighbours' rather than reporting an infinity.  Strata are the same
+    depth-by-openness bands ``empirical_rank`` pools over, because they are
+    the two things that set the spread.
+
+    Returns the z matrix (NaN where not testable) and diagnostics.
+    """
+    obs = np.asarray(obs, float)
+    strata = np.asarray(strata)
+    testable = np.asarray(testable, bool) & np.isfinite(obs)
+    if strata.shape != obs.shape:
+        raise ValueError(
+            f"strata must be per (cell, bin) like obs {obs.shape}, got "
+            f"{strata.shape} -- rank_strata returns the right shape; a 1-D "
+            f"per-bin array has to be broadcast to the cells first")
+    out = np.full(obs.shape, np.nan, dtype=np.float64)
+    K = len(null_draws)
+    if K < 2 or not testable.any():
+        return out, {"n_scored": 0, "n_draws": K, "n_moderated": 0,
+                     "frac_own_variance": float("nan")}
+    NS = np.stack([np.asarray(d, float) for d in null_draws])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu = np.nanmean(NS, axis=0)
+        var = np.nanvar(NS, axis=0, ddof=1)
+    d0 = float(K - 1) if prior_dof is None else float(prior_dof)
+
+    # Stratum-typical variance, from the bins that HAVE one.  Median, not
+    # mean: a handful of huge-variance bins would otherwise set the floor
+    # for the whole stratum and flatten every z in it.
+    s0 = np.full(obs.shape, np.nan)
+    for s in np.unique(strata[testable]):
+        m = testable & (strata == s)
+        v = var[m]
+        v = v[np.isfinite(v) & (v > 0)]
+        if v.size:
+            s0[m] = float(np.median(v))
+    # A stratum with no usable variance anywhere falls back to the global
+    # median rather than dropping its bins.
+    g = var[testable & np.isfinite(var) & (var > 0)]
+    if g.size:
+        s0 = np.where(np.isfinite(s0), s0, float(np.median(g)))
+
+    v_bin = np.where(np.isfinite(var), var, 0.0)
+    have = np.isfinite(s0)
+    v_mod = np.where(
+        have, (d0 * np.nan_to_num(s0) + (K - 1) * v_bin) / (d0 + K - 1),
+        v_bin)
+    # The NUMERATOR carries the draw-mean's own variance too.  With obs and
+    # each null draw at variance s^2, obs - mean_d has variance
+    # s^2 (1 + 1/K), so an uncorrected z would come back at sd
+    # sqrt(1 + 1/K) -- 1.049 at K = 10 -- under a pure null.  Small, but the
+    # whole claim of calling it "z" is that 2 means two sd.
+    sd = np.sqrt(v_mod * (1.0 + 1.0 / K))
+    ok = testable & np.isfinite(mu) & np.isfinite(sd) & (sd > 0)
+    out[ok] = (obs[ok] - mu[ok]) / sd[ok]
+    # How much of the final scale is the bin's own evidence rather than
+    # borrowed: 1.0 would be no moderation at all.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        share = np.where(v_mod > 0, (K - 1) * v_bin / (d0 + K - 1) / v_mod,
+                         np.nan)
+    return out, {
+        "n_scored": int(ok.sum()),
+        "n_draws": K,
+        "prior_dof": d0,
+        "n_moderated": int((testable & have).sum()),
+        "frac_own_variance": float(np.nanmedian(share[ok]))
+        if ok.any() else float("nan"),
+    }
+
+
 def rank_self_calibration(
     null_draws: list[np.ndarray],
     strata: np.ndarray,
@@ -1625,6 +1727,7 @@ def compute_signed_concordance_matrix(
     emit_null: bool = False,
     null_draws: int = 1,
     null_rank: bool = False,
+    null_z: bool = False,
     null_rank_scope: str = "cell",
     null_rank_statistics: tuple[str, ...] = ("coordination",
                                              "direction_logor"),
@@ -1735,8 +1838,8 @@ def compute_signed_concordance_matrix(
     uses_expected = baseline in ("distance-matched", "distance-pooled")
     # The rank IS a comparison against the drawn null, so asking for one
     # without the other is never what the caller meant.
-    emit_null = bool(emit_null or null_rank)
-    if null_rank and int(null_draws) < 1:
+    emit_null = bool(emit_null or null_rank or null_z)
+    if (null_rank or null_z) and int(null_draws) < 1:
         null_draws = 1
     if concordance_combine not in ("signed-diff", "log2-ratio", "linked-only",
                                    "concordant-diff", "concordant-signed",
@@ -2332,13 +2435,14 @@ def compute_signed_concordance_matrix(
         }
     # ---- Rank of each observed bin against its own drawn null ------------
     rank_components = None
+    z_components = None
     null_rank_calibration = None
-    if null_rank and not _null_rates:
+    if (null_rank or null_z) and not _null_rates:
         logger.warning(
             "--null-rank asked for but no drawn null is available: it needs "
             "a non-contact expected pool (--baseline distance-matched or "
             "distance-pooled) to draw from.  No rank matrix written.")
-    if null_rank and _null_rates:
+    if (null_rank or null_z) and _null_rates:
         _want = (tuple(components) if "all" in tuple(null_rank_statistics)
                  else tuple(null_rank_statistics))
         _unknown = [k for k in _want if k not in components]
@@ -2369,27 +2473,47 @@ def compute_signed_concordance_matrix(
             index=cell_names, columns=sorted_bins).to_numpy(float)
         _testable = _testable & np.isfinite(_openness)
         _strata = rank_strata(raw_counts["n_linked"], _openness)
-        rank_components = {}
+        rank_components = {} if null_rank else None
+        z_components = {} if null_z else None
         for _name in _want:
             _draws = [decompose_components(_nr[0], _nr[1], _e_o, _e_c)[_name]
                       for _nr in _null_rates]
-            _arr, _info = empirical_rank(
-                components[_name].to_numpy(float), _draws, _strata,
-                _testable, scope=str(null_rank_scope),
-                min_pool=int(null_rank_min_pool))
-            _df = pd.DataFrame(_arr, index=cell_names, columns=sorted_bins)
-            _df.columns.name = "bin"
-            _df.index.name = "cell"
-            rank_components[_name] = _df
-            _res = (2.0 / (_info["median_pool"] + 1.0)
-                    if _info["median_pool"] else float("nan"))
-            logger.info(
-                "Null rank [%s]: %d of %d cell-bins scored against %s pools "
-                "over %d strata (median pool %d draws -> smallest reportable "
-                "two-sided p = %.2g); %d fell back to the joint pool.",
-                _name, _info["n_scored"], _testable.size, _info["scope"],
-                _info["n_strata"], _info["median_pool"], _res,
-                _info["n_fallback"])
+            if null_rank:
+                _arr, _info = empirical_rank(
+                    components[_name].to_numpy(float), _draws, _strata,
+                    _testable, scope=str(null_rank_scope),
+                    min_pool=int(null_rank_min_pool))
+                _df = pd.DataFrame(_arr, index=cell_names,
+                                   columns=sorted_bins)
+                _df.columns.name = "bin"
+                _df.index.name = "cell"
+                rank_components[_name] = _df
+                _res = (2.0 / (_info["median_pool"] + 1.0)
+                        if _info["median_pool"] else float("nan"))
+                logger.info(
+                    "Null rank [%s]: %d of %d cell-bins scored against %s "
+                    "pools over %d strata (median pool %d draws -> smallest "
+                    "reportable two-sided p = %.2g); %d fell back to the "
+                    "joint pool.",
+                    _name, _info["n_scored"], _testable.size, _info["scope"],
+                    _info["n_strata"], _info["median_pool"], _res,
+                    _info["n_fallback"])
+            if null_z:
+                _zarr, _zinfo = null_z_matrix(
+                    components[_name].to_numpy(float), _draws, _strata,
+                    _testable)
+                _zdf = pd.DataFrame(_zarr, index=cell_names,
+                                    columns=sorted_bins)
+                _zdf.columns.name = "bin"
+                _zdf.index.name = "cell"
+                z_components[_name] = _zdf
+                logger.info(
+                    "Null z [%s]: %d of %d cell-bins scored against their "
+                    "OWN %d draws; the moderated sd is %.0f%% the bin's own "
+                    "variance and the rest its stratum's.  Uncensored, so "
+                    "unlike the rank this one works as an effect size.",
+                    _name, _zinfo["n_scored"], _testable.size,
+                    _zinfo["n_draws"], 100 * _zinfo["frac_own_variance"])
         # IS THE DIRECTION RANK JUST THE MAGNITUDE RANK.  Coordination moves
         # mass out of `mixed` into BOTH concordant cells equally, so it
         # raises S = O_open + O_closed while leaving D = O_open - O_closed
@@ -2430,7 +2554,9 @@ def compute_signed_concordance_matrix(
                         "openness.", 100 * abs(_r))
         if not rank_components:
             rank_components = None
-        elif len(_null_rates) < 2:
+        if not z_components:
+            z_components = None
+        if rank_components and len(_null_rates) < 2:
             logger.warning(
                 "--null-rank with --null-draws 1: each bin contributes a "
                 "single draw to its stratum pool, so the pool is only as "
@@ -2650,6 +2776,15 @@ def compute_signed_concordance_matrix(
                     out_path / f"concordance_{_name}_rank.parquet")
                 _df.to_csv(
                     out_path / f"concordance_{_name}_rank.tsv", sep="\t")
+        # Per-bin z against that bin's OWN draws.  Emitted separately from
+        # the rank because it answers a different question: the rank is
+        # calibrated evidence (censored, good for gating), the z is a
+        # calibrated EFFECT SIZE (uncensored, good for a volcano axis and
+        # for a heatmap whose colours mean the same thing in every cell).
+        if z_components is not None:
+            for _name, _df in z_components.items():
+                _df.to_parquet(out_path / f"concordance_{_name}_z.parquet")
+                _df.to_csv(out_path / f"concordance_{_name}_z.tsv", sep="\t")
         if null_rank_calibration:
             import json as _json
             with open(out_path / "null_rank_calibration.json", "w") as _fh:
@@ -2724,6 +2859,9 @@ def compute_signed_concordance_matrix(
         # Signed -log10(p) against the per-stratum drawn null, or None when
         # --null-rank was off.  Keyed by the statistic it ranks.
         "null_rank":             rank_components,
+        # Per-bin z against that bin's own draws: an uncensored effect size
+        # on a per-cell calibrated scale.  None unless --null-z.
+        "null_z":                z_components,
         # Holding out one drawn null and scoring it: the exceedance rates
         # there ARE this run's false-positive rate.  None below 2 draws.
         "null_rank_calibration": null_rank_calibration,

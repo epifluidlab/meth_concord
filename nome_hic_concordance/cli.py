@@ -378,6 +378,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "unaffected (observed and null meet the same expected).",
     )
     parser.add_argument(
+        "--null-z", action="store_true",
+        help="Also emit concordance_<component>_z.parquet: each cell-bin in "
+             "units of the spread of ITS OWN drawn nulls.  A DIFFERENT "
+             "STATISTIC FROM --null-rank, and the one to reach for when the "
+             "value has to behave like a measurement.  The rank borrows a "
+             "stratum's draws to buy p-resolution, which costs an "
+             "exchangeability assumption and returns a CENSORED number -- it "
+             "cannot exceed -log10(2/(pool+1)), so it saturates in exactly "
+             "the well-measured bins and makes a poor volcano axis.  The z "
+             "uses only the bin's own draws: no exchangeability assumption, "
+             "no ceiling, and still comparable across bins because each is "
+             "divided by what this pipeline's noise actually is at that "
+             "depth and that marginal.  Its cost is the denominator -- an sd "
+             "from K draws carries about 1/sqrt(2(K-1)) relative error, 24 "
+             "percent at K=10 -- so the per-bin variance is moderated toward "
+             "its stratum's median the way limma moderates small-n "
+             "variances, which also stops a bin whose draws happened to "
+             "agree from returning an infinity.  Use 8 or more --null-draws. "
+             "Feed the matrix straight to scripts/celltype_marker_bins.py "
+             "--matrix for a heatmap, a contrast and a volcano on a per-cell "
+             "calibrated scale; no --contrast-center is needed, the "
+             "referencing already did that job per bin.")
+    parser.add_argument(
         "--null-rank-scope", choices=["cell", "joint"], default="cell",
         help="Whose draws go in the pool.  'cell' (default) pools within "
              "each cell, so every cell is scored against its own null and a "
@@ -1647,9 +1670,10 @@ def run_context(
                 dm_window_mb=args.dm_window_mb,
                 dm_dist_bin=args.dm_dist_bin_bp,
                 dm_prior=args.dm_prior,
-                emit_null=(args.emit_null or args.null_rank),
+                emit_null=(args.emit_null or args.null_rank or args.null_z),
                 null_draws=args.null_draws,
                 null_rank=args.null_rank,
+                null_z=args.null_z,
                 null_rank_scope=args.null_rank_scope,
                 null_rank_statistics=tuple(args.null_rank_statistics),
                 null_rank_min_pairs=args.null_rank_min_pairs,
@@ -1689,9 +1713,10 @@ def run_context(
                     dm_window_mb=args.dm_window_mb,
                     dm_dist_bin=args.dm_dist_bin_bp,
                 dm_prior=args.dm_prior,
-                emit_null=(args.emit_null or args.null_rank),
+                emit_null=(args.emit_null or args.null_rank or args.null_z),
                 null_draws=args.null_draws,
                 null_rank=args.null_rank,
+                null_z=args.null_z,
                 null_rank_scope=args.null_rank_scope,
                 null_rank_statistics=tuple(args.null_rank_statistics),
                 null_rank_min_pairs=args.null_rank_min_pairs,

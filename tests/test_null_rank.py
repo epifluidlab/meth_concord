@@ -443,7 +443,7 @@ def test_every_null_flag_reaches_step_five():
     params = set(inspect.signature(
         cc.compute_signed_concordance_matrix).parameters)
     flags = set(re.findall(r'"--(null-[a-z-]+)"', src))
-    assert flags == {"null-draws", "null-rank", "null-rank-scope",
+    assert flags == {"null-draws", "null-rank", "null-z", "null-rank-scope",
                      "null-rank-statistics", "null-rank-min-pairs",
                      "null-rank-min-pool"}
     for flag in flags:
@@ -506,3 +506,147 @@ def test_the_calibration_json_carries_a_tail_resolved_quantile_sketch():
     assert np.all(np.diff(lv) > 0)
     # At least a third of the levels below 0.05, or the tail is unresolved.
     assert float(np.mean(lv < 0.05)) > 0.3
+
+
+# ---------------------------------------------------------------------------
+# --null-z: the same referencing, as an effect size instead of evidence
+# ---------------------------------------------------------------------------
+
+
+def test_z_is_calibrated_on_a_pure_null():
+    """Called z, so 2 has to mean two sd.  In particular the numerator
+    carries the draw-mean's own variance -- obs - mean_d has variance
+    s^2 (1 + 1/K) -- and an uncorrected version comes back wide."""
+    rng = np.random.default_rng(7)
+    n_cells, n_bins, K = 8, 900, 10
+    st = np.zeros((n_cells, n_bins), dtype=np.int32)
+    keep = np.ones((n_cells, n_bins), bool)
+    draws = [rng.normal(0, 1, (n_cells, n_bins)) for _ in range(K)]
+    obs = rng.normal(0, 1, (n_cells, n_bins))
+    z, info = cc.null_z_matrix(obs, draws, st, keep)
+    v = z[np.isfinite(z)]
+    assert abs(float(np.mean(v))) < 0.05
+    assert abs(float(np.std(v)) - 1.0) < 0.08, float(np.std(v))
+    assert info["n_draws"] == K
+
+
+def test_z_tracks_the_effect_where_the_rank_saturates():
+    """The rank cannot exceed -log10(2/(pool+1)), so it flattens exactly the
+    bins that are most clearly real; the z has no ceiling.  That is the
+    difference that matters for a volcano axis."""
+    rng = np.random.default_rng(8)
+    n_cells, n_bins, K = 8, 600, 10
+    st = np.zeros((n_cells, n_bins), dtype=np.int32)
+    keep = np.ones((n_cells, n_bins), bool)
+    draws = [rng.normal(0, 1, (n_cells, n_bins)) for _ in range(K)]
+    obs = rng.normal(0, 1, (n_cells, n_bins))
+    # Both past the pool's resolution floor -- which is the regime the rank
+    # cannot describe and a volcano axis lives in.
+    obs[:, :20] += 6.0
+    obs[:, 20:40] += 18.0                  # three times as large again
+    z, _ = cc.null_z_matrix(obs, draws, st, keep)
+    r, _ = cc.empirical_rank(obs, draws, st, keep, scope="joint")
+
+    z_mid, z_big = np.nanmean(z[:, :20]), np.nanmean(z[:, 20:40])
+    r_mid, r_big = np.nanmean(r[:, :20]), np.nanmean(r[:, 20:40])
+    # z separates the two effect sizes; the rank has run out of room.
+    assert z_big > 2.5 * z_mid
+    assert r_big < 1.05 * r_mid
+    ceiling = -np.log10(2.0 / (n_cells * n_bins * K + 1))
+    assert np.nanmax(np.abs(r)) <= ceiling + 1e-9
+    assert np.nanmax(np.abs(z)) > ceiling
+
+
+def test_a_bin_whose_draws_collapsed_borrows_its_stratum_instead_of_exploding():
+    """Across millions of cell-bins some sets of draws agree by chance.  An
+    unmoderated sd goes to zero there and z goes to infinity."""
+    rng = np.random.default_rng(9)
+    n_cells, n_bins, K = 6, 400, 10
+    st = np.zeros((n_cells, n_bins), dtype=np.int32)
+    keep = np.ones((n_cells, n_bins), bool)
+    draws = [rng.normal(0, 1, (n_cells, n_bins)) for _ in range(K)]
+    for d in draws:                        # bin 0: every draw identical
+        d[:, 0] = 0.0
+    obs = rng.normal(0, 1, (n_cells, n_bins))
+    obs[:, 0] = 0.5
+    z, info = cc.null_z_matrix(obs, draws, st, keep)
+    assert np.isfinite(z[:, 0]).all()
+    assert np.abs(z[:, 0]).max() < 5.0
+    assert 0.0 < info["frac_own_variance"] <= 1.0
+
+
+def test_moderation_leaves_an_informative_bin_on_its_own_scale():
+    """Half weight to the bin and half to its stratum at the default
+    d0 = K - 1, so a bin with a real spread is not flattened toward its
+    neighbours."""
+    rng = np.random.default_rng(10)
+    n_cells, n_bins, K = 6, 500, 10
+    st = np.zeros((n_cells, n_bins), dtype=np.int32)
+    keep = np.ones((n_cells, n_bins), bool)
+    draws = [rng.normal(0, 1, (n_cells, n_bins)) for _ in range(K)]
+    obs = rng.normal(0, 1, (n_cells, n_bins))
+    _, info = cc.null_z_matrix(obs, draws, st, keep)
+    assert 0.4 < info["frac_own_variance"] < 0.6
+    # No moderation at all when the prior is given no weight.
+    _, none = cc.null_z_matrix(obs, draws, st, keep, prior_dof=0.0)
+    assert none["frac_own_variance"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_strata_supply_the_moderation_target_not_one_global_number():
+    """A stratum of genuinely wide bins must not be squeezed toward a
+    stratum of narrow ones -- that would be the unstratified-pool mistake
+    in the denominator."""
+    rng = np.random.default_rng(11)
+    n_cells, n_bins, K = 6, 800, 10
+    wide = np.arange(n_bins) >= 400
+    sd = np.where(wide, 5.0, 0.2)[None, :].repeat(n_cells, 0)
+    st = np.where(wide, 1, 0).astype(np.int32)[None, :].repeat(n_cells, 0)
+    keep = np.ones(sd.shape, bool)
+    draws = [rng.normal(0, sd) for _ in range(K)]
+    obs = rng.normal(0, sd)
+    z, _ = cc.null_z_matrix(obs, draws, st, keep)
+    for half in (slice(0, 400), slice(400, None)):
+        v = z[:, half]
+        assert abs(float(np.nanstd(v)) - 1.0) < 0.12, float(np.nanstd(v))
+    # Pooling the two strata into one target breaks exactly that.
+    z1, _ = cc.null_z_matrix(obs, draws, np.zeros_like(st), keep)
+    assert abs(float(np.nanstd(z1[:, :400])) - 1.0) > 0.3
+
+
+def test_null_z_is_emitted_as_its_own_matrix(tmp_path):
+    res = _run(tmp_path, planted=set(range(0, 60, 7)), n_draws=10)
+    assert res["null_z"] is None          # off by default
+
+    out = tmp_path / "zout"
+    src = tmp_path / "zsrc"
+    src.mkdir(parents=True)
+    r = cc.compute_signed_concordance_matrix(
+        null_rank_paths(src, n_cells=12, n_bins=60,
+                        planted=set(range(0, 60, 7)), coord=0.8),
+        bin_size=10_000, min_distance=500, min_gch_sites=2,
+        baseline="distance-matched", dm_dist_bin=500, dm_prior="shared",
+        output_dir=str(out), save_outputs=True, use_rwr=False, n_threads=1,
+        eb_min_obs=50, null_draws=10, null_z=True, null_rank=False)
+    assert r["null_z"] is not None
+    assert r["null_rank"] is None         # independent switches
+    names = {p.name for p in out.glob("*.parquet")}
+    assert "concordance_coordination_z.parquet" in names
+    assert "concordance_coordination_rank.parquet" not in names
+    # And it finds the planted bins with the right sign.
+    z = r["null_z"]["coordination"].to_numpy(float)
+    idx = np.array([int(b.split(":")[1]) // 10_000
+                    for b in r["coordination"].columns])
+    pl = np.isin(idx, list(range(0, 60, 7)))
+    assert np.nanmean(z[:, pl]) > 2.0
+    assert abs(np.nanmean(z[:, ~pl])) < 0.5
+
+
+def test_null_z_reaches_step_five_from_the_cli():
+    import inspect
+    import re
+    from nome_hic_concordance import cli
+    src = inspect.getsource(cli)
+    assert '"--null-z"' in src
+    assert len(re.findall(r"\bnull_z=", src)) >= 2
+    assert "null_z" in inspect.signature(
+        cc.compute_signed_concordance_matrix).parameters
