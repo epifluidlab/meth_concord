@@ -166,6 +166,43 @@ def load_counts(counts_dir, index, columns):
     return out
 
 
+NULL_REFERENCES = ("none", "subtract", "z")
+
+
+def null_count_keys(draw):
+    """Mirror of concordance._null_keys, for the counts written on disk."""
+    sfx = "" if int(draw) == 0 else str(int(draw))
+    return (f"k_null{sfx}_open", f"k_null{sfx}_closed",
+            f"k_null{sfx}_mixed", f"n_null{sfx}")
+
+
+def load_null_counts(counts_dir, index, columns, observed, max_draws=256):
+    """The drawn-null replicates, shaped like ``observed`` so the same
+    pooling code runs on them unchanged.
+
+    Only the OBSERVED side is replaced.  The expected pool is the same E in
+    both -- that is what makes the comparison a statement about O and not
+    about two different baselines -- so k_dm_* and n_dm are carried over
+    from the real counts verbatim.
+
+    Returns [] when the run was made without --emit-null, which the caller
+    turns into an error only if a reference was actually asked for.
+    """
+    d = _counts_dir(counts_dir)
+    out = []
+    for i in range(int(max_draws)):
+        keys = null_count_keys(i)
+        if not all((d / f"{k}.parquet").exists() for k in keys):
+            break
+        rep = dict(observed)
+        for k, tgt in zip(keys, ("k_open", "k_closed", "k_mixed",
+                                 "n_linked")):
+            rep[tgt] = pd.read_parquet(d / f"{k}.parquet").reindex(
+                index=index, columns=columns).to_numpy(float)
+        out.append(rep)
+    return out
+
+
 def load_prior(counts_dir):
     """The prior the run fitted, so a pooled estimate is shrunk like the
     per-bin ones were rather than by something invented here."""
@@ -219,7 +256,30 @@ def which_statistic_matches(M, counts, alpha, cap=200_000, seed=0):
     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
-def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat):
+def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None):
+    """Sum this position's counts across the given bins, then the statistic.
+
+    Split out so the drawn-null replicates go through byte-identical
+    arithmetic: any asymmetry between how the observed and the null are
+    pooled would land in the difference and read as signal.
+    """
+    import numpy as _np
+    if _dc_fn is None:
+        from nome_hic_concordance.concordance import decompose_components
+        _dc_fn = decompose_components
+    a0 = float(sum(alpha.values()))
+    ao, ac = float(alpha["open"]), float(alpha["closed"])
+    g = lambda k: _np.nansum(counts[k][:, cols], axis=1)
+    n_l, n_e = g("n_linked"), g("n_dm")
+    o_o = (ao + g("k_open")) / (a0 + n_l)
+    o_c = (ac + g("k_closed")) / (a0 + n_l)
+    e_o = (ao + g("k_dm_open")) / (a0 + n_e)
+    e_c = (ac + g("k_dm_closed")) / (a0 + n_e)
+    return _dc_fn(o_o, o_c, e_o, e_c)[stat], n_l
+
+
+def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
+                    null_counts=None, reference="none"):
     """Sum the counts at each position, THEN compute the statistic once.
 
     Averaging a per-bin statistic over a region is not the region's
@@ -236,11 +296,51 @@ def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat):
     in size, so a small one is a single bin stretched across the axis while
     a large one is forty averaged -- pooling makes both one estimate from
     whatever pairs they contain.
+
+    ``reference`` PUTS THE ZERO WHERE THE DRAWN NULL IS.  C and the log
+    odds ratio are referenced to E, and E controls the bin's marginal --
+    but not the fact that the statistic MEANS different amounts at
+    different marginals.  Coordination raises S = O_open + O_closed while
+    D = O_open - O_closed stays pinned at the marginal by the exact
+    per-pair identity, so
+
+        L = log[(S_O + D)/(S_O - D)] - log[(S_E + D)/(S_E - D)]
+
+    and pure coordination at pbar = 0.10 drives L to +1.73 while the same
+    coordination at 0.90 drives it to -1.73.  A profile across PMDs, LADs
+    or late-replicating domains runs straight along that gradient, so its
+    shape is partly the marginal's shape.
+
+    The drawn null is re-paired from the SAME bins' ends, so it carries the
+    same marginal and the same depth and none of the coordination.  Pooled
+    over the same bins at the same position, it says what this statistic
+    reads when the answer is nothing:
+
+      "subtract"  v - mean_d(null_d)   the excess over that, in the
+                                       statistic's own units
+      "z"        (v - mean_d) / sd_d   the same in units of the null's own
+                                       spread at that position
+
+    Referencing has to happen AFTER pooling, on counts summed over the same
+    bins: a pooled value against a per-bin null would compare estimates of
+    different depths, which is the attenuation this function exists to
+    avoid.
+
+    WHAT IT DOES NOT FIX.  Neither form removes the log odds ratio's
+    marginal artifact.  The drawn null has C ~ 0, so its L sits at 0 at
+    every marginal; the artifact is a REAL C seen through the
+    marginal-dependent map above, and a null with no C cannot contain it.
+    Measured on a fixture with identical planted coordination at pbar 0.12
+    and 0.55, L read +0.588 against -0.110 raw, +0.548 against -0.018 under
+    "subtract", and +3.58 against -0.38 under "z" -- the gap does not
+    close.  For C the marginal effect is compression rather than
+    amplification, and the null compresses with it, so "z" does help there:
+    the same two regions sat at 0.37 of each other raw and 0.52 under "z".
+    Read C for magnitude; L's SIGN is not comparable across positions of
+    differing openness, referenced or not.
     """
     import numpy as _np
     from nome_hic_concordance.concordance import decompose_components
-    a0 = float(sum(alpha.values()))
-    ao, ac = float(alpha["open"]), float(alpha["closed"])
     P = _np.full((len(rows), total), _np.nan)
     n_bins = _np.zeros(total, int)
     order = _np.argsort(pos_idx, kind="stable")
@@ -252,13 +352,20 @@ def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat):
         n_bins[i] = cols.size
         if cols.size == 0:
             continue
-        g = lambda k: _np.nansum(counts[k][:, cols], axis=1)
-        n_l, n_e = g("n_linked"), g("n_dm")
-        o_o = (ao + g("k_open")) / (a0 + n_l)
-        o_c = (ac + g("k_closed")) / (a0 + n_l)
-        e_o = (ao + g("k_dm_open")) / (a0 + n_e)
-        e_c = (ac + g("k_dm_closed")) / (a0 + n_e)
-        v = decompose_components(o_o, o_c, e_o, e_c)[stat]
+        v, n_l = _pooled_stat(counts, cols, alpha, stat,
+                              decompose_components)
+        if reference != "none" and null_counts:
+            nv = _np.stack([
+                _pooled_stat(nc, cols, alpha, stat, decompose_components)[0]
+                for nc in null_counts])
+            with _np.errstate(invalid="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                mu = _np.nanmean(nv, axis=0)
+                if reference == "z":
+                    sd = _np.nanstd(nv, axis=0, ddof=1)
+                    v = (v - mu) / _np.where(sd > 0, sd, _np.nan)
+                else:
+                    v = v - mu
         P[:, i] = _np.where(n_l > 0, v, _np.nan)
     return P, rows, n_bins
 
@@ -335,8 +442,12 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
         keep = M.index.intersection(cells)
         rows = M.index.get_indexer(keep)
         sub = {k: v[rows] for k, v in pooled["counts"].items()}
-        P, idx, n_bins = pooled_profiles(sub, keep, bin_idx, pos_idx, total,
-                                         pooled["alpha"], pooled["stat"])
+        P, idx, n_bins = pooled_profiles(
+            sub, keep, bin_idx, pos_idx, total, pooled["alpha"],
+            pooled["stat"],
+            null_counts=[{k: v[rows] for k, v in nc.items()}
+                         for nc in pooled.get("null") or []],
+            reference=pooled.get("reference", "none"))
     else:
         P, idx, n_bins = cell_profiles(M, ct, members, bin_idx, pos_idx,
                                        total)
@@ -404,6 +515,9 @@ def per_domain_values(M, ct, members, bin_idx, pos_idx, dom_idx, n_flank,
     rows = M.index.get_indexer(keep) if pooled is not None else None
     sub = ({k: v[rows] for k, v in pooled["counts"].items()}
            if pooled is not None else None)
+    sub_null = ([{k: v[rows] for k, v in nc.items()}
+                 for nc in pooled.get("null") or []]
+                if pooled is not None else None)
     # TWO positions, not the full scaled axis: this domain's flank and its
     # body.  The scaled axis exists to draw a shape, and a shape is not
     # what a per-domain value is -- collapsing it also avoids recomputing
@@ -419,8 +533,10 @@ def per_domain_values(M, ct, members, bin_idx, pos_idx, dom_idx, n_flank,
             two = np.where((pi_d >= body_lo) & (pi_d < body_hi), 1,
                            0).astype(int)
             if pooled is not None:
-                P, _r, _n = pooled_profiles(sub, keep, bi_d, two, 2,
-                                            pooled["alpha"], pooled["stat"])
+                P, _r, _n = pooled_profiles(
+                    sub, keep, bi_d, two, 2, pooled["alpha"],
+                    pooled["stat"], null_counts=sub_null,
+                    reference=pooled.get("reference", "none"))
             else:
                 P, _r, _n = cell_profiles(M, ct, members, bi_d, two, 2)
             if not P.shape[0]:
@@ -722,7 +838,56 @@ def main(argv=None) -> int:
                          "Default: read from the --matrix filename.  Any "
                          "component decompose_components emits works -- they "
                          "are all functions of the same four pooled rates, "
-                         "so none is privileged.")
+                         "so none is privileged.  To put the ZERO at the "
+                         "drawn null instead of at E, add --null-reference; "
+                         "it is a separate axis rather than more choices "
+                         "here, because this list is taken from "
+                         "decompose_components at import so the two cannot "
+                         "drift, and every statistic in it can be "
+                         "null-referenced.")
+    ap.add_argument("--null-reference", choices=list(NULL_REFERENCES),
+                    default="none",
+                    help="Reference the POOLED statistic to a drawn null "
+                         "pooled over the same bins.  Needs a step-5 run "
+                         "made with --emit-counts AND --emit-null (use "
+                         "--null-draws 5 or more for 'z').  WHY A PROFILE "
+                         "NEEDS THIS.  E controls each bin's marginal, but "
+                         "not the fact that the statistic MEANS different "
+                         "amounts at different marginals: coordination "
+                         "raises S = O_open + O_closed while "
+                         "D = O_open - O_closed stays pinned at the marginal "
+                         "by the exact per-pair identity, so pure "
+                         "coordination at pbar = 0.10 drives the log odds "
+                         "ratio to +1.73 and the same coordination at 0.90 "
+                         "drives it to -1.73.  A profile across PMDs, LADs "
+                         "or late-replicating domains runs along exactly "
+                         "that gradient, so part of the shape it draws is "
+                         "the marginal's shape.  The drawn null is re-paired "
+                         "from the same bins' ends, so it carries the same "
+                         "marginal and depth and none of the coordination.  "
+                         "'subtract' plots the excess over it in the "
+                         "statistic's own units, which puts the zero at 'no "
+                         "coordination' rather than at 'equal to E' -- it "
+                         "removes the half-split offset, the distance-"
+                         "matching residual and the prior floor.  'z' also "
+                         "divides by the spread across draws, so the axis "
+                         "reads in units of what this pipeline's noise "
+                         "actually is at that depth and marginal.  Applied "
+                         "AFTER pooling, never per bin.  WHAT IT DOES NOT "
+                         "FIX: neither form removes the log odds ratio's "
+                         "marginal artifact.  That artifact is a real C seen "
+                         "through a marginal-dependent map, and the drawn "
+                         "null has no C, so it cannot contain it -- measured "
+                         "on a fixture with IDENTICAL planted coordination "
+                         "at pbar 0.12 and 0.55, L read +0.588 against "
+                         "-0.110 raw and the gap did not close under either "
+                         "reference.  For C the marginal effect is "
+                         "compression rather than amplification and the null "
+                         "compresses with it, so 'z' does help there: the "
+                         "same two regions came to 0.37 of each other raw "
+                         "and 0.52 under 'z'.  Read C for magnitude; do not "
+                         "read L's SIGN across positions whose openness "
+                         "differs, referenced or not.")
     ap.add_argument("--contrast-reference-scale", action="append",
                     default=[], metavar="NAME=PATH[:COLUMN]",
                     help="Divide out each cell's assay reliability on the "
@@ -992,7 +1157,32 @@ def main(argv=None) -> int:
         _alpha = load_prior(args.from_counts)
         _pooled = {"counts": load_counts(args.from_counts, M.index,
                                          M.columns),
-                   "alpha": _alpha, "stat": _stat}
+                   "alpha": _alpha, "stat": _stat,
+                   "reference": args.null_reference}
+        _pooled["null"] = (
+            load_null_counts(args.from_counts, M.index, M.columns,
+                             _pooled["counts"])
+            if args.null_reference != "none" else [])
+        if args.null_reference != "none":
+            if not _pooled["null"]:
+                sys.exit(
+                    f"--null-reference {args.null_reference} needs the drawn "
+                    f"null's counts beside the others in {_counts_dir(args.from_counts)}. "
+                    f"Re-run step 5 with --emit-counts AND --emit-null "
+                    f"(--null-draws 5 or more if you want 'z').")
+            if args.null_reference == "z" and len(_pooled["null"]) < 3:
+                sys.exit(
+                    f"--null-reference z needs at least 3 drawn-null "
+                    f"replicates to estimate a spread; found "
+                    f"{len(_pooled['null'])}.  Re-run step 5 with "
+                    f"--null-draws 5 (or use --null-reference subtract, "
+                    f"which needs only the mean).")
+            print(f"  null reference: {args.null_reference}, from "
+                  f"{len(_pooled['null'])} drawn replicate(s) pooled over "
+                  f"the SAME bins at each position.  Zero now means 'what "
+                  f"this statistic reads with no coordination at this "
+                  f"marginal and this depth', not 'equal to E'.",
+                  file=sys.stderr)
         print(f"  the per-cell corrections do not apply here: the "
               f"statistic is rebuilt from each position's own pooled pairs, "
               f"so there is no genome-wide arm offset riding on it to "
@@ -1161,6 +1351,13 @@ def main(argv=None) -> int:
         print(f"  -> region_group_test_{name}.tsv", file=sys.stderr)
     fig = out / f"scaled_profile_{name}.{args.plot_format}"
     _stat_lbl = STAT_LABEL.get(_stat_name, _stat_name or "concordance")
+    # Say on the axis where the zero is.  A reader who takes a
+    # null-referenced curve for a raw one reads every number wrong by the
+    # null's own offset, which is exactly the quantity in dispute.
+    if args.from_counts and args.null_reference == "subtract":
+        _stat_lbl = f"{_stat_lbl}  \u2212 drawn null"
+    elif args.from_counts and args.null_reference == "z":
+        _stat_lbl = f"{_stat_lbl}  (z vs drawn null)"
     scaled_figure(results, fig,
                   args.title or f"{name}: mean {_stat_lbl} across scaled "
                   f"domains",

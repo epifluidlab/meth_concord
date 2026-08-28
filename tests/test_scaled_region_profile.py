@@ -1347,3 +1347,191 @@ def test_a_consistent_effect_scores_far_from_half():
     assert r["frac_positive"] == pytest.approx(0.85, abs=0.01)
     assert r["frac_positive_z"] > 15
     assert r["p_domain"] < 1e-10
+
+
+# ---------------------------------------------------------------------------
+# --null-reference: putting the zero at the drawn null
+# ---------------------------------------------------------------------------
+
+
+def _null_counts_run(tmp_path, n_draws=6, planted=(), coord=0.8):
+    """A real step-5 run with --emit-counts AND --emit-null, so the drawn
+    null's counts sit beside the observed ones and can be pooled the same
+    way."""
+    import logging
+    import sys as _sys
+    import pandas as pd
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_null_rank import null_rank_paths
+    from nome_hic_concordance import concordance as cc
+
+    logging.disable(logging.WARNING)
+    src = tmp_path / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    out = tmp_path / "run"
+    cc.compute_signed_concordance_matrix(
+        null_rank_paths(src, n_cells=12, n_bins=60, planted=set(planted),
+                        coord=coord),
+        bin_size=10_000, min_distance=500, min_gch_sites=2,
+        baseline="distance-matched", dm_dist_bin=500, dm_prior="shared",
+        output_dir=str(out), save_outputs=True, use_rwr=False, n_threads=1,
+        eb_min_obs=50, null_draws=n_draws, emit_counts=True, emit_null=True)
+    s = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": [f"c{i}" for i in range(12)],
+                  "bam_path": ["x"] * 12,
+                  "cell_type": ["T"] * 12}).to_csv(s, sep="\t", index=False)
+    return out, s
+
+
+def _profile_mean(tmp_path, run, samples, bins, stat, reference, tag):
+    import subprocess
+    import sys as _sys
+    import pandas as pd
+    bed = tmp_path / f"{tag}.bed"
+    bed.write_text("".join(f"chr1\t{b * 10000}\t{(b + 1) * 10000}\n"
+                           for b in bins))
+    o = tmp_path / f"prof_{tag}_{reference}"
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--from-counts", str(run),
+         "--from-counts-statistic", stat, "--null-reference", reference,
+         "--samples", str(samples), "--cell-type-column", "cell_type",
+         "--group", "t=T", "--region", f"D={bed}", "--output-dir", str(o),
+         "--plot-format", "png", "--body-bins", "4", "--flank", "20000",
+         "--flank-bins", "1"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-1500:]
+    p = pd.read_csv(next(o.glob("scaled_profile*.tsv")), sep="\t")
+    col = [c for c in p.columns if c.startswith("mean_")][0]
+    return float(p[col].mean()), r.stderr
+
+
+# The fixture cycles four marginals in blocks of four bins.
+_LOW = [b for b in range(60) if (b // 4) % 4 == 0]      # pbar 0.12
+_MID = [b for b in range(60) if (b // 4) % 4 == 2]      # pbar 0.55
+
+
+def test_emit_counts_writes_the_drawn_null_beside_the_observed(tmp_path):
+    """A region's pooled statistic can only be referenced to a null pooled
+    the SAME way, so the null's counts have to be on disk too."""
+    run, _ = _null_counts_run(tmp_path, n_draws=6)
+    got = sorted(p.stem for p in (run / "counts").glob("*null*"))
+    assert len(got) == 6 * 4, got
+    assert "k_null_open" in got and "k_null5_open" in got
+    assert "n_null" in got and "n_null5" in got
+
+
+def test_the_null_replicates_share_the_observed_expected_pool(tmp_path):
+    """Only the OBSERVED side is replaced.  Swapping E as well would make
+    the comparison a statement about two different baselines instead of
+    about O."""
+    import numpy as np
+    import pandas as pd
+    run, _ = _null_counts_run(tmp_path, n_draws=3)
+    M = pd.read_parquet(run / "counts" / "n_linked.parquet")
+    obs = _mod().load_counts(run, M.index, M.columns)
+    reps = _mod().load_null_counts(run, M.index, M.columns, obs)
+    assert len(reps) == 3
+    for rep in reps:
+        for k in ("k_dm_open", "k_dm_closed", "k_dm_mixed", "n_dm"):
+            np.testing.assert_array_equal(rep[k], obs[k])
+        # ... and the observed side really is different.
+        assert not np.array_equal(rep["k_open"], obs["k_open"])
+
+
+def test_a_reference_without_the_drawn_null_says_how_to_get_one(tmp_path):
+    import subprocess
+    import sys as _sys
+    d, s, bed = _counts_run(tmp_path)          # --emit-counts, no --emit-null
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--from-counts", str(d),
+         "--from-counts-statistic", "coordination",
+         "--null-reference", "subtract", "--samples", str(s),
+         "--group", "t=T", "--region", f"dom={bed}",
+         "--cell-type-column", "cell_type", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "out")],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "--emit-null" in r.stderr
+
+
+def test_z_needs_enough_draws_to_have_a_spread(tmp_path):
+    import subprocess
+    import sys as _sys
+    run, s = _null_counts_run(tmp_path, n_draws=2)
+    bed = tmp_path / "z.bed"
+    bed.write_text("chr1\t0\t200000\n")
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--from-counts", str(run),
+         "--from-counts-statistic", "coordination", "--null-reference", "z",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--group", "t=T", "--region", f"D={bed}", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "out")],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "at least 3" in r.stderr and "subtract" in r.stderr
+
+
+def test_the_reference_moves_the_zero_and_says_so_on_the_axis(tmp_path):
+    run, s = _null_counts_run(tmp_path, n_draws=6, planted=_MID)
+    raw, err_raw = _profile_mean(tmp_path, run, s, _MID, "coordination",
+                                 "none", "a")
+    sub, err_sub = _profile_mean(tmp_path, run, s, _MID, "coordination",
+                                 "subtract", "a")
+    assert raw != sub
+    assert "null reference" not in err_raw
+    assert "drawn replicate(s) pooled over the SAME bins" in err_sub
+
+
+def test_the_reference_does_not_repair_the_log_odds_marginal_artifact(
+        tmp_path):
+    """IDENTICAL planted coordination at two marginals, and L still splits.
+
+    Coordination raises S = O_open + O_closed while D = O_open - O_closed
+    stays pinned at the marginal, so L is a real C seen through a
+    marginal-dependent map.  The drawn null has C ~ 0, so it does not
+    contain that map and cannot subtract it.  Pinned because the flag's
+    help makes exactly this claim, and a reader who assumed otherwise would
+    take the artifact for biology.
+    """
+    run, s = _null_counts_run(tmp_path, n_draws=8, planted=_LOW + _MID)
+    got = {}
+    for ref in ("none", "subtract", "z"):
+        lo, _ = _profile_mean(tmp_path, run, s, _LOW, "direction_logor",
+                              ref, "lo")
+        mi, _ = _profile_mean(tmp_path, run, s, _MID, "direction_logor",
+                              ref, "mi")
+        got[ref] = (lo, mi)
+    # Raw: the low-marginal region reads strongly positive and the
+    # mid-marginal one does not, from the same planted coordination.
+    assert got["none"][0] > 0.3 > 0 > got["none"][1]
+    # And no reference closes it -- the sign still splits.
+    for ref in ("subtract", "z"):
+        assert got[ref][0] > 0 > got[ref][1], (ref, got[ref])
+
+
+def test_z_does_help_coordination_where_the_marginal_only_compresses(
+        tmp_path):
+    """C's marginal effect is compression, not amplification, and the null
+    compresses with it -- so dividing by the null's own spread brings two
+    marginals closer.  The opposite of the log odds ratio case above."""
+    run, s = _null_counts_run(tmp_path, n_draws=8, planted=_LOW + _MID)
+    ratio = {}
+    for ref in ("none", "z"):
+        lo, _ = _profile_mean(tmp_path, run, s, _LOW, "coordination", ref,
+                              "clo")
+        mi, _ = _profile_mean(tmp_path, run, s, _MID, "coordination", ref,
+                              "cmi")
+        ratio[ref] = abs(lo) / max(abs(mi), 1e-9)
+    assert ratio["z"] > ratio["none"]
+    assert ratio["z"] < 1.0
+
+
+def test_the_null_is_pooled_not_averaged_per_bin(tmp_path):
+    """The reference has to be applied after pooling: a pooled value against
+    a per-bin null compares estimates of different depths, which is the
+    attenuation --from-counts exists to avoid."""
+    import inspect
+    src = inspect.getsource(_mod().pooled_profiles)
+    # The null statistic is computed from the SAME `cols` slice as the
+    # observed one, inside the per-position loop.
+    assert "_pooled_stat(nc, cols, alpha, stat" in src
+    assert src.index("cols = bi[") < src.index("_pooled_stat(nc, cols")

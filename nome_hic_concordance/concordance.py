@@ -2610,15 +2610,26 @@ def compute_signed_concordance_matrix(
             # counts, which is what makes the region estimate a measurement
             # rather than an average of mostly-prior values.
             _cdir = ensure_dir(str(out_path / "counts"))
-            for _k in list(_SOFT_COUNT_KEYS) + (list(_DM_KEYS)
-                                                if uses_expected else []):
+            # The drawn null's counts ride along when there is one, so a
+            # caller pooling a region can reference the region's pooled
+            # statistic to a null pooled the SAME way.  Referencing a pooled
+            # value to a per-bin null would compare quantities of different
+            # depths, which is the attenuation this whole file exists to
+            # avoid.
+            _null_ks = [k for _d in range(max(1, int(null_draws)))
+                        for k in _null_keys(_d)] if emit_null else []
+            for _k in (list(_SOFT_COUNT_KEYS)
+                       + (list(_DM_KEYS) if uses_expected else [])
+                       + _null_ks):
                 if _k in raw_counts:
                     pd.DataFrame(raw_counts[_k], index=cell_names,
                                  columns=sorted_bins).to_parquet(
                         _cdir / f"{_k}.parquet")
             logger.info(
                 f"Raw per-(cell, bin) counts -> {_cdir} "
-                f"({len(list(_SOFT_COUNT_KEYS)) + (len(_DM_KEYS) if uses_expected else 0)} matrices)")
+                f"({len(list(_SOFT_COUNT_KEYS)) + (len(_DM_KEYS) if uses_expected else 0) + len(_null_ks)} matrices"
+                + (f", including {max(1, int(null_draws))} drawn-null "
+                   f"replicate(s)" if _null_ks else "") + ")")
 
         # Component matrices — the axes for the companion UMAPs.
         for _name, _df in components.items():
