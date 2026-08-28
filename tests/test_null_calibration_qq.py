@@ -300,3 +300,75 @@ def test_min_pairs_without_the_counts_file_says_where_it_lives(tmp_path):
     with pytest.raises(SystemExit) as e:
         m.load_pair(d, "coordination", min_pairs=1)
     assert "pair_counts_per_bin.parquet" in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# The 95% band
+# ---------------------------------------------------------------------------
+
+
+def test_the_band_is_the_exact_order_statistic_interval():
+    """The k-th smallest of n Uniform(0,1) draws is exactly Beta(k, n-k+1),
+    so the band needs no simulation.  Check it against one."""
+    qq = _mod()
+    n = 400
+    levels = np.array([0.05, 0.25, 0.5, 0.75, 0.95])
+    lo, hi = qq.order_statistic_ci(levels, n)
+    assert np.all(lo < levels) and np.all(levels < hi)
+    assert np.all(np.diff(lo) > 0) and np.all(np.diff(hi) > 0)
+
+    rng = np.random.default_rng(0)
+    draws = np.sort(rng.random((4000, n)), axis=1)
+    k = np.ceil(levels * n).astype(int)
+    emp = draws[:, k - 1]
+    cover = np.mean((emp >= lo) & (emp <= hi), axis=0)
+    assert np.all(np.abs(cover - 0.95) < 0.02), cover
+
+
+def test_the_band_narrows_as_the_sample_grows():
+    qq = _mod()
+    lv = np.array([0.1, 0.5, 0.9])
+    w = [np.ptp(np.c_[qq.order_statistic_ci(lv, n)], axis=1).mean()
+         for n in (100, 1_000, 10_000)]
+    assert w[0] > w[1] > w[2]
+
+
+def test_the_two_sample_band_brackets_a_null_drawn_from_the_null():
+    """If the observed really is the null, its quantiles land inside."""
+    qq = _mod()
+    rng = np.random.default_rng(1)
+    null = rng.normal(0, 1, 200_000)
+    obs = rng.normal(0, 1, 5_000)
+    qx, qy = qq.qq_points(obs, null)
+    lo, hi = qq.qq_band(obs, null)
+    assert float(np.mean((qy >= lo) & (qy <= hi))) > 0.9
+    # A shifted observed leaves it.
+    _, qy2 = qq.qq_points(obs + 0.4, null)
+    assert float(np.mean((qy2 >= lo) & (qy2 <= hi))) < 0.5
+
+
+def test_a_hairline_band_is_omitted_rather_than_drawn(tmp_path):
+    """n_obs runs to millions of cell-bins here, and a band a thousandth of
+    an sd wide would read as 'every departure is significant' -- a claim the
+    independence assumption cannot support after RWR."""
+    qq = _mod()
+    rng = np.random.default_rng(2)
+    null = rng.normal(0, 1, 400_000)
+    obs = rng.normal(0, 1, 400_000)
+    curves = {"r": qq.qq_points(obs, null)}
+    tab = pd.DataFrame([{"run": "r", "null_bias_z": 0.0, "lambda": 1.0,
+                         "spike_ratio": 1.0}])
+    out = tmp_path / "f.png"
+    qq.figure(out, tab, curves, "coordination", "t",
+              bands={"r": qq.qq_band(obs, null)})
+    assert out.exists() and out.stat().st_size > 1_000
+
+
+def test_the_band_is_drawn_when_it_is_wide_enough_to_see(tmp_path):
+    qq = _mod()
+    rng = np.random.default_rng(3)
+    null = rng.normal(0, 1, 50_000)
+    obs = rng.normal(0, 1, 300)
+    lo, hi = qq.qq_band(obs, null)
+    qx, _ = qq.qq_points(obs, null)
+    assert float(np.max(hi - lo)) > 0.02 * float(np.ptp(qx))

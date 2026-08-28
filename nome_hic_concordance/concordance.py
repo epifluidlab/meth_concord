@@ -1554,7 +1554,18 @@ def rank_self_calibration(
     finite = np.isfinite(r)
     if not finite.any():
         return None
-    p = np.power(10.0, -np.abs(r[finite]))
+    rv = r[finite]
+    p = np.power(10.0, -np.abs(rv))
+    # SPLIT BY SIGN.  A procedure can be calibrated in |score| and still be
+    # lopsided: 0.05 of pure-null bins clearing the threshold, but all of
+    # them on one side.  That is what a displaced null looks like, and for
+    # the log odds ratio it is the failure mode to watch -- coordination at
+    # a low marginal pushes L one way (see the note by the
+    # coordination/direction correlation check), so a null that inherits any
+    # of that will call co-open far more often than co-closed.  Nominal is
+    # 0.025 each.
+    _t = -np.log10(0.05)
+    _hit = np.abs(rv) >= _t
     # KS distance to uniform.  Inflated by discreteness -- the smallest p the
     # pool can express is 2/(M+1) -- so read the two exceedance rates first
     # and treat this as a shape summary.
@@ -1571,6 +1582,8 @@ def rank_self_calibration(
         "n": int(n),
         "frac_p05": float(np.mean(p <= 0.05)),
         "frac_p01": float(np.mean(p <= 0.01)),
+        "frac_p05_pos": float(np.mean(_hit & (rv > 0))),
+        "frac_p05_neg": float(np.mean(_hit & (rv < 0))),
         "ks_uniform": ks,
         "p_quantile_levels": [float(v) for v in _Q_LEVELS],
         "p_quantiles": [float(v) for v in np.quantile(ps, _Q_LEVELS)],
@@ -2448,6 +2461,15 @@ def compute_signed_concordance_matrix(
                     "finest expressible p %.2g.",
                     _name, _cal["frac_p05"], _cal["n"], _cal["frac_p01"],
                     _cal["ks_uniform"], _cal["finest_p"])
+                _lop = (_cal["frac_p05_pos"], _cal["frac_p05_neg"])
+                if max(_lop) > 3 * max(min(_lop), 1e-4):
+                    logger.warning(
+                        "Null rank [%s] is LOPSIDED: of the pure-null bins "
+                        "clearing p <= 0.05, %.3f fall positive and %.3f "
+                        "negative (nominal 0.025 each).  The rank is then "
+                        "calibrated in magnitude but not in sign, so its "
+                        "direction calls are not trustworthy even where its "
+                        "rate is.", _name, _lop[0], _lop[1])
                 if _cal["frac_p05"] > 0.10:
                     logger.warning(
                         "Null rank [%s] is NOT calibrated: %.3f of pure-null "

@@ -461,3 +461,48 @@ def test_defaults_leave_the_pipeline_where_it_was():
     assert d["null_rank"].default is False
     assert d["null_draws"].default == 1
     assert d["emit_null"].default is False
+
+
+def test_the_self_check_splits_its_false_positives_by_sign():
+    """A procedure can be calibrated in |score| and lopsided in sign, and for
+    the log odds ratio that is the failure mode to watch: coordination at a
+    low marginal pushes L one way, so a null carrying any of it calls
+    co-open far more often than co-closed."""
+    rng = np.random.default_rng(4)
+    n_cells, n_bins, K = 6, 400, 6
+    st = np.zeros((n_cells, n_bins), dtype=np.int32)
+    keep = np.ones((n_cells, n_bins), bool)
+
+    sym = [rng.normal(0, 1, (n_cells, n_bins)) for _ in range(K)]
+    cal = cc.rank_self_calibration(sym, st, keep, min_pool=500)
+    assert cal["frac_p05_pos"] + cal["frac_p05_neg"] == pytest.approx(
+        cal["frac_p05"], abs=1e-12)
+    assert abs(cal["frac_p05_pos"] - cal["frac_p05_neg"]) < 0.02
+
+    # A held-out draw that is displaced relative to its siblings: the total
+    # rate can stay near nominal while every call lands on one side.
+    skew = [rng.normal(0, 1, (n_cells, n_bins)) for _ in range(K)]
+    skew[0] = skew[0] + 1.4
+    bad = cc.rank_self_calibration(skew, st, keep, min_pool=500)
+    assert bad["frac_p05_pos"] > 8 * max(bad["frac_p05_neg"], 1e-4)
+
+
+def test_a_lopsided_rank_is_called_out(tmp_path, caplog):
+    with caplog.at_level("INFO"):
+        _run(tmp_path, planted=set(range(0, 60, 7)))
+    msgs = [r.getMessage() for r in caplog.records]
+    line = [m for m in msgs if "self-check" in m]
+    assert line, msgs
+    # This fixture's null is symmetric, so nothing should be flagged.
+    assert not any("LOPSIDED" in m for m in msgs)
+
+
+def test_the_calibration_json_carries_a_tail_resolved_quantile_sketch():
+    """A Q-Q against uniform lives in the small-p tail; 41 evenly spaced
+    levels stop at p = 0.025, coarser than any threshold worth FDR-ing at."""
+    lv = cc._Q_LEVELS
+    assert lv.min() <= 1e-4
+    assert lv.max() == pytest.approx(1.0)
+    assert np.all(np.diff(lv) > 0)
+    # At least a third of the levels below 0.05, or the tail is unresolved.
+    assert float(np.mean(lv < 0.05)) > 0.3

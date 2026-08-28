@@ -181,6 +181,9 @@ def calibration(obs, null):
     return out
 
 
+QQ_LEVELS = np.linspace(0.001, 0.999, 400)
+
+
 def qq_points(obs, null, n=400):
     """Matched quantiles of the two samples.
 
@@ -192,7 +195,22 @@ def qq_points(obs, null, n=400):
     return np.quantile(null, q), np.quantile(obs, q)
 
 
-def figure(path, table, curves, stat, title):
+def qq_band(obs, null, levels=QQ_LEVELS, alpha=0.05):
+    """Where the observed quantiles would fall if it WERE the null.
+
+    Same order-statistic argument as the uniform case, pushed through the
+    null's empirical quantile function instead of the identity: if the
+    observed were n_obs independent draws from the null, its k-th order
+    statistic sits at a Beta(k, n - k + 1) position in the null's CDF.
+    """
+    n = int(np.asarray(obs).size)
+    if n < 2 or np.asarray(null).size < 2:
+        return None
+    lo, hi = order_statistic_ci(levels, n, alpha)
+    return np.quantile(null, lo), np.quantile(null, hi)
+
+
+def figure(path, table, curves, stat, title, bands=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -216,12 +234,28 @@ def figure(path, table, curves, stat, title):
     # absolute offset is not lost, it moves to panel (b), where it is the
     # headline rather than a scaling nuisance.
     lim = 0.0
+    n_thin = 0
     for i, (name, (qx, qy)) in enumerate(curves.items()):
         nm = float(np.median(qx))
         ns = robust_sd(qx)
         if not (np.isfinite(ns) and ns > 0):
             continue
         zx, zy = (qx - nm) / ns, (qy - nm) / ns
+        # 95% band, in the same standardised units.  Drawn only when it is
+        # WIDE ENOUGH TO SEE: n_obs here runs to millions of cell-bins, and
+        # a band a thousandth of an sd wide would read as "every departure
+        # is significant" -- which is exactly the claim the independence
+        # assumption cannot support after RWR.  Better to omit it and say so
+        # than to draw a hairline that flatters the plot.
+        bd = (bands or {}).get(name)
+        if bd is not None:
+            blo, bhi = (bd[0] - nm) / ns, (bd[1] - nm) / ns
+            if float(np.max(bhi - blo)) >= 0.02 * max(
+                    1e-12, float(np.ptp(np.r_[zx, zy]))):
+                a.fill_between(zx, blo, bhi, color=cm(i % 10), alpha=0.15,
+                               lw=0, zorder=0)
+            else:
+                n_thin += 1
         a.plot(zx, zy, "-", lw=1.5, color=cm(i % 10), label=name)
         lim = max(lim, float(np.max(np.abs(np.r_[zx, zy]))))
     lim = lim * 1.05 if lim > 0 else 1.0
@@ -236,7 +270,10 @@ def figure(path, table, curves, stat, title):
     a.set_title("a  observed against the model's own null", fontsize=10,
                 loc="left")
     a.annotate("on the diagonal = distributed like its own null;\n"
-               "where the null itself SITS is panel (b)",
+               "where the null itself SITS is panel (b)"
+               + ("\n95% band omitted: n is large enough that it is "
+                  "narrower\nthan the line, and RWR makes the entries "
+                  "non-independent\nanyway" if n_thin else ""),
                (0.03, 0.97), xycoords="axes fraction", fontsize=6.5,
                color="0.35", va="top")
     a.legend(fontsize=6.5, frameon=False, loc="lower right")
@@ -299,6 +336,30 @@ def load_rank_calibration(run_dir):
         return json.load(fh)
 
 
+def order_statistic_ci(levels, n, alpha=0.05):
+    """Pointwise CI for the order statistics of ``n`` draws, on the
+    PROBABILITY scale.
+
+    The k-th smallest of n independent Uniform(0, 1) draws is exactly
+    Beta(k, n - k + 1), so the band needs no simulation and no asymptotics.
+    Returned on the probability scale so the caller can push it through
+    whichever reference quantile function it is plotting against: the
+    identity for a uniform Q-Q, the null's own empirical quantile function
+    for a two-sample one.
+
+    IT ASSUMES THE ENTRIES ARE INDEPENDENT, AND HERE THEY ARE NOT.  RWR
+    pools evidence across the cell graph, so neighbouring cells' values in
+    the same bin are correlated and the effective sample size is smaller
+    than n.  The band is therefore NARROWER than the truth -- read a curve
+    that leaves it as "worth explaining", not as a test.
+    """
+    from scipy.stats import beta
+    lv = np.asarray(levels, float)
+    k = np.clip(np.ceil(lv * n), 1, n)
+    return (beta.ppf(alpha / 2, k, n - k + 1),
+            beta.ppf(1 - alpha / 2, k, n - k + 1))
+
+
 def rank_figure(path, entries, title):
     """Q-Q of the held-out null's p-values against uniform, one line per run.
 
@@ -317,6 +378,23 @@ def rank_figure(path, entries, title):
     cm = plt.get_cmap("tab10")
     a = ax[0]
     lim = 0.0
+
+    # 95% pointwise band, drawn ONCE in grey rather than per run.  The
+    # reference is Uniform(0, 1) for every run, so the band depends only on
+    # how many cell-bins went in; taking the smallest n across runs makes it
+    # the widest of them, so a curve outside it is outside every run's.
+    _lv = next((np.asarray(c.get("p_quantile_levels", []), float)
+                for c in entries.values()
+                if len(c.get("p_quantile_levels", [])) > 2), None)
+    _n = min((int(c.get("n", 0)) for c in entries.values()), default=0)
+    if _lv is not None and _n > 1:
+        _ok = _lv > 0
+        _lo, _hi = order_statistic_ci(_lv[_ok], _n)
+        # -log10 is decreasing, so the band's ends swap.
+        a.fill_between(-np.log10(_lv[_ok]), -np.log10(_hi), -np.log10(_lo),
+                       color="0.82", lw=0, zorder=0,
+                       label=f"95% band (n = {_n:,})")
+
     for i, (name, cal) in enumerate(entries.items()):
         lv = np.asarray(cal.get("p_quantile_levels", []), float)
         pq = np.asarray(cal.get("p_quantiles", []), float)
@@ -337,28 +415,39 @@ def rank_figure(path, entries, title):
     a.set_ylabel("held-out drawn null  -log10(p)", fontsize=8)
     a.set_title("a  does a known-null bin score like a null bin?",
                 fontsize=10, loc="left")
-    a.annotate("above the diagonal = the rank calls its own\n"
-               "null too often; dotted = pool resolution floor",
+    a.annotate("above the diagonal = the rank calls its own null too\n"
+               "often; dotted = pool resolution floor.  The band assumes\n"
+               "independent entries -- RWR correlates them, so it is\n"
+               "narrower than the truth.",
                (0.03, 0.97), xycoords="axes fraction", fontsize=6.5,
                color="0.35", va="top")
     a.legend(fontsize=6.5, frameon=False, loc="lower right")
 
     a = ax[1]
     names = list(entries)
-    for j, (key, nominal, col) in enumerate(
-            (("frac_p05", 0.05, "#2c3e50"), ("frac_p01", 0.01, "#8e44ad"))):
+    keys = (("frac_p05", 0.05, "#2c3e50", "p <= 0.05"),
+            ("frac_p01", 0.01, "#8e44ad", "p <= 0.01"),
+            ("frac_p05_pos", 0.025, "#c0392b", "p <= 0.05, positive"),
+            ("frac_p05_neg", 0.025, "#2980b9", "p <= 0.05, negative"))
+    keys = [k for k in keys if any(k[0] in e for e in entries.values())]
+    h = 0.8 / max(1, len(keys))
+    for j, (key, nominal, col, lab) in enumerate(keys):
         vals = [entries[n].get(key, np.nan) / nominal for n in names]
-        a.barh(np.arange(len(names)) + (j - 0.5) * 0.38, vals, height=0.36,
-               color=col, label=f"p <= {nominal:g}")
+        a.barh(np.arange(len(names)) + (j - (len(keys) - 1) / 2) * h, vals,
+               height=h * 0.92, color=col, label=lab)
     a.axvline(1.0, color="0.3", lw=1.0)
     a.axvline(2.0, color="#c0392b", ls="--", lw=0.9)
     a.set_yticks(range(len(names)))
     a.set_yticklabels(names, fontsize=6.5)
-    a.set_xlabel("observed rate / nominal rate   (1 = calibrated)",
-                 fontsize=8)
+    a.set_xlabel("observed rate / nominal rate   (1 = calibrated)\n"
+                 "the two signed bars should MATCH: one much taller means "
+                 "the rank is\ncalibrated in magnitude but lopsided in "
+                 "direction",
+                 fontsize=8, linespacing=1.5)
     a.set_title("b  the rank's own false-positive rate", fontsize=10,
                 loc="left")
-    a.legend(fontsize=6.5, frameon=False, loc="lower right")
+    a.legend(fontsize=6.5, loc="lower right", framealpha=0.9,
+             edgecolor="0.85")
 
     fig.suptitle(f"{title} — rank self-check", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
@@ -412,7 +501,7 @@ def main(argv=None) -> int:
 
     rows = []
     for stat in stats:
-        curves, sub = {}, []
+        curves, bands, sub = {}, {}, []
         for name, d in runs.items():
             obs, null, li = load_pair(d, stat, seed=args.seed,
                                       min_pairs=args.min_pairs)
@@ -421,9 +510,10 @@ def main(argv=None) -> int:
             sub.append(m)
             rows.append(m)
             curves[name] = qq_points(obs, null)
+            bands[name] = qq_band(obs, null)
         tab = pd.DataFrame(sub)
         figure(out / f"null_qq_{stat}.{args.plot_format}", tab, curves,
-               stat, args.title)
+               stat, args.title, bands=bands)
         print(f"  -> null_qq_{stat}.{args.plot_format}", file=sys.stderr)
 
     # ---- The rank's own self-check, where a run wrote one ---------------
@@ -450,12 +540,18 @@ def main(argv=None) -> int:
               "the rank's false-positive rates.", file=sys.stderr)
         for _, r in rk.iterrows():
             flag = "" if r["frac_p05"] <= 0.10 else "   <- NOT calibrated"
+            pos, neg = r.get("frac_p05_pos"), r.get("frac_p05_neg")
+            sgn = ""
+            if pos is not None and neg is not None and np.isfinite(pos):
+                sgn = f"  [+{pos:.3f} / -{neg:.3f}, nominal .025 each]"
+                if max(pos, neg) > 3 * max(min(pos, neg), 1e-4):
+                    flag += "   <- LOPSIDED in sign"
             print(f"  {r['run']:24s} {r['statistic']:16s} "
                   f"p05={r['frac_p05']:.3f} (nominal 0.05)  "
                   f"p01={r['frac_p01']:.3f} (0.01)  "
                   f"KS={r['ks_uniform']:.3f}  "
                   f"pool={int(r['median_pool'])} -> finest p "
-                  f"{r['finest_p']:.2g}{flag}", file=sys.stderr)
+                  f"{r['finest_p']:.2g}{sgn}{flag}", file=sys.stderr)
         print("  A run whose finest expressible p is coarser than the "
               "threshold you intend to FDR at needs more --null-draws, or "
               "wider strata.", file=sys.stderr)
