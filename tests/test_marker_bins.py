@@ -3779,3 +3779,63 @@ def test_a_null_z_matrix_runs_through_heatmap_contrast_and_volcano(tmp_path):
     assert t.loc[idx >= 10, "contrast_tumour_diff"].abs().mean() < 1.0
     # No rank file beside it, so the gate simply does not engage.
     assert "contrast_tumour_rank_frac_max" not in t.columns
+
+
+def test_row_clustering_survives_rows_that_carry_no_pattern():
+    """Correlation distance is undefined for a constant row, and constant
+    rows are normal here: a companion signal need not cover every selected
+    bin, and the uncovered ones are filled with one neutral value before
+    display.  pdist returns NaN for them and scipy's linkage refuses the
+    condensed matrix outright."""
+    mod = _mod()
+    rng = np.random.default_rng(0)
+    Z = rng.normal(0, 1, (12, 6))
+    Z[3] = 0.0                      # a bin the companion never covered
+    Z[7] = 5.0                      # constant at some other level
+    lk, order = mod._row_linkage(Z)
+    assert lk is not None
+    assert np.isfinite(lk).all()
+    # Every row it was handed comes back exactly once: dropping them would
+    # silently change the layout the caller asked for.
+    assert sorted(order.tolist()) == list(range(12))
+
+
+def test_an_uncovered_companion_still_renders_both_orderings(tmp_path):
+    """The reclustered variant is the one that clusters, so it is the one
+    that hit this.  Regression: a real run had the null rank covering 446 of
+    500 selected bins and the run died in linkage."""
+    import pandas as pd
+    rng = np.random.default_rng(0)
+    n, nb = 60, 60
+    ct = np.repeat(np.arange(4), n // 4)
+    tum = ct < 2
+    X = np.zeros((n, nb))
+    X[:, :20] = np.where(tum[:, None], 1.5, -1.5) + rng.normal(0, .3, (n, 20))
+    X[:, 20:] = rng.normal(0, .3, (n, 40))
+    R = rng.normal(0, 1.0, (n, nb))
+    R[:, :20] += np.where(tum[:, None], 3.0, 0.0)
+    R[:, 50:] = np.nan               # bins with no rank at all
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    mat = tmp_path / "concordance_coordination.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    pd.DataFrame(R, index=cells, columns=bins).to_parquet(
+        tmp_path / "concordance_coordination_rank.parquet")
+    s = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["b1", "b2"] * (n // 2)}).to_csv(
+        s, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "40",
+         "--n-permutations", "30", "--contrast", "tumour=CT0,CT1",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2500:]
+    made = {p.name for p in out.glob("*nullrank*")}
+    assert "marker_heatmap_gch_nullrank_reclustered.png" in made
+    assert "marker_heatmap_gch_nullrank_fixedorder.png" in made
+    assert "null-rank covers" in (r.stdout + r.stderr)

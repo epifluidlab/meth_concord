@@ -2163,14 +2163,38 @@ def _remove_batch(M, ct_labels, batch_df):
 
 
 def _row_linkage(Z):
-    """Linkage for the bins, or None; returns (linkage, leaf_order)."""
+    """Linkage for the bins, or None; returns (linkage, leaf_order).
+
+    CORRELATION DISTANCE IS UNDEFINED FOR A CONSTANT ROW, and constant rows
+    are normal here rather than exotic.  A companion signal need not cover
+    every selected bin -- the null rank is written only where the bin
+    measured something, so on one real run it covered 446 of 500 -- and the
+    uncovered rows are filled with a single neutral value before display.
+    Their correlation with anything is 0/0, scipy's pdist hands back NaN,
+    and linkage refuses the condensed matrix outright.  The same happens to
+    a cell that is blank everywhere in the column clustering.
+
+    So the distances are computed here and the undefined ones set to 1.0 --
+    the value correlation distance gives to two uncorrelated vectors.  That
+    is what a row carrying no pattern should contribute: no evidence of
+    similarity to anything, so it clusters last, with the other blanks.
+    Dropping the rows instead would silently change the layout the caller
+    asked for, and this function's whole job is to return an order over the
+    rows it was given.
+    """
     try:
         from scipy.cluster.hierarchy import leaves_list, linkage
+        from scipy.spatial.distance import pdist
     except Exception:
         return None, np.arange(Z.shape[0])
     if Z.shape[0] < 3:
         return None, np.arange(Z.shape[0])
-    lk = linkage(Z, method="average", metric="correlation")
+    with np.errstate(invalid="ignore", divide="ignore"), \
+            warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        d = pdist(np.asarray(Z, np.float64), metric="correlation")
+    d = np.where(np.isfinite(d), d, 1.0)
+    lk = linkage(d, method="average")
     return lk, leaves_list(lk)
 
 
