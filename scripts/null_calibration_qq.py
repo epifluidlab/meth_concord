@@ -278,6 +278,94 @@ def figure(path, table, curves, stat, title):
     plt.close(fig)
 
 
+def load_rank_calibration(run_dir):
+    """The held-out-draw self-check written beside the component matrices.
+
+    Every other check in this script asks whether the model's E sits where
+    it claims.  This one asks something the rank makes directly answerable:
+    a DRAW from the null is a case whose true answer is known, so holding one
+    out and scoring it against its siblings must return uniform p-values.
+    Whatever excess shows up below 0.05 is the rank's own false-positive
+    rate, and every observed bin scored the same way inherits it.
+
+    Returns None when the run was made without --null-rank, or with
+    --null-draws 1 (which leaves no draw to hold out).
+    """
+    import json
+    fp = Path(run_dir) / "null_rank_calibration.json"
+    if not fp.exists():
+        return None
+    with open(fp) as fh:
+        return json.load(fh)
+
+
+def rank_figure(path, entries, title):
+    """Q-Q of the held-out null's p-values against uniform, one line per run.
+
+    Drawn on -log10 axes because the whole question lives in the small-p
+    tail: a procedure can be near-perfect over the body and still call 5x
+    too many bins at p <= 0.01, and on linear axes that is invisible.  The
+    curve flattens at the right where the pool runs out of resolution -- the
+    finest p a pool of M draws can express is 2/(M+1) -- which is a property
+    of the pool size and not a miscalibration.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(1, 2, figsize=(9.6, 4.3))
+    cm = plt.get_cmap("tab10")
+    a = ax[0]
+    lim = 0.0
+    for i, (name, cal) in enumerate(entries.items()):
+        lv = np.asarray(cal.get("p_quantile_levels", []), float)
+        pq = np.asarray(cal.get("p_quantiles", []), float)
+        if lv.size < 3 or pq.size != lv.size:
+            continue
+        ok = (lv > 0) & (pq > 0)
+        x, y = -np.log10(lv[ok]), -np.log10(pq[ok])
+        a.plot(x, y, "-o", ms=2.5, lw=1.3, color=cm(i % 10), label=name)
+        lim = max(lim, float(np.max(np.r_[x, y])))
+        fp = cal.get("finest_p")
+        if fp and np.isfinite(fp):
+            a.axhline(-np.log10(fp), color=cm(i % 10), ls=":", lw=0.8)
+    lim = lim * 1.05 if lim > 0 else 1.0
+    a.plot([0, lim], [0, lim], "--", color="0.5", lw=1.0, zorder=0)
+    a.set_xlim(0, lim)
+    a.set_ylim(0, lim)
+    a.set_xlabel("expected  -log10(p)   (uniform)", fontsize=8)
+    a.set_ylabel("held-out drawn null  -log10(p)", fontsize=8)
+    a.set_title("a  does a known-null bin score like a null bin?",
+                fontsize=10, loc="left")
+    a.annotate("above the diagonal = the rank calls its own\n"
+               "null too often; dotted = pool resolution floor",
+               (0.03, 0.97), xycoords="axes fraction", fontsize=6.5,
+               color="0.35", va="top")
+    a.legend(fontsize=6.5, frameon=False, loc="lower right")
+
+    a = ax[1]
+    names = list(entries)
+    for j, (key, nominal, col) in enumerate(
+            (("frac_p05", 0.05, "#2c3e50"), ("frac_p01", 0.01, "#8e44ad"))):
+        vals = [entries[n].get(key, np.nan) / nominal for n in names]
+        a.barh(np.arange(len(names)) + (j - 0.5) * 0.38, vals, height=0.36,
+               color=col, label=f"p <= {nominal:g}")
+    a.axvline(1.0, color="0.3", lw=1.0)
+    a.axvline(2.0, color="#c0392b", ls="--", lw=0.9)
+    a.set_yticks(range(len(names)))
+    a.set_yticklabels(names, fontsize=6.5)
+    a.set_xlabel("observed rate / nominal rate   (1 = calibrated)",
+                 fontsize=8)
+    a.set_title("b  the rank's own false-positive rate", fontsize=10,
+                loc="left")
+    a.legend(fontsize=6.5, frameon=False, loc="lower right")
+
+    fig.suptitle(f"{title} — rank self-check", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def named(specs, flag):
     out = {}
     for spec in specs:
@@ -337,6 +425,40 @@ def main(argv=None) -> int:
         figure(out / f"null_qq_{stat}.{args.plot_format}", tab, curves,
                stat, args.title)
         print(f"  -> null_qq_{stat}.{args.plot_format}", file=sys.stderr)
+
+    # ---- The rank's own self-check, where a run wrote one ---------------
+    rank_rows = []
+    for stat in stats:
+        entries = {}
+        for name, d in runs.items():
+            cal = load_rank_calibration(d)
+            if cal and stat in cal:
+                entries[name] = cal[stat]
+                rank_rows.append({"statistic": stat, "run": name,
+                                  **{k: v for k, v in cal[stat].items()
+                                     if not isinstance(v, list)}})
+        if entries:
+            rank_figure(out / f"null_rank_qq_{stat}.{args.plot_format}",
+                        entries, args.title)
+            print(f"  -> null_rank_qq_{stat}.{args.plot_format}",
+                  file=sys.stderr)
+    if rank_rows:
+        rk = pd.DataFrame(rank_rows)
+        rk.to_csv(out / "null_rank_calibration.tsv", sep="\t", index=False)
+        print("\nrank self-check: one drawn null held out and scored against "
+              "its siblings.  The true answer is known there, so these ARE "
+              "the rank's false-positive rates.", file=sys.stderr)
+        for _, r in rk.iterrows():
+            flag = "" if r["frac_p05"] <= 0.10 else "   <- NOT calibrated"
+            print(f"  {r['run']:24s} {r['statistic']:16s} "
+                  f"p05={r['frac_p05']:.3f} (nominal 0.05)  "
+                  f"p01={r['frac_p01']:.3f} (0.01)  "
+                  f"KS={r['ks_uniform']:.3f}  "
+                  f"pool={int(r['median_pool'])} -> finest p "
+                  f"{r['finest_p']:.2g}{flag}", file=sys.stderr)
+        print("  A run whose finest expressible p is coarser than the "
+              "threshold you intend to FDR at needs more --null-draws, or "
+              "wider strata.", file=sys.stderr)
 
     full = pd.DataFrame(rows)[
         ["statistic", "run", "min_pairs", "frac_kept", "null_median",

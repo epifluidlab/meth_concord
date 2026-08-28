@@ -602,7 +602,18 @@ _DM_KEYS = ("k_dm_open", "k_dm_closed", "k_dm_mixed", "n_dm")
 # meets the same prior, the same RWR smoothing and the same normalisation.
 # A null that skipped any of those would answer a question about a pipeline
 # nobody runs.
-_NULL_KEYS = ("k_null_open", "k_null_closed", "k_null_mixed", "n_null")
+def _null_keys(draw: int = 0) -> tuple[str, ...]:
+    """Soft-count keys for one drawn-null replicate.
+
+    Draw 0 keeps the original unindexed names, so a single-draw run writes
+    byte-identical outputs to one from before ``--null-draws`` existed.
+    """
+    sfx = "" if int(draw) == 0 else str(int(draw))
+    return (f"k_null{sfx}_open", f"k_null{sfx}_closed",
+            f"k_null{sfx}_mixed", f"n_null{sfx}")
+
+
+_NULL_KEYS = _null_keys(0)
 
 
 def _compute_cell_soft_counts(
@@ -915,6 +926,7 @@ def _compute_cell_dm_expected(
     max_distance: int = 0,
     random_state: int = 42,
     null_split: bool = False,
+    null_draws: int = 1,
 ) -> tuple[str, dict[str, dict[str, float]]]:
     """Per-(cell, bin) expected soft counts (``_DM_KEYS``) from a non-contact
     end-pair null.
@@ -1029,13 +1041,24 @@ def _compute_cell_dm_expected(
             )
         _entry_null = {}
         if null_split and null_pos is not None:
-            _no, _nc, _nm, _nn = _null_observed_for_bin(
-                null_pos, null_p, n_contacts=len(og),
-                min_distance=int(min_distance),
-                seed=seed_base + 5701 + int(b),
-                max_distance=int(max_distance))
-            _entry_null = {"k_null_open": _no, "k_null_closed": _nc,
-                           "k_null_mixed": _nm, "n_null": float(_nn)}
+            # K INDEPENDENT DRAWS from the SAME end pool.  The pool is the
+            # bin's own marginal and stays fixed; only the pairing is
+            # re-randomised, so the draws differ in coordination and in
+            # nothing else.  That is what makes them a null sample for this
+            # bin rather than for some average bin.  Offsetting the seed by
+            # a large prime per draw keeps them independent without
+            # colliding with the neighbouring bin's seeds.
+            for _d in range(max(1, int(null_draws))):
+                _no, _nc, _nm, _nn = _null_observed_for_bin(
+                    null_pos, null_p, n_contacts=len(og),
+                    min_distance=int(min_distance),
+                    seed=seed_base + 5701 + int(b) + _d * 1_000_003,
+                    max_distance=int(max_distance))
+                _ko, _kc, _km, _kn = _null_keys(_d)
+                _entry_null[_ko] = _no
+                _entry_null[_kc] = _nc
+                _entry_null[_km] = _nm
+                _entry_null[_kn] = float(_nn)
         counts[f"{c}:{int(b) * bsz}"] = {
             **_entry_null,
             "k_dm_open": k_o, "k_dm_closed": k_c, "k_dm_mixed": k_m,
@@ -1336,6 +1359,228 @@ def decompose_components(
     }
 
 
+NULL_RANK_COVERAGE_BANDS = (1.0, 4.0, 16.0, 64.0, 256.0)
+NULL_RANK_MARGINAL_BANDS = (0.20, 0.35, 0.50, 0.65, 0.80)
+
+
+def rank_strata(
+    n_raw: np.ndarray,
+    marginal: np.ndarray,
+    coverage_bands: tuple[float, ...] = NULL_RANK_COVERAGE_BANDS,
+    marginal_bands: tuple[float, ...] = NULL_RANK_MARGINAL_BANDS,
+) -> np.ndarray:
+    """Stratum id per (cell, bin), on raw depth x observed openness.
+
+    THESE ARE THE TWO THINGS THAT MAKE BINS NON-EXCHANGEABLE, and pooling a
+    null across them is what a genome-wide ranking silently does.
+
+    Depth, because C and L are ratios of Dirichlet-Multinomial posterior
+    rates: at alpha_0 ~ 100 a bin with n = 10 is 91% prior and one with
+    n = 10,000 is 1%, so the same underlying coordination lands at very
+    different magnitudes and the spread of the null differs by more than
+    the signal does.  Bands are on the RAW pre-imputation n_linked, because
+    that is what the bin actually measured; the post-RWR n is fractional
+    and near-constant and would put everything in one band.
+
+    Openness, because the sensitivity of the log odds ratio to a count
+    difference is 1/(alpha_open + k_open) on the open channel against
+    1/(alpha_closed + k_closed) on the closed one.  On one meningioma GCH
+    run the fitted prior was alpha = (10.2 open, 49.2 closed), so a
+    heterochromatic bin with k_open -> 0 is about five times more sensitive
+    per surplus co-open contact than a euchromatic one.  That is a scale
+    difference, not an offset, and no choice of E removes it -- O and E
+    share it.  It is why PMDs and LADs read co-open against a genome-wide
+    reference: not a displaced zero, an incomparable unit.
+
+    ``marginal`` HAS TO BE THE RAW PER-END OPENNESS (the accessibility
+    matrix), not the ``marginal`` component.  That component is
+    (O_open - O_closed + 1) / 2 built from Dirichlet-Multinomial posterior
+    rates, so it is shrunk toward the genome-wide mean like everything else:
+    on a fixture whose bins were built at true openness 0.12, 0.30, 0.55 and
+    0.80, the component's per-stratum medians spanned only 0.32 to 0.59 and
+    four designed classes collapsed into two bands.  Stratifying on a
+    variable the prior has already flattened is stratifying on nothing.
+
+    The edges are FIXED, not quantiles.  Quantile edges over a mostly
+    sparse genome put the better-covered sparse bins in with the dense ones
+    and re-poison the pool; that measured as power 0.00 in the marker
+    script's permutation null.
+    """
+    cov = np.digitize(np.asarray(n_raw, float),
+                      list(coverage_bands), right=False)
+    mar = np.digitize(np.asarray(marginal, float),
+                      list(marginal_bands), right=False)
+    return (cov * (len(marginal_bands) + 1) + mar).astype(np.int32)
+
+
+def _signed_neglog10_p(obs: np.ndarray, pool: np.ndarray) -> np.ndarray:
+    """Signed -log10(two-sided empirical p) of ``obs`` against ``pool``.
+
+    Conservative by the usual +1: an observed value beyond every draw gets
+    p = 2/(M + 1) rather than 0, so the resolution of the answer never
+    outruns the number of draws behind it.  Sign is which tail, taken
+    against the pool's own median rather than against zero -- the pool IS
+    where zero is for this stratum.
+    """
+    pool = np.sort(pool)
+    m = pool.size
+    n_le = np.searchsorted(pool, obs, side="right")
+    n_ge = m - np.searchsorted(pool, obs, side="left")
+    p_one = (np.minimum(n_le, n_ge) + 1.0) / (m + 1.0)
+    p_two = np.minimum(1.0, 2.0 * p_one)
+    sign = np.sign(obs - float(np.median(pool)))
+    return -np.log10(p_two) * np.where(sign == 0, 1.0, sign)
+
+
+def empirical_rank(
+    obs: np.ndarray,
+    null_draws: list[np.ndarray],
+    strata: np.ndarray,
+    testable: np.ndarray,
+    scope: str = "cell",
+    min_pool: int = 2_000,
+) -> tuple[np.ndarray, dict]:
+    """Rank each observed (cell, bin) against drawn nulls from its stratum.
+
+    WHY NOT RANK AGAINST THE GENOME-WIDE DISTRIBUTION.  That asks each bin
+    to be exchangeable with every other, which needs "most of the genome is
+    neither co-open nor co-closed" to be true.  It is the premise of this
+    analysis in reverse: if coordination really is compartment-scale, then
+    centring on the genome median subtracts the signal and leaves only
+    deviation FROM the compartment pattern.  The drawn null makes no such
+    claim -- it is a null for THAT bin, re-paired from THAT bin's own ends,
+    so the marginal and the depth are matched by construction rather than
+    assumed away.
+
+    WHY POOL AT ALL, THEN.  K draws per bin can only resolve p >= 1/(K + 1),
+    and K has to stay small because every draw is another set of soft-count
+    matrices carried through RWR.  Pooling a stratum's draws across its bins
+    buys n_bins x K draws instead of K -- enough to survive FDR over ~10^4
+    bins at K = 5 -- and costs only the assumption that bins WITHIN a
+    depth x openness stratum are exchangeable, which is the assumption the
+    strata were chosen to make true.
+
+    ``scope="cell"`` pools within each cell, so every cell is scored against
+    its own null and a global offset -- depth, batch, enzyme efficiency --
+    never reaches the output.  That is the same job ``--contrast-reference-d
+    gch=ref_chrM.tsv`` was doing off a handful of chrM bins, done off the
+    whole genome.  ``scope="joint"`` pools across cells, which is more
+    stable per stratum but lets a per-cell offset through.  Under "cell", a
+    (cell, stratum) pool below ``min_pool`` falls back to the joint pool for
+    that stratum rather than reporting a p it cannot support.
+
+    Returns the signed -log10(p) matrix (NaN where not testable) and a dict
+    of diagnostics.
+    """
+    obs = np.asarray(obs, float)
+    strata = np.asarray(strata)
+    testable = np.asarray(testable, bool) & np.isfinite(obs)
+    out = np.full(obs.shape, np.nan, dtype=np.float64)
+    if not testable.any() or not null_draws:
+        return out, {"n_scored": 0, "n_fallback": 0, "n_strata": 0,
+                     "median_pool": 0, "scope": scope}
+
+    # Joint pools first: they are the fallback for thin per-cell strata, so
+    # they have to exist before the per-cell loop even under scope="cell".
+    joint: dict[int, np.ndarray] = {}
+    for s in np.unique(strata[testable]):
+        m = testable & (strata == s)
+        pool = np.concatenate([np.asarray(d, float)[m] for d in null_draws])
+        pool = pool[np.isfinite(pool)]
+        if pool.size:
+            joint[int(s)] = np.sort(pool)
+
+    n_fallback = 0
+    pool_sizes: list[int] = []
+    if scope == "joint":
+        for s, pool in joint.items():
+            m = testable & (strata == s)
+            out[m] = _signed_neglog10_p(obs[m], pool)
+            pool_sizes.append(pool.size)
+    else:
+        for i in range(obs.shape[0]):
+            ti, si = testable[i], strata[i]
+            if not ti.any():
+                continue
+            for s in np.unique(si[ti]):
+                m = ti & (si == s)
+                pool = np.concatenate(
+                    [np.asarray(d, float)[i][m] for d in null_draws])
+                pool = pool[np.isfinite(pool)]
+                if pool.size < int(min_pool):
+                    pool = joint.get(int(s), pool)
+                    n_fallback += int(m.sum())
+                if pool.size < 2:
+                    continue
+                out[i, m] = _signed_neglog10_p(obs[i, m], pool)
+                pool_sizes.append(pool.size)
+
+    return out, {
+        "n_scored": int(np.isfinite(out).sum()),
+        "n_fallback": int(n_fallback),
+        "n_strata": len(joint),
+        "median_pool": int(np.median(pool_sizes)) if pool_sizes else 0,
+        "min_pool_seen": int(np.min(pool_sizes)) if pool_sizes else 0,
+        "scope": scope,
+    }
+
+
+_Q_LEVELS = np.unique(np.concatenate([
+    np.logspace(-4, -1, 16), np.linspace(0.1, 1.0, 25)]))
+
+
+def rank_self_calibration(
+    null_draws: list[np.ndarray],
+    strata: np.ndarray,
+    testable: np.ndarray,
+    scope: str = "cell",
+    min_pool: int = 2_000,
+) -> dict | None:
+    """Score one drawn null against the others: the answer should be uniform.
+
+    The rank is only worth reading if it is calibrated, and unlike every
+    other check in this pipeline that is directly measurable here -- a draw
+    from the null IS a case where the true answer is known, so holding one
+    out and ranking it against its siblings must return uniform p-values.
+    Any excess below 0.05 is the procedure's own false-positive rate, and it
+    is inherited by every observed bin scored the same way.
+
+    Needs at least two draws.  Returns None otherwise.
+    """
+    if len(null_draws) < 2:
+        return None
+    r, info = empirical_rank(null_draws[0], list(null_draws[1:]), strata,
+                             testable, scope=scope, min_pool=min_pool)
+    finite = np.isfinite(r)
+    if not finite.any():
+        return None
+    p = np.power(10.0, -np.abs(r[finite]))
+    # KS distance to uniform.  Inflated by discreteness -- the smallest p the
+    # pool can express is 2/(M+1) -- so read the two exceedance rates first
+    # and treat this as a shape summary.
+    ps = np.sort(p)
+    n = ps.size
+    ecdf = np.arange(1, n + 1) / n
+    ks = float(np.max(np.abs(ecdf - ps)))
+    # A quantile sketch of the held-out p-values, so a Q-Q against uniform
+    # can be drawn later without keeping every value.  LOG-SPACED toward
+    # zero, not evenly spaced: the whole question lives in the small-p tail,
+    # and 41 even levels stop at p = 0.025, which is coarser than any
+    # threshold worth FDR-ing at.
+    return {
+        "n": int(n),
+        "frac_p05": float(np.mean(p <= 0.05)),
+        "frac_p01": float(np.mean(p <= 0.01)),
+        "ks_uniform": ks,
+        "p_quantile_levels": [float(v) for v in _Q_LEVELS],
+        "p_quantiles": [float(v) for v in np.quantile(ps, _Q_LEVELS)],
+        "finest_p": float(2.0 / (info["median_pool"] + 1.0))
+        if info["median_pool"] else float("nan"),
+        "median_pool": int(info["median_pool"]),
+        "scope": scope,
+    }
+
+
 def compute_signed_concordance_matrix(
     cell_posterior_paths: dict[str, str],
     chrom_sizes: dict[str, int] | None = None,
@@ -1365,6 +1610,13 @@ def compute_signed_concordance_matrix(
     eb_min_obs: int = 50,
     dm_prior: str = "separate",
     emit_null: bool = False,
+    null_draws: int = 1,
+    null_rank: bool = False,
+    null_rank_scope: str = "cell",
+    null_rank_statistics: tuple[str, ...] = ("coordination",
+                                             "direction_logor"),
+    null_rank_min_pairs: float = 1.0,
+    null_rank_min_pool: int = 2_000,
     emit_counts: bool = False,
     batch_labels: pd.Series | pd.DataFrame | None = None,
     batch_correction: str = "none",
@@ -1468,6 +1720,11 @@ def compute_signed_concordance_matrix(
     # and share the downstream O/E handling; they differ only in how each
     # bin's expected RATE is formed (see _compute_cell_dm_expected mode).
     uses_expected = baseline in ("distance-matched", "distance-pooled")
+    # The rank IS a comparison against the drawn null, so asking for one
+    # without the other is never what the caller meant.
+    emit_null = bool(emit_null or null_rank)
+    if null_rank and int(null_draws) < 1:
+        null_draws = 1
     if concordance_combine not in ("signed-diff", "log2-ratio", "linked-only",
                                    "concordant-diff", "concordant-signed",
                                    "direction-logor"):
@@ -1538,7 +1795,7 @@ def compute_signed_concordance_matrix(
                     delayed(_compute_cell_dm_expected)(
                         path, cell_name, bin_size, min_distance, min_gch_sites,
                         dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
-                        random_state, emit_null,
+                        random_state, emit_null, null_draws,
                     )
                     for cell_name, path in items
                 )
@@ -1547,7 +1804,7 @@ def compute_signed_concordance_matrix(
                     _compute_cell_dm_expected(
                         path, cell_name, bin_size, min_distance, min_gch_sites,
                         dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
-                        random_state, emit_null,
+                        random_state, emit_null, null_draws,
                     )
                     for cell_name, path in items
                 ]
@@ -1599,7 +1856,9 @@ def compute_signed_concordance_matrix(
 
         matrix_keys = list(_SOFT_COUNT_KEYS) + (
             list(_DM_KEYS) if uses_expected else []) + (
-            list(_NULL_KEYS) if (uses_expected and emit_null) else [])
+            [k for _d in range(max(1, int(null_draws)))
+             for k in _null_keys(_d)]
+            if (uses_expected and emit_null) else [])
         raw_counts: dict[str, np.ndarray] = {
             k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in matrix_keys
         }
@@ -1919,12 +2178,19 @@ def compute_signed_concordance_matrix(
                 imputed["k_u_open"], imputed["k_u_closed"],
                 imputed["k_u_mixed"], imputed["n_unlinked"], alpha_u)
 
-        null_rates = None
-        if "k_null_open" in imputed:
-            null_rates = _side_rates(
-                imputed["k_null_open"], imputed["k_null_closed"],
-                imputed["k_null_mixed"], imputed["n_null"], alpha_l)
-        return o_open, o_closed, e_open, e_closed, null_rates
+        # One (open, closed) rate pair per drawn-null replicate, in draw
+        # order.  The observed prior (alpha_l) is used for all of them: the
+        # null is what O looks like with no coordination, so it has to meet
+        # the same shrinkage O does.
+        null_rates: list[tuple[np.ndarray, np.ndarray]] = []
+        for _d in range(max(1, int(null_draws))):
+            _ko, _kc, _km, _kn = _null_keys(_d)
+            if _ko not in imputed:
+                break
+            null_rates.append(_side_rates(
+                imputed[_ko], imputed[_kc], imputed[_km], imputed[_kn],
+                alpha_l))
+        return o_open, o_closed, e_open, e_closed, (null_rates or None)
 
 
     def _layer2(imputed: dict[str, np.ndarray]) -> pd.DataFrame:
@@ -2049,8 +2315,149 @@ def compute_signed_concordance_matrix(
         null_components = {
             name: pd.DataFrame(arr, index=cell_names, columns=sorted_bins)
             for name, arr in decompose_components(
-                _null_rates[0], _null_rates[1], _e_o, _e_c).items()
+                _null_rates[0][0], _null_rates[0][1], _e_o, _e_c).items()
         }
+    # ---- Rank of each observed bin against its own drawn null ------------
+    rank_components = None
+    null_rank_calibration = None
+    if null_rank and not _null_rates:
+        logger.warning(
+            "--null-rank asked for but no drawn null is available: it needs "
+            "a non-contact expected pool (--baseline distance-matched or "
+            "distance-pooled) to draw from.  No rank matrix written.")
+    if null_rank and _null_rates:
+        _want = (tuple(components) if "all" in tuple(null_rank_statistics)
+                 else tuple(null_rank_statistics))
+        _unknown = [k for k in _want if k not in components]
+        if _unknown:
+            logger.warning(
+                "--null-rank-statistics: no such component(s) %s; known are "
+                "%s.  Skipping them.",
+                ", ".join(_unknown), ", ".join(sorted(components)))
+        _want = tuple(k for k in _want if k in components)
+        # TESTABLE = the bin measured something, on the RAW pre-imputation
+        # count, and every draw actually drew.  RWR fills every entry and
+        # its k-NN graph is built from accessibility, so an imputed entry
+        # carries its cell type's signature by construction; its n is also
+        # fractional and typically below 1, which makes the value ~99%
+        # prior.  Pooled into an empirical null those are a spike at the
+        # prior, and every genuinely measured bin then lands in its tail --
+        # measured as a 0.577 false-positive rate in the marker script.
+        # The mask is applied to the observed AND to the pool, so the
+        # comparison stays like-for-like: both sides are post-RWR, and only
+        # bins that actually measured something are reported.
+        _testable = raw_counts["n_linked"] >= float(null_rank_min_pairs)
+        for _d in range(len(_null_rates)):
+            _nn_key = _null_keys(_d)[3]
+            if _nn_key in raw_counts:
+                _testable = _testable & (raw_counts[_nn_key] >= 1.0)
+        # Raw accessibility, not components["marginal"] -- see rank_strata.
+        _openness = accessibility_raw.reindex(
+            index=cell_names, columns=sorted_bins).to_numpy(float)
+        _testable = _testable & np.isfinite(_openness)
+        _strata = rank_strata(raw_counts["n_linked"], _openness)
+        rank_components = {}
+        for _name in _want:
+            _draws = [decompose_components(_nr[0], _nr[1], _e_o, _e_c)[_name]
+                      for _nr in _null_rates]
+            _arr, _info = empirical_rank(
+                components[_name].to_numpy(float), _draws, _strata,
+                _testable, scope=str(null_rank_scope),
+                min_pool=int(null_rank_min_pool))
+            _df = pd.DataFrame(_arr, index=cell_names, columns=sorted_bins)
+            _df.columns.name = "bin"
+            _df.index.name = "cell"
+            rank_components[_name] = _df
+            _res = (2.0 / (_info["median_pool"] + 1.0)
+                    if _info["median_pool"] else float("nan"))
+            logger.info(
+                "Null rank [%s]: %d of %d cell-bins scored against %s pools "
+                "over %d strata (median pool %d draws -> smallest reportable "
+                "two-sided p = %.2g); %d fell back to the joint pool.",
+                _name, _info["n_scored"], _testable.size, _info["scope"],
+                _info["n_strata"], _info["median_pool"], _res,
+                _info["n_fallback"])
+        # IS THE DIRECTION RANK JUST THE MAGNITUDE RANK.  Coordination moves
+        # mass out of `mixed` into BOTH concordant cells equally, so it
+        # raises S = O_open + O_closed while leaving D = O_open - O_closed
+        # pinned at the marginal by the exact per-pair identity
+        # D == pbar_1 + pbar_2 - 1.  With the same D on both sides,
+        #
+        #   L = log[(S_O + D)/(S_O - D)] - log[(S_E + D)/(S_E - D)]
+        #
+        # so ADDING PURE COORDINATION AT A LOW MARGINAL MAKES L POSITIVE with
+        # no directional preference at all: at pbar = 0.10, C = +0.10 gives
+        # L = +1.73; at pbar = 0.90 the same C gives -1.73; at 0.50 it gives
+        # exactly 0.  PMDs, LADs and late-replicating domains are the
+        # low-marginal end of the genome, so any coordination there reads as
+        # "co-open" in L as a matter of arithmetic.  The rank fixes L's
+        # SCALE -- the stratum pool is wide where L is twitchy -- but it
+        # cannot make L independent of C, because they are not independent.
+        # This correlation is how much of the direction call is really the
+        # magnitude call; near 1 means read C and ignore L's sign.
+        if (rank_components and "coordination" in rank_components
+                and "direction_logor" in rank_components):
+            _rc = rank_components["coordination"].to_numpy(float)
+            _rl = rank_components["direction_logor"].to_numpy(float)
+            _m = np.isfinite(_rc) & np.isfinite(_rl)
+            if _m.sum() > 10:
+                _r = float(np.corrcoef(_rc[_m], _rl[_m])[0, 1])
+                logger.info(
+                    "Null rank: corr(coordination, direction_logor) = %+.3f "
+                    "over %d cell-bins.", _r, int(_m.sum()))
+                if abs(_r) > 0.7:
+                    logger.warning(
+                        "The direction rank is %.0f%% correlated with the "
+                        "magnitude rank.  L is a deterministic function of C "
+                        "and the marginal (see the note above this check), "
+                        "so at this correlation its sign is reporting "
+                        "coordination re-expressed, not a co-open vs "
+                        "co-closed preference.  Read 'coordination'; compare "
+                        "L only between bins at matched C and matched "
+                        "openness.", 100 * abs(_r))
+        if not rank_components:
+            rank_components = None
+        elif len(_null_rates) < 2:
+            logger.warning(
+                "--null-rank with --null-draws 1: each bin contributes a "
+                "single draw to its stratum pool, so the pool is only as "
+                "wide as the stratum is populous, and the procedure cannot "
+                "check itself (that needs a draw to hold out).  Raise "
+                "--null-draws to at least 2, and further if the reported "
+                "p-resolution is coarser than the multiple testing you "
+                "intend to do.")
+        # HOLD OUT ONE DRAW AND SCORE IT.  A draw from the null is a case
+        # where the true answer is known, so its p-values must come back
+        # uniform; whatever excess shows up below 0.05 is this procedure's
+        # own false-positive rate, and every observed bin inherits it.
+        if rank_components is not None and len(_null_rates) >= 2:
+            null_rank_calibration = {}
+            for _name in _want:
+                _draws = [decompose_components(
+                    _nr[0], _nr[1], _e_o, _e_c)[_name] for _nr in _null_rates]
+                _cal = rank_self_calibration(
+                    _draws, _strata, _testable, scope=str(null_rank_scope),
+                    min_pool=int(null_rank_min_pool))
+                if _cal is None:
+                    continue
+                null_rank_calibration[_name] = _cal
+                logger.info(
+                    "Null rank [%s] self-check: holding out one draw, "
+                    "%.3f of %d null cell-bins fall at p <= 0.05 and %.3f at "
+                    "p <= 0.01 (nominal 0.05 / 0.01); KS to uniform %.3f, "
+                    "finest expressible p %.2g.",
+                    _name, _cal["frac_p05"], _cal["n"], _cal["frac_p01"],
+                    _cal["ks_uniform"], _cal["finest_p"])
+                if _cal["frac_p05"] > 0.10:
+                    logger.warning(
+                        "Null rank [%s] is NOT calibrated: %.3f of pure-null "
+                        "cell-bins clear p <= 0.05, against a nominal 0.05. "
+                        "Do not read the rank matrix as a p-value until this "
+                        "is closer to nominal -- usually it means the strata "
+                        "are not separating bins that differ in depth or "
+                        "openness, or that too many pools fell back.",
+                        _name, _cal["frac_p05"])
+
     _pol = coordination_polar(components["coordination"].to_numpy(float),
                               components["direction_excess"].to_numpy(float))
     polar_info = {k: v for k, v in _pol.items()
@@ -2199,6 +2606,22 @@ def compute_signed_concordance_matrix(
             for _name, _df in null_components.items():
                 _df.to_parquet(
                     out_path / f"concordance_{_name}_null.parquet")
+        # Signed -log10(p) of each bin against its own stratum's drawn null.
+        # Emitted ALONGSIDE the effect sizes, never instead of them: a rank
+        # cannot be pooled across a region the way counts can, so the region
+        # tests and --from-counts profiles still need C and L, and the two
+        # answer different questions (how much vs is it there at all).
+        if rank_components is not None:
+            for _name, _df in rank_components.items():
+                _df.to_parquet(
+                    out_path / f"concordance_{_name}_rank.parquet")
+                _df.to_csv(
+                    out_path / f"concordance_{_name}_rank.tsv", sep="\t")
+        if null_rank_calibration:
+            import json as _json
+            with open(out_path / "null_rank_calibration.json", "w") as _fh:
+                _json.dump(null_rank_calibration, _fh, indent=2,
+                           default=_json_safe)
 
         # Soft counts + priors for diagnostics / reproducibility.
         soft_long = []
@@ -2265,6 +2688,12 @@ def compute_signed_concordance_matrix(
         "directional":           components["directional"],
         "directional_corrected": components["directional_corrected"],
         "marginal":              components["marginal"],
+        # Signed -log10(p) against the per-stratum drawn null, or None when
+        # --null-rank was off.  Keyed by the statistic it ranks.
+        "null_rank":             rank_components,
+        # Holding out one drawn null and scoring it: the exceedance rates
+        # there ARE this run's false-positive rate.  None below 2 draws.
+        "null_rank_calibration": null_rank_calibration,
     }
 
 

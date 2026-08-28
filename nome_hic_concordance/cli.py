@@ -340,6 +340,87 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "with scripts/null_calibration_qq.py.",
     )
     parser.add_argument(
+        "--null-draws", type=int, default=1, metavar="K",
+        help="How many independent null replicates to draw per (cell, bin) "
+             "with --emit-null.  One is enough for a Q-Q plot; a RANK needs "
+             "more, because K draws alone can only resolve a p down to "
+             "1/(K+1).  --null-rank pools a stratum's draws across its bins, "
+             "so the pool is n_bins_in_stratum x K and K does not have to be "
+             "large -- K=5 over a 1,000-bin stratum resolves 4e-4, which "
+             "survives FDR over 10,000 bins.  Each draw is another four "
+             "soft-count matrices carried through RWR, so cost is linear in "
+             "K.  Default 1 (unchanged behaviour).",
+    )
+    parser.add_argument(
+        "--null-rank", action="store_true",
+        help="Also emit concordance_<component>_rank.parquet: each bin's "
+             "signed -log10(two-sided p) against drawn nulls from its own "
+             "depth-by-openness stratum.  WHAT THIS IS FOR.  C and the log "
+             "odds ratio already subtract the bin's marginal -- the expected "
+             "pool is that bin's own read ends, re-paired -- but they cannot "
+             "make bins COMPARABLE.  Shrinkage varies with depth (at "
+             "alpha_0 ~ 100 a bin at n=10 is 91 percent prior, one at "
+             "n=10,000 is 1 percent), and the log odds ratio's sensitivity "
+             "to a surplus co-open contact is 1/(alpha_open + k_open), about "
+             "five times larger where k_open -> 0 than in euchromatin on a "
+             "measured GCH run.  So a fixed value of C or L means different "
+             "amounts of evidence in a PMD and in an active domain, which is "
+             "why heterochromatin reads co-open against any genome-wide "
+             "reference.  Ranking against a null drawn from the SAME bin's "
+             "ends matches the marginal and the depth by construction "
+             "instead of assuming them away -- in particular it does NOT "
+             "assume most of the genome is uncoordinated, which a "
+             "genome-median centring does and which would subtract "
+             "compartment-scale signal.  Implies --emit-null, so read that "
+             "flag's note about the half-split end pool: the effect-size "
+             "matrices from a --null-rank run are built on half the ends and "
+             "are noisier than a production run's.  The rank itself is "
+             "unaffected (observed and null meet the same expected).",
+    )
+    parser.add_argument(
+        "--null-rank-scope", choices=["cell", "joint"], default="cell",
+        help="Whose draws go in the pool.  'cell' (default) pools within "
+             "each cell, so every cell is scored against its own null and a "
+             "global offset -- depth, batch, enzyme efficiency, purity -- "
+             "never reaches the output; this is what --contrast-reference-d "
+             "gch=ref_chrM.tsv was approximating off a handful of chrM bins, "
+             "done off the whole genome instead.  'joint' pools across "
+             "cells: steadier per stratum, but a per-cell offset passes "
+             "straight through.  Under 'cell' a (cell, stratum) pool below "
+             "--null-rank-min-pool falls back to that stratum's joint pool.",
+    )
+    parser.add_argument(
+        "--null-rank-statistics", nargs="+", metavar="NAME",
+        default=["coordination", "direction_logor"],
+        help="Which components to rank ('all' for every one).  Default ranks "
+             "the magnitude (coordination) and the direction "
+             "(direction_logor).  Ranking direction_excess as well supplies "
+             "the same axis twice: it and direction_logor are both monotone "
+             "in F at fixed F_exp.",
+    )
+    parser.add_argument(
+        "--null-rank-min-pairs", type=float, default=1.0, metavar="N",
+        help="Minimum RAW (pre-imputation) n_linked for a bin to be scored "
+             "and to contribute to a pool.  RWR fills every entry from a "
+             "k-NN graph built on accessibility, so an imputed entry carries "
+             "its cell type's signature by construction, and its fractional "
+             "n (typically below 1) leaves the value about 99 percent prior. "
+             "Pooled into an empirical null those become a spike at the "
+             "prior and every genuinely measured bin lands in its tail -- "
+             "that mechanism measured a 0.577 false-positive rate in "
+             "scripts/celltype_marker_bins.py.  The threshold masks the "
+             "observed and the pool together, so both sides stay post-RWR "
+             "and like-for-like.  Default 1.",
+    )
+    parser.add_argument(
+        "--null-rank-min-pool", type=int, default=2_000, metavar="M",
+        help="Smallest per-cell stratum pool that will be used on its own "
+             "under --null-rank-scope cell; below it, that stratum's joint "
+             "pool is used instead.  The pool size sets the finest "
+             "reportable two-sided p at 2/(M+1), which is logged per "
+             "statistic.  Default 2000 (p down to 1e-3).",
+    )
+    parser.add_argument(
         "--dm-prior", choices=["separate", "shared"], default="separate",
         help="Whether the observed (linked) and expected (non-contact) "
              "pools get their own Dirichlet-Multinomial EB prior or one "
@@ -1566,7 +1647,13 @@ def run_context(
                 dm_window_mb=args.dm_window_mb,
                 dm_dist_bin=args.dm_dist_bin_bp,
                 dm_prior=args.dm_prior,
-                emit_null=args.emit_null,
+                emit_null=(args.emit_null or args.null_rank),
+                null_draws=args.null_draws,
+                null_rank=args.null_rank,
+                null_rank_scope=args.null_rank_scope,
+                null_rank_statistics=tuple(args.null_rank_statistics),
+                null_rank_min_pairs=args.null_rank_min_pairs,
+                null_rank_min_pool=args.null_rank_min_pool,
                 emit_counts=args.emit_counts,
                 use_rwr=(args.impute == "rwr"),
                 rwr_k=args.rwr_k,
@@ -1602,7 +1689,13 @@ def run_context(
                     dm_window_mb=args.dm_window_mb,
                     dm_dist_bin=args.dm_dist_bin_bp,
                 dm_prior=args.dm_prior,
-                emit_null=args.emit_null,
+                emit_null=(args.emit_null or args.null_rank),
+                null_draws=args.null_draws,
+                null_rank=args.null_rank,
+                null_rank_scope=args.null_rank_scope,
+                null_rank_statistics=tuple(args.null_rank_statistics),
+                null_rank_min_pairs=args.null_rank_min_pairs,
+                null_rank_min_pool=args.null_rank_min_pool,
                 emit_counts=args.emit_counts,
                     use_rwr=(args.impute == "rwr"), rwr_k=args.rwr_k,
                     rwr_restart_prob=args.rwr_restart_prob,
