@@ -2261,56 +2261,119 @@ def statistic_label(matrix_path):
     return None
 
 
-def joint_scatter(ax, tab, a, b, stats, label, stat_labels=None):
-    """Every bin as a dot: the two mean differences against each other.
+def _point_density(x, y, bins=180, smooth=1.5, rng=None):
+    """Local density at each point, from a 2-D histogram rather than a KDE.
 
-    RED is significant in BOTH modalities, grey is everything else.  Two
-    colours rather than four because the question the panel answers is
-    whether a bin is aberrant in both -- a single-modality bin belongs with
-    the background it is being distinguished from, not with a category of
-    its own that competes for the eye.
-
-    The fit is ordinary least squares over EVERY bin, not the red ones: a
-    line through the significant subset would be fitted to the points
-    selected for being extreme, and its slope would measure that selection.
-
-    Its slope is ATTENUATED and the annotation says so.  Both axes are
-    estimated with error, and error on x biases a least-squares slope
-    toward zero -- so the slope is descriptive of the cloud and the
-    correlation, which is what the association claim rests on, is reported
-    beside it.
+    A gaussian_kde evaluated at every point is O(n^2) and there are tens of
+    thousands of bins here.  Binning, smoothing once, then reading each
+    point's cell back gives the same picture in linear time.
     """
-    from scipy.stats import pearsonr, spearmanr
+    from scipy.ndimage import gaussian_filter
+    # Binned over the VIEW when one is given, so the grid resolves the cloud
+    # instead of spending every cell on empty space between outliers.
+    H, xe, ye = np.histogram2d(x, y, bins=bins, range=rng)
+    H = gaussian_filter(H, smooth)
+    xi = np.clip(np.searchsorted(xe, x, side="right") - 1, 0, H.shape[0] - 1)
+    yi = np.clip(np.searchsorted(ye, y, side="right") - 1, 0, H.shape[1] - 1)
+    return H[xi, yi]
+
+
+def joint_scatter(ax, tab, a, b, stats, label, stat_labels=None):
+    """Every bin as a dot, coloured by how many bins are near it.
+
+    NO CATEGORY HIGHLIGHT.  Marking the both-significant bins in red asked
+    the eye to find a subset that was defined by two thresholds, and against
+    tens of thousands of grey points that subset reads as the finding
+    whatever its size.  The claim this panel actually supports is about the
+    CLOUD -- whether the two modalities move together across the genome --
+    and a density surface shows that where scattered dots cannot: at this n
+    the overplotted core is solid ink either way, so the shape of the middle
+    is invisible until it is coloured by density.
+
+    The fit is ordinary least squares over EVERY bin.  Its slope is
+    ATTENUATED and the annotation says so: both axes are estimated with
+    error, and error on x biases a least-squares slope toward zero, so the
+    slope describes the cloud while the correlation carries the association.
+
+    TWO P-VALUES, NOT THREE.  For a simple regression the test of slope = 0
+    and the test of r = 0 are the same t-statistic, so the "fitted line's
+    p-value" and the Pearson p-value are one number, and reporting them
+    separately would suggest two pieces of evidence where there is one.
+    Spearman is the second, genuinely different, test: rank-based, so it
+    survives the heavy tails these differences have.
+
+    BOTH ARE ANTI-CONSERVATIVE HERE and the annotation says that too.  They
+    assume the bins are independent; neighbouring 250 kb bins are strongly
+    correlated, so the effective n is far below the printed one.  Read the
+    coefficient, not the exponent.
+    """
+    from scipy.stats import pearsonr, spearmanr, linregress
 
     sl = stat_labels or {}
     x, y = tab[f"{a}_diff"].to_numpy(float), tab[f"{b}_diff"].to_numpy(float)
-    both = (tab["category"] == "both").to_numpy()
     ok = np.isfinite(x) & np.isfinite(y)
+    xo, yo = x[ok], y[ok]
 
-    ax.scatter(x[ok & ~both], y[ok & ~both], s=4, c="#BFC4C9", lw=0,
-               alpha=0.45, rasterized=True,
-               label=f"not both ({int((ok & ~both).sum()):,})")
-    ax.scatter(x[ok & both], y[ok & both], s=11, c="#D7263D", lw=0,
-               alpha=0.85, rasterized=True,
-               label=f"significant in both ({int((ok & both).sum()):,})")
+    # THE VIEW IS CLIPPED TO A ROBUST RANGE, and it has to be.  These
+    # differences have heavy tails -- a handful of bins sit tens of units
+    # out -- and letting them set the axes squeezes the entire cloud into a
+    # few pixels, which is the failure the density colouring exists to fix.
+    # The fit and every statistic still use ALL the points; only the view is
+    # trimmed, and the count outside it is stated so the trim is visible.
+    lim = None
+    if xo.size > 200:
+        xl = np.percentile(xo, [0.3, 99.7])
+        yl = np.percentile(yo, [0.3, 99.7])
+        mx, my = 0.06 * np.ptp(xl), 0.06 * np.ptp(yl)
+        lim = ((xl[0] - mx, xl[1] + mx), (yl[0] - my, yl[1] + my))
+    dens = (_point_density(xo, yo, rng=lim) if xo.size > 50
+            else np.ones(xo.size))
+    order = np.argsort(dens)          # dense points drawn last, on top
+    sc = ax.scatter(xo[order], yo[order], c=dens[order], s=5, lw=0,
+                    cmap="turbo", rasterized=True)
+    if lim is not None:
+        n_out = int(np.sum((xo < lim[0][0]) | (xo > lim[0][1])
+                           | (yo < lim[1][0]) | (yo > lim[1][1])))
+        ax.set_xlim(*lim[0])
+        ax.set_ylim(*lim[1])
+        if n_out:
+            ax.annotate(f"{n_out:,} bins outside the view (all are in the "
+                        f"fit)", (0.99, 0.01), xycoords="axes fraction",
+                        fontsize=6.5, color="0.4", ha="right", va="bottom")
+    cb = ax.figure.colorbar(sc, ax=ax, pad=0.02, fraction=0.045)
+    cb.set_label("bins per neighbourhood (smoothed 2-D count)", fontsize=7.5)
+    cb.ax.tick_params(labelsize=7)
     ax.axhline(0, color="#9AA0A6", lw=0.8, zorder=0)
     ax.axvline(0, color="#9AA0A6", lw=0.8, zorder=0)
 
     fit = {}
-    if ok.sum() >= 3 and np.ptp(x[ok]) > 0:
-        m, c = np.polyfit(x[ok], y[ok], 1)
-        xs = np.array([x[ok].min(), x[ok].max()])
-        ax.plot(xs, m * xs + c, "-", color="#1A1A1A", lw=1.3, zorder=5)
-        fit = {"slope": float(m), "intercept": float(c),
-               "pearson_r": float(pearsonr(x[ok], y[ok])[0]),
-               "spearman_rho": float(spearmanr(x[ok], y[ok])[0]),
-               "n_fit": int(ok.sum())}
-        ax.annotate(f"slope {m:+.3g} (attenuated by error on x)\n"
-                    f"r = {fit['pearson_r']:+.3f}   "
-                    f"\u03c1 = {fit['spearman_rho']:+.3f}   "
-                    f"n = {fit['n_fit']:,}",
-                    (0.03, 0.97), xycoords="axes fraction", fontsize=7.5,
-                    va="top", color="#1A1A1A")
+    if xo.size >= 3 and np.ptp(xo) > 0:
+        lr = linregress(xo, yo)
+        r, p_r = pearsonr(xo, yo)
+        rho, p_rho = spearmanr(xo, yo)
+        xs = np.array([xo.min(), xo.max()])
+        ax.plot(xs, lr.slope * xs + lr.intercept, "-", color="#1A1A1A",
+                lw=1.4, zorder=5)
+        fit = {"slope": float(lr.slope), "intercept": float(lr.intercept),
+               "slope_stderr": float(lr.stderr),
+               "slope_pvalue": float(lr.pvalue),
+               "pearson_r": float(r), "pearson_p": float(p_r),
+               "spearman_rho": float(rho), "spearman_p": float(p_rho),
+               "n_fit": int(xo.size)}
+        _f = lambda v: "< 1e-300" if v < 1e-300 else f"= {v:.2g}"
+        ax.annotate(
+            f"slope {lr.slope:+.3g} \u00b1 {lr.stderr:.2g}   "
+            f"p {_f(lr.pvalue)}\n"
+            f"Pearson r = {r:+.3f}, p {_f(p_r)}  "
+            f"(same test as the slope)\n"
+            f"Spearman \u03c1 = {rho:+.3f}, p {_f(p_rho)}\n"
+            f"n = {xo.size:,} bins \u2014 neighbouring bins are correlated, "
+            f"so both p are anti-conservative\n"
+            f"slope attenuated by error on x",
+            (0.03, 0.97), xycoords="axes fraction", fontsize=7,
+            va="top", color="#1A1A1A",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.85",
+                      alpha=0.85))
 
     xa = f"{a} mean difference" + (f"  ({sl[a]})" if sl.get(a) else "")
     yb = f"{b} mean difference" + (f"  ({sl[b]})" if sl.get(b) else "")
@@ -2320,7 +2383,6 @@ def joint_scatter(ax, tab, a, b, stats, label, stat_labels=None):
     note = (f"{stats['n_both']:,} significant in both, {same:.0%} same "
             f"direction" if stats["n_both"] else "no bin significant in both")
     ax.set_title(f"{label}: {note}", fontsize=10)
-    ax.legend(frameon=False, fontsize=8, loc="lower right")
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
     return fit

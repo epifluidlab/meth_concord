@@ -3377,26 +3377,20 @@ def _ax():
     return plt.subplots(figsize=(5, 5))
 
 
-def test_the_joint_scatter_is_two_colours_and_red_is_both():
-    """The question the panel answers is whether a bin is aberrant in BOTH
-    modalities.  A single-modality bin belongs with the background it is
-    being distinguished from, not with a category competing for the eye."""
+def test_the_joint_scatter_draws_one_continuous_layer_not_two_categories():
+    """Superseded: the panel used to mark the both-significant bins red
+    against grey.  That asked the eye to find a subset defined by two
+    thresholds, and against tens of thousands of points it read as the
+    finding whatever its size.  The claim the panel supports is about the
+    CLOUD, so it is one layer coloured by density."""
     m = _mod()
     tab = _joint_tab()
     fig, ax = _ax()
     m.joint_scatter(ax, tab, "gch", "hcg",
                     {"n_both": 60, "frac_both_same_direction": 0.9}, "lab")
-    import matplotlib.colors as mc
-    cols = [tuple(np.round(c.get_facecolor()[0][:3], 3))
-            for c in ax.collections]
-    assert len(cols) == 2
-    assert tuple(np.round(mc.to_rgb("#D7263D"), 3)) in cols
-    assert tuple(np.round(mc.to_rgb("#BFC4C9"), 3)) in cols
-    # the red layer holds exactly the bins called in both
-    red = [c for c in ax.collections
-           if tuple(np.round(c.get_facecolor()[0][:3], 3))
-           == tuple(np.round(mc.to_rgb("#D7263D"), 3))][0]
-    assert red.get_offsets().shape[0] == 60
+    big = [c for c in ax.collections if c.get_offsets().shape[0] > 20]
+    assert len(big) == 1
+    assert big[0].get_array() is not None
 
 
 def test_the_fit_is_over_every_bin_not_the_significant_ones():
@@ -4684,3 +4678,106 @@ def test_the_four_selection_modes_are_ordered_the_way_they_should_be(
     assert out_n["fdr"][0] > out_n["unit-p"][0] > out_n["unit-fdr"][0]
     assert out_n["fdr"][1] > out_n["unit-p"][1] >= out_n["unit-fdr"][1]
     assert out_n["unit-fdr"][1] < 0.08
+
+
+# ---------------------------------------------------------------------------
+# --contrast-joint scatter: density, not a category highlight
+# ---------------------------------------------------------------------------
+
+
+def _joint_ax(n=20_000, seed=0):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    z = rng.normal(0, 1, n)
+    x = 0.6 * z + rng.standard_t(3, n) * 0.5
+    y = 0.5 * z + rng.standard_t(3, n) * 0.6
+    tab = pd.DataFrame({"gch_diff": x, "hcg_diff": y,
+                        "category": np.where(np.abs(x) + np.abs(y) > 4,
+                                             "both", "gch")})
+    fig, ax = plt.subplots(figsize=(6.4, 5.2))
+    fit = _mod().joint_scatter(
+        ax, tab, "gch", "hcg",
+        {"n_both": int((tab["category"] == "both").sum()),
+         "frac_both_same_direction": 0.71}, "lab",
+        {"gch": "log-OR", "hcg": "log-OR"})
+    return fig, ax, fit, tab
+
+
+def test_the_joint_scatter_no_longer_highlights_the_both_significant_bins():
+    """Marking them asked the eye to find a subset defined by two
+    thresholds, and against tens of thousands of grey points that subset
+    reads as the finding whatever its size."""
+    import inspect
+    src = inspect.getsource(_mod().joint_scatter)
+    assert "#D7263D" not in src            # the old red
+    assert "significant in both (" not in src
+    fig, ax, fit, tab = _joint_ax()
+    # One point collection, coloured continuously -- not two categorical ones.
+    colls = [c for c in ax.collections if c.get_offsets().shape[0] > 100]
+    assert len(colls) == 1
+    arr = colls[0].get_array()
+    assert arr is not None and len(set(np.asarray(arr).tolist())) > 20
+
+
+def test_the_joint_scatter_is_a_density_surface_with_a_colour_bar():
+    fig, ax, fit, tab = _joint_ax()
+    # A colorbar is its own axes on the figure.
+    assert len(fig.axes) >= 2
+    cb = [a for a in fig.axes if a is not ax]
+    assert any("neighbourhood" in (a.get_ylabel() + a.get_xlabel())
+               for a in cb)
+
+
+def test_the_joint_scatter_reports_both_tests_and_says_they_are_one():
+    """For a simple regression the test of slope = 0 and the test of r = 0
+    are the same t-statistic, so reporting them as two findings would
+    suggest twice the evidence.  Spearman is the second, different test."""
+    fig, ax, fit, tab = _joint_ax()
+    for k in ("slope", "slope_stderr", "slope_pvalue", "pearson_r",
+              "pearson_p", "spearman_rho", "spearman_p", "n_fit"):
+        assert k in fit, k
+    # Identical by construction, which is why the annotation says so.
+    assert fit["slope_pvalue"] == pytest.approx(fit["pearson_p"], rel=1e-9,
+                                                abs=1e-300)
+    txt = " ".join(t.get_text() for t in ax.texts)
+    assert "same test as the slope" in txt
+    assert "Spearman" in txt and "anti-conservative" in txt
+
+
+def test_clipping_the_view_does_not_change_the_fit():
+    """Heavy tails would squeeze the cloud into a few pixels, which is the
+    failure the density colouring exists to fix -- but the statistics must
+    still use every bin."""
+    fig, ax, fit, tab = _joint_ax()
+    from scipy.stats import linregress
+    x = tab["gch_diff"].to_numpy(float)
+    y = tab["hcg_diff"].to_numpy(float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    assert fit["n_fit"] == int(ok.sum())
+    assert fit["slope"] == pytest.approx(linregress(x[ok], y[ok]).slope,
+                                         rel=1e-9)
+    # The view really is tighter than the data.
+    lo, hi = ax.get_xlim()
+    assert lo > x.min() and hi < x.max()
+    assert any("outside the view" in t.get_text() for t in ax.texts)
+
+
+def test_the_density_is_binned_over_the_view_not_the_outliers():
+    mod = _mod()
+    rng = np.random.default_rng(1)
+    core = rng.normal(0, 1, 5_000)
+    x = np.r_[core, [500.0, -500.0]]
+    y = np.r_[rng.normal(0, 1, 5_000), [500.0, -500.0]]
+    wide = mod._point_density(x, y)
+    tight = mod._point_density(x, y, rng=((-4, 4), (-4, 4)))
+    # Binned over the full range the whole core falls into a handful of
+    # cells, so nearly every point gets the same density and the surface
+    # carries no shape; binned over the view it resolves into thousands of
+    # distinct levels.  Measured: 4 against 3,520.
+    n_wide = len(set(np.round(wide[:5_000], 6).tolist()))
+    n_tight = len(set(np.round(tight[:5_000], 6).tolist()))
+    assert n_wide < 20, n_wide
+    assert n_tight > 500, n_tight
