@@ -4444,3 +4444,144 @@ def test_the_q_value_uses_the_stratified_null_when_one_was_measured():
     assert true_fdr < 0.20, true_fdr
     # finest_q is what the pool can actually express, not a formula.
     assert info["finest_q"] == pytest.approx(float(np.nanmin(q)), abs=1e-9)
+
+
+def test_the_permutation_count_is_a_cap_not_a_repetition_count():
+    """Unit labels are exhaustible.  With five cell types split two against
+    three there are C(5,2)-1 = 9 relabellings, and asking for a thousand
+    still returns nine -- so the flag reads like a knob that could be turned
+    up when it is not one."""
+    mod = _mod()
+    u = ["tumor1", "tumor2", "GM12878", "IMR90", "monocyte"]
+    t = ["tumor1", "tumor2"]
+    for cap in (9, 100, 10_000):
+        assert len(mod.unit_relabellings(u, 2, t, max_n=cap)) == 9
+        assert len(mod.unit_relabellings(u, 2, t, max_n=cap,
+                                         scope="reference")) == 3
+    # Below the ceiling it really does cap.
+    assert len(mod.unit_relabellings(u, 2, t, max_n=4)) == 4
+    # More UNITS is what adds relabellings, not a larger cap.
+    u6 = u + ["fibroblast"]
+    assert len(mod.unit_relabellings(u6, 2, t, max_n=10_000)) == 14   # C(6,2)-1
+    assert len(mod.unit_relabellings(u6, 2, t, max_n=10_000,
+                                     scope="reference")) == 6         # C(4,2)
+
+
+def test_the_run_says_how_many_relabellings_are_possible(tmp_path):
+    """Printing only the number used invites it to be read as a repetition
+    count that could be raised."""
+    import pandas as pd
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_contrast_evaluation import _dataset
+    d, s, _ = _dataset(tmp_path, n_bins=300, real=75)
+    sdf = pd.read_csv(s, sep="\t")
+    sdf["exp_batch"] = ["b1", "b2"] * (len(sdf) // 2)
+    sdf.to_csv(s, sep="\t", index=False)
+    cd = tmp_path / "counts"
+    K = pd.read_parquet(cd / "k_open.parquet")
+    C = pd.read_parquet(cd / "k_closed.parquet")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        X = np.log(K.to_numpy()) - np.log(C.to_numpy())
+    mat = tmp_path / "concordance_direction_logor.parquet"
+    pd.DataFrame(np.where(np.isfinite(X), X, np.nan), index=K.index,
+                 columns=K.columns).to_parquet(mat)
+
+    def run(cap):
+        out = tmp_path / f"o{cap}"
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+             "--samples", str(s), "--cell-type-column", "cell_type",
+             "--batch-column", "exp_batch", "--n-bins", "60",
+             "--n-permutations", "20", "--contrast", "m=tumor1,tumor2",
+             "--contrast-test", "welch", "--contrast-permute-units", str(cap),
+             "--output-dir", str(out), "--plot-format", "png"],
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-2000:]
+        return r.stderr
+
+    assert "9 of 9 possible unit relabellings" in run(9)
+    assert "the complete enumeration" in run(1000)
+    assert "capped from 9" in run(4)
+
+
+def _welch_matrix_run(tmp_path, tag, *extra, n_bins=2000, real=600,
+                      effect=1.6, cov=0.35, ppc=6.0, fdr="0.05"):
+    import pandas as pd
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_contrast_evaluation import _dataset
+    d, s, _ = _dataset(tmp_path / tag, n_bins=n_bins, real=real,
+                       effect=effect, cov=cov, ppc=ppc)
+    sdf = pd.read_csv(s, sep="\t")
+    sdf["exp_batch"] = ["b1", "b2"] * (len(sdf) // 2)
+    sdf.to_csv(s, sep="\t", index=False)
+    cd = tmp_path / tag / "counts"
+    K = pd.read_parquet(cd / "k_open.parquet")
+    C = pd.read_parquet(cd / "k_closed.parquet")
+    e = 1 / (1 + np.exp(0.4))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        X = (np.log(K.to_numpy()) - np.log(C.to_numpy())
+             - (np.log(e) - np.log(1 - e)))
+    mat = tmp_path / tag / "concordance_direction_logor.parquet"
+    pd.DataFrame(np.where(np.isfinite(X), X, np.nan), index=K.index,
+                 columns=K.columns).to_parquet(mat)
+    out = tmp_path / tag / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--batch-column", "exp_batch", "--n-bins", "200",
+         "--n-permutations", "20", "--contrast", "m=tumor1,tumor2",
+         "--contrast-test", "welch", "--contrast-fdr", fdr,
+         "--output-dir", str(out), "--plot-format", "png", *extra],
+        capture_output=True, text=True)
+    return out, r, real
+
+
+def test_unit_fdr_actually_changes_the_call_set(tmp_path):
+    """The relabellings were a diagnostic until now: the BEDs, the volcano
+    and the joint contrast all still came from BH on the nominal p, so the
+    counts did not move however inflated that p was measured to be."""
+    import pandas as pd
+    got = {}
+    for sel in ("fdr", "unit-fdr"):
+        out, r, real = _welch_matrix_run(
+            tmp_path, sel, "--contrast-permute-units", "9",
+            "--contrast-permute-scope", "reference",
+            "--contrast-select", sel)
+        assert r.returncode == 0, r.stderr[-2500:]
+        t = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
+        i = t["bin"].str.split(":").str[1].astype(int) // 250_000
+        m = t["contrast_m"].astype(bool)
+        n = int(m.sum())
+        got[sel] = (n, 1 - float((m & (i < real)).sum()) / max(n, 1))
+    n_bh, fdr_bh = got["fdr"]
+    n_un, fdr_un = got["unit-fdr"]
+    # BH on the nominal p over-calls at a true rate well past its nominal.
+    assert fdr_bh > 0.15, fdr_bh
+    # Selecting on the relabelled-null q brings it back to nominal.
+    assert fdr_un < 0.08, fdr_un
+    assert n_un < n_bh
+
+
+def test_unit_fdr_without_the_relabellings_says_which_flag_to_add(tmp_path):
+    out, r, _ = _welch_matrix_run(tmp_path, "noperm", "--contrast-select",
+                                  "unit-fdr", n_bins=300, real=80)
+    assert r.returncode != 0
+    assert "--contrast-permute-units" in r.stderr
+
+
+def test_unit_fdr_says_when_the_relabellings_cannot_reach_the_threshold(
+        tmp_path):
+    """The empirical P(null <= t) bottoms out at one draw in R x n_bins and
+    the q multiplies it back by n_bins over the rank, so the most extreme
+    bin can never score below about 1/R.  With three relabellings that is
+    0.33, and a run that returns nothing should say the reason is
+    arithmetic rather than biology."""
+    out, r, _ = _welch_matrix_run(
+        tmp_path, "floor", "--contrast-permute-units", "9",
+        "--contrast-permute-scope", "reference",
+        "--contrast-select", "unit-fdr",
+        n_bins=400, real=40, effect=0.15, cov=0.10, ppc=2.0)
+    assert r.returncode == 0, r.stderr[-2500:]
+    if "WARNING no bin can clear" in r.stderr:
+        assert "the floor is about 1/3" in r.stderr
+        assert "--contrast-permute-scope all gives" in r.stderr

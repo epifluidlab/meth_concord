@@ -3260,15 +3260,28 @@ def main():
                     help="Bins per contrast BED with --contrast-select top-n "
                          "(0 = same as --n-bins).  Ignored under the default "
                          "fdr rule, which has no fixed count.")
-    ap.add_argument("--contrast-select", choices=["fdr", "top-n"],
-                    default="fdr",
+    ap.add_argument("--contrast-select",
+                    choices=["fdr", "top-n", "unit-fdr"], default="fdr",
                     help="How a contrast BED is filled.  'fdr' (default) keeps "
                          "every bin below --contrast-fdr, which is what the "
                          "volcano colours and can legitimately come back "
                          "empty.  'top-n' keeps the --n-contrast-bins largest "
                          "|t| whether or not any of them is significant, so it "
                          "always returns a set and never says the contrast is "
-                         "empty.")
+                         "empty.  'unit-fdr' keeps every bin below "
+                         "--contrast-fdr on the RELABELLED-NULL q instead of "
+                         "on BH of the nominal p, and needs "
+                         "--contrast-permute-units.  Use it when the "
+                         "relabellings say the nominal p is inflated: BH "
+                         "assumes that p is uniform under the null, and on a "
+                         "measured run it was not -- welch ran at 0.24 on "
+                         "GCH and 0.38 on HCG against a nominal 0.05, so "
+                         "'FDR < 0.05' was really controlling near those.  "
+                         "Selecting on the calibrated q makes the BEDs, the "
+                         "volcano, the joint contrast and the heatmaps all "
+                         "reflect the rate that was actually measured, "
+                         "instead of leaving it to a column the reader has "
+                         "to filter by hand.")
     ap.add_argument("--delta-var", action="append", default=None,
                     metavar="NAME=PATH",
                     help="concordance_delta_var.parquet for the matching "
@@ -3514,7 +3527,21 @@ def main():
                     help="MEASURE how inflated this run's nominal p is on "
                          "THIS dataset, by relabelling which replication "
                          "units are the contrast arm and re-running the "
-                         "identical test.  N caps how many "
+                         "identical test.  N IS A CAP, NOT A REPETITION "
+                         "COUNT: unit labels are exhaustible, so with five "
+                         "cell types split two against three there are "
+                         "C(5,2) - 1 = 9 relabellings and asking for a "
+                         "thousand still returns nine (with "
+                         "--contrast-permute-scope reference and three "
+                         "reference units, three).  What supplies the "
+                         "resolution is not their number but the pooling "
+                         "across bins -- 3 relabellings over 10,000 bins is "
+                         "a pool of 30,000 -- and what would sharpen it is "
+                         "more cell types, not more permutations.  Do NOT "
+                         "manufacture units by splitting a cell type in "
+                         "half: the halves share a donor, which reintroduces "
+                         "exactly the pseudo-replication this is measuring.  "
+                         "N caps how many "
                          "balanced relabellings to use; 0 (default) is off "
                          "and any positive number takes all of them when "
                          "there are fewer (with five cell types, two against "
@@ -4536,6 +4563,7 @@ def main():
                                         out_mask, args.contrast_test)
             # ---- Empirical p from relabelled units ---------------------
             summary_unitperm = locals().get("summary_unitperm") or {}
+            unitnull_q = None
             if args.contrast_permute_units and cs is not None \
                     and donor_v is not None:
                 _u_all = np.asarray(donor_v, dtype=object)
@@ -4619,9 +4647,32 @@ def main():
                     _exp_cal = 0.05 * _n_test
                     _enr_nom = _n_nom / _exp_nom if _exp_nom > 0 else np.nan
                     _enr_cal = _n_cal / _exp_cal if _exp_cal > 0 else np.nan
-                    print(f"  contrast {label!r}: {_pi['n_relabellings']} "
-                          f"unit relabellings (median pool "
-                          f"{_pi['median_pool']:,}).  ON THIS DATA the "
+                    # HOW MANY RELABELLINGS EXIST, not how many were
+                    # asked for.  --contrast-permute-units is a CAP: the
+                    # unit labels are exhaustible, so with five cell types
+                    # split two against three there are C(5,2) - 1 = 9 and
+                    # asking for a thousand still returns nine.  Saying only
+                    # "9 relabellings" invites it to be read as a repetition
+                    # count that could be raised.
+                    _n_poss = len(unit_relabellings(
+                        _units, len(_ua), _ua,
+                        scope=args.contrast_permute_scope))
+                    _cap_note = (
+                        "the complete enumeration; the unit labels are "
+                        "exhaustible, so raising --contrast-permute-units "
+                        "cannot add any"
+                        if _pi["n_relabellings"] >= _n_poss
+                        else f"capped from {_n_poss} by "
+                             f"--contrast-permute-units")
+                    print(f"  contrast {label!r}: "
+                          f"{_pi['n_relabellings']} of {_n_poss} possible "
+                          f"unit relabellings ({_cap_note}).  Median pool "
+                          f"{_pi['median_pool']:,} bin-statistics -- but "
+                          f"they reuse the same cells and neighbouring bins "
+                          f"are correlated, so the real resolution is "
+                          f"coarser than 1/{_pi['median_pool'] + 1:,}.  More "
+                          f"cell types, not more permutations, is what would "
+                          f"sharpen this.  ON THIS DATA the "
                           f"nominal {args.contrast_test!r} p runs at "
                           f"{_fpr:.3f} against a nominal 0.05 "
                           f"({_fpr / 0.05:.1f}x); a true 5 percent needs "
@@ -4686,6 +4737,7 @@ def main():
                     # what it says whatever the nominal p is worth.
                     _q, _qi = empirical_null_qvalue(cs["p"], _flat,
                                                     p_perm=_pe)
+                    unitnull_q = _q
                     scores_df[f"contrast_{label}_qvalue_unitnull"] = _q
                     extra_cols.append(f"contrast_{label}_qvalue_unitnull")
                     _at = {t: int(np.sum(np.isfinite(_q) & (_q <= t)))
@@ -4762,6 +4814,56 @@ def main():
                           f"parametric p.  The gap is what a whole-cell shift "
                           f"was buying.", file=sys.stderr)
             q = _bh_fdr(cs["p"])
+            if args.contrast_select == "unit-fdr":
+                if unitnull_q is None:
+                    sys.exit(
+                        "--contrast-select unit-fdr needs the relabelled "
+                        "null: add --contrast-permute-units 9 (and, for a "
+                        "null the contrast arm is excluded from, "
+                        "--contrast-permute-scope reference).")
+                # THE POINT OF MEASURING IT.  Until now the relabellings
+                # were a diagnostic and the call set still came from BH on
+                # the nominal p -- which on this data is the p that ran at
+                # 0.24 and 0.38 against 0.05, so "FDR < 0.05" was not 0.05.
+                # Selecting on the calibrated q makes every downstream
+                # artefact -- the BEDs, the volcano, the joint contrast, the
+                # heatmaps -- reflect the rate that was actually measured.
+                _n_bh = int(np.sum(np.isfinite(q) & (q < args.contrast_fdr)))
+                _n_un = int(np.sum(np.isfinite(unitnull_q)
+                                   & (unitnull_q < args.contrast_fdr)))
+                # THE FLOOR IS SET BY THE RELABELLINGS, NOT THE POOL.  The
+                # empirical P(null <= t) bottoms out at one draw in
+                # R x n_bins, and the q multiplies it back by n_bins over
+                # the rank -- so the most extreme bin can never score below
+                # about 1/R, and with three relabellings that is 0.33.
+                # Pooling across bins buys resolution in the middle of the
+                # list, where a real set of discoveries lives, but nothing
+                # at rank 1.  If the whole curve sits above the threshold
+                # there is nothing to select and the reason is arithmetic.
+                _fq = float(np.nanmin(unitnull_q)) \
+                    if np.isfinite(unitnull_q).any() else float("nan")
+                if _n_un == 0 and np.isfinite(_fq) \
+                        and _fq >= args.contrast_fdr:
+                    print(f"  contrast {label!r}: WARNING no bin can clear "
+                          f"q<{args.contrast_fdr} here -- the smallest q "
+                          f"this null expresses is {_fq:.2f}, and with "
+                          f"{_pi['n_relabellings']} relabellings the floor "
+                          f"is about 1/{_pi['n_relabellings']} = "
+                          f"{1 / max(_pi['n_relabellings'], 1):.2f} at the "
+                          f"top of the list.  Either the signal is not "
+                          f"strong enough to push a large SET of bins down "
+                          f"(which is what buys a small q), or you need more "
+                          f"cell types.  --contrast-permute-scope all gives "
+                          f"9 relabellings instead of 3, at the cost of a "
+                          f"null the contrast arm leaks into.",
+                          file=sys.stderr)
+                print(f"  contrast {label!r}: selecting on the relabelled-"
+                      f"null q, not on BH of the nominal p -> {_n_un:,} bins "
+                      f"at q<{args.contrast_fdr} against {_n_bh:,} from BH.  "
+                      f"BH assumes the nominal p is uniform under the null "
+                      f"and on this data it is not, which is what the "
+                      f"relabellings just measured.", file=sys.stderr)
+                q = unitnull_q
             gs = global_shift_report(cs["diff"],
                                      np.isfinite(q) & (q < args.contrast_fdr))
             if gs and gs["frac_bins_same_direction"] > 0.9:
@@ -4850,7 +4952,7 @@ def main():
             rank = np.where(np.isfinite(cs["p"]),
                             -np.log10(np.maximum(cs["p"], 1e-300)), -np.inf)
             mask = np.zeros(M.shape[1], bool)
-            if args.contrast_select == "fdr":
+            if args.contrast_select in ("fdr", "unit-fdr"):
                 # Significance, not a fixed count.  A rank cut returns N bins
                 # whether or not anything differs, so "the top 500" reads as a
                 # finding even when the contrast is empty; an FDR cut can
