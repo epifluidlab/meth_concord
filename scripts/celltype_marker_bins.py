@@ -1470,6 +1470,32 @@ def moderated_t(a, b, prior_df=4.0):
     3 the design has.  Larger is more powerful and eventually
     anti-conservative: d0 = 8 measured 0.70 / 0.045 and d0 = 20 measured
     0.75 / 0.058 on the same fixture.
+
+    WHY NOT A LIKELIHOOD RATIO TEST UNDER A COUNT MODEL.  Measured on the
+    same fixture, at the CELL level:
+
+        binomial GLM, Wald      power 1.00   FPR 0.563
+        binomial GLM, LRT       power 1.00   FPR 0.563
+        beta-binomial, LRT      power 1.00   FPR 0.496
+
+    The test statistic is irrelevant -- Wald and LRT agree to three decimal
+    places -- and beta-binomial buys almost nothing, because the
+    over-dispersion it models is WITHIN a replication unit while the error
+    is BETWEEN them.  Poisson and negative binomial are the wrong family
+    outright: the denominator here is known and fixed (the pairs in the
+    bin), not a nuisance library size, so this is a proportion and the
+    binomial variance np(1-p) is the correct one; both also need integer
+    counts, which soft counts are not.
+
+    A beta-binomial LRT on unit-POOLED counts is the one real contender.
+    Its dispersion parameter is estimated from 2 residual degrees of
+    freedom, so the chi-square(1) reference is far from asymptotic and it
+    measured FPR 0.148; with the dispersion shared across bins and an
+    F(1, 3) reference it becomes competitive -- power 0.87 at FPR 0.000 --
+    but ONLY while dispersion really is homogeneous.  Re-run with the
+    per-bin dispersion varying tenfold, which is what a genome looks like,
+    and it collapses to power 0.25 while this test holds at 0.75.  Sharing
+    a variance is a strong assumption; moderating one is a weak one.
     """
     from scipy.stats import t as _t
     a, b = np.asarray(a, float), np.asarray(b, float)
@@ -3251,12 +3277,23 @@ def main():
                          "with --emit-counts.  Required by --contrast-test "
                          "glm.  Auto-discovered from the matrix's own "
                          "directory.")
-    ap.add_argument("--donor-column", default=None, metavar="COLUMN",
-                    help="Column of --samples naming the donor / biological "
-                         "replicate.  It is the unit of replication: cells "
-                         "from one donor are not replicates of each other, "
-                         "and without this --contrast-test glm reports an "
-                         "effect size and no p-value at all.")
+    ap.add_argument("--replicate-column", "--donor-column", default=None,
+                    metavar="COLUMN", dest="replicate_column",
+                    help="Column of --samples naming the unit of BIOLOGICAL "
+                         "REPLICATION -- the thing there are only a handful "
+                         "of, and across which the p-value is taken.  "
+                         "Defaults to --cell-type-column, which is usually "
+                         "right here: tumor1 and tumor2 are two tumours and "
+                         "GM12878, IMR90 and monocyte are three separate "
+                         "sources, so a tumour-vs-reference contrast has two "
+                         "clusters against three however many cells each "
+                         "contributes.  Cells within one of them are not "
+                         "replicates of each other, which is why the "
+                         "cell-level p is not a p-value: it measured a 0.605 "
+                         "false-positive rate against a nominal 0.05.  Point "
+                         "this at a donor column instead when several cell "
+                         "types come from one donor, or the shared donor "
+                         "would be counted as independent evidence.")
     ap.add_argument("--glm-prior-df", type=float, default=4.0, metavar="D",
                     help="Bins' worth of borrowed variance added to the "
                          "donor design's own degrees of freedom, limma-style. "
@@ -3604,13 +3641,23 @@ def main():
                   f"supplies only the cell x bin grid for this test.",
                   file=sys.stderr)
         donor_v = None
-        if args.donor_column:
-            if args.donor_column not in samples.columns:
-                sys.exit(f"--donor-column {args.donor_column!r} not in "
-                         f"--samples; have: "
-                         f"{', '.join(map(str, samples.columns))}")
+        if args.contrast_test == "glm":
+            # Default to the cell type: it is the unit there are only a
+            # handful of, and a contrast of two tumours against three
+            # reference sources has 2 clusters against 3 no matter how many
+            # cells each contributes.
+            _rep_col = args.replicate_column or args.cell_type_column
+            if _rep_col not in samples.columns:
+                sys.exit(f"--replicate-column {_rep_col!r} not in --samples; "
+                         f"have: {', '.join(map(str, samples.columns))}")
             donor_v = samples.set_index(samples.columns[0])[
-                args.donor_column].reindex(M.index).astype(str).to_numpy()
+                _rep_col].reindex(M.index).astype(str).to_numpy()
+            _how = ("--replicate-column" if args.replicate_column
+                    else "--cell-type-column (default)")
+            print(f"  {name}: replication unit = {_rep_col!r} from {_how}, "
+                  f"{len(set(donor_v[pd.notna(donor_v)]))} levels.  The "
+                  f"p-value is taken ACROSS these, not across cells.",
+                  file=sys.stderr)
         NR_df = _companion(path, args.null_rank, name,
                            rank_filename_for(path), "--null-rank", matrix=M)
         if NR_df is None and args.null_rank:
@@ -4193,7 +4240,8 @@ def main():
                       f"coverage-weighted.", file=sys.stderr)
                 if cs.get("p_unit") == "donor":
                     print(f"  contrast {label!r}: p from a moderated t over "
-                          f"{cs['n_donors']} donors on donor-pooled logits "
+                          f"{cs['n_donors']} replication units on their "
+                          f"pooled logits "
                           f"(prior df {args.glm_prior_df:g}).  NOT from the "
                           f"GLM: on a fixture with donor-level bin effects "
                           f"the cell-level p ran at a 0.605 false-positive "
@@ -4202,12 +4250,12 @@ def main():
                           f"is far below what those need.",
                           file=sys.stderr)
                 else:
-                    print(f"  contrast {label!r}: WARNING no --donor-column, "
-                          f"so there is NO p-value -- only the effect size.  "
-                          f"A cell-level p here measured a 0.605 "
-                          f"false-positive rate against a nominal 0.05, "
-                          f"because cells from one donor are not replicates.",
-                          file=sys.stderr)
+                    print(f"  contrast {label!r}: WARNING no replication "
+                          f"units resolved, so there is NO p-value -- only "
+                          f"the effect size.  A cell-level p here measured a "
+                          f"0.605 false-positive rate against a nominal 0.05, "
+                          f"because cells from one cell type or donor are "
+                          f"not replicates of each other.", file=sys.stderr)
             if cs is None:                     # not stratified, or it fell back
                 if args.contrast_weight != "none":
                     cs = weighted_contrast(Xc, Vc, in_mask, out_mask,

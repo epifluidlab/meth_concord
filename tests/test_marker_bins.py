@@ -4046,10 +4046,10 @@ def _glm_cli_run(tmp_path, *extra, effect=1.4):
 
 def test_glm_runs_end_to_end_and_lands_in_the_table(tmp_path):
     import pandas as pd
-    out, r = _glm_cli_run(tmp_path, "--donor-column", "donor", "--volcano")
+    out, r = _glm_cli_run(tmp_path, "--replicate-column", "donor", "--volcano")
     assert r.returncode == 0, r.stderr[-2500:]
     assert "binomial GLM on raw counts" in r.stderr
-    assert "moderated t over 4 donors" in r.stderr
+    assert "moderated t over 4 replication units" in r.stderr
     assert (out / "volcano_gch_tum.pdf").exists()
     t = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
     i = t["bin"].str.split(":").str[1].astype(int) // 250_000
@@ -4059,14 +4059,19 @@ def test_glm_runs_end_to_end_and_lands_in_the_table(tmp_path):
 
 
 def test_glm_without_counts_says_which_flag_is_missing(tmp_path):
-    out, r = _glm_cli_run(tmp_path, "--donor-column", "donor",
+    out, r = _glm_cli_run(tmp_path, "--replicate-column", "donor",
                           "--from-counts", "gch=/nope")
     assert r.returncode != 0
     assert "--emit-counts" in r.stderr or "missing" in r.stderr
 
 
-def test_glm_without_a_donor_column_warns_that_there_is_no_p(tmp_path):
-    out, r = _glm_cli_run(tmp_path)
+def test_the_replication_unit_defaults_to_the_cell_type(tmp_path):
+    """tumor1 and tumor2 are two tumours; GM12878, IMR90 and monocyte are
+    three separate sources.  A tumour-vs-reference contrast therefore has
+    two clusters against three however many cells each contributes, and
+    that is the unit the p belongs to -- so requiring a separate column
+    would have been a footgun, not a safeguard."""
+    out, r = _glm_cli_run(tmp_path)          # no --replicate-column
     assert r.returncode == 0, r.stderr[-2500:]
-    assert "no --donor-column" in r.stderr
-    assert "0.605" in r.stderr
+    assert "--cell-type-column (default)" in r.stderr
+    assert "moderated t over 4 replication units" in r.stderr
