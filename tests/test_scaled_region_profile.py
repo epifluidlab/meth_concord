@@ -1399,7 +1399,8 @@ def _profile_mean(tmp_path, run, samples, bins, stat, reference, tag):
          "--plot-format", "png", "--body-bins", "4", "--flank", "20000",
          "--flank-bins", "1"], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-1500:]
-    p = pd.read_csv(next(o.glob("scaled_profile*.tsv")), sep="\t")
+    p = pd.read_csv(next(f for f in o.glob("scaled_profile*.tsv")
+                     if not f.name.endswith(".per_position.tsv")), sep="\t")
     col = [c for c in p.columns if c.startswith("mean_")][0]
     return float(p[col].mean()), r.stderr
 
@@ -1800,3 +1801,166 @@ def test_an_unmeasured_bin_drops_out_of_the_pooled_statistic_on_its_own():
     b, _ = mod._pooled_stat(padded, np.arange(6), alpha,
                             "direction_logor", decompose_components)
     np.testing.assert_allclose(a, b, rtol=1e-12)
+
+
+def _uniform_counts_run(tmp_path, tag, n_dom=699, width=1_000_000,
+                        spacing=2_800_000, nb=8000, n_cells=40, *extra):
+    """A genome with UNIFORM depth and UNIFORM coordination everywhere.
+
+    Any structure a profile draws on this is manufactured by the axis, not
+    read from the data.
+    """
+    import json
+    import subprocess
+    import sys as _sys
+    import pandas as pd
+    rng = np.random.default_rng(0)
+    bsz = 250_000
+    d = tmp_path / tag
+    (d / "counts").mkdir(parents=True, exist_ok=True)
+    cells = [f"c{i}" for i in range(n_cells)]
+    bins = [f"chr1:{i * bsz}" for i in range(nb)]
+    N = rng.poisson(40, (n_cells, nb)).astype(float)
+    conc, exc = 0.60, 0.06
+    mats = {"k_open": (conc + exc) * .25 * N,
+            "k_closed": (conc + exc) * .75 * N,
+            "n_linked": N, "k_dm_open": conc * .25 * N,
+            "k_dm_closed": conc * .75 * N, "n_dm": N}
+    mats["k_mixed"] = N - mats["k_open"] - mats["k_closed"]
+    mats["k_dm_mixed"] = N - mats["k_dm_open"] - mats["k_dm_closed"]
+    for k, v in mats.items():
+        pd.DataFrame(v, index=cells, columns=bins).to_parquet(
+            d / "counts" / f"{k}.parquet")
+    json.dump({"shared": {"alpha": {"open": 11., "closed": 49.,
+                                    "mixed": 40.}}},
+              open(d / "dirichlet_multinomial_prior.json", "w"))
+    s = d / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n_cells,
+                  "cell_type": ["T"] * (n_cells // 2)
+                  + ["R"] * (n_cells - n_cells // 2)}).to_csv(
+        s, sep="\t", index=False)
+    bed = d / "dom.bed"
+    bed.write_text("".join(
+        f"chr1\t{i * spacing}\t{i * spacing + width}\n"
+        for i in range(1, n_dom)))
+    out = d / "out"
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--from-counts", str(d),
+         "--from-counts-statistic", "coordination", "--samples", str(s),
+         "--cell-type-column", "cell_type", "--group", "t=T",
+         "--region", f"DOM={bed}", "--output-dir", str(out),
+         "--plot-format", "png", "--body-bins", "40", "--flank", "2000000",
+         "--flank-bins", "20", *extra], capture_output=True, text=True)
+    return out, r
+
+
+def test_the_per_position_curve_and_its_depth_are_written(tmp_path):
+    """Without them the panel cannot be diagnosed: a reader looking at a
+    drop at the boundary has no way to tell a change in SIGNAL from a change
+    in how many bins were behind it."""
+    import pandas as pd
+    out, r = _uniform_counts_run(tmp_path, "pp")
+    assert r.returncode == 0, r.stderr[-2500:]
+    f = out / "scaled_profile_coordination.per_position.tsv"
+    assert f.exists()
+    d = pd.read_csv(f, sep="\t")
+    assert set(d["zone"]) == {"upstream", "body", "downstream"}
+    assert len(d) == (2 * 20 + 40)          # one row per position per group
+    for c in ("mean", "lo", "hi", "n_bin_placements", "n_cells"):
+        assert c in d.columns, c
+
+
+def test_the_scaled_axis_pools_less_inside_the_domain_and_says_so(tmp_path):
+    """A body position spans domain_width/--body-bins while a flank position
+    spans --flank/--flank-bins: at the defaults a 1 Mb domain gives 25 kb
+    against 100 kb, so body positions pool a quarter of the bins."""
+    import pandas as pd
+    out, r = _uniform_counts_run(tmp_path, "depth")
+    assert r.returncode == 0, r.stderr[-2500:]
+    d = pd.read_csv(out / "scaled_profile_coordination.per_position.tsv",
+                    sep="\t")
+    fl = d.loc[d["zone"] != "body", "n_bin_placements"].median()
+    bd = d.loc[d["zone"] == "body", "n_bin_placements"].median()
+    assert fl > 100 and bd > 10
+    assert 0.2 < bd / fl < 0.32, bd / fl        # the predicted 0.25x
+    assert "bins pooled per position" in r.stderr
+    assert "0.25x" in r.stderr
+    assert "partly a step in how much sequence" in r.stderr
+
+
+def test_that_imbalance_does_not_by_itself_manufacture_a_step(tmp_path):
+    """Measured, because it is the obvious suspect when every domain set
+    drops inside: on uniform data the pooled C came back at 0.0595 outside
+    and 0.0589 inside, 0.99x.  Four times less pooling costs about a
+    percent, not a factor of three -- so a large step in a real panel is
+    not this."""
+    import pandas as pd
+    out, r = _uniform_counts_run(tmp_path, "nostep")
+    assert r.returncode == 0, r.stderr[-2500:]
+    d = pd.read_csv(out / "scaled_profile_coordination.per_position.tsv",
+                    sep="\t")
+    body = d.loc[d["zone"] == "body", "mean"].mean()
+    flank = d.loc[d["zone"] != "body", "mean"].mean()
+    assert 0.97 < body / flank < 1.03, body / flank
+
+
+def test_shuffled_domains_keep_the_widths_that_drive_the_artefact():
+    """The body of a narrow domain pools fewer bins than its flank, and how
+    much fewer is set by the width -- so a control that resampled widths
+    would not carry the effect it is meant to test."""
+    import pandas as pd
+    mod = _mod()
+    bins = pd.DataFrame({
+        "chrom": ["chr1"] * 400 + ["chr2"] * 200,
+        "start": np.r_[np.arange(400), np.arange(200)] * 250_000,
+        "end": (np.r_[np.arange(400), np.arange(200)] + 1) * 250_000})
+    dom = pd.DataFrame({
+        "chrom": ["chr1"] * 30 + ["chr2"] * 10,
+        "start": np.r_[np.arange(30), np.arange(10)] * 2_000_000,
+        "end": np.r_[np.arange(30), np.arange(10)] * 2_000_000
+        + np.r_[np.full(30, 1_000_000), np.full(10, 400_000)]})
+    sh = mod.shuffle_domains(dom, bins, seed=0)
+    assert len(sh) == len(dom)
+    np.testing.assert_array_equal(
+        np.sort((sh["end"] - sh["start"]).to_numpy()),
+        np.sort((dom["end"] - dom["start"]).to_numpy()))
+    assert sh["chrom"].value_counts().to_dict() == \
+        dom["chrom"].value_counts().to_dict()
+    # Different positions, and inside the contigs.
+    assert not np.allclose(np.sort(sh["start"]), np.sort(dom["start"]))
+    for c, sub in sh.groupby("chrom"):
+        top = bins.loc[bins["chrom"] == c, "end"].max()
+        assert sub["end"].max() <= top
+    # A different seed gives a different draw.
+    assert not np.allclose(
+        np.sort(mod.shuffle_domains(dom, bins, seed=1)["start"]),
+        np.sort(sh["start"]))
+
+
+def test_the_shuffle_control_adds_a_panel_carrying_the_machinery(tmp_path):
+    """If the signal drops inside PMDs and their flanks are HMDs, switching
+    to HMDs must show a RISE.  When both instead drop relative to their own
+    flanks the shape is coming from the machinery or from something both
+    sets share -- and nothing about the axis, the pooling or the statistic
+    knows where a domain is, so a size-matched set at random positions
+    carries all of that and none of the biology."""
+    import pandas as pd
+    out, r = _uniform_counts_run(tmp_path, "shuf", 699, 1_000_000,
+                                 2_800_000, 8000, 40, "--shuffle-control")
+    assert r.returncode == 0, r.stderr[-2500:]
+    d = pd.read_csv(out / "scaled_profile_coordination.per_position.tsv",
+                    sep="\t")
+    regs = set(d["region"])
+    assert "DOM" in regs and "DOM (shuffled)" in regs
+
+    def ratio(reg, col):
+        s = d[d["region"] == reg]
+        return (s.loc[s["zone"] == "body", col].mean()
+                / s.loc[s["zone"] != "body", col].mean())
+
+    # The control carries the SAME pooling imbalance -- that is the point.
+    assert abs(ratio("DOM", "n_bin_placements")
+               - ratio("DOM (shuffled)", "n_bin_placements")) < 0.06
+    # And on uniform data neither shows a step, real or shuffled.
+    assert 0.95 < ratio("DOM", "mean") < 1.05
+    assert 0.95 < ratio("DOM (shuffled)", "mean") < 1.05

@@ -55,6 +55,41 @@ def _bp_mod():
     return m
 
 
+def shuffle_domains(domains, bins, seed=0):
+    """The same domains, same widths, same chromosomes, random positions.
+
+    THE CONTROL FOR A SHAPE THAT CANNOT BE TRUE.  If a profile drops inside
+    PMDs and their flanks are HMDs, then switching to HMDs must show a
+    RISE -- and if instead both drop relative to their own flanks, the shape
+    is coming from the machinery or from something both sets share, not
+    from what distinguishes them.  Nothing about the axis, the pooling or
+    the statistic knows where a domain is, so a size-matched set at random
+    positions carries every one of those and none of the biology.  A drop
+    that survives shuffling is not about the domains.
+
+    Widths and per-chromosome counts are preserved exactly, because both
+    feed the artefact being tested: the body of a narrow domain pools fewer
+    bins than its flank, and how much fewer is set by the width.
+    """
+    rng = np.random.default_rng(int(seed))
+    lim = bins.groupby("chrom")["end"].max().to_dict()
+    out = []
+    for _, d in domains.iterrows():
+        c = str(d["chrom"])
+        # INTEGER coordinates, like the BED they stand in for.  Drawing a
+        # float start and adding the width back does not return the width:
+        # at genomic magnitudes lo + w - lo lost a few hundred bp on 2 of 40
+        # domains, which is enough to move a bin between the body and the
+        # flank and to break the width matching this control depends on.
+        w = int(round(float(d["end"]) - float(d["start"])))
+        top = int(float(lim.get(c, 0.0))) - w
+        if top <= 0 or w <= 0:
+            continue
+        lo = int(rng.integers(0, top + 1))
+        out.append({"chrom": c, "start": lo, "end": lo + w})
+    return pd.DataFrame(out, columns=["chrom", "start", "end"])
+
+
 def scaled_index(bins, domains, n_body, flank_bp, n_flank):
     """Position on the scaled axis for every (bin, domain) overlap.
 
@@ -955,6 +990,27 @@ def main(argv=None) -> int:
                          "and by --min-pairs when profiling a --matrix "
                          "rather than --from-counts.  Auto-discovered beside "
                          "the matrix.")
+    ap.add_argument("--shuffle-control", action="store_true",
+                    help="Also profile a SIZE-MATCHED set of domains at "
+                         "random positions, as an extra panel.  Use it when "
+                         "the shape cannot be true -- if the signal drops "
+                         "inside PMDs and their flanks are HMDs, then "
+                         "switching to HMDs must show a RISE, and if instead "
+                         "both drop relative to their own flanks the shape "
+                         "is coming from the machinery or from something "
+                         "both sets share.  Nothing about the axis, the "
+                         "pooling or the statistic knows where a domain is, "
+                         "so the shuffled panel carries every one of those "
+                         "and none of the biology: a drop that survives "
+                         "shuffling is not about the domains.  Widths and "
+                         "per-chromosome counts are preserved exactly, "
+                         "because both feed the effect being tested -- the "
+                         "body of a narrow domain pools fewer bins than its "
+                         "flank, and how much fewer is set by the width.")
+    ap.add_argument("--shuffle-seed", type=int, default=0,
+                    help="Seed for --shuffle-control (default 0).  Re-run "
+                         "with a few to see how much the shuffled panel "
+                         "moves on its own.")
     ap.add_argument("--min-pairs", type=int, default=0, metavar="N",
                     help="Use only (cell, bin) entries with at least N RAW "
                          "read pairs of their own, so the curve and its "
@@ -1397,6 +1453,14 @@ def main(argv=None) -> int:
         prof = {lab: group_profile(M, ct, mem, bi, pi, total, args.conf, **kw)
                 for lab, mem in groups.items()}
         results[rname] = prof
+        if args.shuffle_control:
+            sh = shuffle_domains(dom, bins, seed=args.shuffle_seed)
+            sbi, spi, stot, _ = scaled_index(bins, sh, args.body_bins,
+                                             args.flank, args.flank_bins)
+            results[f"{rname} (shuffled)"] = {
+                lab: group_profile(M, ct, mem, sbi, spi, stot, args.conf,
+                                   **kw)
+                for lab, mem in groups.items()}
         _dv = None
         if args.domain_test and len(groups) >= 2:
             _dv = {lab: per_domain_values(M, ct, mem, bi, pi, dmi,
@@ -1449,6 +1513,55 @@ def main(argv=None) -> int:
 
     tab = pd.DataFrame(rows)
     tab.to_csv(out / f"scaled_profile_{name}.tsv", sep="\t", index=False)
+
+    # THE CURVE ITSELF, position by position, and how much sequence each
+    # position was built from.
+    #
+    # Without this the panel cannot be diagnosed.  The axis is SCALED, so a
+    # body position spans domain_width / --body-bins while a flank position
+    # spans --flank / --flank-bins: at the defaults a 1 Mb domain gives each
+    # body position 25 kb against the flank's 100 kb, so body positions pool
+    # a quarter of the bins.  Whether that matters depends on the statistic
+    # -- on a uniform fixture the pooled C came back at 0.05412 inside and
+    # 0.054117 outside, so the axis alone does not manufacture a step -- but
+    # a reader looking at a drop at the boundary has no way to tell a change
+    # in signal from a change in how many bins were behind it until n_bins
+    # is on the page.
+    rows = []
+    for rname, prof in results.items():
+        for lab, pr in prof.items():
+            nb_ = np.asarray(pr.get("n_bins", []), float)
+            for i in range(len(pr["mean"])):
+                zone = ("upstream" if i < args.flank_bins
+                        else "body" if i < args.flank_bins + args.body_bins
+                        else "downstream")
+                rows.append({
+                    "region": rname, "group": lab, "position": i,
+                    "zone": zone, "mean": pr["mean"][i], "lo": pr["lo"][i],
+                    "hi": pr["hi"][i], "n_cells": pr.get("n_cells"),
+                    "n_bin_placements": (float(nb_[i]) if i < nb_.size
+                                         else float("nan"))})
+    if rows:
+        pp = pd.DataFrame(rows)
+        pp.to_csv(out / f"scaled_profile_{name}.per_position.tsv", sep="\t",
+                  index=False)
+        for rname in results:
+            sub = pp[pp["region"] == rname]
+            fl = sub.loc[sub["zone"] != "body", "n_bin_placements"].median()
+            bd = sub.loc[sub["zone"] == "body", "n_bin_placements"].median()
+            if np.isfinite(fl) and np.isfinite(bd) and fl > 0:
+                _r = bd / fl
+                _msg = (f"  {rname}: bins pooled per position -- flank "
+                        f"{fl:,.0f}, body {bd:,.0f} ({_r:.2f}x).")
+                if _r < 0.5 or _r > 2.0:
+                    _msg += (" A step at the boundary is partly a step in "
+                             "how much sequence each position pools; the "
+                             "scaled axis gives a body position "
+                             "domain_width/--body-bins against the flank's "
+                             "--flank/--flank-bins.  Compare region sets "
+                             "only where this ratio is similar, or set "
+                             "--flank-bins so the two match.")
+                print(_msg, file=sys.stderr)
 
     if tests:
         tt = pd.concat(tests, ignore_index=True)
