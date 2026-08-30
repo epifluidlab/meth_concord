@@ -703,7 +703,7 @@ def test_pooled_profiles_uses_counts_not_the_per_bin_values():
     counts["k_open"][:, :4] = 7.0            # a real excess in the first half
     bin_idx = np.arange(n_bins)
     pos_idx = np.repeat(np.arange(total), [4, 2, 2])
-    P, rows, nb = m.pooled_profiles(
+    P, rows, nb, npair = m.pooled_profiles(
         counts, np.arange(n_cells), bin_idx, pos_idx, total,
         {"open": 10.0, "closed": 49.0, "mixed": 41.0}, "direction_logor")
     assert P.shape == (n_cells, total)
@@ -758,7 +758,8 @@ def test_pooling_gives_coordination_as_readily_as_the_log_odds_ratio():
     bin_idx, pos_idx = np.arange(n_bins), np.repeat([0, 1], 3)
     got = {}
     for stat in ("coordination", "direction_logor"):
-        P, _r, _n = m.pooled_profiles(counts, np.arange(n_cells), bin_idx,
+        P, _r, _n, _np2 = m.pooled_profiles(counts, np.arange(n_cells),
+                                            bin_idx,
                                       pos_idx, total, alpha, stat)
         assert np.isfinite(P).all()
         got[stat] = P[0]
@@ -2035,3 +2036,65 @@ def test_the_null_reference_uses_the_same_formula_as_the_observed():
     import inspect
     src = inspect.getsource(_mod().pooled_profiles)
     assert src.count("formula=formula") == 2
+
+
+def test_the_log_odds_ratio_needs_the_haldane_correction_and_c_does_not():
+    """log(k) is biased low by about 1/(2k), and the observed and expected
+    pools have DIFFERENT marginals, so the two biases do not cancel.  The
+    scaled axis puts body positions at a quarter of the flank's depth, so
+    that bias lands as a step at every boundary.
+
+    Simulated on a PMD-like table -- observed open 0.05, expected open 0.02,
+    true L = +0.969.  Coordination is unaffected either way, which is why
+    the +0.5 can be applied to all three categories without cost."""
+    rng = np.random.default_rng(0)
+    p_o, p_c, q_o, q_c = 0.05, 0.55, 0.02, 0.58
+    true_L = np.log(p_o / p_c) - np.log(q_o / q_c)
+
+    def est(n, c, reps=40000):
+        ko = rng.binomial(n, p_o, reps) + 0.0
+        kc = rng.binomial(n, p_c, reps) + 0.0
+        eo = rng.binomial(n, q_o, reps) + 0.0
+        ec = rng.binomial(n, q_c, reps) + 0.0
+        d = n + 3 * c
+        oo, oc = (ko + c) / d, (kc + c) / d
+        e1, e2 = (eo + c) / d, (ec + c) / d
+        f = lambda a: np.log(np.clip(a, 1e-6, None))
+        L = (f(oo) - f(oc)) - (f(e1) - f(e2))
+        return float(np.mean(L)), float(np.mean((oo + oc) - (e1 + e2)))
+
+    # Uncorrected, the log odds ratio explodes exactly where a body position
+    # sits; corrected, it holds.
+    raw_120, _ = est(120, 0.0)
+    cor_120, _ = est(120, 0.5)
+    assert raw_120 - true_L > 0.5, raw_120
+    assert abs(cor_120 - true_L) < 0.05, cor_120
+    raw_2000, _ = est(2000, 0.0)
+    assert abs(raw_2000 - true_L) < 0.05          # fine when deep
+    # Coordination is untouched by the correction at every depth.
+    for n in (2000, 500, 120, 30):
+        _, c_cor = est(n, 0.5)
+        assert abs(c_cor - 0.0) < 0.01, (n, c_cor)
+
+
+def test_the_correction_is_applied_to_all_four_pooled_counts():
+    """Symmetrically, or it would shift the ratio it is meant to stabilise."""
+    import inspect
+    src = inspect.getsource(_mod()._pooled_stat)
+    assert "_c = 0.5" in src
+    assert src.count("+ _c)") == 4
+    assert "n_l + 3 * _c" in src and "n_e + 3 * _c" in src
+
+
+def test_the_pooled_depth_is_reported_per_position(tmp_path):
+    """Bin placements alone do not say how much evidence they carried, and
+    the log odds ratio's bias depends on the pairs."""
+    import pandas as pd
+    out, r = _uniform_counts_run(tmp_path, "npairs", 699, 1_000_000,
+                                 2_800_000, 8000, 40)
+    assert r.returncode == 0, r.stderr[-2500:]
+    d = pd.read_csv(out / "scaled_profile_coordination.per_position.tsv",
+                    sep="\t")
+    assert "median_pairs_per_cell" in d.columns
+    assert d["median_pairs_per_cell"].notna().any()
+    assert "Median pooled pairs per cell inside" in r.stderr

@@ -338,10 +338,30 @@ def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None, keep=None,
         # buys nothing here and costs a depth-dependent bias.  k/n makes
         # depth affect the noise, which the interval already shows, and not
         # the expected value.
-        sl = _np.where(n_l > 0, n_l, _np.nan)
-        se = _np.where(n_e > 0, n_e, _np.nan)
-        o_o, o_c = g("k_open") / sl, g("k_closed") / sl
-        e_o, e_c = g("k_dm_open") / se, g("k_dm_closed") / se
+        # HALDANE-ANSCOMBE +0.5, and the log odds ratio does not work
+        # without it.  log(k) is biased low by about 1/(2k), the observed
+        # and expected pools have DIFFERENT marginals so the two biases do
+        # not cancel, and a thin channel drives the whole ratio.  Simulated
+        # on a PMD-like table (observed open 0.05, expected open 0.02) at a
+        # true L of +0.969, the plain k/n estimate returned +0.979 at a
+        # pooled n of 2,000, +1.800 at 120 and +3.831 at 30 -- and the
+        # scaled axis puts body positions at a quarter of the flank's
+        # depth, so that lands as a step at every boundary.  With +0.5 the
+        # same table gave 0.969, 0.964 and 0.658.  The sign of the raw bias
+        # follows which channel is thinner, which is why it can push a
+        # tumour arm down in heterochromatin and up elsewhere.
+        #
+        # 0.5 on all three categories, so the rates still sum to 1 and the
+        # denominator is n + 1.5.  That is a shrinkage too, but with an
+        # effective concentration of 1.5 against the fitted prior's ~100:
+        # at a pooled n of 30 it keeps 95 percent of the estimate where the
+        # prior kept 23 percent.  Coordination is essentially untouched;
+        # the log odds ratio is rescued.
+        _c = 0.5
+        sl = _np.where(n_l > 0, n_l + 3 * _c, _np.nan)
+        se = _np.where(n_e > 0, n_e + 3 * _c, _np.nan)
+        o_o, o_c = (g("k_open") + _c) / sl, (g("k_closed") + _c) / sl
+        e_o, e_c = (g("k_dm_open") + _c) / se, (g("k_dm_closed") + _c) / se
     else:
         o_o = (ao + g("k_open")) / (a0 + n_l)
         o_c = (ac + g("k_closed")) / (a0 + n_l)
@@ -418,6 +438,10 @@ def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
                  if float(min_pairs) > 0 else None)
     P = _np.full((len(rows), total), _np.nan)
     n_bins = _np.zeros(total, int)
+    # Pooled PAIRS per position, which is the number the log odds ratio's
+    # small-sample bias actually depends on -- bin placements alone do not
+    # say how much evidence they carried.
+    n_pairs = _np.full(total, _np.nan)
     order = _np.argsort(pos_idx, kind="stable")
     bi, pi = bin_idx[order], pos_idx[order]
     starts = _np.searchsorted(pi, _np.arange(total), side="left")
@@ -444,7 +468,10 @@ def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
                 else:
                     v = v - mu
         P[:, i] = _np.where(n_l > 0, v, _np.nan)
-    return P, rows, n_bins
+        _pos = n_l[n_l > 0]
+        if _pos.size:
+            n_pairs[i] = float(_np.median(_pos))
+    return P, rows, n_bins, n_pairs
 
 
 def cell_profiles(M, ct, members, bin_idx, pos_idx, total):
@@ -459,7 +486,7 @@ def cell_profiles(M, ct, members, bin_idx, pos_idx, total):
     P = np.full((len(rows), total), np.nan)
     n_bins = np.zeros(total, int)
     if not len(rows):
-        return P, rows.index, n_bins
+        return P, rows.index, n_bins, np.full(total, np.nan)
     v = rows.to_numpy(float)
     order = np.argsort(pos_idx, kind="stable")
     bi, pi = bin_idx[order], pos_idx[order]
@@ -473,7 +500,7 @@ def cell_profiles(M, ct, members, bin_idx, pos_idx, total):
         with np.errstate(invalid="ignore"), warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             P[:, i] = np.nanmean(v[:, cols], axis=1)
-    return P, rows.index, n_bins
+    return P, rows.index, n_bins, np.full(total, np.nan)
 
 
 def anchor_to_flank(P, n_flank, n_body):
@@ -519,7 +546,7 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
         keep = M.index.intersection(cells)
         rows = M.index.get_indexer(keep)
         sub = {k: v[rows] for k, v in pooled["counts"].items()}
-        P, idx, n_bins = pooled_profiles(
+        P, idx, n_bins, n_pairs = pooled_profiles(
             sub, keep, bin_idx, pos_idx, total, pooled["alpha"],
             pooled["stat"],
             null_counts=[{k: v[rows] for k, v in nc.items()}
@@ -528,8 +555,8 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
             min_pairs=pooled.get("min_pairs", 0),
             formula=pooled.get("formula", "mle"))
     else:
-        P, idx, n_bins = cell_profiles(M, ct, members, bin_idx, pos_idx,
-                                       total)
+        P, idx, n_bins, n_pairs = cell_profiles(M, ct, members, bin_idx,
+                                                pos_idx, total)
     if baseline == "flank":
         P = anchor_to_flank(P, n_flank, n_body)
     # One number per CELL: its mean over the body.  With --baseline flank
@@ -547,6 +574,7 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
                 if P.shape[0] and n_body else np.array([]))
     out = {"mean": np.full(total, np.nan), "lo": np.full(total, np.nan),
            "hi": np.full(total, np.nan), "n_bins": n_bins,
+           "n_pairs": n_pairs,
            "n_cells": int(P.shape[0]), "body": body, "cells": idx,
            "members": {g: int((ct.loc[idx] == g).sum()) for g in members}}
     if not P.shape[0]:
@@ -612,14 +640,15 @@ def per_domain_values(M, ct, members, bin_idx, pos_idx, dom_idx, n_flank,
             two = np.where((pi_d >= body_lo) & (pi_d < body_hi), 1,
                            0).astype(int)
             if pooled is not None:
-                P, _r, _n = pooled_profiles(
+                P, _r, _n, _npair = pooled_profiles(
                     sub, keep, bi_d, two, 2, pooled["alpha"],
                     pooled["stat"], null_counts=sub_null,
                     reference=pooled.get("reference", "none"),
                     min_pairs=pooled.get("min_pairs", 0),
                     formula=pooled.get("formula", "mle"))
             else:
-                P, _r, _n = cell_profiles(M, ct, members, bi_d, two, 2)
+                P, _r, _n, _npair = cell_profiles(M, ct, members,
+                                                  bi_d, two, 2)
             if not P.shape[0]:
                 continue
             # Anchored on THIS domain's own flank, which is what makes the
@@ -1600,6 +1629,7 @@ def main(argv=None) -> int:
     for rname, prof in results.items():
         for lab, pr in prof.items():
             nb_ = np.asarray(pr.get("n_bins", []), float)
+            np_ = np.asarray(pr.get("n_pairs", []), float)
             for i in range(len(pr["mean"])):
                 zone = ("upstream" if i < args.flank_bins
                         else "body" if i < args.flank_bins + args.body_bins
@@ -1609,7 +1639,9 @@ def main(argv=None) -> int:
                     "zone": zone, "mean": pr["mean"][i], "lo": pr["lo"][i],
                     "hi": pr["hi"][i], "n_cells": pr.get("n_cells"),
                     "n_bin_placements": (float(nb_[i]) if i < nb_.size
-                                         else float("nan"))})
+                                         else float("nan")),
+                    "median_pairs_per_cell": (float(np_[i]) if i < np_.size
+                                              else float("nan"))})
     if rows:
         pp = pd.DataFrame(rows)
         pp.to_csv(out / f"scaled_profile_{name}.per_position.tsv", sep="\t",
@@ -1622,6 +1654,28 @@ def main(argv=None) -> int:
                 _r = bd / fl
                 _msg = (f"  {rname}: bins pooled per position -- flank "
                         f"{fl:,.0f}, body {bd:,.0f} ({_r:.2f}x).")
+                _pb = sub.loc[sub["zone"] == "body",
+                              "median_pairs_per_cell"].median()
+                if np.isfinite(_pb):
+                    _msg += (f"  Median pooled pairs per cell inside: "
+                             f"{_pb:,.0f}.")
+                    # THE LOG ODDS RATIO NEEDS MORE THAN C DOES.  log(k) is
+                    # biased low by about 1/(2k) and the observed and
+                    # expected pools have different marginals, so the two
+                    # biases do not cancel.  Simulated on a PMD-like table
+                    # at a true L of +0.969 with the +0.5 correction in
+                    # place: 0.969 at a pooled n of 2,000, 0.964 at 120,
+                    # 0.659 at 30.  Coordination was within 0.001 at all
+                    # three.
+                    if _pb < 100 and "logor" in str(name):
+                        _msg += (" BELOW ~100 THE LOG ODDS RATIO IS NOT "
+                                 "RELIABLE there: even with the "
+                                 "Haldane +0.5 correction a simulated true "
+                                 "+0.969 came back at +0.659 at a pooled n "
+                                 "of 30.  Coordination survives that depth; "
+                                 "the log odds ratio does not.  Use a "
+                                 "coarser bin size, fewer --body-bins, or "
+                                 "read coordination instead.")
                 if _r < 0.5 or _r > 2.0:
                     _msg += (" A step at the boundary is partly a step in "
                              "how much sequence each position pools; the "
