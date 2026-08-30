@@ -3260,8 +3260,19 @@ def main():
                     help="Bins per contrast BED with --contrast-select top-n "
                          "(0 = same as --n-bins).  Ignored under the default "
                          "fdr rule, which has no fixed count.")
+    ap.add_argument("--contrast-unit-p", type=float, default=0.05,
+                    metavar="P",
+                    help="Threshold for --contrast-select unit-p, on the "
+                         "relabelled-null p rather than on an FDR.  It is a "
+                         "PER-BIN rate: at p <= 0.05 over 10,000 tested "
+                         "bins, about 500 clear by chance however well "
+                         "calibrated the p is, so a set selected this way is "
+                         "a screen and not a list of bins each claimed to "
+                         "differ.  The run prints the expected count beside "
+                         "the observed one.")
     ap.add_argument("--contrast-select",
-                    choices=["fdr", "top-n", "unit-fdr"], default="fdr",
+                    choices=["fdr", "top-n", "unit-fdr", "unit-p"],
+                    default="fdr",
                     help="How a contrast BED is filled.  'fdr' (default) keeps "
                          "every bin below --contrast-fdr, which is what the "
                          "volcano colours and can legitimately come back "
@@ -3281,7 +3292,13 @@ def main():
                          "volcano, the joint contrast and the heatmaps all "
                          "reflect the rate that was actually measured, "
                          "instead of leaving it to a column the reader has "
-                         "to filter by hand.")
+                         "to filter by hand.  'unit-p' keeps every bin below "
+                         "--contrast-unit-p on that same relabelled-null p "
+                         "WITHOUT the multiple-testing step -- legitimate "
+                         "when the set is a screen, such as a foreground for "
+                         "genomic enrichment, and not a list of bins each "
+                         "claimed to differ.  Both need "
+                         "--contrast-permute-units.")
     ap.add_argument("--delta-var", action="append", default=None,
                     metavar="NAME=PATH",
                     help="concordance_delta_var.parquet for the matching "
@@ -4564,7 +4581,7 @@ def main():
             # ---- Empirical p from relabelled units ---------------------
             summary_unitperm = locals().get("summary_unitperm") or {}
             unitperm_nulls = locals().get("unitperm_nulls") or {}
-            unitnull_q = None
+            unitnull_q = unitperm_p = None
             if args.contrast_permute_units and cs is not None \
                     and donor_v is not None:
                 _u_all = np.asarray(donor_v, dtype=object)
@@ -4741,6 +4758,7 @@ def main():
                     _q, _qi = empirical_null_qvalue(cs["p"], _flat,
                                                     p_perm=_pe)
                     unitnull_q = _q
+                    unitperm_p = _pe
                     scores_df[f"contrast_{label}_qvalue_unitnull"] = _q
                     extra_cols.append(f"contrast_{label}_qvalue_unitnull")
                     _at = {t: int(np.sum(np.isfinite(_q) & (_q <= t)))
@@ -4817,6 +4835,41 @@ def main():
                           f"parametric p.  The gap is what a whole-cell shift "
                           f"was buying.", file=sys.stderr)
             q = _bh_fdr(cs["p"])
+            # The threshold the SELECTION uses.  It is --contrast-fdr for
+            # every mode that selects on an error RATE, and
+            # --contrast-unit-p for the one that selects on a raw p.
+            sel_thr = args.contrast_fdr
+            if args.contrast_select == "unit-p":
+                if unitperm_p is None:
+                    sys.exit(
+                        "--contrast-select unit-p needs the relabelled null: "
+                        "add --contrast-permute-units 9 (and, for a null the "
+                        "contrast arm is excluded from, "
+                        "--contrast-permute-scope reference).")
+                # SELECTING ON A P, NOT ON A RATE.  Legitimate when the set
+                # is a screen -- a foreground for enrichment, say -- and not
+                # a list of bins each claimed to differ.  What it is not is
+                # a multiple-testing correction: at a calibrated p <= t over
+                # N tested bins, t x N of them clear by chance whatever the
+                # calibration.  The count is printed so that cannot be
+                # missed.
+                scores_df[f"contrast_{label}_fdr_bh"] = q
+                extra_cols.append(f"contrast_{label}_fdr_bh")
+                sel_thr = args.contrast_unit_p
+                _n_t = int(np.sum(np.isfinite(unitperm_p)))
+                _n_p = int(np.sum(np.isfinite(unitperm_p)
+                                  & (unitperm_p < sel_thr)))
+                _exp = sel_thr * _n_t
+                print(f"  contrast {label!r}: selecting on the relabelled-"
+                      f"null p at {sel_thr:g}, NOT on an FDR -> {_n_p:,} "
+                      f"bins, against {_exp:,.0f} expected by chance over "
+                      f"{_n_t:,} tested ({_n_p / max(_exp, 1e-9):.2f}x).  "
+                      f"This is a per-bin rate, so about {_exp:,.0f} of "
+                      f"those are false however well calibrated the p is.  "
+                      f"BH on the same p is kept as "
+                      f"contrast_{label}_fdr_bh; --contrast-select unit-fdr "
+                      f"selects on it.", file=sys.stderr)
+                q = unitperm_p
             if args.contrast_select == "unit-fdr":
                 if unitnull_q is None:
                     sys.exit(
@@ -4955,12 +5008,12 @@ def main():
             rank = np.where(np.isfinite(cs["p"]),
                             -np.log10(np.maximum(cs["p"], 1e-300)), -np.inf)
             mask = np.zeros(M.shape[1], bool)
-            if args.contrast_select in ("fdr", "unit-fdr"):
+            if args.contrast_select in ("fdr", "unit-fdr", "unit-p"):
                 # Significance, not a fixed count.  A rank cut returns N bins
                 # whether or not anything differs, so "the top 500" reads as a
                 # finding even when the contrast is empty; an FDR cut can
                 # return nothing, which is the honest answer in that case.
-                sig = (np.isfinite(q) & (q < args.contrast_fdr)
+                sig = (np.isfinite(q) & (q < sel_thr)
                        & np.isfinite(cs["diff"]))
                 if args.contrast_min_diff > 0:
                     sig &= np.abs(cs["diff"]) >= args.contrast_min_diff

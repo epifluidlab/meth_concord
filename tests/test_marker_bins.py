@@ -4625,3 +4625,62 @@ def test_no_null_foregrounds_without_the_relabellings(tmp_path):
     out, r, _ = _welch_matrix_run(tmp_path, "nonf", n_bins=400, real=100)
     assert r.returncode == 0, r.stderr[-2000:]
     assert not list(out.glob("*nullfg*.bed"))
+
+
+def test_unit_p_selects_on_the_permutation_p_without_the_fdr_step(tmp_path):
+    """Legitimate when the set is a screen -- a foreground for enrichment --
+    rather than a list of bins each claimed to differ.  What it is not is a
+    multiple-testing correction, and the run has to say so: at p <= t over N
+    tested bins, t x N clear by chance whatever the calibration."""
+    import pandas as pd
+    got = {}
+    for tag, thr in (("p05", "0.05"), ("p001", "0.001")):
+        out, r, real = _welch_matrix_run(
+            tmp_path, tag, "--contrast-permute-units", "9",
+            "--contrast-permute-scope", "reference",
+            "--contrast-select", "unit-p", "--contrast-unit-p", thr)
+        assert r.returncode == 0, r.stderr[-2500:]
+        assert "NOT on an FDR" in r.stderr
+        assert "expected by chance over" in r.stderr
+        t = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
+        i = t["bin"].str.split(":").str[1].astype(int) // 250_000
+        m = t["contrast_m"].astype(bool)
+        # Every selected bin really is below the threshold it was given.
+        pp = t["contrast_m_pvalue_unitperm"].to_numpy(float)
+        assert np.all(pp[m.to_numpy()] < float(thr) + 1e-12)
+        # BH on the same p is preserved, not overwritten.
+        assert "contrast_m_fdr_bh" in t.columns
+        got[thr] = int(m.sum())
+    # A tighter p keeps fewer bins -- the knob does what it says.
+    assert got["0.001"] < got["0.05"]
+
+
+def test_unit_p_without_the_relabellings_says_which_flag_to_add(tmp_path):
+    out, r, _ = _welch_matrix_run(tmp_path, "nopermp", "--contrast-select",
+                                  "unit-p", n_bins=300, real=80)
+    assert r.returncode != 0
+    assert "--contrast-permute-units" in r.stderr
+
+
+def test_the_four_selection_modes_are_ordered_the_way_they_should_be(
+        tmp_path):
+    """fdr (BH on an inflated p) over-calls; unit-p is a per-bin screen;
+    unit-fdr is the calibrated list.  Measured on one fixture: 725 calls at
+    a true rate of 0.21, 587 at 0.08, 332 at 0.02."""
+    import pandas as pd
+    out_n = {}
+    for sel, extra in (("fdr", []), ("unit-p", ["--contrast-unit-p", "0.05"]),
+                       ("unit-fdr", [])):
+        out, r, real = _welch_matrix_run(
+            tmp_path, f"ord_{sel}", "--contrast-permute-units", "9",
+            "--contrast-permute-scope", "reference",
+            "--contrast-select", sel, *extra)
+        assert r.returncode == 0, r.stderr[-2500:]
+        t = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
+        i = t["bin"].str.split(":").str[1].astype(int) // 250_000
+        m = t["contrast_m"].astype(bool)
+        n = int(m.sum())
+        out_n[sel] = (n, 1 - float((m & (i < real)).sum()) / max(n, 1))
+    assert out_n["fdr"][0] > out_n["unit-p"][0] > out_n["unit-fdr"][0]
+    assert out_n["fdr"][1] > out_n["unit-p"][1] >= out_n["unit-fdr"][1]
+    assert out_n["unit-fdr"][1] < 0.08
