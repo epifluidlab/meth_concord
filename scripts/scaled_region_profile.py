@@ -1180,6 +1180,24 @@ def main(argv=None) -> int:
     if steps:
         M = pd.DataFrame(Xc, index=M.index, columns=M.columns)
         print("  normalised: " + "; ".join(steps), file=sys.stderr)
+    if not args.from_counts:
+        # The complement of the --from-counts note: this mode averages the
+        # PER-BIN statistic, which is exactly what a differential test on
+        # the same matrix operated on -- so a profile here can be read
+        # against that test's up/down sets.  It carries that test's bias
+        # too, and says so.
+        _mstat = statistic_of(mpath) or "the matrix"
+        print(f"  profiling the PER-BIN {_mstat} averaged over the bins at "
+              f"each position -- the same quantity "
+              f"celltype_marker_bins.py's contrast tests, so this panel is "
+              f"comparable with its up/down sets.  It inherits that "
+              f"quantity's region-size bias: a thin bin's value is mostly "
+              f"the prior, so a region with many of them is attenuated, and "
+              f"--from-counts pools the counts instead."
+              + ("" if args.min_pairs > 0 else
+                 "  Every entry is post-RWR here; add --min-pairs 1 to keep "
+                 "only the ones with raw pairs of their own."),
+              file=sys.stderr)
     if args.baseline == "flank":
         # Reported apart from the matrix normalisation, and not counted as
         # it: anchoring is a DISPLAY choice made after the fact, and it
@@ -1265,6 +1283,31 @@ def main(argv=None) -> int:
         print(f"  pooling raw counts per axis position and computing "
               f"{_stat} from them (prior nu={sum(_alpha.values()):.1f})",
               file=sys.stderr)
+        # WHICH QUANTITY THIS IS, said out loud, because it is NOT the one
+        # celltype_marker_bins.py tests and the difference is large enough
+        # to change the shape of a profile.
+        #
+        #   here          the statistic of the POOLED counts at a position
+        #   marker bins   the MEAN over cells of the PER-BIN statistic
+        #
+        # They are not the same number.  A per-bin value in a thin bin is
+        # mostly the prior, so averaging them attenuates -- on a region of
+        # 16 thin bins and 4 dense ones, a true log odds ratio of +0.35
+        # came back as +0.402 pooled and +0.109 averaged, 0.27x.  The
+        # attenuation follows the SHARE of thin bins, which differs between
+        # a PMD and an HMD, so the two modes can order the same regions
+        # differently.  Pooling is the better estimate of the region; the
+        # per-bin mean is what a differential test on the matrix operated
+        # on.  To reproduce THAT, profile the matrix itself.
+        print(f"  NOTE this is the pooled-count {_stat}, not the per-bin "
+              f"mean that celltype_marker_bins.py tests.  A thin bin's "
+              f"per-bin value is mostly the prior, so averaging attenuates: "
+              f"on a 20-bin region with 16 thin bins a true log odds ratio "
+              f"of +0.35 read +0.402 pooled and +0.109 averaged.  Pooling is "
+              f"the better estimate of the region; to reproduce what the "
+              f"differential test saw, drop --from-counts and pass --matrix "
+              f"concordance_{_stat}.parquet (add --min-pairs 1 to keep only "
+              f"measured entries).", file=sys.stderr)
         _how = ("--from-counts-statistic" if args.from_counts_statistic
                 else f"the --matrix filename {Path(mpath).name!r}")
         _cdir = _counts_dir(args.from_counts)

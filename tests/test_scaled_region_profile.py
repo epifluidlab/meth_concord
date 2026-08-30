@@ -1658,3 +1658,53 @@ def test_the_null_replicates_are_masked_on_the_OBSERVED_counts(tmp_path):
     # And _pooled_stat never derives one itself.
     st = inspect.getsource(mod._pooled_stat)
     assert 'n_linked"] >=' not in st
+
+
+def test_each_mode_says_which_quantity_it_plots(tmp_path):
+    """The two modes compute different numbers and the difference is large
+    enough to change a profile's shape, so a run that does not say which one
+    it drew invites the panel to be read against a differential test it does
+    not match."""
+    out, r, mat, _ = _sparse_profile_run(
+        tmp_path, "--matrix",
+        str(tmp_path / "concordance_coordination.parquet"))
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "PER-BIN" in r.stderr
+    assert "celltype_marker_bins.py's contrast tests" in r.stderr
+    assert "region-size bias" in r.stderr
+    assert "post-RWR" in r.stderr          # and how to drop the imputed ones
+
+    out2, r2, _, _ = _sparse_profile_run(
+        tmp_path, "--from-counts", str(tmp_path),
+        "--from-counts-statistic", "coordination")
+    assert r2.returncode == 0, r2.stderr[-2000:]
+    assert "not the per-bin mean that celltype_marker_bins.py tests" in r2.stderr
+    assert "--matrix concordance_coordination.parquet" in r2.stderr
+
+
+def test_the_two_modes_really_do_differ_on_a_thin_region():
+    """Pinned because the note above quotes these numbers.  A per-bin value
+    in a thin bin is mostly the prior, so averaging attenuates, and the
+    attenuation follows the SHARE of thin bins -- which is why a PMD and an
+    HMD can order differently under the two modes."""
+    rng = np.random.default_rng(0)
+    n = np.array([3] * 16 + [300] * 4, float)
+    true_lo = 0.35
+    k = rng.binomial(n.astype(int), 1 / (1 + np.exp(-true_lo))).astype(float)
+    a0, ao = 100.0, 11.0
+    per_bin = (np.log((ao + k) / (a0 + n))
+               - np.log((ao + n - k) / (a0 + n))).mean()
+    pooled = (np.log((ao + k.sum()) / (a0 + n.sum()))
+              - np.log((ao + n.sum() - k.sum()) / (a0 + n.sum())))
+    assert pooled == pytest.approx(0.402, abs=0.02)
+    assert per_bin == pytest.approx(0.109, abs=0.02)
+    assert per_bin / pooled < 0.35
+    # A dense region of the same size is barely attenuated, which is what
+    # makes this a bias between regions rather than a scale factor.
+    n2 = np.full(20, 300.0)
+    k2 = rng.binomial(n2.astype(int), 1 / (1 + np.exp(-true_lo))).astype(float)
+    pb2 = (np.log((ao + k2) / (a0 + n2))
+           - np.log((ao + n2 - k2) / (a0 + n2))).mean()
+    p2 = (np.log((ao + k2.sum()) / (a0 + n2.sum()))
+          - np.log((ao + n2.sum() - k2.sum()) / (a0 + n2.sum())))
+    assert pb2 / p2 > 0.65
