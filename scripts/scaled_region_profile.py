@@ -1667,7 +1667,10 @@ def main(argv=None) -> int:
                     # place: 0.969 at a pooled n of 2,000, 0.964 at 120,
                     # 0.659 at 30.  Coordination was within 0.001 at all
                     # three.
-                    if _pb < 100 and "logor" in str(name):
+                    # ``name`` is the CONTEXT ("gch", "gch_hmd"), not the
+                    # statistic, so keying the warning on it meant it never
+                    # fired -- on the run that needed it most.
+                    if _pb < 100 and "logor" in str(_stat_name):
                         _msg += (" BELOW ~100 THE LOG ODDS RATIO IS NOT "
                                  "RELIABLE there: even with the "
                                  "Haldane +0.5 correction a simulated true "

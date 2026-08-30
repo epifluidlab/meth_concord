@@ -2098,3 +2098,60 @@ def test_the_pooled_depth_is_reported_per_position(tmp_path):
     assert "median_pairs_per_cell" in d.columns
     assert d["median_pairs_per_cell"].notna().any()
     assert "Median pooled pairs per cell inside" in r.stderr
+
+
+def test_the_thin_depth_warning_keys_on_the_statistic_not_the_context(
+        tmp_path):
+    """It was keyed on ``name``, which is the CONTEXT ("gch", "gch_hmd") and
+    not the statistic -- so it never fired, on the run that needed it most.
+    The log odds ratio is the one that breaks at low pooled depth;
+    coordination survives it, so warning about both would be noise."""
+    import json
+    import subprocess
+    import sys as _sys
+    import pandas as pd
+    rng = np.random.default_rng(0)
+    n_cells, nb, bsz = 16, 900, 250_000
+    d = tmp_path / "thin"
+    (d / "counts").mkdir(parents=True, exist_ok=True)
+    cells = [f"c{i}" for i in range(n_cells)]
+    bins = [f"chr1:{i * bsz}" for i in range(nb)]
+    N = rng.poisson(0.4, (n_cells, nb)).astype(float)
+    ko = rng.binomial(N.astype(int), 0.05).astype(float)
+    kc = rng.binomial(N.astype(int), 0.55).astype(float)
+    eo = rng.binomial(N.astype(int), 0.02).astype(float)
+    ec = rng.binomial(N.astype(int), 0.58).astype(float)
+    for k, v in {"k_open": ko, "k_closed": kc,
+                 "k_mixed": np.maximum(N - ko - kc, 0), "n_linked": N,
+                 "k_dm_open": eo, "k_dm_closed": ec,
+                 "k_dm_mixed": np.maximum(N - eo - ec, 0), "n_dm": N}.items():
+        pd.DataFrame(v, index=cells, columns=bins).to_parquet(
+            d / "counts" / f"{k}.parquet")
+    json.dump({"shared": {"alpha": {"open": 11., "closed": 49.,
+                                    "mixed": 40.}}},
+              open(d / "dirichlet_multinomial_prior.json", "w"))
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n_cells,
+                  "cell_type": ["T"] * 8 + ["R"] * 8}).to_csv(
+        d / "s.tsv", sep="\t", index=False)
+    (d / "dom.bed").write_text("".join(
+        f"chr1\t{i * 2_800_000}\t{i * 2_800_000 + 400_000}\n"
+        for i in range(1, 200)))
+
+    def run(stat):
+        r = subprocess.run(
+            [_sys.executable, str(_SCRIPT), "--from-counts", str(d),
+             "--from-counts-statistic", stat, "--name", "gch_hmd",
+             "--samples", str(d / "s.tsv"), "--cell-type-column", "cell_type",
+             "--group", "t=T", "--region", f"HMD={d / 'dom.bed'}",
+             "--output-dir", str(d / stat), "--plot-format", "png",
+             "--body-bins", "40", "--flank", "2000000", "--flank-bins", "20"],
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-2000:]
+        return r.stderr
+
+    lo, co = run("direction_logor"), run("coordination")
+    assert "Median pooled pairs per cell inside" in lo
+    # The context is named gch_hmd in both, so a name-keyed test would have
+    # passed for coordination too.
+    assert "NOT RELIABLE" in lo
+    assert "NOT RELIABLE" not in co
