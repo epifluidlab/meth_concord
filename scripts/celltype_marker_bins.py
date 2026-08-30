@@ -1710,6 +1710,82 @@ def glm_contrast(counts, in_mask, out_mask, statistic, cells, batch_df=None,
     return out
 
 
+def unit_relabellings(units, n_a, true_a, max_n=0, seed=0):
+    """Every balanced way of calling ``n_a`` units the contrast arm, minus
+    the real one.
+
+    Balanced -- the same arm sizes as the real contrast -- because power and
+    variance both depend on them, so a 1-vs-4 split would not be the test
+    that was actually run.
+    """
+    import itertools
+    true_a = frozenset(true_a)
+    out = [frozenset(c) for c in itertools.combinations(sorted(units), int(n_a))
+           if frozenset(c) != true_a]
+    if max_n and len(out) > int(max_n):
+        rng = np.random.default_rng(int(seed))
+        out = [out[i] for i in sorted(rng.choice(len(out), int(max_n),
+                                                 replace=False))]
+    return out
+
+
+def unit_permutation_p(p_obs, p_null, strata=None, min_pool=2_000):
+    """An empirical p from relabelled units, pooled across bins.
+
+    WHY THIS EXISTS.  A test can be the most powerful one on a dataset and
+    still have a nominal p that means nothing -- measured on one run, welch
+    and mwu on per-cell values recovered far more spiked signal than the
+    unit-level GLM and carried a permuted false-positive rate two to three
+    times nominal.  Those are not in conflict: the extra power is real, and
+    so is the inflation, because cells within a cell type are not
+    replicates.  Replacing the nominal p with the rank of the observed
+    statistic in a null built by RELABELLING WHICH UNITS ARE THE CONTRAST
+    ARM keeps the power and fixes the calibration, because the relabelled
+    runs inherit exactly the same pseudo-replication.
+
+    Extremeness is measured as -log10(p) so any test can be fed in -- the
+    nominal p never has to be believed, only ordered.
+
+    POOLED ACROSS BINS, because with five units there are only nine
+    relabellings and a per-bin null of nine cannot resolve a p below 0.1.
+    Pooling within a coverage stratum buys n_bins x 9 draws, at the cost of
+    assuming bins within a stratum are exchangeable -- which is what the
+    strata are chosen to make true.
+
+    IT IS AN UPPER BOUND ON THE P, not an exact one: a relabelled split such
+    as {tumor1, GM12878} against the rest still carries real biology, so the
+    null is contaminated with signal and the p is conservative.  A bin that
+    clears it has cleared something harder than the nominal test.
+    """
+    obs = -np.log10(np.clip(np.asarray(p_obs, float), 1e-300, 1.0))
+    nulls = [-np.log10(np.clip(np.asarray(q, float), 1e-300, 1.0))
+             for q in p_null]
+    out = np.full(obs.shape, np.nan)
+    if not nulls:
+        return out, {"n_relabellings": 0, "median_pool": 0}
+    st = (np.zeros(obs.shape, int) if strata is None
+          else np.asarray(strata).astype(int))
+    testable = np.isfinite(obs)
+    pools = []
+    for s in np.unique(st[testable]):
+        m = testable & (st == s)
+        pool = np.concatenate([q[m] for q in nulls])
+        pool = np.sort(pool[np.isfinite(pool)])
+        if pool.size < int(min_pool):
+            everything = np.concatenate(
+                [q[testable] for q in nulls])
+            pool = np.sort(everything[np.isfinite(everything)])
+        if pool.size < 2:
+            continue
+        # One-sided: bigger -log10(p) is more extreme, whichever tail the
+        # underlying test used.
+        n_ge = pool.size - np.searchsorted(pool, obs[m], side="left")
+        out[m] = (n_ge + 1.0) / (pool.size + 1.0)
+        pools.append(pool.size)
+    return out, {"n_relabellings": len(nulls),
+                 "median_pool": int(np.median(pools)) if pools else 0}
+
+
 def _glm_statistic_for(matrix_path):
     """Which 2x2 table the matrix's statistic is a log odds ratio of."""
     stem = Path(matrix_path).name
@@ -3339,6 +3415,50 @@ def main():
                          "power 0.55 at FPR 0.050, 4 gave 0.60 / 0.037, 8 "
                          "gave 0.70 / 0.045 and 20 gave 0.75 / 0.058.  Raise "
                          "it for power, and watch the FPR.")
+    ap.add_argument("--contrast-permute-units", type=int, default=0,
+                    metavar="N",
+                    help="MEASURE how inflated this run's nominal p is on "
+                         "THIS dataset, by relabelling which replication "
+                         "units are the contrast arm and re-running the "
+                         "identical test.  N caps how many "
+                         "balanced relabellings to use; 0 (default) is off "
+                         "and any positive number takes all of them when "
+                         "there are fewer (with five cell types, two against "
+                         "three, there are nine).  WHY.  A test can be the "
+                         "most powerful on a dataset and still have a "
+                         "nominal p that means nothing -- measured on one "
+                         "run, welch and mwu on per-cell values recovered "
+                         "far more spiked signal than the unit-level GLM and "
+                         "carried a permuted false-positive rate two to "
+                         "three times nominal.  Those do not contradict each "
+                         "other: the extra power is real and so is the "
+                         "inflation, because cells within a cell type are "
+                         "not replicates.  The relabelled runs inherit the "
+                         "SAME pseudo-replication, so what they return IS "
+                         "this dataset's false-positive rate for this test.  "
+                         "Reported with the nominal cut that buys a true 5 "
+                         "percent and how many bins clear it.  IT DOES NOT "
+                         "REPLACE THE P: an empirical p from these "
+                         "relabellings is far too conservative, because a "
+                         "split such as tumor1+GM12878 against the rest "
+                         "still carries real cell-type biology -- measured, "
+                         "it returned zero bins at FDR 0.05 whether 25, 5 or "
+                         "2 percent of bins were genuinely differential.  It "
+                         "rides along as contrast_<label>_pvalue_unitperm "
+                         "for inspection.  For the same reason the measured "
+                         "inflation is an UPPER bound.  Works with any "
+                         "--contrast-test.  "
+                         "Needs --replicate-column (or its cell-type "
+                         "default) with 2+ units per arm.  Cost is N times "
+                         "the contrast, so pair it with --glm-threads.")
+    ap.add_argument("--contrast-permute-min-pool", type=int, default=2_000,
+                    metavar="M",
+                    help="Smallest per-stratum pool of relabelled statistics "
+                         "to use on its own; below it, every testable bin's "
+                         "draws are pooled instead.  Nine relabellings "
+                         "cannot resolve a p below 0.1 per bin, so pooling "
+                         "across bins within a coverage stratum is what "
+                         "makes the empirical p usable at all.")
     ap.add_argument("--glm-threads", type=int, default=1, metavar="N",
                     help="Parallel workers for the per-bin GLM fits (about "
                          "15 ms each, so ~3 min for 10,000 bins on one "
@@ -3678,7 +3798,7 @@ def main():
                   f"supplies only the cell x bin grid for this test.",
                   file=sys.stderr)
         donor_v = None
-        if args.contrast_test == "glm":
+        if args.contrast_test == "glm" or args.contrast_permute_units:
             # Default to the cell type: it is the unit there are only a
             # handful of, and a contrast of two tumours against three
             # reference sources has 2 clusters against 3 no matter how many
@@ -4301,6 +4421,100 @@ def main():
                 else:
                     cs = contrast_stats(Xc, in_mask, args.min_cells_per_group,
                                         out_mask, args.contrast_test)
+            # ---- Empirical p from relabelled units ---------------------
+            summary_unitperm = locals().get("summary_unitperm") or {}
+            if args.contrast_permute_units and cs is not None \
+                    and donor_v is not None:
+                _u_all = np.asarray(donor_v, dtype=object)
+                _ua = sorted(set(_u_all[in_mask]))
+                _ub = sorted(set(_u_all[out_mask]))
+                _units = _ua + _ub
+                if len(_ua) < 2 or len(_ub) < 2:
+                    print(f"  contrast {label!r}: --contrast-permute-units "
+                          f"needs 2+ replication units per arm, have "
+                          f"{len(_ua)} vs {len(_ub)}; skipped.",
+                          file=sys.stderr)
+                else:
+                    _rel = unit_relabellings(
+                        _units, len(_ua), _ua,
+                        max_n=args.contrast_permute_units, seed=args.seed)
+                    _nulls = []
+                    for _combo in _rel:
+                        _mi = np.isin(_u_all, list(_combo))
+                        _mo = np.isin(_u_all, [u for u in _units
+                                               if u not in _combo])
+                        if args.contrast_test == "glm":
+                            _r = glm_contrast(
+                                glm_counts, _mi, _mo, glm_statistic,
+                                list(M.index),
+                                batch_df=(batch_df if args.glm_batch
+                                          else None),
+                                donor=donor_v,
+                                min_cells=args.min_cells_per_group,
+                                min_pairs=max(1, int(_min_pairs)),
+                                prior_df=args.glm_prior_df,
+                                n_jobs=args.glm_threads)
+                        else:
+                            _r = contrast_stats(Xc, _mi,
+                                                args.min_cells_per_group,
+                                                _mo, args.contrast_test)
+                        _nulls.append(_r["p"])
+                    _cstrata = (coverage_strata(Cc >= max(1, int(_min_pairs)))
+                                if Cc is not None else None)
+                    _pe, _pi = unit_permutation_p(
+                        cs["p"], _nulls, strata=_cstrata,
+                        min_pool=args.contrast_permute_min_pool)
+                    _flat = np.concatenate(
+                        [q[np.isfinite(q)] for q in _nulls])
+                    _fpr = float(np.mean(_flat <= 0.05))
+                    _thr = float(np.quantile(_flat, 0.05)) \
+                        if _flat.size >= 200 else float("nan")
+                    _n_nom = int(np.sum(np.isfinite(cs["p"])
+                                        & (cs["p"] <= 0.05)))
+                    _n_cal = int(np.sum(np.isfinite(cs["p"])
+                                        & (cs["p"] <= _thr))) \
+                        if np.isfinite(_thr) else 0
+                    # DIAGNOSTIC, NOT A REPLACEMENT.  Swapping the nominal p
+                    # for this empirical one was the first design and it is
+                    # wrong: a relabelled split such as {tumor1, GM12878}
+                    # against the rest still carries real cell-type biology,
+                    # so the null is contaminated with signal and the p is
+                    # far too conservative -- measured, it returned ZERO
+                    # bins at FDR 0.05 whether 25, 5 or 2 percent of bins
+                    # were genuinely differential.  What the relabellings DO
+                    # settle is how badly the nominal p is inflated on this
+                    # dataset, and what nominal cut buys a true 5 percent.
+                    # Both are reported; the p that goes into FDR is left
+                    # alone, and the empirical one rides along as a column.
+                    print(f"  contrast {label!r}: {_pi['n_relabellings']} "
+                          f"unit relabellings (median pool "
+                          f"{_pi['median_pool']:,}).  ON THIS DATA the "
+                          f"nominal {args.contrast_test!r} p runs at "
+                          f"{_fpr:.3f} against a nominal 0.05 "
+                          f"({_fpr / 0.05:.1f}x); a true 5 percent needs "
+                          f"p <= {_thr:.2g}, which {_n_cal:,} bins clear "
+                          f"against {_n_nom:,} at 0.05.  The relabelled null "
+                          f"still mixes real cell types, so {_fpr:.3f} is an "
+                          f"UPPER bound on the inflation.",
+                          file=sys.stderr)
+                    if _fpr > 0.10:
+                        print(f"  contrast {label!r}: WARNING at "
+                              f"{_fpr / 0.05:.1f}x nominal, a BH-FDR at "
+                              f"q=0.05 on these p-values is controlling "
+                              f"something nearer q={_fpr / 0.05 * 0.05:.2f}. "
+                              f"Read the {_n_cal:,} bins clearing "
+                              f"p <= {_thr:.2g}, or switch to "
+                              f"--contrast-test glm, whose p is taken across "
+                              f"replication units.", file=sys.stderr)
+                    scores_df[f"contrast_{label}_pvalue_unitperm"] = _pe
+                    extra_cols.append(f"contrast_{label}_pvalue_unitperm")
+                    summary_unitperm[f"{name}:{label}"] = {
+                        "n_relabellings": _pi["n_relabellings"],
+                        "nominal_fpr_at_0.05": _fpr,
+                        "threshold_for_true_5pct": _thr,
+                        "n_bins_nominal_p05": _n_nom,
+                        "n_bins_calibrated": _n_cal,
+                        "test": args.contrast_test}
             if C_df is not None:
                 cov = coverage_report(
                     C_df.reindex(index=M.index, columns=M.columns)

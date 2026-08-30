@@ -4162,3 +4162,122 @@ def test_every_third_party_import_is_a_declared_dependency():
     assert not missing, (
         f"imported but not declared in requirements.txt / pyproject.toml: "
         f"{missing}")
+
+
+# ---------------------------------------------------------------------------
+# --contrast-permute-units: how inflated is THIS run's p?
+# ---------------------------------------------------------------------------
+
+
+def test_relabellings_are_balanced_and_exclude_the_real_split():
+    mod = _mod()
+    units = ["tumor1", "tumor2", "GM12878", "IMR90", "monocyte"]
+    got = mod.unit_relabellings(units, 2, ["tumor1", "tumor2"])
+    assert len(got) == 9 and len(set(got)) == 9
+    assert all(len(g) == 2 for g in got)
+    assert frozenset(["tumor1", "tumor2"]) not in got
+    capped = mod.unit_relabellings(units, 2, ["tumor1", "tumor2"], max_n=4)
+    assert len(capped) == 4 and set(capped) <= set(got)
+
+
+def test_the_empirical_p_pools_across_bins_because_nine_cannot_resolve_it():
+    """Nine relabellings give a per-bin floor of 0.1.  Pooling within a
+    stratum buys n_bins x 9 draws, which is what makes it usable at all."""
+    mod = _mod()
+    rng = np.random.default_rng(0)
+    n_bins = 800
+    p_obs = rng.random(n_bins)
+    nulls = [rng.random(n_bins) for _ in range(9)]
+    pe, info = mod.unit_permutation_p(p_obs, nulls, min_pool=100)
+    assert info["n_relabellings"] == 9
+    assert info["median_pool"] == 9 * n_bins
+    assert np.isfinite(pe).all()
+    assert pe.min() < 0.01                      # far below the 0.1 per-bin floor
+    # Uniform in, uniform out.
+    assert abs(float(np.mean(pe <= 0.05)) - 0.05) < 0.03
+
+
+def test_a_more_extreme_observed_gets_a_smaller_empirical_p():
+    mod = _mod()
+    rng = np.random.default_rng(1)
+    nulls = [rng.random(500) for _ in range(9)]
+    p_obs = np.full(500, 0.5)
+    p_obs[:50] = 1e-8                           # very extreme
+    pe, _ = mod.unit_permutation_p(p_obs, nulls, min_pool=100)
+    assert pe[:50].max() < pe[50:].min()
+
+
+def test_it_reports_the_inflation_without_overwriting_the_p(tmp_path):
+    """Replacing the p with the empirical one was the first design and it is
+    wrong: the relabelled null carries real cell-type biology, so the p is
+    far too conservative -- it returned zero bins at FDR 0.05 whether 25, 5
+    or 2 percent of bins were genuinely differential.  What the relabellings
+    do settle is how inflated the nominal p is."""
+    import pandas as pd
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_contrast_evaluation import _dataset
+    d, s, real = _dataset(tmp_path, n_bins=400, real=100)
+    sdf = pd.read_csv(s, sep="\t")
+    sdf["exp_batch"] = ["b1", "b2"] * (len(sdf) // 2)
+    sdf.to_csv(s, sep="\t", index=False)
+    cd = tmp_path / "counts"
+    K = pd.read_parquet(cd / "k_open.parquet")
+    C = pd.read_parquet(cd / "k_closed.parquet")
+    e = 1 / (1 + np.exp(0.4))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        X = (np.log(K.to_numpy()) - np.log(C.to_numpy())
+             - (np.log(e) - np.log(1 - e)))
+    X = np.where(np.isfinite(X), X, np.nan)
+    mat = tmp_path / "concordance_direction_logor.parquet"
+    pd.DataFrame(X, index=K.index, columns=K.columns).to_parquet(mat)
+
+    def run(extra):
+        out = tmp_path / f"o{len(extra)}"
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+             "--samples", str(s), "--cell-type-column", "cell_type",
+             "--batch-column", "exp_batch", "--n-bins", "80",
+             "--n-permutations", "20", "--contrast", "m=tumor1,tumor2",
+             "--contrast-test", "welch", "--output-dir", str(out),
+             "--plot-format", "png", *extra], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-2500:]
+        return pd.read_csv(out / "bin_scores_gch.tsv", sep="\t"), r.stderr
+
+    base, _ = run([])
+    perm, err = run(["--contrast-permute-units", "9"])
+    assert "unit relabellings" in err
+    assert "UPPER bound on the inflation" in err
+    # The p that feeds FDR is untouched, so the call set does not move.
+    np.testing.assert_allclose(base["contrast_m_pvalue"].to_numpy(),
+                               perm["contrast_m_pvalue"].to_numpy(),
+                               equal_nan=True)
+    assert "contrast_m_pvalue_unitperm" in perm.columns
+    assert "contrast_m_pvalue_nominal" not in perm.columns
+
+
+def test_an_arm_with_one_unit_is_skipped_not_guessed(tmp_path, capsys):
+    """No variance between units, so there is nothing to relabel."""
+    import pandas as pd
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_contrast_evaluation import _dataset
+    d, s, _ = _dataset(tmp_path, n_bins=120, real=30)
+    sdf = pd.read_csv(s, sep="\t")
+    sdf["exp_batch"] = ["b1", "b2"] * (len(sdf) // 2)
+    sdf.to_csv(s, sep="\t", index=False)
+    cd = tmp_path / "counts"
+    K = pd.read_parquet(cd / "k_open.parquet")
+    mat = tmp_path / "concordance_direction_logor.parquet"
+    rng = np.random.default_rng(0)
+    pd.DataFrame(rng.normal(0, 1, K.shape), index=K.index,
+                 columns=K.columns).to_parquet(mat)
+    out = tmp_path / "one"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--batch-column", "exp_batch", "--n-bins", "30",
+         "--n-permutations", "20", "--contrast", "one=tumor1",
+         "--contrast-test", "welch", "--contrast-permute-units", "9",
+         "--output-dir", str(out), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "needs 2+ replication units per arm" in r.stderr
