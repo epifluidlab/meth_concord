@@ -3839,3 +3839,234 @@ def test_an_uncovered_companion_still_renders_both_orderings(tmp_path):
     assert "marker_heatmap_gch_nullrank_reclustered.png" in made
     assert "marker_heatmap_gch_nullrank_fixedorder.png" in made
     assert "null-rank covers" in (r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------------------
+# --contrast-test glm: raw counts, coverage-weighted, donor-level p
+# ---------------------------------------------------------------------------
+
+
+def _glm_fixture(seed=1, n=200, nb=400, effect=0.9, n_real=20):
+    """Donor-level bin effects, per-cell effects, then binomial sampling.
+
+    The donor term is the whole point: cells from one donor are not
+    replicates, and a fixture without it makes every cell-level test look
+    calibrated.
+    """
+    rng = np.random.default_rng(seed)
+    tum = np.arange(n) < 70
+    dn = np.where(tum, np.where(np.arange(n) < 35, "T1", "T2"),
+                  np.array(["R1", "R2", "R3"])[np.arange(n) % 3])
+    du = list(dict.fromkeys(dn))
+    dix = np.array([du.index(d) for d in dn])
+    depth = rng.gamma(2, 6, (n, nb))
+    lo = (-0.4 + rng.normal(0, .35, (len(du), nb))[dix]
+          + rng.normal(0, .25, (n, 1)))
+    lo[:, :n_real] += np.where(tum[:, None], effect, 0.0)
+    N = np.maximum(np.round(depth), 1).astype(int)
+    K = rng.binomial(N, 1 / (1 + np.exp(-lo))).astype(float)
+    e = 1 / (1 + np.exp(0.4))
+    counts = {"k_open": K, "k_closed": N - K, "k_mixed": depth * .5,
+              "n_linked": N.astype(float), "k_dm_open": N * e,
+              "k_dm_closed": N * (1 - e), "k_dm_mixed": depth * .5,
+              "n_dm": N.astype(float)}
+    cells = [f"c{i}" for i in range(n)]
+    return counts, tum, dn, cells, n_real
+
+
+def test_the_glm_coefficient_recovers_the_planted_effect():
+    """It is the statistic itself, not a proxy: the group coefficient of a
+    binomial GLM with logit(E) as an offset is exactly the difference in
+    L between the arms."""
+    mod = _mod()
+    counts, tum, dn, cells, n_real = _glm_fixture(effect=0.9)
+    r = mod.glm_effect(counts, tum, ~tum, "direction_logor", cells)
+    assert np.nanmean(r["diff"][:n_real]) == pytest.approx(0.9, abs=0.15)
+    assert abs(np.nanmean(r["diff"][n_real:])) < 0.1
+
+
+def test_counts_weight_cells_by_evidence_where_a_rank_test_cannot():
+    """A rank test gives a bin measured on 3 read pairs the same vote as one
+    measured on 500, and at n = 3 that vote is about 97 percent prior."""
+    import inspect
+    src = inspect.getsource(_mod().glm_effect)
+    assert "offset=off" in src
+    # The expected pool is an OFFSET, never a fitted column: as a covariate
+    # the model could rescale the baseline it is measured against.
+    assert "e_s" in src and "e_f" in src
+    # No dispersion estimate on the fit: statsmodels computes the Pearson
+    # scale on the row scale for a two-column binomial endog, which on
+    # genuinely over-dispersed data came back at 0.012 and shrank the
+    # standard error ninefold.  The comment above it says so; the CALL must
+    # not carry it.
+    assert ".fit(scale" not in src.replace(" ", "")
+
+
+def test_the_cell_level_p_is_not_reported_because_it_is_not_a_p_value():
+    """Measured on the fixture above: a cell-level GLM p runs at a 0.605
+    false-positive rate against a nominal 0.05, and 0.189 even with
+    donor-clustered standard errors -- five clusters is far below what a
+    sandwich estimator needs."""
+    mod = _mod()
+    counts, tum, dn, cells, _ = _glm_fixture()
+    r = mod.glm_effect(counts, tum, ~tum, "direction_logor", cells)
+    assert "p" not in r
+    # And the wrapper hands back NaN rather than the cell-level p when there
+    # is no donor column to test over.
+    r2 = mod.glm_contrast(counts, tum, ~tum, "direction_logor", cells)
+    assert np.isnan(r2["p"]).all()
+    assert r2["p_unit"] is None
+    assert np.isfinite(r2["diff"]).any()
+
+
+def test_the_donor_p_is_calibrated_where_the_cell_p_is_not():
+    mod = _mod()
+    counts, tum, dn, cells, n_real = _glm_fixture(effect=0.9)
+    r = mod.glm_contrast(counts, tum, ~tum, "direction_logor", cells,
+                         donor=dn)
+    assert r["p_unit"] == "donor"
+    assert r["n_donors"] == 5
+    fpr = float(np.nanmean(r["p"][n_real:] < 0.05))
+    power = float(np.nanmean(r["p"][:n_real] < 0.05))
+    assert fpr < 0.09, fpr
+    assert power > 0.3, power
+
+
+def test_pooling_the_variance_and_moderating_it_is_what_buys_the_power():
+    """Welch spends a degree of freedom the design cannot afford at 2 against
+    3, and a rank test cannot fire at all -- its floor there is 0.2."""
+    mod = _mod()
+    counts, tum, dn, cells, n_real = _glm_fixture(effect=0.9)
+    keep = np.ones(len(cells), bool)
+    L, order = mod.donor_logits(counts, keep, dn, "direction_logor")
+    is_in = np.array([bool(tum[np.asarray(dn) == d][0]) for d in order])
+    got = {}
+    for d0 in (0.0, 4.0, 20.0):
+        mt = mod.moderated_t(L[is_in], L[~is_in], prior_df=d0)
+        got[d0] = (float(np.nanmean(mt["p"][:n_real] < 0.05)),
+                   float(np.nanmean(mt["p"][n_real:] < 0.05)))
+    # More borrowing is more powerful, and eventually anti-conservative.
+    assert got[20.0][0] >= got[4.0][0] >= got[0.0][0]
+    assert got[0.0][1] < 0.09
+    assert got[20.0][1] > got[4.0][1]
+    # A rank test on 2 vs 3 donors cannot reach 0.05 at all.
+    from scipy.stats import mannwhitneyu
+    assert mannwhitneyu([1.0, 2.0], [5.0, 6.0, 7.0]).pvalue > 0.05
+
+
+def test_donor_logits_pool_counts_before_forming_the_statistic():
+    """A ratio of aggregated counts is not the mean of per-cell ratios, and a
+    thin cell's ratio is mostly the prior -- the same reason --from-counts
+    exists in scaled_region_profile.py."""
+    mod = _mod()
+    counts = {"k_open": np.array([[1.0], [9.0]]),
+              "k_closed": np.array([[9.0], [1.0]]),
+              "k_mixed": np.zeros((2, 1)), "n_linked": np.array([[10.], [10.]]),
+              "k_dm_open": np.array([[5.0], [5.0]]),
+              "k_dm_closed": np.array([[5.0], [5.0]]),
+              "k_dm_mixed": np.zeros((2, 1)), "n_dm": np.array([[10.], [10.]])}
+    L, order = mod.donor_logits(counts, np.ones(2, bool),
+                                np.array(["d", "d"]), "direction_logor")
+    assert order == ["d"]
+    # Pooled: (1+9)/(9+1) -> log 1 = 0, not the mean of log(1/9), log(9/1).
+    assert L[0, 0] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_batch_enters_the_design_rather_than_pre_correcting_the_matrix():
+    """Centring by batch and then testing spends the batch's degrees of
+    freedom without telling the test it spent them."""
+    import pandas as pd
+    mod = _mod()
+    cells = [f"c{i}" for i in range(8)]
+    b = pd.DataFrame({"batch": ["b1", "b2"] * 4}, index=cells)
+    X, names = mod._design(np.array([1, 1, 1, 1, 0, 0, 0, 0.]), b, cells)
+    assert names == ["const", "group", "batch=b2"]
+    assert X.shape == (8, 3)
+    # A level constant across the cells contributes nothing and would make
+    # the fit singular.
+    b1 = pd.DataFrame({"batch": ["b1"] * 8}, index=cells)
+    _, n1 = mod._design(np.zeros(8), b1, cells)
+    assert n1 == ["const", "group"]
+
+
+def test_the_glm_statistic_comes_from_the_matrix_name(tmp_path):
+    mod = _mod()
+    assert mod._glm_statistic_for(
+        "/x/concordance_direction_logor.parquet") == "direction_logor"
+    assert mod._glm_statistic_for(
+        "/x/concordance_coordination_z.parquet") == "coordination"
+    with pytest.raises(SystemExit):
+        mod._glm_statistic_for("/x/concordance_marginal.parquet")
+
+
+def _glm_cli_run(tmp_path, *extra, effect=1.4):
+    import pandas as pd
+    rng = np.random.default_rng(1)
+    n, nb = 160, 200
+    ctn = np.array(["T1", "T2", "R1", "R2"])[np.arange(n) % 4]
+    tum = np.isin(ctn, ["T1", "T2"])
+    dn = ctn.copy()
+    du = list(dict.fromkeys(dn))
+    dix = np.array([du.index(d) for d in dn])
+    depth = rng.gamma(2, 6, (n, nb))
+    lo = (-0.4 + rng.normal(0, .30, (len(du), nb))[dix]
+          + rng.normal(0, .25, (n, 1)))
+    lo[:, :20] += np.where(tum[:, None], effect, 0.0)
+    N = np.maximum(np.round(depth), 1).astype(int)
+    K = rng.binomial(N, 1 / (1 + np.exp(-lo))).astype(float)
+    e = 1 / (1 + np.exp(0.4))
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 250000}" for i in range(nb)]
+    cd = tmp_path / "counts"
+    cd.mkdir(exist_ok=True)
+    for k, v in {"k_open": K, "k_closed": N - K, "k_mixed": depth * .5,
+                 "n_linked": N.astype(float), "k_dm_open": N * e,
+                 "k_dm_closed": N * (1 - e), "k_dm_mixed": depth * .5,
+                 "n_dm": N.astype(float)}.items():
+        pd.DataFrame(v, index=cells, columns=bins).to_parquet(
+            cd / f"{k}.parquet")
+    X = np.log(np.clip(K, .5, None) / np.clip(N - K, .5, None)) + 0.4
+    mat = tmp_path / "concordance_direction_logor.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    s = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": ctn, "donor": dn,
+                  "sample": np.where(np.arange(n) % 2 == 0, "b1", "b2")}
+                 ).to_csv(s, sep="\t", index=False)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--batch-column", "sample", "--n-bins", "50",
+         "--n-permutations", "20", "--contrast", "tum=T1,T2",
+         "--contrast-test", "glm", "--output-dir", str(out),
+         "--plot-format", "png", *extra], capture_output=True, text=True)
+    return out, r
+
+
+def test_glm_runs_end_to_end_and_lands_in_the_table(tmp_path):
+    import pandas as pd
+    out, r = _glm_cli_run(tmp_path, "--donor-column", "donor", "--volcano")
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "binomial GLM on raw counts" in r.stderr
+    assert "moderated t over 4 donors" in r.stderr
+    assert (out / "volcano_gch_tum.pdf").exists()
+    t = pd.read_csv(out / "bin_scores_gch.tsv", sep="\t")
+    i = t["bin"].str.split(":").str[1].astype(int) // 250_000
+    assert t.loc[i < 20, "contrast_tum_diff"].mean() > 0.8
+    assert abs(t.loc[i >= 20, "contrast_tum_diff"].mean()) < 0.3
+    assert np.mean(t.loc[i >= 20, "contrast_tum_pvalue"] < 0.05) < 0.10
+
+
+def test_glm_without_counts_says_which_flag_is_missing(tmp_path):
+    out, r = _glm_cli_run(tmp_path, "--donor-column", "donor",
+                          "--from-counts", "gch=/nope")
+    assert r.returncode != 0
+    assert "--emit-counts" in r.stderr or "missing" in r.stderr
+
+
+def test_glm_without_a_donor_column_warns_that_there_is_no_p(tmp_path):
+    out, r = _glm_cli_run(tmp_path)
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "no --donor-column" in r.stderr
+    assert "0.605" in r.stderr

@@ -1366,6 +1366,308 @@ def _companion(matrix_path, specs, name, filename, flag, matrix=None):
             if matrix is not None else df)
 
 
+GLM_COUNT_KEYS = ("k_open", "k_closed", "k_mixed", "n_linked",
+                  "k_dm_open", "k_dm_closed", "k_dm_mixed", "n_dm")
+
+# Which two count columns each statistic is a log odds ratio OF, and which
+# expected pair supplies the offset.  Taken from the definitions in
+# decompose_components: the GLM's group coefficient is then the SAME
+# quantity the matrix holds, estimated from counts instead of averaged from
+# per-cell values.
+GLM_MODELS = {
+    # C is an excess of concordant mass over the expected.  On the log-odds
+    # scale that is concordant against mixed, offset by the expected split.
+    "coordination": (("k_open", "k_closed"), ("k_mixed",),
+                     ("k_dm_open", "k_dm_closed"), ("k_dm_mixed",)),
+    # L = log(O_open/O_closed) - log(E_open/E_closed) exactly, so co-open
+    # against co-closed with the expected log odds as the offset makes the
+    # group coefficient equal to the difference in L between the arms.
+    "direction_logor": (("k_open",), ("k_closed",),
+                        ("k_dm_open",), ("k_dm_closed",)),
+}
+
+
+def _design(group, batch_df, cells):
+    """Intercept, the group indicator, and one column per batch level.
+
+    Batch enters as a COVARIATE rather than as a pre-correction.  Centring
+    the matrix by batch first and then testing spends the batch's degrees of
+    freedom without telling the test it spent them, so the standard errors
+    come back too small; here they are paid for.
+    """
+    cols = [np.ones(len(cells)), np.asarray(group, float)]
+    names = ["const", "group"]
+    if batch_df is not None:
+        for c in batch_df.columns:
+            v = batch_df[c].reindex(cells).astype(str).to_numpy()
+            levels = [l for l in sorted(set(v)) if l == l][1:]   # drop base
+            for l in levels:
+                col = (v == l).astype(float)
+                # A level that is constant, or perfectly collinear with the
+                # arm, contributes nothing and would make the fit singular.
+                if 0 < col.sum() < len(col):
+                    cols.append(col)
+                    names.append(f"{c}={l}")
+    X = np.column_stack(cols)
+    return X, names
+
+
+def donor_logits(counts, keep, donor, statistic, min_pairs=1):
+    """One offset-referenced logit per (donor, bin), from POOLED counts.
+
+    Counts are summed within the donor first and the statistic formed once,
+    which is the same reason ``--from-counts`` exists in
+    scaled_region_profile.py: a ratio of aggregated counts is not the mean
+    of per-cell ratios, and a thin cell's ratio is mostly the prior.
+
+    The value is exactly the statistic the matrix holds -- for
+    ``direction_logor``, log(O_open/O_closed) - log(E_open/E_closed) on that
+    donor's pooled pairs.
+    """
+    succ_k, fail_k, e_succ_k, e_fail_k = GLM_MODELS[statistic]
+    dv = np.asarray(donor, dtype=object)
+    order = [d for d in dict.fromkeys(dv[keep])]
+    n_bins = counts["n_linked"].shape[1]
+    L = np.full((len(order), n_bins), np.nan)
+    for i, d in enumerate(order):
+        rows = np.flatnonzero(keep & (dv == d))
+        if not rows.size:
+            continue
+        deep = counts["n_linked"][rows] >= float(min_pairs)
+        g = lambda ks: np.sum(
+            [np.where(deep, counts[k][rows], 0.0) for k in ks],
+            axis=0).sum(axis=0)
+        s, f = g(succ_k), g(fail_k)
+        es, ef = g(e_succ_k), g(e_fail_k)
+        ok = (s > 0) & (f > 0) & (es > 0) & (ef > 0)
+        L[i, ok] = (np.log(s[ok]) - np.log(f[ok])
+                    - np.log(es[ok]) + np.log(ef[ok]))
+    return L, order
+
+
+def moderated_t(a, b, prior_df=4.0):
+    """Two-sample t per bin with the variance moderated across bins.
+
+    WHY NOT WELCH, AND WHY NOT A RANK TEST.  Measured on a fixture with
+    donor-level bin effects, two donors against three:
+
+        cell-level GLM p                 power 1.00   FPR 0.605
+        GLM, donor-clustered SEs         power 0.80   FPR 0.189
+        Welch t on donor logits          power 0.15   FPR 0.032
+        Mann-Whitney on donor logits     power 0.00   FPR 0.000
+        POOLED t on donor logits         power 0.55   FPR 0.050
+        pooled + moderation (d0 = 4)     power 0.60   FPR 0.037
+
+    against a nominal 0.05.  The cell-level p is not a p-value at these
+    cluster counts, and neither is a donor-clustered SE -- five clusters is
+    far below the thirty-odd those need.  A rank test cannot fire at all:
+    its floor at 2 against 3 is 0.2.  Pooling the variance across the arms
+    recovers the third degree of freedom Welch spends, and moderating it
+    across bins buys the rest, which is exactly what limma exists for at
+    this sample size.
+
+    ``prior_df`` is how many bins' worth of borrowed variance to add to the
+    3 the design has.  Larger is more powerful and eventually
+    anti-conservative: d0 = 8 measured 0.70 / 0.045 and d0 = 20 measured
+    0.75 / 0.058 on the same fixture.
+    """
+    from scipy.stats import t as _t
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        na = np.isfinite(a).sum(axis=0)
+        nb = np.isfinite(b).sum(axis=0)
+        diff = np.nanmean(a, axis=0) - np.nanmean(b, axis=0)
+        va = np.nanvar(a, axis=0, ddof=1)
+        vb = np.nanvar(b, axis=0, ddof=1)
+    ok = (na >= 2) & (nb >= 2)
+    df = np.where(ok, na + nb - 2, np.nan)
+    s2 = np.where(ok, ((na - 1) * np.nan_to_num(va)
+                       + (nb - 1) * np.nan_to_num(vb)) / np.where(df > 0, df, 1),
+                  np.nan)
+    good = np.isfinite(s2) & (s2 > 0)
+    s0 = float(np.median(s2[good])) if good.any() else np.nan
+    d0 = float(prior_df)
+    s2m = ((d0 * s0 + df * s2) / (d0 + df)) if np.isfinite(s0) else s2
+    se = np.sqrt(s2m * (1.0 / np.where(na > 0, na, np.nan)
+                        + 1.0 / np.where(nb > 0, nb, np.nan)))
+    tstat = np.where(se > 0, diff / se, np.nan)
+    p = np.where(np.isfinite(tstat), 2 * _t.sf(np.abs(tstat), df + d0), np.nan)
+    return {"diff": diff, "p": p, "t": tstat, "n_in": na, "n_out": nb,
+            "prior_df": d0, "s0": s0}
+
+
+def _design(group, batch_df, cells):
+    """Intercept, the group indicator, and one column per batch level.
+
+    Batch enters as a COVARIATE rather than as a pre-correction.  Centring
+    the matrix by batch first and then testing spends the batch's degrees of
+    freedom without telling the test it spent them, so the standard errors
+    come back too small; here they are paid for.
+    """
+    cols = [np.ones(len(cells)), np.asarray(group, float)]
+    names = ["const", "group"]
+    if batch_df is not None:
+        for c in batch_df.columns:
+            v = batch_df[c].reindex(cells).astype(str).to_numpy()
+            for l in [x for x in sorted(set(v))][1:]:      # first level = base
+                col = (v == l).astype(float)
+                # A level that is constant, or perfectly aliased with the
+                # arm, contributes nothing and makes the fit singular.
+                if 0 < col.sum() < len(col):
+                    cols.append(col)
+                    names.append(f"{c}={l}")
+    return np.column_stack(cols), names
+
+
+def glm_effect(counts, in_mask, out_mask, statistic, cells, batch_df=None,
+               min_cells=3, min_pairs=1, n_jobs=1):
+    """Per-bin binomial GLM on the RAW soft counts: the EFFECT SIZE only.
+
+    WHY COUNTS RATHER THAN THE PER-CELL VALUES.  A rank test over cells
+    gives a bin measured on 3 read pairs the same vote as one measured on
+    500.  Worse, at n = 3 the Dirichlet-Multinomial posterior is about 97
+    percent prior, so that vote is very nearly the prior itself and the test
+    compares two arms' shrinkage rather than their data.  A binomial GLM on
+    the counts weights every cell by the evidence it carries, and its group
+    coefficient IS the statistic: for ``direction_logor``, the difference in
+    L between the arms, on the log-odds scale the matrix already lives on.
+    Measured against a planted 0.9: this returns +0.79 where the mean of the
+    per-cell values is pulled toward the prior.
+
+    The expected pool enters as an OFFSET, not a covariate, because that is
+    what "referenced to E" means -- with logit(E) pinned at coefficient 1
+    the intercept is the departure from E.  Fitting it as a covariate would
+    let the model rescale the baseline it is meant to be measured against.
+
+    IT RETURNS NO P-VALUE, DELIBERATELY.  Cells from one donor are not
+    replicates and the binomial treats every read pair as independent; the
+    same fixture that gives the coefficient above gives a false-positive
+    rate of 0.605 at a nominal 0.05, and 0.189 even with donor-clustered
+    standard errors.  The p belongs to ``moderated_t`` on donor-pooled
+    logits, which measured 0.037.
+    """
+    import warnings as _w
+    try:
+        import statsmodels.api as sm
+    except Exception:
+        sys.exit("--contrast-test glm needs statsmodels: "
+                 "pip install statsmodels")
+
+    succ_k, fail_k, e_succ_k, e_fail_k = GLM_MODELS[statistic]
+    n_bins = counts["n_linked"].shape[1]
+    in_mask, out_mask = np.asarray(in_mask, bool), np.asarray(out_mask, bool)
+    keep = in_mask | out_mask
+    rows_all = np.flatnonzero(keep)
+    cells = list(cells)
+    Xf, names = _design(in_mask[keep].astype(float), batch_df,
+                        [cells[i] for i in rows_all])
+
+    def _sum(keys, j, rows):
+        return np.sum([counts[k][rows, j] for k in keys], axis=0)
+
+    def _one(j):
+        n_l = counts["n_linked"][rows_all, j]
+        ok = np.isfinite(n_l) & (n_l >= float(min_pairs))
+        g = in_mask[rows_all][ok].astype(float)
+        n_a, n_b = int(g.sum()), int(g.size - g.sum())
+        if n_a < int(min_cells) or n_b < int(min_cells):
+            return np.nan, n_a, n_b
+        X = Xf[ok]
+        keepc = np.ptp(X, axis=0) > 0
+        keepc[0] = keepc[1] = True          # const and group always stay
+        X = X[:, keepc]
+        succ, fail = _sum(succ_k, j, rows_all[ok]), _sum(fail_k, j, rows_all[ok])
+        e_s, e_f = _sum(e_succ_k, j, rows_all[ok]), _sum(e_fail_k, j, rows_all[ok])
+        eps = 1e-9
+        off = np.log(np.clip(e_s, eps, None)) - np.log(np.clip(e_f, eps, None))
+        endog = np.column_stack([np.clip(succ, 0.0, None),
+                                 np.clip(fail, 0.0, None)])
+        if not (np.isfinite(endog).all() and np.isfinite(off).all()) \
+                or endog.sum() <= 0:
+            return np.nan, n_a, n_b
+        try:
+            with _w.catch_warnings():
+                _w.simplefilter("ignore")
+                # NO scale="X2".  statsmodels computes the Pearson
+                # dispersion on the row scale for a two-column binomial
+                # endog, which on genuinely over-dispersed donor-pooled data
+                # came back at 0.012 -- shrinking the standard error ninefold
+                # and turning a null into p = 8e-27.
+                res = sm.GLM(endog, X, family=sm.families.Binomial(),
+                             offset=off).fit()
+            b = float(res.params[1])
+        except Exception:
+            return np.nan, n_a, n_b
+        return (b if np.isfinite(b) else np.nan), n_a, n_b
+
+    if int(n_jobs) > 1:
+        from joblib import Parallel, delayed
+        got = Parallel(n_jobs=int(n_jobs))(delayed(_one)(j)
+                                           for j in range(n_bins))
+    else:
+        got = [_one(j) for j in range(n_bins)]
+    diff, na, nb = (np.asarray(v) for v in zip(*got))
+    return {"diff": diff.astype(float), "n_in": na.astype(int),
+            "n_out": nb.astype(int), "design": names}
+
+
+def glm_contrast(counts, in_mask, out_mask, statistic, cells, batch_df=None,
+                 donor=None, min_cells=3, min_pairs=1, prior_df=4.0,
+                 n_jobs=1):
+    """Coverage-weighted effect size from the cells, p-value from the donors.
+
+    The two halves answer different questions and neither can do the
+    other's job at these sample sizes -- see ``glm_effect`` for why the
+    cell-level p is not a p-value, and ``moderated_t`` for the measured
+    comparison of every alternative.
+    """
+    eff = glm_effect(counts, in_mask, out_mask, statistic, cells,
+                     batch_df=batch_df, min_cells=min_cells,
+                     min_pairs=min_pairs, n_jobs=n_jobs)
+    out = dict(eff)
+    out["d"] = np.full(eff["diff"].shape, np.nan)
+    if donor is None:
+        out["p"] = np.full(eff["diff"].shape, np.nan)
+        out["p_unit"] = None
+        return out
+    keep = np.asarray(in_mask, bool) | np.asarray(out_mask, bool)
+    L, order = donor_logits(counts, keep, donor, statistic,
+                            min_pairs=min_pairs)
+    dv = np.asarray(donor, dtype=object)
+    is_in = np.array([bool(np.asarray(in_mask, bool)[dv == d][0])
+                      for d in order])
+    mt = moderated_t(L[is_in], L[~is_in], prior_df=prior_df)
+    out["p"] = mt["p"]
+    out["donor_diff"] = mt["diff"]
+    out["n_donor_in"] = mt["n_in"]
+    out["n_donor_out"] = mt["n_out"]
+    out["p_unit"] = "donor"
+    out["n_donors"] = len(order)
+    return out
+
+
+def _glm_statistic_for(matrix_path):
+    """Which 2x2 table the matrix's statistic is a log odds ratio of."""
+    stem = Path(matrix_path).name
+    base = stem[len("concordance_"):-len(".parquet")] \
+        if stem.startswith("concordance_") and stem.endswith(".parquet") \
+        else ""
+    for suf in ("_z", "_rank"):
+        if base.endswith(suf):
+            base = base[:-len(suf)]
+    if base not in GLM_MODELS:
+        sys.exit(
+            f"--contrast-test glm cannot model {stem!r}: it fits the counts "
+            f"behind {' or '.join(sorted(GLM_MODELS))}, and the statistic is "
+            f"read from the matrix filename.  Point --matrix at "
+            f"concordance_coordination.parquet or "
+            f"concordance_direction_logor.parquet (the _z and _rank forms of "
+            f"those are accepted too -- the GLM refits from raw counts "
+            f"either way).")
+    return base
+
+
 def rank_filename_for(matrix_path):
     """The rank matrix that belongs beside ``matrix_path``.
 
@@ -2941,7 +3243,43 @@ def main():
                          "compositional, so it is safe while real aberrations "
                          "are a small share of the genome and will subtract "
                          "the finding when they are not.")
-    ap.add_argument("--contrast-test", choices=["mwu", "welch"], default="mwu",
+    ap.add_argument("--from-counts", action="append", default=None,
+                    metavar="NAME=DIR",
+                    help="The 05_concordance directory (or its counts/ "
+                         "subdirectory) holding the RAW per-(cell, bin) soft "
+                         "counts for --matrix NAME, from a step-5 run made "
+                         "with --emit-counts.  Required by --contrast-test "
+                         "glm.  Auto-discovered from the matrix's own "
+                         "directory.")
+    ap.add_argument("--donor-column", default=None, metavar="COLUMN",
+                    help="Column of --samples naming the donor / biological "
+                         "replicate.  It is the unit of replication: cells "
+                         "from one donor are not replicates of each other, "
+                         "and without this --contrast-test glm reports an "
+                         "effect size and no p-value at all.")
+    ap.add_argument("--glm-prior-df", type=float, default=4.0, metavar="D",
+                    help="Bins' worth of borrowed variance added to the "
+                         "donor design's own degrees of freedom, limma-style. "
+                         "Measured on a fixture with donor-level bin effects, "
+                         "two donors against three, at a nominal 0.05: 0 gave "
+                         "power 0.55 at FPR 0.050, 4 gave 0.60 / 0.037, 8 "
+                         "gave 0.70 / 0.045 and 20 gave 0.75 / 0.058.  Raise "
+                         "it for power, and watch the FPR.")
+    ap.add_argument("--glm-threads", type=int, default=1, metavar="N",
+                    help="Parallel workers for the per-bin GLM fits (about "
+                         "15 ms each, so ~3 min for 10,000 bins on one "
+                         "core).")
+    ap.add_argument("--glm-batch", action="store_true",
+                    help="Put --batch-column in the GLM design as a "
+                         "covariate.  Preferable to correcting the matrix "
+                         "first and then testing, which spends the batch's "
+                         "degrees of freedom without telling the test it "
+                         "spent them, so the standard errors come back too "
+                         "small.  Off by default because a batch perfectly "
+                         "aliased with the arm makes the fit singular and "
+                         "the column is silently dropped.")
+    ap.add_argument("--contrast-test", choices=["mwu", "welch", "glm"],
+                    default="mwu",
                     help="Per-bin two-sample test for a contrast.  'mwu' "
                          "(default) is a two-sided Mann-Whitney U over cells: "
                          "no normality assumption, and one outlying cell "
@@ -2949,7 +3287,17 @@ def main():
                          "way the volcano's x-axis is the difference of means, "
                          "in D units.  A rank test has a p-value FLOOR set by "
                          "the arm sizes -- 0.1 at 3 vs 3 -- and the run warns "
-                         "when that floor puts FDR out of reach.")
+                         "when that floor puts FDR out of reach.  'glm' is "
+                         "different in kind: it goes back to the RAW soft "
+                         "counts (--from-counts) and fits a binomial GLM with "
+                         "the expected pool as an offset, so its coefficient "
+                         "IS the statistic and every cell is weighted by the "
+                         "evidence it carries rather than one vote each -- a "
+                         "bin measured on 3 read pairs is about 97 percent "
+                         "prior, and mwu gives it the same vote as one "
+                         "measured on 500.  Its p comes from a moderated t "
+                         "over DONORS, not from the GLM; see --donor-column "
+                         "and --glm-prior-df.")
     ap.add_argument("--contrast-fdr", type=float, default=0.05,
                     help="BH-FDR cut for --contrast-select fdr (0.05).")
     ap.add_argument("--contrast-min-diff", type=float, default=0.0,
@@ -3223,6 +3571,46 @@ def main():
                           matrix=M)
         # Named after the MATRIX's statistic, so a coordination matrix is
         # never gated on the direction's evidence.
+        # Raw soft counts for --contrast-test glm.  The statistic is taken
+        # from the MATRIX's filename, so a coordination matrix is never
+        # modelled as the direction's 2x2 table.
+        glm_counts = glm_statistic = None
+        if args.contrast_test == "glm":
+            glm_statistic = _glm_statistic_for(path)
+            _cd = None
+            for spec in (args.from_counts or []):
+                if "=" not in spec:
+                    sys.exit(f"--from-counts must be NAME=DIR, got {spec!r}")
+                k, v = spec.split("=", 1)
+                if k.strip() == name:
+                    _cd = Path(v.strip())
+            if _cd is None:
+                _cd = Path(path).parent
+            _cd = _cd / "counts" if (_cd / "counts").is_dir() else _cd
+            missing = [k for k in GLM_COUNT_KEYS
+                       if not (_cd / f"{k}.parquet").exists()]
+            if missing:
+                sys.exit(
+                    f"--contrast-test glm: {_cd} is missing "
+                    f"{', '.join(missing)}.  Re-run step 5 with "
+                    f"--emit-counts, or point --from-counts {name}=<dir> at "
+                    f"the run that has them.")
+            glm_counts = {
+                k: pd.read_parquet(_cd / f"{k}.parquet").reindex(
+                    index=M.index, columns=M.columns).to_numpy(float)
+                for k in GLM_COUNT_KEYS}
+            print(f"  {name}: raw soft counts for the GLM from {_cd} "
+                  f"(statistic {glm_statistic!r}); the imputed --matrix "
+                  f"supplies only the cell x bin grid for this test.",
+                  file=sys.stderr)
+        donor_v = None
+        if args.donor_column:
+            if args.donor_column not in samples.columns:
+                sys.exit(f"--donor-column {args.donor_column!r} not in "
+                         f"--samples; have: "
+                         f"{', '.join(map(str, samples.columns))}")
+            donor_v = samples.set_index(samples.columns[0])[
+                args.donor_column].reindex(M.index).astype(str).to_numpy()
         NR_df = _companion(path, args.null_rank, name,
                            rank_filename_for(path), "--null-rank", matrix=M)
         if NR_df is None and args.null_rank:
@@ -3781,6 +4169,45 @@ def main():
                     for lv, gcs in strat_per.items():
                         scores_df[f"contrast_{label}_diff_{lv}"] = gcs["diff"]
                         extra_cols.append(f"contrast_{label}_diff_{lv}")
+            if args.contrast_test == "glm":
+                # RAW counts, not the imputed matrix.  RWR's k-NN graph is
+                # built from accessibility, so an imputed entry carries its
+                # cell type's signature by construction: testing arms on it
+                # asks whether the imputation knew which arm a cell was in.
+                if glm_counts is None:
+                    sys.exit(
+                        "--contrast-test glm needs the raw soft counts: pass "
+                        "--from-counts <05_concordance dir> from a step-5 run "
+                        "made with --emit-counts")
+                cs = glm_contrast(
+                    glm_counts, in_mask, out_mask, glm_statistic,
+                    list(M.index), batch_df=(batch_df if args.glm_batch
+                                             else None),
+                    donor=donor_v, min_cells=args.min_cells_per_group,
+                    min_pairs=max(1, int(_min_pairs)),
+                    prior_df=args.glm_prior_df, n_jobs=args.glm_threads)
+                print(f"  contrast {label!r}: binomial GLM on raw counts, "
+                      f"design {' + '.join(cs['design'])}, statistic "
+                      f"{glm_statistic!r}.  The coefficient IS the "
+                      f"difference in that statistic between the arms, "
+                      f"coverage-weighted.", file=sys.stderr)
+                if cs.get("p_unit") == "donor":
+                    print(f"  contrast {label!r}: p from a moderated t over "
+                          f"{cs['n_donors']} donors on donor-pooled logits "
+                          f"(prior df {args.glm_prior_df:g}).  NOT from the "
+                          f"GLM: on a fixture with donor-level bin effects "
+                          f"the cell-level p ran at a 0.605 false-positive "
+                          f"rate against a nominal 0.05, and 0.189 even with "
+                          f"donor-clustered standard errors -- five clusters "
+                          f"is far below what those need.",
+                          file=sys.stderr)
+                else:
+                    print(f"  contrast {label!r}: WARNING no --donor-column, "
+                          f"so there is NO p-value -- only the effect size.  "
+                          f"A cell-level p here measured a 0.605 "
+                          f"false-positive rate against a nominal 0.05, "
+                          f"because cells from one donor are not replicates.",
+                          file=sys.stderr)
             if cs is None:                     # not stratified, or it fell back
                 if args.contrast_weight != "none":
                     cs = weighted_contrast(Xc, Vc, in_mask, out_mask,
