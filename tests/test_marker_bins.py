@@ -4342,3 +4342,53 @@ def test_a_reference_scope_with_too_few_units_returns_nothing():
     mod = _mod()
     assert mod.unit_relabellings(["a", "b", "c"], 2, ["a", "b"],
                                  scope="reference") == []
+
+
+def test_the_q_value_is_calibrated_against_the_measured_null_not_uniform():
+    """BH assumes uniform p under the null.  On this data they are not --
+    a nominal welch p ran at 0.24 on relabelled GCH and 0.38 on HCG against
+    0.05 -- so BH at q=0.05 controls something near the measured rate.
+    Counting false positives from the null that was actually observed fixes
+    it, and the fix is checkable: q <= t must give a true FDR near t."""
+    mod = _mod()
+    rng = np.random.default_rng(0)
+    n, n_real = 10_000, 800
+    # A null whose p-values crowd zero exactly like the real run's.
+    null = rng.beta(0.35, 1.0, 300_000)
+    assert 0.30 < float(np.mean(null <= 0.05)) < 0.40
+    p = rng.beta(0.35, 1.0, n)
+    p[:n_real] = rng.beta(0.05, 1.0, n_real)
+    q, info = mod.empirical_null_qvalue(p, null)
+    for t in (0.05, 0.10, 0.20):
+        called = q <= t
+        true_fdr = 1 - float(np.sum(called[:n_real])) / max(int(called.sum()), 1)
+        assert abs(true_fdr - t) < 0.03, (t, true_fdr)
+    # BH on the same p-values does not: it takes the nominal p at face value.
+    from scipy.stats import false_discovery_control as _bh
+    try:
+        bh = _bh(p)
+    except Exception:
+        pytest.skip("scipy too old for false_discovery_control")
+    called = bh <= 0.05
+    assert 1 - float(np.sum(called[:n_real])) / max(int(called.sum()), 1) > 0.2
+
+
+def test_the_q_value_is_monotone_in_the_p_it_came_from():
+    """Step-up, like BH: a bin can never get a smaller q than a more extreme
+    one."""
+    mod = _mod()
+    rng = np.random.default_rng(1)
+    null = rng.random(50_000)
+    p = rng.random(2_000)
+    q, _ = mod.empirical_null_qvalue(p, null)
+    o = np.argsort(p)
+    assert np.all(np.diff(q[o]) >= -1e-12)
+    assert np.all((q >= 0) & (q <= 1))
+
+
+def test_a_tiny_null_pool_returns_no_q_rather_than_a_confident_one():
+    mod = _mod()
+    q, info = mod.empirical_null_qvalue(np.random.random(100),
+                                        np.random.random(20))
+    assert np.isnan(q).all()
+    assert info["n_null"] == 20

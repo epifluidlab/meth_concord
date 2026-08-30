@@ -1710,6 +1710,55 @@ def glm_contrast(counts, in_mask, out_mask, statistic, cells, batch_df=None,
     return out
 
 
+def empirical_null_qvalue(p_obs, p_null):
+    """A q-value against the RELABELLED null instead of against uniform.
+
+    Benjamini-Hochberg assumes the p-values are uniform under the null.  On
+    this data they are not -- a nominal welch p ran at 0.24 on relabelled
+    GCH and 0.38 on HCG, against 0.05 -- so BH at q = 0.05 is really
+    controlling something near 0.24 or 0.38.  The fix is not a different
+    threshold on the same p, which only trades one arbitrary cut for
+    another; it is to count the false positives from the null that was
+    actually measured:
+
+        expected false at cut t  =  P(null p <= t) x n_tested
+        q at the k-th smallest   =  expected(p_k) / k
+
+    monotonised upward the way BH's step-up is, so a bin is never assigned
+    a smaller q than a more extreme one.  Then `q <= 0.1` means what it
+    says, whatever the nominal p is worth.
+
+    IT ONLY WORKS IF THE NULL IS BIG ENOUGH.  With a pooled null of tens of
+    thousands the smallest resolvable P(null <= t) is 1/pool, so the finest
+    q is that times n_tested divided by the rank -- reported by the caller
+    so a q of 0 is never mistaken for certainty.
+    """
+    p = np.asarray(p_obs, float)
+    null = np.sort(np.asarray(p_null, float)[
+        np.isfinite(np.asarray(p_null, float))])
+    q = np.full(p.shape, np.nan)
+    fin = np.isfinite(p)
+    if not fin.any() or null.size < 100:
+        return q, {"n_null": int(null.size), "finest_q": float("nan")}
+    obs = p[fin]
+    order = np.argsort(obs, kind="stable")
+    ps = obs[order]
+    n = ps.size
+    # P(null <= t) at each observed p, then the expected count at that cut.
+    frac = np.searchsorted(null, ps, side="right") / null.size
+    expected = frac * n
+    ranks = np.arange(1, n + 1)
+    raw = expected / ranks
+    # Step-up monotonisation: q_(k) = min over j >= k.
+    qs = np.minimum.accumulate(raw[::-1])[::-1]
+    qs = np.clip(qs, 0.0, 1.0)
+    out = np.empty(n)
+    out[order] = qs
+    q[fin] = out
+    return q, {"n_null": int(null.size),
+               "finest_q": float(n / null.size)}
+
+
 def unit_relabellings(units, n_a, true_a, max_n=0, seed=0, scope="all"):
     """Ways of calling some units the contrast arm, other than the real one.
 
@@ -4603,6 +4652,29 @@ def main():
                               file=sys.stderr)
                     scores_df[f"contrast_{label}_pvalue_unitperm"] = _pe
                     extra_cols.append(f"contrast_{label}_pvalue_unitperm")
+                    # THE COLUMN TO THRESHOLD ON.  BH assumes the p-values
+                    # are uniform under the null and on this data they are
+                    # not, so BH at q=0.05 controls something nearer the
+                    # measured rate.  This counts the false positives from
+                    # the null that was actually observed, so q <= 0.1 means
+                    # what it says whatever the nominal p is worth.
+                    _q, _qi = empirical_null_qvalue(cs["p"], _flat)
+                    scores_df[f"contrast_{label}_qvalue_unitnull"] = _q
+                    extra_cols.append(f"contrast_{label}_qvalue_unitnull")
+                    _at = {t: int(np.sum(np.isfinite(_q) & (_q <= t)))
+                           for t in (0.05, 0.10, 0.20)}
+                    print(f"  contrast {label!r}: FDR against that null "
+                          f"(column contrast_{label}_qvalue_unitnull) -- "
+                          + ", ".join(f"{v:,} bins at q<={t:g}"
+                                      for t, v in _at.items())
+                          + f".  Threshold THIS, not the nominal p: it "
+                            f"counts false positives from the null that was "
+                            f"measured rather than assuming a uniform one.  "
+                            f"Finest resolvable q here is {_qi['finest_q']:.3f}"
+                            f" (null pool {_qi['n_null']:,}).",
+                          file=sys.stderr)
+                    summary_unitperm[f"{name}:{label}:qvalue"] = {
+                        f"n_q{int(t * 100):02d}": v for t, v in _at.items()}
                     summary_unitperm[f"{name}:{label}"] = {
                         "n_relabellings": _pi["n_relabellings"],
                         "nominal_fpr_at_0.05": _fpr,
