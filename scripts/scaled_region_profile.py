@@ -1315,6 +1315,22 @@ def main(argv=None) -> int:
               f"and dirichlet_multinomial_prior.json.  --matrix supplies "
               f"only the cell x bin grid and the statistic's NAME; none of "
               f"its values are read.", file=sys.stderr)
+        # NO IMPUTED VALUE REACHES THIS PATH, and it is worth saying rather
+        # than leaving to be inferred.  Step 5 writes counts/ from
+        # raw_counts, before RWR: on a fixture where 74.9 percent of
+        # (cell, bin) entries had no read pairs and RWR filled every one of
+        # them, the file on disk still matched the raw counts exactly and
+        # not the imputed ones.  A bin a cell never measured contributes 0
+        # to the numerator AND 0 to the denominator, so it drops out of the
+        # pooled statistic on its own -- which is why --min-pairs 0, the
+        # default, already means "only bins that were measured".
+        _nl0 = float(np.mean(_pooled["counts"]["n_linked"] == 0))
+        print(f"  these are RAW, PRE-IMPUTATION counts: {_nl0:.1%} of "
+              f"(cell, bin) entries have no read pairs and contribute "
+              f"nothing to either side of the pooled statistic, so the "
+              f"curve is built only from bins that were measured.  RWR "
+              f"filled those entries in the --matrix; it never touched "
+              f"these.", file=sys.stderr)
         print(f"  the statistic came from {_how}", file=sys.stderr)
         _rank = ({} if mpath is None
                  else which_statistic_matches(M, _pooled["counts"], _alpha))

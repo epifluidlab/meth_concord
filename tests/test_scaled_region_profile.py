@@ -1708,3 +1708,95 @@ def test_the_two_modes_really_do_differ_on_a_thin_region():
     p2 = (np.log((ao + k2.sum()) / (a0 + n2.sum()))
           - np.log((ao + n2.sum() - k2.sum()) / (a0 + n2.sum())))
     assert pb2 / p2 > 0.65
+
+
+def _sparse_posteriors(tmp, n_cells=14, n_bins=60, bsz=10_000, cov=0.25,
+                       seed=0):
+    """Cells that each measure only a quarter of the bins, so RWR has
+    something to fill."""
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    paths = {}
+    for c in range(n_cells):
+        rec = []
+        for b in range(n_bins):
+            if rng.random() > cov:
+                continue
+            base = b * bsz
+            pm = 0.7 if 20 <= b < 40 else 0.3
+            for i in range(int(rng.integers(3, 12))):
+                p1 = 0.9 if rng.random() < pm else 0.1
+                p2 = 0.9 if rng.random() < pm else 0.1
+                o1 = 200 + (i * 13) % 3000
+                o2 = o1 + 1000 + (i * 37) % 5000
+                rec.append({"chrom": "chr1", "pos1": base + o1,
+                            "pos2": base + o2, "n1": 4, "n2": 4,
+                            "posterior1": p1, "posterior2": p2,
+                            "distance": o2 - o1})
+                rec.append({"chrom": "chr1", "pos1": base + o1,
+                            "pos2": base + o1 + 40, "n1": 4, "n2": 4,
+                            "posterior1": p1,
+                            "posterior2": 0.9 if rng.random() < pm else 0.1,
+                            "distance": 40})
+        df = pd.DataFrame(rec)
+        for k in ("pos1", "pos2", "distance"):
+            df[k] = df[k].astype(np.int64)
+        for k in ("n1", "n2"):
+            df[k] = df[k].astype(np.int32)
+        f = tmp / f"c{c}.parquet"
+        df.to_parquet(f)
+        paths[f"c{c}"] = str(f)
+    return paths
+
+
+def test_from_counts_never_sees_an_imputed_value(tmp_path):
+    """The whole reason --from-counts answers "pool only what was measured"
+    without any extra flag: step 5 writes counts/ from raw_counts, BEFORE
+    RWR.  Pinned on a fixture where three quarters of the entries have no
+    read pairs and RWR fills every one of them."""
+    import logging
+    import pandas as pd
+    from nome_hic_concordance import concordance as cc
+    logging.disable(logging.WARNING)
+    src = tmp_path / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    res = cc.compute_signed_concordance_matrix(
+        _sparse_posteriors(src), bin_size=10_000, min_distance=500,
+        min_gch_sites=2, dm_dist_bin=500, baseline="distance-matched",
+        dm_prior="shared", output_dir=str(tmp_path / "o"), save_outputs=True,
+        use_rwr=True, n_threads=1, eb_min_obs=50, emit_counts=True)
+    assert res["rwr_diagnostics"] is not None          # RWR really ran
+    raw = res["raw_counts"]["n_linked"]
+    imp = res["imputed_counts"]["n_linked"]
+    assert float(np.mean(raw == 0)) > 0.5              # lots to fill
+    assert float(np.mean(imp == 0)) < 0.01             # and it filled it
+    disk = pd.read_parquet(
+        tmp_path / "o" / "counts" / "n_linked.parquet").to_numpy(float)
+    np.testing.assert_allclose(disk, raw)
+    assert not np.allclose(disk, imp)
+
+
+def test_an_unmeasured_bin_drops_out_of_the_pooled_statistic_on_its_own():
+    """Which is why --min-pairs 0, the default, already means "only bins
+    that were measured": a bin a cell never saw contributes 0 to the
+    numerator AND 0 to the denominator."""
+    mod = _mod()
+    from nome_hic_concordance.concordance import decompose_components
+    alpha = {"open": 1.0, "closed": 1.0, "mixed": 1.0}
+    n_cells = 3
+    measured = {"k_open": np.full((n_cells, 1), 6.0),
+                "k_closed": np.full((n_cells, 1), 2.0),
+                "k_mixed": np.full((n_cells, 1), 2.0),
+                "n_linked": np.full((n_cells, 1), 10.0),
+                "k_dm_open": np.full((n_cells, 1), 4.0),
+                "k_dm_closed": np.full((n_cells, 1), 4.0),
+                "k_dm_mixed": np.full((n_cells, 1), 2.0),
+                "n_dm": np.full((n_cells, 1), 10.0)}
+    # Same data, plus five bins nobody measured.
+    padded = {k: np.hstack([v, np.zeros((n_cells, 5))])
+              for k, v in measured.items()}
+    a, _ = mod._pooled_stat(measured, np.array([0]), alpha,
+                            "direction_logor", decompose_components)
+    b, _ = mod._pooled_stat(padded, np.arange(6), alpha,
+                            "direction_logor", decompose_components)
+    np.testing.assert_allclose(a, b, rtol=1e-12)
