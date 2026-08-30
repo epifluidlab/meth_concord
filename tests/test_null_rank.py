@@ -650,3 +650,40 @@ def test_null_z_reaches_step_five_from_the_cli():
     assert len(re.findall(r"\bnull_z=", src)) >= 2
     assert "null_z" in inspect.signature(
         cc.compute_signed_concordance_matrix).parameters
+
+
+def test_the_allocation_is_reported_before_it_happens(tmp_path, caplog):
+    """A large cohort dies here as a bare OOM kill with no clue which option
+    caused it.  Every drawn-null replicate is FOUR cell-by-bin matrices, so
+    --null-draws dominates: at 1,577 cells and 9,548 bins the 12 base
+    matrices are 1.4 GB and --null-draws 10 takes it to 6.3 GB, doubled
+    again by the imputed copy before RWR allocates anything."""
+    src = tmp_path / "src"
+    src.mkdir(parents=True)
+    with caplog.at_level("INFO"):
+        cc.compute_signed_concordance_matrix(
+            null_rank_paths(src, n_cells=8, n_bins=40),
+            bin_size=10_000, min_distance=500, min_gch_sites=2,
+            dm_dist_bin=500, baseline="distance-matched", dm_prior="shared",
+            output_dir=str(tmp_path / "o"), save_outputs=False,
+            use_rwr=False, n_threads=1, eb_min_obs=50, null_draws=6,
+            emit_null=True)
+    msgs = [r.getMessage() for r in caplog.records]
+    line = [m for m in msgs if "Allocating" in m]
+    assert line, msgs
+    # 8 soft-count + 4 dm + 6 x 4 null = 36, and it names the null share.
+    assert "36 cell-by-bin matrices" in line[0]
+    assert "24 of them are 6 drawn-null replicates" in line[0]
+
+
+def test_the_memory_arithmetic_matches_the_cohort_that_was_killed():
+    """1,577 cells x 9,548 bins, --null-draws 10: 52 matrices at 120 MB is
+    6.3 GB raw and 12.5 GB with the imputed copy, before RWR."""
+    n_cells, n_bins = 1577, 9548
+    one_mb = n_cells * n_bins * 8 / 1e6
+    assert one_mb == pytest.approx(120, abs=2)
+    for k, want_gb in ((0, 1.4), (3, 2.9), (5, 3.9), (10, 6.3)):
+        n_mat = 8 + 4 + 4 * k
+        assert n_mat * one_mb / 1000 == pytest.approx(want_gb, abs=0.1), k
+    # Dropping 10 -> 3 more than halves it, which is the advice given.
+    assert (8 + 4 + 4 * 3) / (8 + 4 + 4 * 10) < 0.5

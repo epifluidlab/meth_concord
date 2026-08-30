@@ -1975,6 +1975,35 @@ def compute_signed_concordance_matrix(
             [k for _d in range(max(1, int(null_draws)))
              for k in _null_keys(_d)]
             if (uses_expected and emit_null) else [])
+        # SAY WHAT IS ABOUT TO BE ALLOCATED.  This is where the run dies on
+        # a large cohort, and it dies as a bare OOM kill with no clue which
+        # option caused it.  Every drawn-null replicate adds FOUR
+        # cell-by-bin matrices, so --null-draws dominates: at 1,577 cells
+        # and 9,548 bins one matrix is 120 MB, the 12 base matrices are
+        # 1.4 GB, and --null-draws 10 takes that to 6.3 GB -- doubled again
+        # by the imputed copy, before RWR has allocated anything of its own.
+        _one_mb = n_cells * n_bins * 8 / 1e6
+        _tot_gb = len(matrix_keys) * _one_mb / 1000.0
+        _n_null = (max(1, int(null_draws)) if (uses_expected and emit_null)
+                   else 0)
+        logger.info(
+            "Allocating %d cell-by-bin matrices at %.0f MB each = %.1f GB "
+            "(%d of them are %d drawn-null replicates x 4).  The imputed "
+            "copy doubles this, and RWR adds its own working memory on top.",
+            len(matrix_keys), _one_mb, _tot_gb, 4 * _n_null, _n_null)
+        if 2 * _tot_gb > 8.0:
+            logger.warning(
+                "That is %.1f GB before imputation and %.1f GB after, which "
+                "is where a large cohort gets OOM-killed with no other "
+                "message.  --null-draws is the lever: each replicate is four "
+                "matrices, so dropping it from %d to 3 would take the pair "
+                "to %.1f/%.1f GB.  The rank's resolution comes from pooling "
+                "a stratum's draws ACROSS BINS rather than from the number "
+                "of draws, so 3 costs it little; --null-z wants at least 3 "
+                "for a spread.",
+                _tot_gb, 2 * _tot_gb, _n_null,
+                (len(matrix_keys) - 4 * _n_null + 12) * _one_mb / 1000.0,
+                2 * (len(matrix_keys) - 4 * _n_null + 12) * _one_mb / 1000.0)
         raw_counts: dict[str, np.ndarray] = {
             k: np.zeros((n_cells, n_bins), dtype=np.float64) for k in matrix_keys
         }
