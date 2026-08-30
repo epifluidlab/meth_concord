@@ -4392,3 +4392,55 @@ def test_a_tiny_null_pool_returns_no_q_rather_than_a_confident_one():
                                         np.random.random(20))
     assert np.isnan(q).all()
     assert info["n_null"] == 20
+
+
+def test_bh_on_the_permutation_p_is_the_same_thing_as_the_q_value():
+    """The two routes to a calibrated FDR are one route.  BH is valid on the
+    permutation p because that p is calibrated by construction, and BH's
+    step-up on it is algebraically the expected-over-rank q -- so there is
+    no choice to make between them."""
+    mod = _mod()
+    rng = np.random.default_rng(0)
+    n = 8000
+    nulls = [rng.beta(0.35, 1.0, n) for _ in range(3)]
+    p = rng.beta(0.35, 1.0, n)
+    p[:700] = rng.beta(0.04, 1.0, 700)
+    pe, _ = mod.unit_permutation_p(p, nulls, min_pool=2000)
+
+    def bh(v):
+        o = np.argsort(v)
+        r = np.arange(1, v.size + 1)
+        adj = np.minimum.accumulate((v[o] * v.size / r)[::-1])[::-1]
+        out = np.empty_like(v)
+        out[o] = np.clip(adj, 0, 1)
+        return out
+
+    q_bh = bh(pe)
+    q_shipped, _ = mod.empirical_null_qvalue(p, np.concatenate(nulls),
+                                             p_perm=pe)
+    assert float(np.nanmax(np.abs(q_bh - q_shipped))) < 0.01
+    for t in (0.05, 0.1, 0.2):
+        assert abs(int((q_bh <= t).sum()) - int((q_shipped <= t).sum())) < 10
+
+
+def test_the_q_value_uses_the_stratified_null_when_one_was_measured():
+    """Bins of similar coverage pooled together, the same correction the
+    permutation null and the drawn-null rank both needed."""
+    mod = _mod()
+    rng = np.random.default_rng(2)
+    n = 6000
+    st = (np.arange(n) % 2).astype(int)
+    # The two strata have genuinely different null shapes.
+    nulls = []
+    for _ in range(3):
+        v = np.where(st == 0, rng.beta(0.2, 1.0, n), rng.beta(0.9, 1.0, n))
+        nulls.append(v)
+    p = np.where(st == 0, rng.beta(0.2, 1.0, n), rng.beta(0.9, 1.0, n))
+    p[:400] = rng.beta(0.03, 1.0, 400)
+    pe, _ = mod.unit_permutation_p(p, nulls, strata=st, min_pool=1000)
+    q, info = mod.empirical_null_qvalue(p, np.concatenate(nulls), p_perm=pe)
+    called = q <= 0.10
+    true_fdr = 1 - float((q[:400] <= 0.10).sum()) / max(int(called.sum()), 1)
+    assert true_fdr < 0.20, true_fdr
+    # finest_q is what the pool can actually express, not a formula.
+    assert info["finest_q"] == pytest.approx(float(np.nanmin(q)), abs=1e-9)
