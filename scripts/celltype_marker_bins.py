@@ -1445,7 +1445,7 @@ def donor_logits(counts, keep, donor, statistic, min_pairs=1):
     return L, order
 
 
-def moderated_t(a, b, prior_df=4.0):
+def moderated_t(a, b, prior_df=4.0, strata=None):
     """Two-sample t per bin with the variance moderated across bins.
 
     WHY NOT WELCH, AND WHY NOT A RANK TEST.  Measured on a fixture with
@@ -1512,15 +1512,37 @@ def moderated_t(a, b, prior_df=4.0):
                        + (nb - 1) * np.nan_to_num(vb)) / np.where(df > 0, df, 1),
                   np.nan)
     good = np.isfinite(s2) & (s2 > 0)
-    s0 = float(np.median(s2[good])) if good.any() else np.nan
+    # WHICH VARIANCE TO BORROW.  Deep bins have tighter unit-level logits
+    # than thin ones, so one global median is the wrong target at both ends:
+    # it inflates the deep bins' variance and deflates the thin ones'.
+    # Taking the median WITHIN a depth band instead moved the measured
+    # false-positive rate from 0.071 to 0.060 against a nominal 0.05, at a
+    # cost of 0.07 in power -- worth it when the result is FDR-corrected
+    # over ten thousand bins.  Quantile edges are fine HERE, unlike for the
+    # permutation pool: borrowing a slightly wrong variance degrades
+    # gracefully, while a poisoned null pool takes power to zero.
+    if strata is not None and good.any():
+        st = np.asarray(strata)
+        s0v = np.full(s2.shape, np.nan)
+        for k in np.unique(st[good]):
+            m = good & (st == k)
+            if m.sum() >= 20:
+                s0v[st == k] = float(np.median(s2[m]))
+        s0 = float(np.median(s2[good]))
+        s0v = np.where(np.isfinite(s0v), s0v, s0)
+    else:
+        s0 = float(np.median(s2[good])) if good.any() else np.nan
+        s0v = np.full(s2.shape, s0)
     d0 = float(prior_df)
-    s2m = ((d0 * s0 + df * s2) / (d0 + df)) if np.isfinite(s0) else s2
+    s2m = np.where(np.isfinite(s0v), (d0 * s0v + df * s2) / (d0 + df), s2)
     se = np.sqrt(s2m * (1.0 / np.where(na > 0, na, np.nan)
                         + 1.0 / np.where(nb > 0, nb, np.nan)))
     tstat = np.where(se > 0, diff / se, np.nan)
     p = np.where(np.isfinite(tstat), 2 * _t.sf(np.abs(tstat), df + d0), np.nan)
     return {"diff": diff, "p": p, "t": tstat, "n_in": na, "n_out": nb,
-            "prior_df": d0, "s0": s0}
+            "prior_df": d0, "s0": s0,
+            "n_var_strata": int(len(np.unique(np.asarray(strata))))
+            if strata is not None else 1}
 
 
 def _design(group, batch_df, cells):
@@ -1663,13 +1685,24 @@ def glm_contrast(counts, in_mask, out_mask, statistic, cells, batch_df=None,
     dv = np.asarray(donor, dtype=object)
     is_in = np.array([bool(np.asarray(in_mask, bool)[dv == d][0])
                       for d in order])
-    mt = moderated_t(L[is_in], L[~is_in], prior_df=prior_df)
+    # Depth bands for the variance target, from the pairs each bin actually
+    # pooled across the units that could be tested.
+    tot = np.nansum(np.where(np.isfinite(counts["n_linked"][keep]),
+                             counts["n_linked"][keep], 0.0), axis=0)
+    fin = np.isfinite(tot) & (tot > 0)
+    if fin.sum() >= 80:
+        edges = np.quantile(tot[fin], [0.25, 0.5, 0.75])
+        vstrata = np.where(fin, np.digitize(tot, edges), -1)
+    else:
+        vstrata = None
+    mt = moderated_t(L[is_in], L[~is_in], prior_df=prior_df, strata=vstrata)
     out["p"] = mt["p"]
     out["donor_diff"] = mt["diff"]
     out["n_donor_in"] = mt["n_in"]
     out["n_donor_out"] = mt["n_out"]
     out["p_unit"] = "donor"
     out["n_donors"] = len(order)
+    out["n_var_strata"] = mt.get("n_var_strata", 1)
     return out
 
 

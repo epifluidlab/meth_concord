@@ -4075,3 +4075,45 @@ def test_the_replication_unit_defaults_to_the_cell_type(tmp_path):
     assert r.returncode == 0, r.stderr[-2500:]
     assert "--cell-type-column (default)" in r.stderr
     assert "moderated t over 4 replication units" in r.stderr
+
+
+def test_the_borrowed_variance_is_taken_within_a_depth_band():
+    """Deep bins have tighter unit-level logits than thin ones, so one global
+    median inflates the deep bins' variance and deflates the thin ones'.
+    Measured: 0.071 -> 0.060 against a nominal 0.05."""
+    mod = _mod()
+    rng = np.random.default_rng(5)
+    nb = 2000
+    # Two depth classes with 5x different unit-level spread, no real effect.
+    deep = np.arange(nb) < nb // 2
+    sd = np.where(deep, 0.10, 0.50)
+    a = rng.normal(0, sd, (2, nb))
+    b = rng.normal(0, sd, (3, nb))
+    st = deep.astype(int)
+    flat = mod.moderated_t(a, b, prior_df=4.0)
+    strat = mod.moderated_t(a, b, prior_df=4.0, strata=st)
+    assert strat["n_var_strata"] == 2 and flat["n_var_strata"] == 1
+    # One global median sits BETWEEN the two classes, so it is wrong in both
+    # directions at once: the deep bins borrow too large a variance and go
+    # conservative, the thin bins borrow too small a one and go
+    # anti-conservative.  Measured here: 0.003 and 0.162 flat, against a
+    # nominal 0.05.  The overall rate hides it -- 0.083 -- which is why this
+    # is checked per class.
+    rate = lambda r, m: float(np.nanmean(r["p"][m] < 0.05))
+    assert rate(flat, deep) < 0.02
+    assert rate(flat, ~deep) > 0.10
+    for half in (deep, ~deep):
+        assert abs(rate(strat, half) - 0.05) < 0.025, rate(strat, half)
+        assert abs(rate(strat, half) - 0.05) < abs(rate(flat, half) - 0.05)
+
+
+def test_a_thin_stratum_falls_back_to_the_global_variance():
+    """A band with too few bins to estimate a median must not supply one."""
+    mod = _mod()
+    rng = np.random.default_rng(6)
+    nb = 300
+    st = np.zeros(nb, int)
+    st[:5] = 1                      # far below the 20-bin floor
+    a, b = rng.normal(0, .3, (2, nb)), rng.normal(0, .3, (3, nb))
+    r = mod.moderated_t(a, b, prior_df=4.0, strata=st)
+    assert np.isfinite(r["p"][:5]).all()
