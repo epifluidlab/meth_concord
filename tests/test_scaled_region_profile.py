@@ -1535,3 +1535,126 @@ def test_the_null_is_pooled_not_averaged_per_bin(tmp_path):
     # observed one, inside the per-position loop.
     assert "_pooled_stat(nc, cols, alpha, stat" in src
     assert src.index("cols = bi[") < src.index("_pooled_stat(nc, cols")
+
+
+# ---------------------------------------------------------------------------
+# --min-pairs: profile what was measured, not what RWR filled in
+# ---------------------------------------------------------------------------
+
+
+def _sparse_profile_run(tmp_path, *extra, cov=0.15):
+    """A sparse dataset with an arm-tinted imputed matrix beside its raw
+    counts -- the shape that makes an all-entries profile separate two
+    groups partly because the imputation knew which group each cell was in.
+    """
+    import json
+    import subprocess
+    import sys as _sys
+    import pandas as pd
+    rng = np.random.default_rng(0)
+    n, nb = 40, 60
+    ct = np.array(["T"] * 20 + ["R"] * 20)
+    tum = ct == "T"
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{i * 10000}" for i in range(nb)]
+    N = np.where(rng.random((n, nb)) < cov,
+                 rng.poisson(4, (n, nb)) + 1, 0).astype(float)
+    p = np.where(np.isin(np.arange(nb), range(20, 40)), 0.75, 0.4)
+    K = rng.binomial(N.astype(int), np.broadcast_to(p, (n, nb))).astype(float)
+    cd = tmp_path / "counts"
+    cd.mkdir(parents=True, exist_ok=True)
+    e = 0.4
+    for k, v in {"k_open": K, "k_closed": N - K, "k_mixed": N * 0,
+                 "n_linked": N, "k_dm_open": N * e, "k_dm_closed": N * (1 - e),
+                 "k_dm_mixed": N * 0, "n_dm": N}.items():
+        pd.DataFrame(v, index=cells, columns=bins).to_parquet(
+            cd / f"{k}.parquet")
+    json.dump({"shared": {"alpha": {"open": 1., "closed": 1., "mixed": 1.}}},
+              open(tmp_path / "dirichlet_multinomial_prior.json", "w"))
+    pd.DataFrame(N, index=cells, columns=bins).to_parquet(
+        tmp_path / "pair_counts_per_bin.parquet")
+    X = np.where(tum[:, None], 0.9, -0.9) + rng.normal(0, .05, (n, nb))
+    mat = tmp_path / "concordance_coordination.parquet"
+    pd.DataFrame(X, index=cells, columns=bins).to_parquet(mat)
+    bed = tmp_path / "d.bed"
+    bed.write_text("chr1\t200000\t400000\n")
+    s = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": ct}).to_csv(s, sep="\t", index=False)
+    out = tmp_path / f"out{len(extra)}{abs(hash(extra)) % 9999}"
+    r = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--samples", str(s),
+         "--cell-type-column", "cell_type", "--group", "t=T", "--group",
+         "o=R", "--region", f"D={bed}", "--plot-format", "png",
+         "--body-bins", "4", "--flank", "20000", "--flank-bins", "1",
+         "--output-dir", str(out), *extra], capture_output=True, text=True)
+    return out, r, mat, N
+
+
+def test_min_pairs_blanks_the_imputed_entries_on_the_matrix_path(tmp_path):
+    """RWR reaches every entry from a k-NN graph built on accessibility, so
+    an imputed value carries its cell type's signature by construction."""
+    out, r, mat, N = _sparse_profile_run(
+        tmp_path, "--matrix", str(tmp_path / "concordance_coordination.parquet"),
+        "--min-pairs", "2")
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "--min-pairs 2:" in r.stderr
+    kept = float(np.mean(N >= 2))
+    assert 0.10 < kept < 0.20
+    # The reported survival matches the planted coverage, not the matrix's
+    # 100% non-NA.
+    import re
+    m = re.search(r"(\d[\d,]*) of ([\d,]*) non-NA", r.stderr)
+    assert m, r.stderr
+    got = int(m.group(1).replace(",", "")) / int(m.group(2).replace(",", ""))
+    assert abs(got - kept) < 0.02, (got, kept)
+
+
+def test_min_pairs_on_a_matrix_needs_the_raw_counts_and_says_so(tmp_path):
+    import subprocess
+    import sys as _sys
+    out, r, mat, _ = _sparse_profile_run(
+        tmp_path, "--matrix", str(tmp_path / "concordance_coordination.parquet"))
+    assert r.returncode == 0
+    (tmp_path / "pair_counts_per_bin.parquet").unlink()
+    r2 = subprocess.run(
+        [_sys.executable, str(_SCRIPT), "--samples", str(tmp_path / "s.tsv"),
+         "--cell-type-column", "cell_type", "--group", "t=T",
+         "--region", f"D={tmp_path / 'd.bed'}", "--matrix", str(mat),
+         "--min-pairs", "2", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "no")], capture_output=True, text=True)
+    assert r2.returncode != 0
+    assert "--pair-counts" in r2.stderr and "--from-counts" in r2.stderr
+
+
+def test_min_pairs_drops_thin_bins_from_the_pooled_sums(tmp_path):
+    out, r, _, N = _sparse_profile_run(
+        tmp_path, "--from-counts", str(tmp_path),
+        "--from-counts-statistic", "coordination", "--min-pairs", "2")
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "pooling only the" in r.stderr
+    # 0 is not the same as "off": it already excludes bins with no pairs,
+    # since they add nothing to numerator or denominator.
+    out0, r0, _, _ = _sparse_profile_run(
+        tmp_path, "--from-counts", str(tmp_path),
+        "--from-counts-statistic", "coordination")
+    assert r0.returncode == 0
+    assert "pooling only the" not in r0.stderr
+
+
+def test_the_null_replicates_are_masked_on_the_OBSERVED_counts(tmp_path):
+    """A drawn-null replicate carries its own draw count in n_linked, so a
+    mask recomputed inside _pooled_stat would sum a different set of bins
+    for the null than for the observed -- and the difference between them
+    would be partly a difference in which bins were summed."""
+    import inspect
+    mod = _mod()
+    src = inspect.getsource(mod.pooled_profiles)
+    # The same keep_bins object goes to both calls.
+    assert "keep=keep_bins" in src
+    assert src.count("keep=keep_bins") == 2
+    assert 'keep_bins = (counts["n_linked"]' in \
+        inspect.getsource(mod.pooled_profiles)
+    # And _pooled_stat never derives one itself.
+    st = inspect.getsource(mod._pooled_stat)
+    assert 'n_linked"] >=' not in st

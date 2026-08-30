@@ -256,7 +256,7 @@ def which_statistic_matches(M, counts, alpha, cap=200_000, seed=0):
     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
-def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None):
+def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None, keep=None):
     """Sum this position's counts across the given bins, then the statistic.
 
     Split out so the drawn-null replicates go through byte-identical
@@ -269,7 +269,18 @@ def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None):
         _dc_fn = decompose_components
     a0 = float(sum(alpha.values()))
     ao, ac = float(alpha["open"]), float(alpha["closed"])
-    g = lambda k: _np.nansum(counts[k][:, cols], axis=1)
+    if keep is None:
+        g = lambda k: _np.nansum(counts[k][:, cols], axis=1)
+    else:
+        # ``keep`` IS DERIVED FROM THE OBSERVED COUNTS AND PASSED IN, not
+        # recomputed here.  A drawn-null replicate carries its own draw
+        # count in n_linked, so a mask computed inside would include a
+        # different set of bins for the null than for the observed and the
+        # difference between them would be partly a difference in which
+        # bins were summed.
+        km = keep[:, cols]
+        g = lambda k: _np.nansum(
+            _np.where(km, counts[k][:, cols], 0.0), axis=1)
     n_l, n_e = g("n_linked"), g("n_dm")
     o_o = (ao + g("k_open")) / (a0 + n_l)
     o_c = (ac + g("k_closed")) / (a0 + n_l)
@@ -279,7 +290,7 @@ def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None):
 
 
 def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
-                    null_counts=None, reference="none"):
+                    null_counts=None, reference="none", min_pairs=0):
     """Sum the counts at each position, THEN compute the statistic once.
 
     Averaging a per-bin statistic over a region is not the region's
@@ -341,6 +352,8 @@ def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
     """
     import numpy as _np
     from nome_hic_concordance.concordance import decompose_components
+    keep_bins = (counts["n_linked"] >= float(min_pairs)
+                 if float(min_pairs) > 0 else None)
     P = _np.full((len(rows), total), _np.nan)
     n_bins = _np.zeros(total, int)
     order = _np.argsort(pos_idx, kind="stable")
@@ -353,10 +366,11 @@ def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
         if cols.size == 0:
             continue
         v, n_l = _pooled_stat(counts, cols, alpha, stat,
-                              decompose_components)
+                              decompose_components, keep=keep_bins)
         if reference != "none" and null_counts:
             nv = _np.stack([
-                _pooled_stat(nc, cols, alpha, stat, decompose_components)[0]
+                _pooled_stat(nc, cols, alpha, stat, decompose_components,
+                             keep=keep_bins)[0]
                 for nc in null_counts])
             with _np.errstate(invalid="ignore"), warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
@@ -447,7 +461,8 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
             pooled["stat"],
             null_counts=[{k: v[rows] for k, v in nc.items()}
                          for nc in pooled.get("null") or []],
-            reference=pooled.get("reference", "none"))
+            reference=pooled.get("reference", "none"),
+            min_pairs=pooled.get("min_pairs", 0))
     else:
         P, idx, n_bins = cell_profiles(M, ct, members, bin_idx, pos_idx,
                                        total)
@@ -536,7 +551,8 @@ def per_domain_values(M, ct, members, bin_idx, pos_idx, dom_idx, n_flank,
                 P, _r, _n = pooled_profiles(
                     sub, keep, bi_d, two, 2, pooled["alpha"],
                     pooled["stat"], null_counts=sub_null,
-                    reference=pooled.get("reference", "none"))
+                    reference=pooled.get("reference", "none"),
+                    min_pairs=pooled.get("min_pairs", 0))
             else:
                 P, _r, _n = cell_profiles(M, ct, members, bi_d, two, 2)
             if not P.shape[0]:
@@ -935,7 +951,27 @@ def main(argv=None) -> int:
     ap.add_argument("--pair-counts", action="append", default=[],
                     metavar="NAME=PATH",
                     help="pair_counts_per_bin.parquet for the matching "
-                         "matrix.")
+                         "matrix.  Needed by --contrast-regress-coverage, "
+                         "and by --min-pairs when profiling a --matrix "
+                         "rather than --from-counts.  Auto-discovered beside "
+                         "the matrix.")
+    ap.add_argument("--min-pairs", type=int, default=0, metavar="N",
+                    help="Use only (cell, bin) entries with at least N RAW "
+                         "read pairs of their own, so the curve and its "
+                         "interval are built from what was measured rather "
+                         "than from what RWR filled in.  RWR reaches every "
+                         "entry, and its k-NN graph is built on "
+                         "accessibility, so an imputed value carries its "
+                         "cell type's signature by construction -- a profile "
+                         "over all entries can therefore separate two groups "
+                         "partly because the imputation knew which group "
+                         "each cell was in.  Under --from-counts this drops "
+                         "thin bins from the POOLED sums (0, the default, "
+                         "already excludes bins with no pairs, since they "
+                         "add nothing to either the numerator or the "
+                         "denominator); under --matrix it blanks those "
+                         "entries before the per-cell average, which needs "
+                         "--pair-counts.  The run reports what it cost.")
     ap.add_argument("--body-bins", type=int, default=40,
                     help="Bins the domain body is scaled to (default 40).  "
                          "Past roughly the median domain width divided by "
@@ -1104,6 +1140,34 @@ def main(argv=None) -> int:
         Xc = mk.center_cells(Xc)
         steps.append("centred each cell on its median")
     cnt_specs = _named(args.pair_counts, "--pair-counts")
+    if args.min_pairs > 0 and not args.from_counts:
+        # THE MATRIX PATH IS THE ONE THAT NEEDS THIS.  --from-counts already
+        # reads raw counts; a --matrix is post-RWR, and RWR reaches every
+        # entry from a k-NN graph built on accessibility, so an imputed
+        # value carries its cell type's signature by construction.  Averaging
+        # over all of them can separate two groups partly because the
+        # imputation knew which group each cell was in.
+        _cp = cnt_specs.get(name)
+        if _cp is None:
+            _beside = Path(mpath).parent / "pair_counts_per_bin.parquet"
+            _cp = str(_beside) if _beside.exists() else None
+        if _cp is None:
+            sys.exit(
+                f"--min-pairs needs the raw read-pair counts to know which "
+                f"entries were measured: pass --pair-counts "
+                f"{name}=pair_counts_per_bin.parquet, or profile with "
+                f"--from-counts, which reads raw counts already.")
+        _C = pd.read_parquet(_cp).reindex(
+            index=M.index, columns=M.columns).to_numpy(float)
+        _keep = np.isfinite(_C) & (_C >= float(args.min_pairs))
+        _before = int(np.isfinite(Xc).sum())
+        Xc = np.where(_keep, Xc, np.nan)
+        _after = int(np.isfinite(Xc).sum())
+        steps.append(f"kept only entries with >= {args.min_pairs} raw pairs")
+        print(f"  --min-pairs {args.min_pairs}: {_after:,} of {_before:,} "
+              f"non-NA (cell, bin) entries survive ({_after / max(_before, 1):.1%}); "
+              f"the rest were RWR's, and a position where an arm keeps none "
+              f"is now blank rather than imputed.", file=sys.stderr)
     if args.contrast_regress_coverage:
         if name not in cnt_specs:
             sys.exit(f"--contrast-regress-coverage needs --pair-counts "
@@ -1158,7 +1222,17 @@ def main(argv=None) -> int:
         _pooled = {"counts": load_counts(args.from_counts, M.index,
                                          M.columns),
                    "alpha": _alpha, "stat": _stat,
-                   "reference": args.null_reference}
+                   "reference": args.null_reference,
+                   "min_pairs": int(args.min_pairs)}
+        if args.min_pairs > 0:
+            _nl = _pooled["counts"]["n_linked"]
+            _kept = float(np.mean(_nl >= float(args.min_pairs)))
+            _nz = float(np.mean(_nl > 0))
+            print(f"  --min-pairs {args.min_pairs}: pooling only the "
+                  f"{_kept:.1%} of (cell, bin) entries with that many raw "
+                  f"pairs ({_nz:.1%} have any at all).  The curve and its "
+                  f"interval are then built from measured pairs, not from "
+                  f"what RWR filled in.", file=sys.stderr)
         _pooled["null"] = (
             load_null_counts(args.from_counts, M.index, M.columns,
                              _pooled["counts"])
