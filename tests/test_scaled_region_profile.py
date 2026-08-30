@@ -1804,7 +1804,8 @@ def test_an_unmeasured_bin_drops_out_of_the_pooled_statistic_on_its_own():
 
 
 def _uniform_counts_run(tmp_path, tag, n_dom=699, width=1_000_000,
-                        spacing=2_800_000, nb=8000, n_cells=40, *extra):
+                        spacing=2_800_000, nb=8000, n_cells=40, *extra,
+                        per_bin=40):
     """A genome with UNIFORM depth and UNIFORM coordination everywhere.
 
     Any structure a profile draws on this is manufactured by the axis, not
@@ -1820,7 +1821,7 @@ def _uniform_counts_run(tmp_path, tag, n_dom=699, width=1_000_000,
     (d / "counts").mkdir(parents=True, exist_ok=True)
     cells = [f"c{i}" for i in range(n_cells)]
     bins = [f"chr1:{i * bsz}" for i in range(nb)]
-    N = rng.poisson(40, (n_cells, nb)).astype(float)
+    N = rng.poisson(per_bin, (n_cells, nb)).astype(float)
     conc, exc = 0.60, 0.06
     mats = {"k_open": (conc + exc) * .25 * N,
             "k_closed": (conc + exc) * .75 * N,
@@ -1964,3 +1965,73 @@ def test_the_shuffle_control_adds_a_panel_carrying_the_machinery(tmp_path):
     # And on uniform data neither shows a step, real or shuffled.
     assert 0.95 < ratio("DOM", "mean") < 1.05
     assert 0.95 < ratio("DOM (shuffled)", "mean") < 1.05
+
+
+def _uniform_ratio(tmp_path, tag, per_bin, formula):
+    """body/flank on data whose true coordination is identical everywhere."""
+    import pandas as pd
+    out, r = _uniform_counts_run(
+        tmp_path, f"{tag}_{formula}", 699, 1_000_000, 2_800_000, 8000, 40,
+        "--from-counts-formula", formula, per_bin=per_bin)
+    assert r.returncode == 0, r.stderr[-2500:]
+    d = pd.read_csv(out / "scaled_profile_coordination.per_position.tsv",
+                    sep="\t")
+    b = d.loc[d["zone"] == "body", "mean"].mean()
+    f = d.loc[d["zone"] != "body", "mean"].mean()
+    return b, f, r.stderr
+
+
+def test_the_prior_draws_a_step_at_every_boundary_out_of_depth_alone():
+    """With n_dm == n_linked and one prior on both pools, the shrunken C is
+    excess * n / (alpha_0 + n) -- so it depends on how many pairs the
+    POSITION pooled, and the scaled axis pools ~4x less inside a domain.
+    This is why a shuffled control reproduced a real panel's drop."""
+    a0, exc = 100.0, 0.06
+    for per_bin, want in ((40, 0.97), (2, 0.69), (0.2, 0.34)):
+        nf, nb = 280 * per_bin, 70 * per_bin      # measured placements
+        cf, cb = exc * nf / (a0 + nf), exc * nb / (a0 + nb)
+        assert cb / cf == pytest.approx(want, abs=0.03), (per_bin, cb / cf)
+    # k/n has no such term at all: the estimate is the excess at any depth,
+    # which is what removes the step.
+    for per_bin in (40, 2, 0.2):
+        nf, nb = 280 * per_bin, 70 * per_bin
+        assert (exc * nb / nb) / (exc * nf / nf) == pytest.approx(1.0)
+
+
+def test_mle_removes_the_boundary_step_and_dm_shows_it(tmp_path):
+    """Measured end to end on data with IDENTICAL coordination inside and
+    outside, at a single-cell depth."""
+    b_dm, f_dm, err_dm = _uniform_ratio(tmp_path, "step", 2, "dm")
+    b_ml, f_ml, err_ml = _uniform_ratio(tmp_path, "step", 2, "mle")
+    assert b_dm / f_dm < 0.93, b_dm / f_dm          # the artefact
+    assert 0.98 < b_ml / f_ml < 1.02, b_ml / f_ml   # gone
+    # And mle recovers the planted excess itself, not just its flatness.
+    assert b_ml == pytest.approx(0.06, abs=0.003)
+    assert f_ml == pytest.approx(0.06, abs=0.003)
+    assert "WARNING this shrinks by pooled depth" in err_dm
+    assert "with NO prior" in err_ml
+
+
+def test_mle_is_the_default_for_the_pooled_path(tmp_path):
+    """The prior stabilises a PER-BIN estimate at n of a few; a position
+    pools thousands of pairs, so it buys nothing here and costs a
+    depth-dependent bias.  Defaulting to the biased one would leave the next
+    reader with the same broken panel."""
+    import inspect
+    mod = _mod()
+    assert inspect.signature(mod._pooled_stat).parameters[
+        "formula"].default == "mle"
+    assert inspect.signature(mod.pooled_profiles).parameters[
+        "formula"].default == "mle"
+    out, r = _uniform_counts_run(tmp_path, "dflt", 699, 1_000_000,
+                                 2_800_000, 8000, 40)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "with NO prior" in r.stderr
+
+
+def test_the_null_reference_uses_the_same_formula_as_the_observed():
+    """Referencing an unshrunk observed to a shrunk null would subtract the
+    prior's depth term instead of the null's coordination."""
+    import inspect
+    src = inspect.getsource(_mod().pooled_profiles)
+    assert src.count("formula=formula") == 2

@@ -291,7 +291,8 @@ def which_statistic_matches(M, counts, alpha, cap=200_000, seed=0):
     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
-def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None, keep=None):
+def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None, keep=None,
+                 formula="mle"):
     """Sum this position's counts across the given bins, then the statistic.
 
     Split out so the drawn-null replicates go through byte-identical
@@ -317,15 +318,41 @@ def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None, keep=None):
         g = lambda k: _np.nansum(
             _np.where(km, counts[k][:, cols], 0.0), axis=1)
     n_l, n_e = g("n_linked"), g("n_dm")
-    o_o = (ao + g("k_open")) / (a0 + n_l)
-    o_c = (ac + g("k_closed")) / (a0 + n_l)
-    e_o = (ao + g("k_dm_open")) / (a0 + n_e)
-    e_c = (ac + g("k_dm_closed")) / (a0 + n_e)
+    if formula == "mle":
+        # NO PRIOR ON A POOLED ESTIMATE, and this is not a preference.
+        #
+        # With n_dm == n_linked and one prior on both pools, the shrunken C
+        # collapses to  excess * n / (alpha_0 + n)  -- so it depends on how
+        # many pairs the POSITION pooled, not only on the coordination.
+        # The scaled axis pools unequally by construction: a body position
+        # spans domain_width/n_body against the flank's flank_bp/n_flank,
+        # which measured 70 placements against 280.  At single-cell depth
+        # that turns into a step at every domain boundary out of nothing.
+        # Measured on uniform data -- identical coordination inside and
+        # out -- the body/flank ratio came to 0.99 at 40 pairs per bin per
+        # cell, 0.87 at 2 and 0.68 at 0.4.  It is why a shuffled control
+        # reproduced a real panel's drop.
+        #
+        # The prior exists to stabilise a PER-BIN estimate at n of a few.
+        # A position pools thousands of pairs across cells and bins, so it
+        # buys nothing here and costs a depth-dependent bias.  k/n makes
+        # depth affect the noise, which the interval already shows, and not
+        # the expected value.
+        sl = _np.where(n_l > 0, n_l, _np.nan)
+        se = _np.where(n_e > 0, n_e, _np.nan)
+        o_o, o_c = g("k_open") / sl, g("k_closed") / sl
+        e_o, e_c = g("k_dm_open") / se, g("k_dm_closed") / se
+    else:
+        o_o = (ao + g("k_open")) / (a0 + n_l)
+        o_c = (ac + g("k_closed")) / (a0 + n_l)
+        e_o = (ao + g("k_dm_open")) / (a0 + n_e)
+        e_c = (ac + g("k_dm_closed")) / (a0 + n_e)
     return _dc_fn(o_o, o_c, e_o, e_c)[stat], n_l
 
 
 def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
-                    null_counts=None, reference="none", min_pairs=0):
+                    null_counts=None, reference="none", min_pairs=0,
+                    formula="mle"):
     """Sum the counts at each position, THEN compute the statistic once.
 
     Averaging a per-bin statistic over a region is not the region's
@@ -401,11 +428,12 @@ def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
         if cols.size == 0:
             continue
         v, n_l = _pooled_stat(counts, cols, alpha, stat,
-                              decompose_components, keep=keep_bins)
+                              decompose_components, keep=keep_bins,
+                              formula=formula)
         if reference != "none" and null_counts:
             nv = _np.stack([
                 _pooled_stat(nc, cols, alpha, stat, decompose_components,
-                             keep=keep_bins)[0]
+                             keep=keep_bins, formula=formula)[0]
                 for nc in null_counts])
             with _np.errstate(invalid="ignore"), warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
@@ -497,7 +525,8 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
             null_counts=[{k: v[rows] for k, v in nc.items()}
                          for nc in pooled.get("null") or []],
             reference=pooled.get("reference", "none"),
-            min_pairs=pooled.get("min_pairs", 0))
+            min_pairs=pooled.get("min_pairs", 0),
+            formula=pooled.get("formula", "mle"))
     else:
         P, idx, n_bins = cell_profiles(M, ct, members, bin_idx, pos_idx,
                                        total)
@@ -587,7 +616,8 @@ def per_domain_values(M, ct, members, bin_idx, pos_idx, dom_idx, n_flank,
                     sub, keep, bi_d, two, 2, pooled["alpha"],
                     pooled["stat"], null_counts=sub_null,
                     reference=pooled.get("reference", "none"),
-                    min_pairs=pooled.get("min_pairs", 0))
+                    min_pairs=pooled.get("min_pairs", 0),
+                    formula=pooled.get("formula", "mle"))
             else:
                 P, _r, _n = cell_profiles(M, ct, members, bi_d, two, 2)
             if not P.shape[0]:
@@ -990,6 +1020,30 @@ def main(argv=None) -> int:
                          "and by --min-pairs when profiling a --matrix "
                          "rather than --from-counts.  Auto-discovered beside "
                          "the matrix.")
+    ap.add_argument("--from-counts-formula", choices=["mle", "dm"],
+                    default="mle",
+                    help="How the pooled rates are formed.  'mle' (default) "
+                         "is k/n with NO prior.  'dm' applies the run's "
+                         "Dirichlet-Multinomial prior, as the per-bin "
+                         "matrices do -- and on this axis that is a bug, not "
+                         "a choice: with n_dm == n_linked and one prior on "
+                         "both pools the shrunken C collapses to "
+                         "excess * n / (alpha_0 + n), so it depends on how "
+                         "many pairs the POSITION pooled.  The scaled axis "
+                         "pools unequally by construction, a body position "
+                         "spanning domain_width/--body-bins against the "
+                         "flank's --flank/--flank-bins -- measured, 70 bin "
+                         "placements against 280.  On uniform data with "
+                         "IDENTICAL coordination inside and out, 'dm' "
+                         "returned a body/flank ratio of 0.99 at 40 pairs "
+                         "per bin per cell, 0.87 at 2 and 0.68 at 0.4, so at "
+                         "single-cell depth it draws a step at every domain "
+                         "boundary out of nothing -- which is why a shuffled "
+                         "control reproduced a real panel's drop.  The prior "
+                         "exists to stabilise a PER-BIN estimate at n of a "
+                         "few; a position pools thousands of pairs, so it "
+                         "buys nothing and costs a depth-dependent bias.  "
+                         "Keep 'dm' only to reproduce an older figure.")
     ap.add_argument("--shuffle-control", action="store_true",
                     help="Also profile a SIZE-MATCHED set of domains at "
                          "random positions, as an extra panel.  Use it when "
@@ -1297,7 +1351,8 @@ def main(argv=None) -> int:
                                          M.columns),
                    "alpha": _alpha, "stat": _stat,
                    "reference": args.null_reference,
-                   "min_pairs": int(args.min_pairs)}
+                   "min_pairs": int(args.min_pairs),
+                   "formula": args.from_counts_formula}
         if args.min_pairs > 0:
             _nl = _pooled["counts"]["n_linked"]
             _kept = float(np.mean(_nl >= float(args.min_pairs)))
@@ -1336,9 +1391,23 @@ def main(argv=None) -> int:
               f"so there is no genome-wide arm offset riding on it to "
               f"remove.  --baseline flank still anchors each cell.",
               file=sys.stderr)
-        print(f"  pooling raw counts per axis position and computing "
-              f"{_stat} from them (prior nu={sum(_alpha.values()):.1f})",
-              file=sys.stderr)
+        if args.from_counts_formula == "mle":
+            print(f"  pooling raw counts per axis position and computing "
+                  f"{_stat} from them as k/n, with NO prior: the axis pools "
+                  f"unequally (a body position spans "
+                  f"domain_width/--body-bins against the flank's "
+                  f"--flank/--flank-bins), and a shrunken C is "
+                  f"excess * n/(alpha_0 + n), so the prior would draw a step "
+                  f"at every boundary from the depth difference alone.",
+                  file=sys.stderr)
+        else:
+            print(f"  pooling raw counts per axis position and computing "
+                  f"{_stat} from them with the run's prior "
+                  f"(nu={sum(_alpha.values()):.1f}).  WARNING this shrinks "
+                  f"by pooled depth, and the scaled axis pools ~4x less "
+                  f"inside a domain than in its flank, so expect a step at "
+                  f"the boundary that is not signal.  --from-counts-formula "
+                  f"mle removes it.", file=sys.stderr)
         # WHICH QUANTITY THIS IS, said out loud, because it is NOT the one
         # celltype_marker_bins.py tests and the difference is large enough
         # to change the shape of a profile.
