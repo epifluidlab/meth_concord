@@ -1599,8 +1599,12 @@ def glm_effect(counts, in_mask, out_mask, statistic, cells, batch_df=None,
     try:
         import statsmodels.api as sm
     except Exception:
-        sys.exit("--contrast-test glm needs statsmodels: "
-                 "pip install statsmodels")
+        sys.exit(
+            "--contrast-test glm needs statsmodels, which is a declared "
+            "dependency of this package -- this environment predates it.\n"
+            "  conda install -c conda-forge statsmodels\n"
+            "  # or: pip install 'statsmodels>=0.13'\n"
+            "  # or, to pick up every dependency: pip install -e .")
 
     succ_k, fail_k, e_succ_k, e_fail_k = GLM_MODELS[statistic]
     n_bins = counts["n_linked"].shape[1]

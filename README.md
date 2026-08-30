@@ -12,8 +12,8 @@ pip install -e .
 ```
 
 The pipeline depends on `numpy`, `scipy`, `pandas`, `pyarrow`, `pysam`,
-`py2bit`, `scikit-learn`, `umap-learn`, `matplotlib`, `seaborn`, and `joblib`
-(see `requirements.txt`).
+`py2bit`, `scikit-learn`, `umap-learn`, `matplotlib`, `seaborn`, `joblib`, and
+`statsmodels` (see `requirements.txt`).
 
 ## Run
 

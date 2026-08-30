@@ -4117,3 +4117,48 @@ def test_a_thin_stratum_falls_back_to_the_global_variance():
     a, b = rng.normal(0, .3, (2, nb)), rng.normal(0, .3, (3, nb))
     r = mod.moderated_t(a, b, prior_df=4.0, strata=st)
     assert np.isfinite(r["p"][:5]).all()
+
+
+def test_every_third_party_import_is_a_declared_dependency():
+    """A module imported inside a FUNCTION is invisible to a fresh install
+    until someone runs that code path -- which is how --contrast-test glm
+    shipped needing statsmodels without declaring it, and the user found out
+    from a SystemExit on a cluster."""
+    import ast as _ast
+
+    root = Path(_SCRIPT).resolve().parents[1]
+    declared = (root / "requirements.txt").read_text()
+    pyproject = (root / "pyproject.toml").read_text()
+    src = Path(_SCRIPT).read_text()
+    # Third-party modules this script imports anywhere, including inside
+    # functions.  Standard library and first-party are not declared.
+    stdlib = {"argparse", "importlib", "json", "sys", "warnings", "re",
+              "pathlib", "subprocess", "inspect", "math", "itertools",
+              "collections", "functools", "os", "textwrap", "csv", "time",
+              "typing", "dataclasses", "shutil", "tempfile", "gzip",
+              "contextlib", "random", "hashlib", "zlib"}
+    first_party = {"nome_hic_concordance"}
+    # Parsed, not grepped: a docstring line beginning "from either ..." is
+    # not an import, and the first version of this test said it was.
+    mods = set()
+    for node in _ast.walk(_ast.parse(src)):
+        if isinstance(node, _ast.Import):
+            tops = [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, _ast.ImportFrom):
+            tops = [(node.module or "").split(".")[0]] if not node.level else []
+        else:
+            continue
+        for top in tops:
+            if top and top not in stdlib and top not in first_party \
+                    and not top.startswith("_"):
+                mods.add(top)
+    alias = {"sklearn": "scikit-learn", "PIL": "pillow", "yaml": "pyyaml"}
+    optional = {"combat", "harmonypy", "pyBigWig"}
+    missing = sorted(
+        m for m in mods
+        if m not in optional
+        and alias.get(m, m) not in declared
+        and alias.get(m, m) not in pyproject)
+    assert not missing, (
+        f"imported but not declared in requirements.txt / pyproject.toml: "
+        f"{missing}")
