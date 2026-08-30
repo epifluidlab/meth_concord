@@ -4563,6 +4563,7 @@ def main():
                                         out_mask, args.contrast_test)
             # ---- Empirical p from relabelled units ---------------------
             summary_unitperm = locals().get("summary_unitperm") or {}
+            unitperm_nulls = locals().get("unitperm_nulls") or {}
             unitnull_q = None
             if args.contrast_permute_units and cs is not None \
                     and donor_v is not None:
@@ -4727,6 +4728,8 @@ def main():
                               f"switch to --contrast-test glm, whose p is "
                               f"taken across replication units.",
                               file=sys.stderr)
+                    unitperm_nulls[f"{name}:{label}"] = [
+                        np.asarray(v, float) for v in _nulls]
                     scores_df[f"contrast_{label}_pvalue_unitperm"] = _pe
                     extra_cols.append(f"contrast_{label}_pvalue_unitperm")
                     # THE COLUMN TO THRESHOLD ON.  BH assumes the p-values
@@ -5305,6 +5308,48 @@ def main():
                 bed[msk].drop(columns=flags).to_csv(
                     out_dir / f"bin_scores_{name}.{pre}.{suf}.bed",
                     sep="\t", index=False, na_rep="NA")
+            # A MATCHED NULL FOREGROUND, one per relabelling.
+            #
+            # Genomic enrichment on this foreground has a trap that no
+            # per-bin threshold closes: the false positives are not random
+            # bins.  They come from cell-type structure, and cell-type-
+            # variable sequence is itself clustered in compartments and
+            # domains -- so a foreground that is half noise can return a
+            # clean-looking enrichment for the same features the real bins
+            # sit in.  Tightening the p does not help, because the noise
+            # tightens with it.
+            #
+            # The control is a foreground of the SAME SIZE taken from a run
+            # where the labels were relabelled: it carries the cell-type
+            # structure and none of the tumour effect.  Run the enrichment on
+            # these too and read the real one against them, rather than
+            # against a genome background.
+            _nl = (locals().get("unitperm_nulls") or {}).get(f"{name}:{lab}")
+            _n_fg = int(parts["up"].sum() + parts["down"].sum())
+            if _nl and _n_fg > 0:
+                _tested_idx = np.flatnonzero(tested)
+                for _k, _np_ in enumerate(_nl):
+                    _v = np.asarray(_np_, float)
+                    _v = _v[_tested_idx] if _v.size == tested.size else _v
+                    _ok = np.isfinite(_v)
+                    if _ok.sum() < _n_fg:
+                        continue
+                    _sel = _tested_idx[_ok][np.argsort(_v[_ok],
+                                                       kind="stable")[:_n_fg]]
+                    _m = np.zeros(len(bed), bool)
+                    _m[_sel] = True
+                    bed[_m].drop(columns=flags).to_csv(
+                        out_dir / f"bin_scores_{name}.{pre}.nullfg{_k}.bed",
+                        sep="\t", index=False, na_rep="NA")
+                print(f"  {name}: {len(_nl)} matched null foregrounds of "
+                      f"{_n_fg:,} bins each -> "
+                      f"bin_scores_{name}.{pre}.nullfg*.bed.  Run the "
+                      f"genomic enrichment on these too: the false positives "
+                      f"here are cell-type structure, which is itself "
+                      f"clustered in the genome, so a noisy foreground can "
+                      f"return a clean-looking enrichment for the same "
+                      f"features.  Read the real foreground against these, "
+                      f"not against a genome background.", file=sys.stderr)
             gap = int((tested & (qv < args.contrast_fdr) & ~keep).sum())
             summary_contrast[lab].update({
                 "n_bed_up": int(parts["up"].sum()),

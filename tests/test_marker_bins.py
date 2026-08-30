@@ -4585,3 +4585,43 @@ def test_unit_fdr_says_when_the_relabellings_cannot_reach_the_threshold(
     if "WARNING no bin can clear" in r.stderr:
         assert "the floor is about 1/3" in r.stderr
         assert "--contrast-permute-scope all gives" in r.stderr
+
+
+def test_matched_null_foregrounds_are_written_for_the_enrichment_control(
+        tmp_path):
+    """Genomic enrichment on this foreground has a trap no per-bin threshold
+    closes: the false positives are cell-type structure, and cell-type-
+    variable sequence is itself clustered in compartments and domains, so a
+    half-noise foreground can return a clean-looking enrichment for the same
+    features the real bins sit in.  Tightening the p does not help -- the
+    noise tightens with it.  The control is a SAME-SIZE foreground from a
+    relabelled run."""
+    import pandas as pd
+    out, r, _ = _welch_matrix_run(
+        tmp_path, "nullfg", "--contrast-permute-units", "9",
+        "--contrast-permute-scope", "reference",
+        "--contrast-select", "unit-fdr")
+    assert r.returncode == 0, r.stderr[-2500:]
+    fg = sorted(out.glob("bin_scores_gch.contrast_m.nullfg*.bed"))
+    assert len(fg) == 3, [f.name for f in fg]
+    n_real = sum(
+        len(pd.read_csv(f, sep="\t"))
+        for f in (out / "bin_scores_gch.contrast_m.up.bed",
+                  out / "bin_scores_gch.contrast_m.down.bed") if f.exists())
+    assert n_real > 0
+    # Matched on COUNT, which is what an enrichment comparison needs: an
+    # unmatched null would differ in power as well as in labels.
+    for f in fg:
+        assert len(pd.read_csv(f, sep="\t")) == n_real, f.name
+    assert "matched null foregrounds" in r.stderr
+    # Same columns as the real foreground, so the same enrichment command
+    # runs on either without edits.
+    a = pd.read_csv(out / "bin_scores_gch.contrast_m.up.bed", sep="\t")
+    b = pd.read_csv(fg[0], sep="\t")
+    assert list(a.columns) == list(b.columns)
+
+
+def test_no_null_foregrounds_without_the_relabellings(tmp_path):
+    out, r, _ = _welch_matrix_run(tmp_path, "nonf", n_bins=400, real=100)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert not list(out.glob("*nullfg*.bed"))
