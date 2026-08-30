@@ -4281,3 +4281,64 @@ def test_an_arm_with_one_unit_is_skipped_not_guessed(tmp_path, capsys):
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-2000:]
     assert "needs 2+ replication units per arm" in r.stderr
+
+
+def test_the_enrichment_is_reported_not_left_to_the_reader(tmp_path):
+    """A calibrated per-bin threshold is not a multiple-testing correction:
+    at a true 5% over N bins, 0.05N clear by chance.  A run that prints only
+    the count invites it to be read as a finding -- on one real run, 529
+    bins cleared a calibrated cut over 10,837 bins, against 542 expected."""
+    import pandas as pd
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_contrast_evaluation import _dataset
+    d, s, _ = _dataset(tmp_path, n_bins=400, real=100)
+    sdf = pd.read_csv(s, sep="\t")
+    sdf["exp_batch"] = ["b1", "b2"] * (len(sdf) // 2)
+    sdf.to_csv(s, sep="\t", index=False)
+    cd = tmp_path / "counts"
+    K = pd.read_parquet(cd / "k_open.parquet")
+    C = pd.read_parquet(cd / "k_closed.parquet")
+    e = 1 / (1 + np.exp(0.4))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        X = (np.log(K.to_numpy()) - np.log(C.to_numpy())
+             - (np.log(e) - np.log(1 - e)))
+    mat = tmp_path / "concordance_direction_logor.parquet"
+    pd.DataFrame(np.where(np.isfinite(X), X, np.nan), index=K.index,
+                 columns=K.columns).to_parquet(mat)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--matrix", f"gch={mat}",
+         "--samples", str(s), "--cell-type-column", "cell_type",
+         "--batch-column", "exp_batch", "--n-bins", "80",
+         "--n-permutations", "20", "--contrast", "m=tumor1,tumor2",
+         "--contrast-test", "welch", "--contrast-permute-units", "9",
+         "--output-dir", str(tmp_path / "o"), "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "expected from a relabelling" in r.stderr
+    assert "THE ENRICHMENT IS THE RESULT" in r.stderr
+
+
+def test_the_reference_scope_excludes_the_contrast_arm_from_the_null():
+    """The balanced null is contaminated and cannot not be: with two tumours
+    among five units, three of the nine relabellings put BOTH in the
+    reference arm and the other six put one in each, so every one inherits
+    some of the signal being tested."""
+    mod = _mod()
+    units = ["tumor1", "tumor2", "GM12878", "IMR90", "monocyte"]
+    tum = ["tumor1", "tumor2"]
+    allr = mod.unit_relabellings(units, 2, tum, scope="all")
+    ref = mod.unit_relabellings(units, 2, tum, scope="reference")
+    # Every balanced relabelling touches a tumour, one way or the other.
+    both_in_ref = [g for g in allr if not (set(g) & set(tum))]
+    assert len(both_in_ref) == 3            # GI, GM, IM
+    assert len(allr) - len(both_in_ref) == 6
+    # The reference scope never puts a tumour in either arm.
+    assert ref and all(not (set(g) & set(tum)) for g in ref)
+    assert len(ref) == 3                    # each reference type, alone
+    assert all(len(g) == 1 for g in ref)
+
+
+def test_a_reference_scope_with_too_few_units_returns_nothing():
+    mod = _mod()
+    assert mod.unit_relabellings(["a", "b", "c"], 2, ["a", "b"],
+                                 scope="reference") == []

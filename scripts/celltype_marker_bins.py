@@ -1710,16 +1710,35 @@ def glm_contrast(counts, in_mask, out_mask, statistic, cells, batch_df=None,
     return out
 
 
-def unit_relabellings(units, n_a, true_a, max_n=0, seed=0):
-    """Every balanced way of calling ``n_a`` units the contrast arm, minus
-    the real one.
+def unit_relabellings(units, n_a, true_a, max_n=0, seed=0, scope="all"):
+    """Ways of calling some units the contrast arm, other than the real one.
 
-    Balanced -- the same arm sizes as the real contrast -- because power and
-    variance both depend on them, so a 1-vs-4 split would not be the test
-    that was actually run.
+    ``scope="all"`` takes every BALANCED relabelling -- the same arm sizes as
+    the real contrast, because power and variance both depend on them, so a
+    1-vs-4 split would not be the test that was actually run.
+
+    ``scope="reference"`` DROPS THE CONTRAST ARM'S UNITS ENTIRELY and
+    relabels only within the reference.  The balanced null is contaminated
+    and cannot not be: with two tumours among five units, three of the nine
+    relabellings put BOTH tumours in the reference arm and the other six put
+    one in each, so every one of them inherits some of the signal being
+    tested.  That makes the measured inflation an upper bound, and on a run
+    where the real contrast came back at 1.0x chance it is the difference
+    between "no effect" and "a null built partly from the effect".
+    Excluding the contrast arm gives a null with none of it -- at the cost
+    of smaller, unbalanced arms, so read it as a check on the inflation
+    rather than as the same test.
     """
     import itertools
     true_a = frozenset(true_a)
+    if scope == "reference":
+        rest = sorted(set(units) - true_a)
+        if len(rest) < 2:
+            return []
+        n_ref_a = max(1, len(rest) // 2)
+        return [frozenset(c)
+                for c in itertools.combinations(rest, n_ref_a)][
+            :None if not max_n else int(max_n)]
     out = [frozenset(c) for c in itertools.combinations(sorted(units), int(n_a))
            if frozenset(c) != true_a]
     if max_n and len(out) > int(max_n):
@@ -3451,6 +3470,25 @@ def main():
                          "Needs --replicate-column (or its cell-type "
                          "default) with 2+ units per arm.  Cost is N times "
                          "the contrast, so pair it with --glm-threads.")
+    ap.add_argument("--contrast-permute-scope",
+                    choices=["all", "reference"], default="all",
+                    help="Which relabellings form the null.  'all' (default) "
+                         "takes every BALANCED one, matching the real arm "
+                         "sizes.  It is contaminated and cannot not be: with "
+                         "two tumours among five units, three of the nine "
+                         "relabellings put both tumours in the reference arm "
+                         "and the other six put one in each, so every one "
+                         "inherits some of the signal being tested -- which "
+                         "is why the reported inflation is an upper bound.  "
+                         "'reference' DROPS the contrast arm's units "
+                         "entirely and relabels only within the reference, "
+                         "giving a null with none of the effect in it.  Its "
+                         "arms are smaller and unbalanced, so read it as a "
+                         "check on the inflation rather than as the same "
+                         "test.  Run both when the balanced null says the "
+                         "real split is no more extreme than a relabelling: "
+                         "that reading is only trustworthy if the clean null "
+                         "agrees.")
     ap.add_argument("--contrast-permute-min-pool", type=int, default=2_000,
                     metavar="M",
                     help="Smallest per-stratum pool of relabelled statistics "
@@ -4437,11 +4475,21 @@ def main():
                 else:
                     _rel = unit_relabellings(
                         _units, len(_ua), _ua,
-                        max_n=args.contrast_permute_units, seed=args.seed)
+                        max_n=args.contrast_permute_units, seed=args.seed,
+                        scope=args.contrast_permute_scope)
+                    if not _rel:
+                        print(f"  contrast {label!r}: "
+                              f"--contrast-permute-scope "
+                              f"{args.contrast_permute_scope} leaves no "
+                              f"relabelling (needs 2+ units outside the "
+                              f"contrast arm); skipped.", file=sys.stderr)
+                    _pool_units = ([u for u in _units if u not in _ua]
+                                   if args.contrast_permute_scope == "reference"
+                                   else _units)
                     _nulls = []
                     for _combo in _rel:
                         _mi = np.isin(_u_all, list(_combo))
-                        _mo = np.isin(_u_all, [u for u in _units
+                        _mo = np.isin(_u_all, [u for u in _pool_units
                                                if u not in _combo])
                         if args.contrast_test == "glm":
                             _r = glm_contrast(
@@ -4486,26 +4534,73 @@ def main():
                     # dataset, and what nominal cut buys a true 5 percent.
                     # Both are reported; the p that goes into FDR is left
                     # alone, and the empirical one rides along as a column.
+                    # THE NUMBER THAT SETTLES IT.  A calibrated per-bin
+                    # threshold is not a multiple-testing correction: at a
+                    # true 5 percent over N bins, 0.05 N of them clear by
+                    # chance.  What says whether the contrast found anything
+                    # is how many MORE than that it found.
+                    _n_test = int(np.sum(np.isfinite(cs["p"])))
+                    _exp_nom = _fpr * _n_test
+                    _exp_cal = 0.05 * _n_test
+                    _enr_nom = _n_nom / _exp_nom if _exp_nom > 0 else np.nan
+                    _enr_cal = _n_cal / _exp_cal if _exp_cal > 0 else np.nan
                     print(f"  contrast {label!r}: {_pi['n_relabellings']} "
                           f"unit relabellings (median pool "
                           f"{_pi['median_pool']:,}).  ON THIS DATA the "
                           f"nominal {args.contrast_test!r} p runs at "
                           f"{_fpr:.3f} against a nominal 0.05 "
                           f"({_fpr / 0.05:.1f}x); a true 5 percent needs "
-                          f"p <= {_thr:.2g}, which {_n_cal:,} bins clear "
-                          f"against {_n_nom:,} at 0.05.  The relabelled null "
-                          f"still mixes real cell types, so {_fpr:.3f} is an "
-                          f"UPPER bound on the inflation.",
+                          f"p <= {_thr:.2g}.  "
+                          + (f"The contrast arm is excluded from this null, "
+                             f"so the effect being tested cannot leak into "
+                             f"it -- though the reference cell types still "
+                             f"differ from each other, which is what a "
+                             f"cell-type contrast is meant to survive."
+                             if args.contrast_permute_scope == "reference"
+                             else f"The relabelled null still mixes real "
+                                  f"cell types, so {_fpr:.3f} is an UPPER "
+                                  f"bound on the inflation."),
                           file=sys.stderr)
-                    if _fpr > 0.10:
+                    print(f"  contrast {label!r}: at p<=0.05, {_n_nom:,} "
+                          f"bins against {_exp_nom:,.0f} expected from a "
+                          f"relabelling -> {_enr_nom:.2f}x.  At p<={_thr:.2g},"
+                          f" {_n_cal:,} against {_exp_cal:,.0f} -> "
+                          f"{_enr_cal:.2f}x.  THE ENRICHMENT IS THE RESULT, "
+                          f"not the count: a calibrated per-bin cut is not a "
+                          f"multiple-testing correction, and at a true 5 "
+                          f"percent over {_n_test:,} bins about "
+                          f"{_exp_cal:,.0f} clear by chance.",
+                          file=sys.stderr)
+                    if max(_enr_nom, _enr_cal) < 1.3:
+                        print(f"  contrast {label!r}: WARNING the real split "
+                              f"produces no more extreme bins than a random "
+                              f"relabelling of the same cell types "
+                              f"({_enr_cal:.2f}x at the calibrated cut).  "
+                              f"Whatever list you take here is "
+                              f"indistinguishable from one an arbitrary "
+                              f"cell-type split would give.  Before "
+                              f"concluding there is no effect, note this "
+                              f"null is CONTAMINATED -- with 2 units in the "
+                              f"contrast arm, some relabellings put both of "
+                              f"them in the reference and inherit the very "
+                              f"signal being tested.  "
+                              + ("This null already excludes the contrast "
+                                 "arm, so that escape is closed."
+                                 if args.contrast_permute_scope == "reference"
+                                 else "Re-run with --contrast-permute-scope "
+                                      "reference for a null the contrast arm "
+                                      "is excluded from."),
+                              file=sys.stderr)
+                    elif _fpr > 0.10:
                         print(f"  contrast {label!r}: WARNING at "
                               f"{_fpr / 0.05:.1f}x nominal, a BH-FDR at "
                               f"q=0.05 on these p-values is controlling "
                               f"something nearer q={_fpr / 0.05 * 0.05:.2f}. "
                               f"Read the {_n_cal:,} bins clearing "
-                              f"p <= {_thr:.2g}, or switch to "
-                              f"--contrast-test glm, whose p is taken across "
-                              f"replication units.", file=sys.stderr)
+                              f"p <= {_thr:.2g} ({_enr_cal:.2f}x chance), or "
+                              f"switch to --contrast-test glm, whose p is "
+                              f"taken across replication units.",
+                              file=sys.stderr)
                     scores_df[f"contrast_{label}_pvalue_unitperm"] = _pe
                     extra_cols.append(f"contrast_{label}_pvalue_unitperm")
                     summary_unitperm[f"{name}:{label}"] = {
@@ -4514,6 +4609,10 @@ def main():
                         "threshold_for_true_5pct": _thr,
                         "n_bins_nominal_p05": _n_nom,
                         "n_bins_calibrated": _n_cal,
+                        "n_bins_tested": _n_test,
+                        "enrichment_at_0.05": _enr_nom,
+                        "enrichment_at_calibrated": _enr_cal,
+                        "scope": args.contrast_permute_scope,
                         "test": args.contrast_test}
             if C_df is not None:
                 cov = coverage_report(
