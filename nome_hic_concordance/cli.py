@@ -153,19 +153,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "pooled the cell graph) and the MoM concentration is inflated by "
              "RWR's variance reduction, crushing cell-type signal onto a thin "
              "PC.  'mle' = plug-in k/n: preserves RWR's cell-type-aware "
-             "smoothing.  'auto' (default) = 'mle'.  THIS IS A TRADE.  "
-             "Against MLE: a full-set comparison (kNN cell-type accuracy on "
-             "ALL cells) found DM ahead -- DM+skip1 0.937, DM+harmony+skip0 "
-             "0.940, against MLE's best 0.930, and MLE falls to ~0.80 when "
-             "no batch correction runs, so pair it with --batch-column.  An "
-             "earlier MLE win there was an artifact of validating on the "
-             "high-coverage labeled subset.  For MLE: against the drawn null "
-             "the two are indistinguishable (C: -0.056 vs -0.057 on GCH, "
-             "n = 3.0e6 cell-bins; 0.192 vs 0.206 on HCG), so calibration "
-             "does not choose between them, while DM's depth-dependent "
-             "shrinkage drew a step at every domain boundary in the pooled "
-             "region profile.  MLE lets one estimator serve the per-bin and "
-             "the pooled analyses alike.",
+             "smoothing.  'auto' (default) = 'mle'.  Against the drawn "
+             "null the two are indistinguishable (null median in robust "
+             "sds, C: -0.056 MLE vs -0.057 DM+shared on GCH over 3.0e6 "
+             "cell-bins; 0.192 vs 0.206 on HCG), so calibration does not "
+             "choose between them.  MLE is preferred because DM's shrinkage "
+             "is depth-dependent, C = excess * n/(alpha_0 + n), which drew "
+             "a step at every domain boundary in the pooled region profile "
+             "that --from-counts-formula mle removed -- so one estimator "
+             "now serves the per-bin and the pooled analyses alike.  "
+             "HISTORICAL: an older full-set kNN cell-type comparison put DM "
+             "ahead (DM+skip1 0.937 against MLE's best 0.930).  It was "
+             "re-run after later changes to the MLE path and MLE no longer "
+             "trails, including at --skip-top-svd 0, which is why MLE takes "
+             "no skip.",
     )
     parser.add_argument(
         "--baseline",
@@ -574,9 +575,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "removes the cell-type axis when cell-type composition is "
              "imbalanced across batches (empirically PC0 AUC 0.91→0.60).  "
              "Harmony is 'protected' but, in the full-set comparison, did not "
-             "improve cell-type clustering under the DM default (DM+harmony"
-             "+skip1 0.926 vs DM+none+skip1 0.937); its lone marginal win "
-             "needs --skip-top-svd 0.  "
+             "improve cell-type clustering under what was then the DM default "
+             "(DM+harmony+skip1 0.926 vs DM+none+skip1 0.937); its lone "
+             "marginal win needs --skip-top-svd 0.  That comparison has not "
+             "been repeated since MLE became the default.  "
              "Default 'harmony' (needs --batch-column + `harmonypy`); it falls "
              "back to 'none' with a warning when no --batch-column is given.  "
              "'auto' resolves to 'harmony' when --batch-column is set, else "
@@ -1324,8 +1326,10 @@ def _resolve_step7_params(args) -> dict:
     # dominant PC0 of Δ_signed is a non-cell-type confound (the
     # low-coverage cells), with cell type on PC1 — for BOTH estimators.
     # So signed defaults to skip 1 (drop the confound; full-set kNN
-    # 0.884 → 0.937 for DM).  The exception is explicit MLE, where skip
-    # didn't help (kNN ~flat), so leave it at 0 there.  Non-signed
+    # 0.884 → 0.937 for DM).  The exception is MLE -- now including the
+    # 'auto' default, not just an explicit --concordance-formula mle --
+    # where skip did not help (kNN ~flat) on the original comparison and
+    # still does not on the re-run, so leave it at 0 there.  Non-signed
     # methods never skip.  User-explicit values (including 0) override.
     _signed_formula = _resolve_concordance_formula(args)
     if args.skip_top_svd is None:
@@ -1437,20 +1441,23 @@ def run_context(
             f"--batch-correction {batch_correction!r} needs --batch-column, "
             f"which was not provided; running with batch correction OFF.")
         batch_correction = "none"
-    # The MLE default's known weak spot, so say it where it bites rather
-    # than only in --help.  On the full cell set MLE reached ~0.80 kNN
-    # cell-type accuracy with no batch correction against ~0.93 with it;
-    # DM degrades far more gently, which is why it stays available.
+    # The older full-set kNN comparison had signed MLE degrading sharply
+    # with no batch correction.  That comparison predates later changes to
+    # the MLE path and its skip-top-svd finding did not survive a re-run,
+    # so the size of the effect is NOT restated here -- but the run is
+    # still worth flagging, since it is the one combination where the
+    # cell-type embedding has been seen to suffer.
     if (batch_correction == "none"
             and _resolve_concordance_formula(args) == "mle"
             and args.concordance_method == "signed"):
-        logger.warning(
-            "Signed MLE with batch correction OFF: on the full cell set this "
-            "combination measured ~0.80 kNN cell-type accuracy against ~0.93 "
-            "with harmony, because the low-coverage cells confound the "
-            "leading component.  Pass --batch-column, or use "
-            "--concordance-formula dm (with --dm-prior shared), if the "
-            "cell-type embedding matters for this run.")
+        logger.info(
+            "Signed MLE with batch correction OFF.  An older full-set "
+            "comparison found the cell-type embedding degraded in this "
+            "combination, the low-coverage cells confounding the leading "
+            "component; that measurement is stale and MLE has since been "
+            "re-run favourably, so treat this as a prompt to check rather "
+            "than a known defect.  Pass --batch-column if the cell-type "
+            "embedding matters for this run.")
     if batch_correction != "none" and 5 not in steps:
         logger.info(
             f"Batch correction ({batch_correction}): Step 5 not in --steps, so "
@@ -1652,22 +1659,21 @@ def run_context(
             # double-shrinkage), the post-norm refinement basis strips per-cell
             # shifts from the refined k-NN graph, and one refine pass is needed
             # for MLE to lift cell-type onto the dominant PC0.
-            # MLE is the signed default, and it is a TRADE, not a win on
-            # every axis.  Against it: a full-set comparison (kNN cell-type
-            # accuracy on ALL cells, claimed labels) put DM ahead --
-            # DM+skip1 = 0.937 and DM+harmony+skip0 = 0.940 against MLE's
-            # best 0.930, with MLE collapsing to ~0.80 when no batch
-            # correction runs.  An earlier MLE win on that axis was an
-            # artifact of validating on the high-coverage labeled subset,
-            # where PC0 is always cell type.
-            # For it: against the drawn null the two are indistinguishable
-            # (null median in robust sds -- C: -0.056 MLE against -0.057
-            # DM+shared on GCH, n = 3.0e6 cell-bins; 0.192 against 0.206 on
-            # HCG), so calibration does not choose; and DM's shrinkage is
-            # depth-dependent, C = excess * n/(alpha_0 + n), which drew a
-            # step at every domain boundary in the pooled region profile
-            # that --from-counts-formula mle removed.  Chosen so that one
-            # estimator serves both the per-bin and the pooled analyses.
+            # MLE is the signed default.  Against the drawn null the two
+            # estimators are indistinguishable (null median in robust sds
+            # -- C: -0.056 MLE against -0.057 DM+shared on GCH, n = 3.0e6
+            # cell-bins; 0.192 against 0.206 on HCG), so calibration does
+            # not choose between them.  MLE wins on the pooled side: DM's
+            # shrinkage is depth-dependent, C = excess * n/(alpha_0 + n),
+            # which drew a step at every domain boundary in the region
+            # profile that --from-counts-formula mle removed.  One
+            # estimator now serves both the per-bin and pooled analyses.
+            #
+            # An older full-set kNN cell-type comparison put DM ahead
+            # (DM+skip1 0.937 against MLE's best 0.930) and was the reason
+            # DM held this default.  Re-run after later changes to the MLE
+            # path, MLE no longer trails -- including at --skip-top-svd 0,
+            # which is why the skip rule below leaves MLE at 0.
             concordance_formula = _resolve_concordance_formula(args)
             concordance_combine = _resolve_concordance_combine(args)
             refinement_basis = (

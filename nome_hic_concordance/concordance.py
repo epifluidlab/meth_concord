@@ -1775,16 +1775,15 @@ def compute_signed_concordance_matrix(
         ``(k_i + α_i) / (n + α_total)`` — calibrated but, on POST-RWR
         counts, double-shrinks (RWR already pooled the cell graph, and the
         MoM concentration is inflated by RWR's variance reduction).
-        NOT a clean win either way.  DM leads on cell-type kNN over the
-        full cell set (DM+skip1 0.937 against MLE's best 0.930, and MLE
-        falls to ~0.80 with no batch correction); an earlier claim that MLE
-        lifts cell type onto the dominant SVD component came from
-        validating on the high-coverage labeled subset and did not survive
-        the full set.  MLE leads on the pooled side: DM's shrinkage is
-        depth-dependent, ``C = excess * n/(α₀ + n)``, which drew a step at
-        every domain boundary in the scaled region profile.  Against the
-        drawn null the two are indistinguishable, so calibration does not
-        arbitrate.
+        Against the drawn null the two are indistinguishable, so
+        calibration does not arbitrate between them.  MLE is preferred on
+        the pooled side: DM's shrinkage is depth-dependent,
+        ``C = excess * n/(α₀ + n)``, which drew a step at every domain
+        boundary in the scaled region profile.  An older full-set kNN
+        cell-type comparison put DM ahead (DM+skip1 0.937 against MLE's
+        best 0.930) and is why DM held the default; re-run after later
+        changes to the MLE path, MLE no longer trails, including at
+        ``skip_top_svd=0``.
     rwr_refinement_basis : {"raw", "postnorm"}
         For refinement passes (``rwr_n_refine_passes >= 1``): which form of
         the previous pass's Δ_signed to build the next k-NN graph from.
