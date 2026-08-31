@@ -495,3 +495,46 @@ def test_the_pdf_carries_no_type_3_fonts(tmp_path):
     joined = b"".join(blobs)
     assert joined.count(b"/Type3") == 0
     assert joined.count(b"/FontFile2") > 0        # embedded TrueType
+
+
+def test_the_band_is_never_drawn_in_a_run_s_own_colour(tmp_path):
+    """A band edge in the curve's colour reads as a second data line.
+
+    Where the band is narrow its two edges collapse into what looks like an
+    extra line hugging the diagonal; where it opens out in the tails they
+    separate into two.  One run then appears to have three curves, which is
+    exactly what a reader reported.  Panel (a) must contain exactly ONE line
+    in each run's palette colour: its own.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    qq = _mod()
+    rng = np.random.default_rng(21)
+    mat = rng.normal(0, 0.8, (80, 1)) + rng.normal(0, 1.0, (80, 400))
+    null = mat.ravel()
+    obs = null + 0.5 * rng.standard_t(3, null.size)
+    curves = {"gch": qq.qq_points(obs, null)}
+    tab = pd.DataFrame([{"run": "gch", "null_bias_z": 0.0, "lambda": 1.0,
+                         "spike_ratio": 1.0}])
+    band = qq.qq_band_cells(mat, n_boot=40, seed=0)
+    assert band is not None
+
+    real_close, held = plt.close, []
+    plt.close = lambda *a, **k: held.append(a)          # keep the figure
+    try:
+        qq.figure(tmp_path / "f.png", tab, curves, "coordination", "t",
+                  bands={"gch": band}, band_kind="cell")
+        fig = plt.figure(max(plt.get_fignums()))
+        panel_a = fig.axes[0]
+        want = mcolors.to_rgba(qq._PALETTE[0])
+        same = [ln for ln in panel_a.lines
+                if mcolors.to_rgba(ln.get_color()) == want]
+        assert len(same) == 1, [ln.get_color() for ln in panel_a.lines]
+        # and the band itself is actually present, as a filled collection
+        assert len(panel_a.collections) >= 1
+    finally:
+        plt.close = real_close
+        for n in plt.get_fignums():
+            plt.close(n)

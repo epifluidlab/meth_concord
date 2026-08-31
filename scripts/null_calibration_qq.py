@@ -369,10 +369,22 @@ def figure(path, table, curves, stat, title, bands=None, band_kind="cell"):
                 # is ~37x wider and is the honest one, so the answer is to
                 # widen the band rather than to hide it; an edge line keeps
                 # it visible even where the fill is sub-pixel.
-                a.fill_between(zx, blo, bhi, color=col, alpha=0.30, lw=0,
+                # GREY, NEVER THE RUN'S OWN COLOUR.  Drawn in the curve's
+                # colour, the band's two edges read as data: where it is
+                # narrow they collapse into what looks like a second line
+                # hugging the diagonal, and where it opens out in the tails
+                # they separate into two, so a single run appears to have
+                # three curves.  Giving the band its own hue makes it
+                # unmistakably not-a-curve, which is what lets it keep the
+                # edge lines it needs to stay visible when the fill goes
+                # sub-pixel.  Bands from different runs are all grey; they
+                # sit on the same diagonal and overlap anyway, and the
+                # question asked is only ever "does THIS curve leave its
+                # band".
+                a.fill_between(zx, blo, bhi, color="0.62", alpha=0.45, lw=0,
                                zorder=1)
-                a.plot(zx, blo, "-", color=col, lw=0.5, alpha=0.85, zorder=2)
-                a.plot(zx, bhi, "-", color=col, lw=0.5, alpha=0.85, zorder=2)
+                a.plot(zx, blo, "-", color="0.45", lw=0.5, zorder=1)
+                a.plot(zx, bhi, "-", color="0.45", lw=0.5, zorder=1)
                 lim = max(lim, float(np.max(np.abs(np.r_[blo, bhi]))))
                 drew_band = True
             a.plot(zx, zy, "-", lw=1.2, color=col, label=name, zorder=3)
@@ -389,7 +401,8 @@ def figure(path, table, curves, stat, title, bands=None, band_kind="cell"):
         handles, labels = a.get_legend_handles_labels()
         if drew_band and band_kind in _BAND_LABEL:
             import matplotlib.patches as mpatches
-            handles.append(mpatches.Patch(facecolor="0.6", alpha=0.3, lw=0))
+            handles.append(mpatches.Patch(facecolor="0.62", alpha=0.45,
+                                          edgecolor="0.45", lw=0.5))
             labels.append(_BAND_LABEL[band_kind])
         # A Q-Q curve sweeps corner to corner, so there is no corner a legend
         # can sit in without touching it; an opaque backing keeps both
