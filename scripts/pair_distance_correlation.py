@@ -43,11 +43,25 @@ no supplementary alignment, mapQ above the threshold on BOTH ends, both ends
 on the same chromosome.  They come from the same site_calls module the
 pipeline uses, so this script and Step 1 see the same reads.
 
-WHAT THE VALUES ARE.  The mean of the 0/1 calls on an end -- the fraction of
-its cytosines called accessible (GpC) or methylated (CpG).  Not the mixture
-model's posterior: that is Step 3/4 output and lives in 04_posteriors, while
-this script reads BAMs.  An end with one site therefore contributes a 0 or a
-1, and --min-sites-per-end trades pairs for a less granular value.
+WHAT THE VALUES ARE.  Two inputs, and they differ in what an end is worth:
+
+  --context-bed / --reference   a BAM pass, and the value is the MEAN of the
+      0/1 calls on the end -- the fraction of its cytosines called accessible
+      (GpC) or methylated (CpG).  An end with one site contributes a bare 0
+      or 1, which --min-sites-per-end trades pairs to avoid.
+
+  --posteriors                  Step 4's own output, and the value is the
+      mixture model's POSTERIOR for the end.  No BAM pass and no context
+      table: the site calling and the model already happened.  The third
+      panel joins the two contexts on (chrom, pos1, pos2), which is exactly
+      "pairs carrying both contexts on both ends", while the first two use
+      each context's table whole and keep the pairs the join drops.
+
+--exclude-bed drops a pair when EITHER end lands in one of the given regions
+-- a blacklist, a CGI+shore track, or both, merged.  Either end
+disqualifies it: a contact is a statement about two loci, so one end in a
+CpG island makes the pair a comparison between an island and something else
+rather than half a usable observation.
 """
 
 from __future__ import annotations
@@ -96,8 +110,134 @@ def measures_of(vals):
     return out
 
 
+def load_exclude(paths):
+    """Merged intervals per chromosome, from one or more BED files."""
+    if not paths:
+        return None
+    import gzip
+    by_chrom = {}
+    for path in paths:
+        op = gzip.open if str(path).endswith(".gz") else open
+        with op(path, "rt") as fh:
+            for line in fh:
+                if not line.strip() or line.startswith(("#", "track", "browser")):
+                    continue
+                f = line.split()
+                if len(f) < 3:
+                    continue
+                by_chrom.setdefault(f[0], []).append((int(f[1]), int(f[2])))
+    out = {}
+    for c, iv in by_chrom.items():
+        iv.sort()
+        merged = []
+        for lo, hi in iv:
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        out[c] = (np.array([m[0] for m in merged], np.int64),
+                  np.array([m[1] for m in merged], np.int64))
+    return out
+
+
+def excluded(regions, chrom, positions):
+    """True where a position falls in any excluded interval.
+
+    EITHER END DISQUALIFIES THE PAIR.  A contact is a statement about two
+    loci, so a pair with one end in a CpG island is not half usable -- its
+    concordance is a comparison between an island and something else, and
+    keeping it would put that comparison in every distance bin the island's
+    partners happen to land in.
+    """
+    if regions is None:
+        return np.zeros(len(positions), bool)
+    got = regions.get(str(chrom))
+    if got is None:
+        return np.zeros(len(positions), bool)
+    starts, ends = got
+    pos = np.asarray(positions, np.int64)
+    i = np.searchsorted(starts, pos, side="right") - 1
+    ok = i >= 0
+    out = np.zeros(pos.shape, bool)
+    out[ok] = pos[ok] < ends[i[ok]]
+    return out
+
+
+def collect_cell_posteriors(paths, edges, min_sites, exclude):
+    """One cell → {measure: (bins, x, y)} from Step-4 posteriors.
+
+    THE VALUES ARE THE MIXTURE MODEL'S POSTERIORS, not per-end means of 0/1
+    calls: this reads what Step 4 wrote rather than re-reading the BAM, so
+    an end with two sites carries the model's belief about it instead of a
+    bare 0, 0.5 or 1.
+
+    ``paths`` is {context: parquet}.  The third measure needs the SAME read
+    pair in both contexts, so the two tables are joined on (chrom, pos1,
+    pos2) -- Step 4 writes one row per pair per context, and the join is
+    exactly "pairs carrying both contexts on both ends".  The first two
+    measures use their own context's table whole, so they keep the pairs the
+    join would drop.
+    """
+    nb = len(edges) - 1
+    cols = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
+    tabs = {}
+    for ctx, path in paths.items():
+        if path is None or not Path(path).exists():
+            continue
+        t = pd.read_parquet(path, columns=cols)
+        t = t[(t["n1"] >= min_sites) & (t["n2"] >= min_sites)]
+        t = t[np.isfinite(t["posterior1"]) & np.isfinite(t["posterior2"])]
+        if exclude is not None and len(t):
+            drop = np.zeros(len(t), bool)
+            for c, sub in t.groupby("chrom", sort=False):
+                idx = sub.index
+                bad = (excluded(exclude, c, sub["pos1"].to_numpy())
+                       | excluded(exclude, c, sub["pos2"].to_numpy()))
+                drop[t.index.get_indexer(idx)] = bad
+            t = t[~drop]
+        tabs[ctx] = t.reset_index(drop=True)
+
+    def _binned(t):
+        d = np.abs(t["pos2"].to_numpy(np.int64) - t["pos1"].to_numpy(np.int64))
+        keep = (d >= edges[0]) & (d <= edges[-1])
+        b = np.clip(np.digitize(d[keep], edges) - 1, 0, nb - 1).astype(np.int64)
+        return keep, b
+
+    got = {}
+    for m, ctx in (("gg", "GCH"), ("hh", "HCG")):
+        t = tabs.get(ctx)
+        if t is None or not len(t):
+            got[m] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
+            continue
+        keep, b = _binned(t)
+        # Leftmost end first, so a difference's sign is consistent later.
+        p1 = t["posterior1"].to_numpy(float)[keep]
+        p2 = t["posterior2"].to_numpy(float)[keep]
+        lo = t["pos1"].to_numpy(np.int64)[keep] <= t["pos2"].to_numpy(np.int64)[keep]
+        got[m] = (b, np.where(lo, p1, p2), np.where(lo, p2, p1))
+
+    g, h = tabs.get("GCH"), tabs.get("HCG")
+    if g is not None and h is not None and len(g) and len(h):
+        j = g.merge(h, on=["chrom", "pos1", "pos2"], suffixes=("_g", "_h"))
+        if len(j):
+            keep, b = _binned(j)
+            lo = (j["pos1"].to_numpy(np.int64)[keep]
+                  <= j["pos2"].to_numpy(np.int64)[keep])
+            gd = (j["posterior1_g"].to_numpy(float)[keep]
+                  - j["posterior2_g"].to_numpy(float)[keep])
+            hd = (j["posterior1_h"].to_numpy(float)[keep]
+                  - j["posterior2_h"].to_numpy(float)[keep])
+            got["gh"] = (b, np.where(lo, gd, -gd), np.where(lo, hd, -hd))
+        else:
+            got["gh"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
+    else:
+        got["gh"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
+    n_pairs = max((len(t) for t in tabs.values()), default=0)
+    return got, n_pairs
+
+
 def collect_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
-                 max_pairs, min_sites, seed):
+                 max_pairs, min_sites, seed, exclude=None):
     """One cell → {measure: [(bin, x, y), ...]}.
 
     The per-pair values are KEPT rather than streamed into running sums,
@@ -114,6 +254,9 @@ def collect_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
     for _chrom, mid1, mid2, c1, c2 in iter_cell_read_pairs(
             bam_path, ctx_positions, trim_ends=trim_ends, mapq_min=mapq_min,
             max_pairs_per_cell=max_pairs, rng=rng):
+        if exclude is not None and bool(
+                excluded(exclude, _chrom, [mid1, mid2]).any()):
+            continue
         d = abs(int(mid2) - int(mid1))
         if d < edges[0] or d > edges[-1]:
             continue
@@ -269,6 +412,34 @@ def main(argv=None) -> int:
     ap.add_argument("--context-bed-offset", type=int, default=0)
     ap.add_argument("--dbsnp-vcf", default=None)
     ap.add_argument("--max-cells", type=int, default=0)
+    ap.add_argument("--posteriors", default=None,
+                    metavar="GCH:DIR,HCG:DIR",
+                    help="Read Step-4 posteriors instead of the BAMs: "
+                         "'GCH:.../context_GCH/04_posteriors,"
+                         "HCG:.../context_HCG/04_posteriors'.  The values "
+                         "are then the mixture model's posterior per END, "
+                         "not the per-end mean of 0/1 calls, so an end with "
+                         "two sites carries the model's belief rather than a "
+                         "bare 0, 0.5 or 1.  The third panel needs the SAME "
+                         "read pair in both contexts, so the two tables are "
+                         "joined on (chrom, pos1, pos2) -- Step 4 writes one "
+                         "row per pair per context and that join IS 'pairs "
+                         "carrying both contexts on both ends'.  The first "
+                         "two panels use their own table whole, so they keep "
+                         "the pairs the join drops.  Cell names come from "
+                         "--samples and the files are <cell>.posteriors."
+                         "parquet.")
+    ap.add_argument("--exclude-bed", action="append", default=None,
+                    metavar="PATH",
+                    help="Drop a read pair if EITHER end falls in one of "
+                         "these regions.  Repeatable, and the intervals are "
+                         "merged across files, so a blacklist and a CGI+shore "
+                         "track can be given together.  Either end "
+                         "disqualifies the pair: a contact is a statement "
+                         "about two loci, so one end in a CpG island makes "
+                         "the pair a comparison between an island and "
+                         "something else rather than half a usable "
+                         "observation.")
     ap.add_argument("--min-dist", type=float, default=1e2)
     ap.add_argument("--max-dist", type=float, default=1e7)
     ap.add_argument("--bins-per-decade", type=int, default=1,
@@ -317,7 +488,17 @@ def main(argv=None) -> int:
     samples = load_samples(args.samples)
     if args.max_cells and args.max_cells > 0:
         samples = samples.iloc[: args.max_cells]
-    if args.context_bed:
+    if args.posteriors:
+        # Step 4 already did the site calling and the mixture model, so no
+        # context table and no BAM pass are needed here.
+        pdirs = _parse_context_bed(args.posteriors)
+        for need in ("GCH", "HCG"):
+            if need not in pdirs:
+                sys.exit(f"--posteriors must define {need}: the third panel "
+                         f"joins the two contexts on the same read pair "
+                         f"(got {list(pdirs)}).")
+        ctx_positions = None
+    elif args.context_bed:
         bed = _parse_context_bed(args.context_bed)
         for need in ("GCH", "HCG"):
             if need not in bed:
@@ -331,24 +512,56 @@ def main(argv=None) -> int:
             args.reference, str(out / "context"), contexts=["GCH", "HCG"],
             dbsnp_vcf=args.dbsnp_vcf, n_threads=args.threads)
     else:
-        sys.exit("provide --context-bed or --reference.")
-    if args.exclude_chrom:
+        sys.exit("provide --posteriors, --context-bed or --reference.")
+    if args.exclude_chrom and ctx_positions is not None:
         drop = {c.strip() for c in args.exclude_chrom.split(",") if c.strip()}
         ctx_positions = {k: {c: v for c, v in d.items() if c not in drop}
                          for k, d in ctx_positions.items()}
 
+    exclude = load_exclude(args.exclude_bed)
+    if exclude is not None:
+        n_iv = sum(len(v[0]) for v in exclude.values())
+        n_bp = sum(int((v[1] - v[0]).sum()) for v in exclude.values())
+        print(f"  --exclude-bed: {n_iv:,} merged intervals over "
+              f"{len(exclude)} contigs, {n_bp / 1e6:.1f} Mb; a pair is "
+              f"dropped if EITHER end lands in one", file=sys.stderr)
+    print(f"  values: "
+          + ("Step-4 posteriors per end (--posteriors)"
+             if args.posteriors else
+             "per-end mean of the 0/1 site calls (BAM pass)"),
+          file=sys.stderr)
     print(f"  {len(samples)} cells, {nb} distance bins "
           f"({args.min_dist:g}-{args.max_dist:g} bp, "
           f"{args.bins_per_decade}/decade)", file=sys.stderr)
-    jobs = [(row["bam_path"], ctx_positions, edges, args.trim_ends,
-             args.mapq_min, args.max_pairs_per_cell, args.min_sites_per_end,
-             args.seed + i) for i, (_, row) in enumerate(samples.iterrows())]
+    if args.posteriors:
+        _pd = _parse_context_bed(args.posteriors)
+        jobs, missing = [], []
+        for _, row in samples.iterrows():
+            paths = {c: Path(d) / f"{row['cell_name']}.posteriors.parquet"
+                     for c, d in _pd.items()}
+            if not any(v.exists() for v in paths.values()):
+                missing.append(row["cell_name"])
+                continue
+            jobs.append((paths, edges, args.min_sites_per_end, exclude))
+        if missing:
+            print(f"  {len(missing)} of {len(samples)} cells have no "
+                  f"posterior file and are skipped (first: "
+                  f"{missing[0]})", file=sys.stderr)
+        if not jobs:
+            sys.exit("--posteriors: no <cell>.posteriors.parquet found for "
+                     "any cell in --samples")
+        fn = collect_cell_posteriors
+    else:
+        jobs = [(row["bam_path"], ctx_positions, edges, args.trim_ends,
+                 args.mapq_min, args.max_pairs_per_cell,
+                 args.min_sites_per_end, args.seed + i, exclude)
+                for i, (_, row) in enumerate(samples.iterrows())]
+        fn = collect_cell
     if args.threads > 1:
         from joblib import Parallel, delayed
-        got = Parallel(n_jobs=args.threads)(
-            delayed(collect_cell)(*j) for j in jobs)
+        got = Parallel(n_jobs=args.threads)(delayed(fn)(*j) for j in jobs)
     else:
-        got = [collect_cell(*j) for j in jobs]
+        got = [fn(*j) for j in jobs]
     per_cell = [g[0] for g in got]
     n_pairs_total = sum(g[1] for g in got)
 
