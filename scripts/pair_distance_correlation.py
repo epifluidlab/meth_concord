@@ -317,29 +317,46 @@ def _excluded_rows(t, exclude):
     return drop
 
 
-def _cap(arrs, max_n, rng):
-    """Uniformly subsample the parallel arrays of one measure.
+def _cap(arrs, max_n, rng, per_bin=0, nb=0):
+    """Subsample one measure's arrays.  THIS IS WHAT BOUNDS MEMORY.
 
-    THIS IS WHAT BOUNDS MEMORY.  Every cell's observations are held until
-    the permutation runs -- the null needs the raw values, and a permutation
-    cannot be done on a running sum -- so an uncapped cohort accumulates
-    every cis pair of every cell at once.  A 1,577-cell run was OOM-killed
-    part way through the read for exactly this reason, with
-    --max-pairs-per-cell honoured on the BAM path and silently ignored here.
+    Every cell's observations are held until the permutation runs -- the
+    null needs the raw values, and a permutation cannot be done on a running
+    sum -- so an uncapped cohort accumulates every cis pair of every cell at
+    once.  A 1,577-cell run was OOM-killed part way through the read for
+    exactly this, with --max-pairs-per-cell honoured on the BAM path and
+    silently ignored here.
 
-    Uniform over rows, so the distance distribution survives: capping the
-    long-range bin alone would change the axis.
+    PER BIN IS THE RIGHT CAP, and a uniform one is close to useless.  Contact
+    frequency decays with distance, so the pairs are overwhelmingly short and
+    a uniform subsample keeps that shape -- which starves exactly the bins
+    the axis exists for.  On a 500,000-pair cell whose bins held 450,093 /
+    44,792 / 4,599 / 471 / 45, a uniform cap of 50,000 left the longest bin
+    with TWO pairs.  A per-bin cap of 5,000 kept all 45, all 471 and all
+    4,599, capped only the two crowded bins, and used less memory doing it.
+
+    ``max_n`` (uniform, over everything) is still applied when given, after
+    the per-bin cap, as a hard ceiling.
     """
     b, x, y = arrs
-    if not max_n or b.size <= max_n:
-        return arrs
-    k = rng.choice(b.size, int(max_n), replace=False)
-    k.sort()
-    return b[k], x[k], y[k]
+    if per_bin and b.size:
+        keep = []
+        for i in range(int(nb)):
+            idx = np.flatnonzero(b == i)
+            if idx.size > int(per_bin):
+                idx = rng.choice(idx, int(per_bin), replace=False)
+            keep.append(idx)
+        k = np.sort(np.concatenate(keep)) if keep else np.empty(0, np.int64)
+        if k.size < b.size:
+            b, x, y = b[k], x[k], y[k]
+    if max_n and b.size > max_n:
+        k = np.sort(rng.choice(b.size, int(max_n), replace=False))
+        b, x, y = b[k], x[k], y[k]
+    return b, x, y
 
 
 def collect_cell_posteriors(paths, edges, min_sites, exclude, max_pairs=0,
-                            seed=0):
+                            seed=0, per_bin=0):
     """One cell → {measure: (bins, x, y)} from Step-4 posteriors.
 
     THE VALUES ARE THE MIXTURE MODEL'S POSTERIORS, not per-end means of 0/1
@@ -394,7 +411,7 @@ def collect_cell_posteriors(paths, edges, min_sites, exclude, max_pairs=0,
         lo = (t["pos1"].to_numpy(np.int64)[keep]
               <= t["pos2"].to_numpy(np.int64)[keep])
         got[m] = _cap((b, np.where(lo, p1, p2), np.where(lo, p2, p1)),
-                      max_pairs, rng)
+                      max_pairs, rng, per_bin, nb)
 
     g, h = tabs.get("GCH"), tabs.get("HCG")
     got["gh"] = got["gx"] = empty
@@ -410,13 +427,15 @@ def collect_cell_posteriors(paths, edges, min_sites, exclude, max_pairs=0,
             h2 = j["posterior2_h"].to_numpy(np.float32)[keep]
             gd, hd = g1 - g2, h1 - h2
             got["gh"] = _cap((b, np.where(lo, gd, -gd),
-                              np.where(lo, hd, -hd)), max_pairs, rng)
+                              np.where(lo, hd, -hd)), max_pairs, rng,
+                             per_bin, nb)
             # GCH one end against HCG the OTHER, both orientations, so a
             # pair contributes two rows here and one everywhere else.
             got["gx"] = _cap((np.concatenate([b, b]),
                               np.concatenate([g1, g2]),
                               np.concatenate([h2, h1])),
-                             2 * max_pairs if max_pairs else 0, rng)
+                             2 * max_pairs if max_pairs else 0, rng,
+                             2 * per_bin if per_bin else 0, nb)
     n_pairs = max((len(t) for t in tabs.values()), default=0)
     return got, n_pairs
 
@@ -783,6 +802,23 @@ def main(argv=None) -> int:
                          "eligible set is the intersection.")
     ap.add_argument("--trim-ends", type=int, default=5)
     ap.add_argument("--mapq-min", type=int, default=30)
+    ap.add_argument("--max-pairs-per-bin", type=int, default=0,
+                    metavar="N",
+                    help="Cap the observations kept per cell per measure per "
+                         "DISTANCE BIN (0 = unlimited).  THIS IS THE ONE TO "
+                         "USE.  Contact frequency decays with distance, so "
+                         "pairs are overwhelmingly short and a uniform cap "
+                         "keeps that shape -- which starves exactly the bins "
+                         "the axis exists for.  On a 500,000-pair cell whose "
+                         "bins held 450,093 / 44,792 / 4,599 / 471 / 45, "
+                         "--max-pairs-per-cell 50000 left the longest bin "
+                         "with TWO pairs, while --max-pairs-per-bin 5000 "
+                         "kept all 45, all 471 and all 4,599 and capped only "
+                         "the two crowded bins -- on less memory, since the "
+                         "ceiling is N x bins rather than N.  Budget it as "
+                         "cells x measures x bins x N x 16 bytes; at 1,577 "
+                         "cells, 5 measure-slots and 5 bins that is about "
+                         "0.63 GB per 1,000.")
     ap.add_argument("--max-pairs-per-cell", type=int, default=0,
                     metavar="N",
                     help="Cap the observations kept per cell per measure "
@@ -794,8 +830,11 @@ def main(argv=None) -> int:
                          "cell at once.  A 1,577-cell run was OOM-killed "
                          "part way through the read for exactly this.  The "
                          "subsample is uniform over rows, so the distance "
-                         "distribution survives.  Applies to both inputs; "
-                         "on the BAM path it also stops the parse early.")
+                         "distribution survives -- which is the problem: "
+                         "that distribution is dominated by short pairs, so "
+                         "prefer --max-pairs-per-bin and keep this as a hard "
+                         "ceiling if at all.  Applies to both inputs; on the "
+                         "BAM path it also stops the parse early.")
     ap.add_argument("--min-pairs", type=int, default=50, metavar="N",
                     help="Bins with fewer eligible pairs report NaN rather "
                          "than a correlation of three points.")
@@ -889,7 +928,8 @@ def main(argv=None) -> int:
                 missing.append(row["cell_name"])
                 continue
             jobs.append((paths, edges, args.min_sites_per_end, exclude,
-                         args.max_pairs_per_cell, args.seed + len(jobs)))
+                         args.max_pairs_per_cell, args.seed + len(jobs),
+                         args.max_pairs_per_bin))
         if missing:
             print(f"  {len(missing)} of {len(samples)} cells have no "
                   f"posterior file and are skipped (first: "
@@ -912,11 +952,22 @@ def main(argv=None) -> int:
 
     _obs = sum(int(c[m][0].size) for c in per_cell for m, _ in _MEASURES)
     _gb = _obs * (8 + 4 + 4) / 1e9        # int64 bin + two float32
+    _capped = bool(args.max_pairs_per_bin or args.max_pairs_per_cell)
     print(f"  {_obs:,} observations held ({_gb:.2f} GB); the null needs the "
           f"raw values, so they stay resident until the permutation runs"
-          + ("" if args.max_pairs_per_cell else
-             ".  --max-pairs-per-cell is 0 (unlimited) -- set it if this "
-             "grows past your memory"), file=sys.stderr)
+          + ("" if _capped else
+             ".  Neither --max-pairs-per-bin nor --max-pairs-per-cell is "
+             "set -- prefer the first if this grows past your memory"),
+          file=sys.stderr)
+    # PER-BIN RETENTION, because a cap that silently emptied the long bins
+    # would look like an absence of long-range pairs rather than a setting.
+    _gg = np.concatenate([c["gg"][0] for c in per_cell
+                          if c["gg"][0].size]) if per_cell else np.empty(0)
+    if _gg.size:
+        _cnt = np.bincount(_gg.astype(int), minlength=nb)
+        print("  GCH-GCH observations per distance bin: "
+              + ", ".join(f"{edges[i]:.0f}-{edges[i+1]:.0f}: {_cnt[i]:,}"
+                          for i in range(nb)), file=sys.stderr)
     pooled = pool_cells(per_cell, nb)
     n_used = sum(1 for c in per_cell
                  if any(c[m][0].size for m, _ in _MEASURES))

@@ -755,8 +755,91 @@ def test_the_run_reports_how_much_it_is_holding(tmp_path):
     out, r = _run(tmp_path, s, gd, hd, "held", "--n-permutations", "10")
     assert r.returncode == 0, r.stderr[-2000:]
     assert "observations held" in r.stderr
-    assert "--max-pairs-per-cell is 0 (unlimited)" in r.stderr
+    assert "Neither --max-pairs-per-bin nor --max-pairs-per-cell" in r.stderr
     out2, r2 = _run(tmp_path, s, gd, hd, "held2", "--n-permutations", "10",
-                    "--max-pairs-per-cell", "200")
+                    "--max-pairs-per-bin", "200")
     assert "observations held" in r2.stderr
-    assert "unlimited" not in r2.stderr
+    assert "Neither" not in r2.stderr
+
+
+def test_a_uniform_cap_starves_the_long_range_bins():
+    """Contact frequency decays with distance, so pairs are overwhelmingly
+    short and a uniform subsample keeps that shape -- which empties exactly
+    the bins the axis exists for."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    # Bin occupancies with a realistic decay.
+    counts = [450_093, 44_792, 4_599, 471, 45]
+    b = np.concatenate([np.full(c, i, np.int64)
+                        for i, c in enumerate(counts)])
+    x = rng.random(b.size).astype(np.float32)
+    y = rng.random(b.size).astype(np.float32)
+
+    uni = m._cap((b, x, y), 50_000, np.random.default_rng(1))
+    per = m._cap((b, x, y), 0, np.random.default_rng(1), per_bin=5_000, nb=5)
+    u = np.bincount(uni[0], minlength=5)
+    p = np.bincount(per[0], minlength=5)
+    # The uniform cap all but empties the longest bin.
+    assert u[4] < 10, u
+    # The per-bin cap keeps every one of them, and caps only the crowded two.
+    assert p[4] == 45 and p[3] == 471 and p[2] == 4_599
+    assert p[0] == 5_000 and p[1] == 5_000
+    # ... on LESS memory, since the ceiling is N x bins rather than N.
+    assert per[0].size < uni[0].size
+
+
+def test_the_per_bin_cap_leaves_a_thin_bin_alone():
+    m = _mod()
+    rng = np.random.default_rng(2)
+    b = np.concatenate([np.full(9000, 0, np.int64), np.full(12, 1, np.int64)])
+    x = rng.random(b.size).astype(np.float32)
+    y = rng.random(b.size).astype(np.float32)
+    got = m._cap((b, x, y), 0, rng, per_bin=1000, nb=2)
+    cnt = np.bincount(got[0], minlength=2)
+    assert cnt.tolist() == [1000, 12]
+
+
+def test_both_caps_compose_with_the_per_bin_one_first():
+    """--max-pairs-per-cell stays usable as a hard ceiling on top."""
+    m = _mod()
+    rng = np.random.default_rng(3)
+    b = np.concatenate([np.full(5000, i, np.int64) for i in range(4)])
+    x = rng.random(b.size).astype(np.float32)
+    y = rng.random(b.size).astype(np.float32)
+    got = m._cap((b, x, y), 1200, rng, per_bin=1000, nb=4)
+    assert got[0].size == 1200            # 4 x 1000 then trimmed to 1200
+    only_bin = m._cap((b, x, y), 0, rng, per_bin=1000, nb=4)
+    assert only_bin[0].size == 4000
+
+
+def test_the_run_reports_what_survived_in_each_bin(tmp_path):
+    """A cap that silently emptied the long bins would look like an absence
+    of long-range pairs rather than a setting."""
+    s, gd, hd = _posterior_cells(tmp_path, n_cells=4, n=3000)
+    out, r = _run(tmp_path, s, gd, hd, "perbin", "--n-permutations", "10",
+                  "--max-pairs-per-bin", "300")
+    assert r.returncode == 0, r.stderr[-2000:]
+    line = [l for l in r.stderr.splitlines() if "per distance bin" in l][0]
+    assert "GCH-GCH observations per distance bin" in line
+    # 4 cells x 300 per bin, so every bin caps at the same number.
+    import re
+    # The counts follow the RANGE label, so anchor on it -- a bare ": (\d+)"
+    # also matches the "100" of "100-1000".
+    got = [int(v.replace(",", ""))
+           for v in re.findall(r"\d+-\d+: ([\d,]+)", line)]
+    assert len(got) == 5
+    assert max(got) <= 1200               # 4 cells x 300 per bin
+    assert len(set(got)) == 1             # all bins capped alike here
+
+
+def test_per_bin_is_named_as_the_one_to_use():
+    """Checked on the RENDERED help, not the source: argparse strings are
+    split across lines, so the phrase never appears contiguously in the
+    file and the first version of this test passed on nothing."""
+    import subprocess
+    import sys
+    out = subprocess.run([sys.executable, str(_SCRIPT), "--help"],
+                         capture_output=True, text=True).stdout
+    flat = " ".join(out.split())
+    assert "THIS IS THE ONE TO USE" in flat
+    assert "prefer --max-pairs-per-bin" in flat
