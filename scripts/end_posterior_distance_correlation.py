@@ -70,6 +70,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -78,6 +80,7 @@ if str(_REPO_ROOT) not in sys.path:
 from nome_hic_concordance.distance_stats import (      # noqa: E402
     accumulate, bootstrap_delta, build_edges, corr_from_acc, fdr,
     fisher_z_cell, fisher_z_pooled, new_acc, stars)
+from nome_hic_concordance.progress import Progress      # noqa: E402
 
 logger = logging.getLogger("end_posterior_dist")
 
@@ -204,15 +207,25 @@ def _load_cell(paths: dict[str, Path], cell: str, min_sites: int,
 
     Returns ``{ctx: DataFrame[chrom,pos1,pos2,distance,p1,p2]}``; contexts with
     no file for this cell are omitted rather than faked.
+
+    ``chrom`` comes back CATEGORICAL, read straight out of the parquet
+    dictionary instead of being materialised as one Python string per row.
+    The join in :func:`joined_pairs` is the hottest step of the run, and
+    factorising an object column there hashes a Python object per row while
+    HOLDING THE GIL -- measured at 1.63x scaling on 8 threads against 2.48x
+    once the column is categorical.  The contexts are then given a common
+    category set, because pandas falls back to object when merging
+    categoricals whose categories differ, which would hand the cost straight
+    back; the union is over ~25 chromosome names, not rows.
     """
     out = {}
     for ctx, d in paths.items():
         p = d / f"{cell}.posteriors.parquet"
         if not p.exists():
             continue
-        df = pd.read_parquet(p, columns=["chrom", "pos1", "pos2", "n1", "n2",
-                                         "distance", "posterior1",
-                                         "posterior2"])
+        df = pq.read_table(p, columns=["chrom", "pos1", "pos2", "n1", "n2",
+                                       "distance", "posterior1", "posterior2"]
+                           ).to_pandas(categories=["chrom"])
         df = df[(df["n1"] >= min_sites) & (df["n2"] >= min_sites)
                 & df["posterior1"].notna() & df["posterior2"].notna()]
         if df.empty:
@@ -223,6 +236,13 @@ def _load_cell(paths: dict[str, Path], cell: str, min_sites: int,
                 continue
         out[ctx] = df.rename(columns={"posterior1": "p1", "posterior2": "p2"})[
             ["chrom", "pos1", "pos2", "distance", "p1", "p2"]]
+    if len(out) > 1:
+        cats = None
+        for f in out.values():
+            c = f["chrom"].cat.categories
+            cats = c if cats is None else cats.union(c)
+        for ctx, f in out.items():
+            out[ctx] = f.assign(chrom=f["chrom"].cat.set_categories(cats))
     return out
 
 
@@ -558,7 +578,26 @@ def _figure_by_group(per_group, out_path, args, colors=None):
 _W: dict = {}
 
 
+#: Cell count at or above which --backend auto switches to processes.  Worker
+#: start-up is a flat cost; below this it outweighs the GIL it buys out of.
+_PROCESS_FROM_CELLS = 96
+
+
+def _pin_inner_threads() -> None:
+    """Stop pyarrow opening a full thread pool inside every worker.
+
+    pyarrow defaults BOTH its cpu and io pools to the machine's core count, so
+    ``--n-threads 10`` really asked for 10 workers x 16 inner threads on a
+    10-core box.  The oversubscription is why utilisation looked high for the
+    first few cells and then collapsed.  Parallelism here is per CELL, so one
+    inner thread per worker is what we want.
+    """
+    pa.set_cpu_count(1)
+    pa.set_io_thread_count(1)
+
+
 def _init_worker(paths, edges, args, pools, batch_of, merged, excl_chrom):
+    _pin_inner_threads()
     _W.update(paths=paths, edges=edges, args=args, pools=pools,
               batch_of=batch_of, merged=merged, excl_chrom=excl_chrom)
 
@@ -569,6 +608,30 @@ def _worker(job):
     return _accumulate_cell(cell, i, _W["paths"], _W["edges"], _W["args"],
                             _W["pools"], _W["batch_of"], _W["merged"],
                             _W["excl_chrom"])
+
+
+def _drain(results, accs, per_cell, total, label):
+    """Fold each cell's accumulators in AS IT ARRIVES, reporting progress.
+
+    ``list(executor.map(...))`` would hold every cell's accumulators before
+    folding any of them, and would show nothing until the last one landed.
+    These runs are thousands of cells long, so both matter: the fold keeps
+    only the running totals plus what the bootstrap genuinely needs, and the
+    count gives an ETA instead of a silent hour.
+    """
+    n_pairs = n_null = 0
+    bar = Progress(total, f"{label}: cells")
+    try:
+        for a, np_, nn_ in results:
+            for k in accs:
+                accs[k] += a[k]
+            per_cell.append(a)
+            n_pairs += np_
+            n_null += nn_
+            bar.update()
+    finally:
+        bar.close()
+    return n_pairs, n_null
 
 
 def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
@@ -654,19 +717,50 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
 
 
 def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
-    """Donor end pools for --null-scope pooled, one per batch stratum."""
-    parts: dict[str, list] = {}
-    for ci, cell in enumerate(cells):
+    """Donor end pools for --null-scope pooled, one per batch stratum.
+
+    Parallel over cells, because this is a SECOND full pass of the same
+    load-and-join that dominates the run: left serial it silently doubled the
+    wall clock of every --null-scope pooled run while nine of ten cores idled.
+    Threads rather than processes -- the per-cell end tables are large and
+    would cost more to pickle back than the join costs to compute, and with
+    ``chrom`` categorical the join no longer pins the GIL.
+    """
+    def _one(job):
+        ci, cell = job
         j = joined_pairs(_load_cell(paths, cell, args.min_sites, merged,
                                     excl_chrom))
         if j is None or j.empty:
-            continue
+            return None
         key = batch_of.get(cell, "") if batch_of else ""
         # Same enumeration as run_group's job list, so a cell's ids here and
         # in its own pass agree without either side recording an offset.
-        parts.setdefault(key, []).append(
-            end_table(j, {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")},
-                      _pair_base(ci)))
+        return key, end_table(j, {"g": ("p1_g", "p2_g"),
+                                  "h": ("p1_h", "p2_h")}, _pair_base(ci))
+
+    jobs = list(enumerate(cells))
+    parts: dict[str, list] = {}
+    bar = Progress(len(jobs), "pooled donors: cells")
+    try:
+        # getattr: callers that build a minimal args for this one helper
+        # never had to supply a thread count, and should not start to.
+        if getattr(args, "n_threads", 1) > 1 and len(jobs) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            _pin_inner_threads()
+            with ThreadPoolExecutor(max_workers=args.n_threads) as ex:
+                it = ex.map(_one, jobs)
+                for got in it:
+                    if got is not None:
+                        parts.setdefault(got[0], []).append(got[1])
+                    bar.update()
+        else:
+            for job in jobs:
+                got = _one(job)
+                if got is not None:
+                    parts.setdefault(got[0], []).append(got[1])
+                bar.update()
+    finally:
+        bar.close()
     pools = {}
     for k, ps in parts.items():
         pos = np.concatenate([p[0] for p in ps])
@@ -695,7 +789,11 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
     jobs = [(c, i) for i, c in enumerate(cells)]
     if executor is not None and len(cells) > 1:
         # The pool is created once for the whole run and reused across groups.
-        chunk = max(1, len(jobs) // (args.n_threads * 8))
+        # Only ProcessPoolExecutor.map honours chunksize; threads ignore it.
+        # Keep chunks small so one straggling worker cannot be left holding a
+        # long tail of cells while the rest idle -- cells differ several-fold
+        # in depth, which is exactly when a coarse chunking strands work.
+        chunk = max(1, min(8, len(jobs) // (args.n_threads * 16)))
         if args.backend == "process" and pools:
             # Pooled donors are per GROUP, so they cannot ride on a pool built
             # once for the whole run: a shared initializer would hand every
@@ -706,20 +804,18 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                     max_workers=args.n_threads, initializer=_init_worker,
                     initargs=(paths, edges, args, pools, batch_of, merged,
                               excl_chrom)) as gex:
-                out = list(gex.map(_worker, jobs, chunksize=chunk))
+                out = _drain(gex.map(_worker, jobs, chunksize=chunk),
+                             accs, per_cell, len(jobs), label)
         elif args.backend == "process":
-            out = list(executor.map(_worker, jobs, chunksize=chunk))
+            out = _drain(executor.map(_worker, jobs, chunksize=chunk),
+                         accs, per_cell, len(jobs), label)
         else:
-            out = list(executor.map(
+            out = _drain(executor.map(
                 lambda ci: _accumulate_cell(ci[0], ci[1], paths, edges, args,
                                             pools, batch_of, merged,
-                                            excl_chrom), jobs))
-        for a, np_, nn_ in out:
-            for k in accs:
-                accs[k] += a[k]
-            per_cell.append(a)
-            n_pairs += np_
-            n_null += nn_
+                                            excl_chrom), jobs),
+                         accs, per_cell, len(jobs), label)
+        n_pairs, n_null = out
     else:
         for c, i in jobs:
             a, np_, nn_ = _accumulate_cell(c, i, paths, edges, args, pools,
@@ -864,14 +960,18 @@ def main(argv=None) -> int:
     ap.add_argument("--exclude-chrom", default="",
                     help="Comma-separated chromosomes to drop entirely "
                          "(e.g. chrM,chrX,chrY).")
-    ap.add_argument("--backend", choices=["thread", "process"],
-                    default="thread",
-                    help="'thread' (default) measured fastest: on 16 cells x "
-                         "250k pairs, 8 threads took 5.8 s against 8.6 s "
-                         "serial and 8.0 s with processes, whose worker "
-                         "start-up and argument pickling outweigh the GIL they "
-                         "escape.  Try 'process' on a machine with many more "
-                         "cores, where that trade may reverse.")
+    ap.add_argument("--backend", choices=["auto", "thread", "process"],
+                    default="auto",
+                    help="'auto' (default) takes 'thread' below "
+                         f"{_PROCESS_FROM_CELLS} cells and 'process' at or "
+                         "above it.  Starting the workers costs a flat ~1.1 s, "
+                         "so on 8 workers threads win small runs (8 cells: "
+                         "0.24 s against 1.15 s) and lose big ones (192 "
+                         "cells: 3.26 s against 2.50 s), crossing near "
+                         f"{_PROCESS_FROM_CELLS}.  The margin grows with core "
+                         "count, since the GIL the processes escape is "
+                         "contended by every extra thread.  Force either to "
+                         "override.")
     ap.add_argument("--n-threads", type=int, default=4,
                     help="Cells are scored in parallel and their accumulators "
                          "summed; each cell gets its own seeded RNG, so the "
@@ -961,6 +1061,17 @@ def main(argv=None) -> int:
             groups.setdefault(g, []).append(c)
     executor = None
     if args.n_threads > 1 and len(cells) > 1:
+        # Resolve 'auto' ONCE, here, so run_group and the workers all see a
+        # concrete backend rather than each re-deciding it.
+        if args.backend == "auto":
+            args.backend = ("process" if len(cells) >= _PROCESS_FROM_CELLS
+                            else "thread")
+            logger.info(f"--backend auto -> {args.backend} ({len(cells)} "
+                        f"cells, threshold {_PROCESS_FROM_CELLS}).")
+        # Our parallelism is per cell, so pyarrow must not also fan out: in the
+        # parent this stops its pool competing with our threads, and
+        # _init_worker repeats it inside each process.
+        _pin_inner_threads()
         if args.backend == "process":
             from concurrent.futures import ProcessPoolExecutor
             executor = ProcessPoolExecutor(
@@ -972,6 +1083,8 @@ def main(argv=None) -> int:
             executor = ThreadPoolExecutor(max_workers=args.n_threads)
         logger.info(f"Parallel over cells: {args.n_threads} "
                     f"{args.backend}(s), pool reused across groups.")
+    elif args.backend == "auto":            # serial: nothing to choose
+        args.backend = "thread"
     try:
         per_group = {}
         for label, gcells in groups.items():

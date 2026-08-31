@@ -627,3 +627,181 @@ def test_fdr_is_applied_across_the_whole_figure(tmp_path):
     assert np.isnan(q[3])
     assert (q[np.isfinite(q)] >= p[np.isfinite(p)] - 1e-12).all()
     assert ds.stars(0.0005) == "***" and ds.stars(0.2) == ""
+
+
+# ------------------------------------------- parallel scaling (regression) --
+
+def _args(m, **kw):
+    """The args these helpers actually read, defaulted the way main() does."""
+    import argparse
+    a = argparse.Namespace(
+        min_sites=2, seed=42, null_type="distance-matched",
+        null_scope="cell", null_window=1000,
+        null_anchor_window=10_000_000, n_threads=1)
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_load_cell_returns_categorical_chrom_with_shared_categories(tmp_path):
+    """The join key must not be an object column.
+
+    Factorising object dtype inside the merge hashes one Python string per row
+    while holding the GIL, which is what stopped --n-threads from scaling
+    (1.63x on 8 threads, against 2.48x once categorical).  The two contexts
+    must also share ONE category set: pandas quietly falls back to object when
+    merging categoricals whose categories differ, which would hand the whole
+    cost straight back with every test still passing.
+    """
+    m = _mod()
+    _fixture(tmp_path, n_cells=2)
+    per_ctx = m._load_cell({"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"},
+                           "c0", 2)
+    assert set(per_ctx) == {"GCH", "HCG"}
+    for ctx, df in per_ctx.items():
+        assert isinstance(df["chrom"].dtype, pd.CategoricalDtype), ctx
+    a, b = per_ctx["GCH"]["chrom"], per_ctx["HCG"]["chrom"]
+    assert list(a.cat.categories) == list(b.cat.categories)
+    # and the join still works, on the same rows as before
+    j = m.joined_pairs(per_ctx)
+    assert j is not None and len(j) == len(per_ctx["GCH"])
+
+
+def test_single_context_cell_still_loads(tmp_path):
+    """The category-unifying step must not fire on a one-context cell."""
+    m = _mod()
+    _fixture(tmp_path, n_cells=2)
+    per_ctx = m._load_cell({"GCH": tmp_path / "GCH"}, "c0", 2)
+    assert set(per_ctx) == {"GCH"}
+    assert len(per_ctx["GCH"]) > 0
+    assert m.joined_pairs(per_ctx) is None
+
+
+def test_drain_folds_identically_to_materialising_every_cell(tmp_path):
+    """_drain replaces list(executor.map(...)); it must not change the sum."""
+    m = _mod()
+    _fixture(tmp_path, n_cells=4)
+    paths = {"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"}
+    edges = m.build_edges(100, 100_000, 4)
+    args = _args(m)
+    jobs = [(f"c{i}", i) for i in range(4)]
+    raw = [m._accumulate_cell(c, i, paths, edges, args, {}, {}, None, ())
+           for c, i in jobs]
+
+    want = {k: v.copy() for k, v in
+            {(mm, cc): m.new_acc(len(edges) - 1)
+             for mm, _ in m._MEASURES for cc, _ in m._CONDS}.items()}
+    wp = wn = 0
+    for a, np_, nn_ in raw:
+        for k in want:
+            want[k] += a[k]
+        wp += np_
+        wn += nn_
+
+    got = {(mm, cc): m.new_acc(len(edges) - 1)
+           for mm, _ in m._MEASURES for cc, _ in m._CONDS}
+    per_cell = []
+    gp, gn = m._drain(iter(raw), got, per_cell, len(jobs), "t")
+    assert (gp, gn) == (wp, wn)
+    assert len(per_cell) == 4          # the bootstrap still gets every cell
+    for k in want:
+        assert np.allclose(got[k], want[k])
+
+
+def test_build_pools_parallel_matches_serial(tmp_path):
+    """Parallelising the donor pass must not move a single donor end."""
+    m = _mod()
+    _fixture(tmp_path, n_cells=6)
+    paths = {"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"}
+    cells = [f"c{i}" for i in range(6)]
+    a1, a8 = _args(m), _args(m)
+    a1.n_threads, a8.n_threads = 1, 8
+    ser = m._build_pools(cells, paths, a1, None, None, ())
+    par = m._build_pools(cells, paths, a8, None, None, ())
+    assert set(ser) == set(par)
+    for k in ser:
+        pos_s, vals_s, pi_s = ser[k]
+        pos_p, vals_p, pi_p = par[k]
+        assert np.array_equal(pos_s, pos_p)
+        assert np.array_equal(pi_s, pi_p)
+        for name in ("g", "h"):
+            assert np.allclose(vals_s[name], vals_p[name])
+
+
+def test_pin_inner_threads_stops_pyarrow_fanning_out():
+    """--n-threads 10 must not mean 10 workers x a full pyarrow pool each."""
+    import pyarrow as pa
+    m = _mod()
+    before = pa.cpu_count()
+    try:
+        pa.set_cpu_count(max(2, before))
+        m._pin_inner_threads()
+        assert pa.cpu_count() == 1
+        assert pa.io_thread_count() == 1
+    finally:
+        pa.set_cpu_count(before)
+
+
+def _run_cli(tmp_path, extra):
+    """Run the script as a REAL subprocess.
+
+    The process backend spawns children that re-import the main module from
+    its path.  The in-test loader registers this script under a synthetic name
+    that a child cannot import, so exercising --backend process through
+    main() would only ever test the loader.  This is also the shape the user
+    runs it in.
+    """
+    import subprocess
+    sp = _fixture(tmp_path)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT),
+         "--posteriors", f"GCH={tmp_path / 'GCH'}",
+         "--posteriors", f"HCG={tmp_path / 'HCG'}",
+         "--samples", sp, "--min-pairs", "50", "--plot-format", "png",
+         "--output-dir", str(out)] + extra,
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    return pd.read_csv(out / "end_posterior_dist_all.tsv", sep="\t"), r.stderr
+
+
+def test_backends_agree_and_auto_picks_by_cell_count(tmp_path):
+    """Switching the default backend must not move a single number.
+
+    Each cell is seeded from its own index, not from a shared generator, so
+    thread and process pools have to give bit-identical curves.  If they ever
+    diverge, the parallelism is leaking state and the backend choice becomes a
+    scientific decision rather than a performance one.
+    """
+    auto, err = _run_cli(tmp_path / "a", ["--n-threads", "2"])
+    assert "--backend auto -> thread" in err            # 8 cells < 96
+    thr, _ = _run_cli(tmp_path / "t",
+                      ["--n-threads", "2", "--backend", "thread"])
+    prc, _ = _run_cli(tmp_path / "p",
+                      ["--n-threads", "2", "--backend", "process"])
+    for name, other in (("thread", thr), ("process", prc)):
+        assert list(other.columns) == list(auto.columns), name
+        for c in auto.columns:
+            assert np.allclose(auto[c], other[c], equal_nan=True), (name, c)
+
+
+def test_process_backend_agrees_under_pooled_donors(tmp_path):
+    """--null-scope pooled builds its donor pool per GROUP.
+
+    That is the path where a process pool cannot ride on the run-wide
+    initializer, so it takes a separate branch; check that branch lands on the
+    same numbers as threads rather than on an empty or shared donor set.
+    """
+    kw = ["--n-threads", "2", "--null-scope", "pooled"]
+    thr, _ = _run_cli(tmp_path / "t", kw + ["--backend", "thread"])
+    prc, _ = _run_cli(tmp_path / "p", kw + ["--backend", "process"])
+    for c in thr.columns:
+        assert np.allclose(thr[c], prc[c], equal_nan=True), c
+
+
+def test_auto_switches_to_processes_once_past_the_threshold(tmp_path):
+    """The threshold is the whole point of 'auto'; pin its direction."""
+    m = _mod()
+    assert m._PROCESS_FROM_CELLS > 8      # the fixture must land below it
+    _, err = _run_cli(tmp_path, ["--n-threads", "2", "--max-cells", "8"])
+    assert "--backend auto -> thread" in err
