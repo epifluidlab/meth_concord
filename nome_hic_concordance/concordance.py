@@ -1707,7 +1707,7 @@ def compute_signed_concordance_matrix(
     min_cell_pairs: int = 0,
     min_bin_coverage: float = 0.0,
     statistic: str = "signed",
-    concordance_formula: str = "dm",
+    concordance_formula: str = "mle",
     baseline: str = "short-range",
     concordance_combine: str = "signed-diff",
     dm_window_mb: float = 0.0,
@@ -1767,15 +1767,24 @@ def compute_signed_concordance_matrix(
         Which output matrix to produce as the headline.  "open" still
         uses U-3 soft counts but reports Δ_open = E[π_l_open] − p̂²
         (the one-sided variant).  "both" returns both matrices.
-    concordance_formula : {"dm", "mle"}
-        Estimator for the per-(cell, bin) rates feeding Δ.  "dm" (default)
-        uses the Dirichlet-Multinomial posterior mean
+    concordance_formula : {"mle", "dm"}
+        Estimator for the per-(cell, bin) rates feeding Δ.  "mle" (default)
+        uses the plug-in ``k_i / n``, preserving RWR's cell-type-aware
+        smoothing rather than layering a cell-type-blind shrinkage on top.
+        "dm" uses the Dirichlet-Multinomial posterior mean
         ``(k_i + α_i) / (n + α_total)`` — calibrated but, on POST-RWR
         counts, double-shrinks (RWR already pooled the cell graph, and the
-        MoM concentration is inflated by RWR's variance reduction).  "mle"
-        uses the plug-in ``k_i / n``, preserving RWR's cell-type-aware
-        smoothing; empirically lifts the cell-type axis onto the dominant
-        SVD component so ``--skip-top-svd`` is unnecessary.
+        MoM concentration is inflated by RWR's variance reduction).
+        NOT a clean win either way.  DM leads on cell-type kNN over the
+        full cell set (DM+skip1 0.937 against MLE's best 0.930, and MLE
+        falls to ~0.80 with no batch correction); an earlier claim that MLE
+        lifts cell type onto the dominant SVD component came from
+        validating on the high-coverage labeled subset and did not survive
+        the full set.  MLE leads on the pooled side: DM's shrinkage is
+        depth-dependent, ``C = excess * n/(α₀ + n)``, which drew a step at
+        every domain boundary in the scaled region profile.  Against the
+        drawn null the two are indistinguishable, so calibration does not
+        arbitrate.
     rwr_refinement_basis : {"raw", "postnorm"}
         For refinement passes (``rwr_n_refine_passes >= 1``): which form of
         the previous pass's Δ_signed to build the next k-NN graph from.
