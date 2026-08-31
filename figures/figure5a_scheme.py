@@ -48,17 +48,19 @@ plt.rcParams.update({
     "text.color": INK, "axes.edgecolor": INK,
 })
 
-fig = plt.figure(figsize=(16.4, 14.0), dpi=200)
+fig = plt.figure(figsize=(16.4, 17.4), dpi=200)
 ax = fig.add_axes([0, 0, 1, 1])
 ax.set_xlim(0, 164)
-ax.set_ylim(0, 140)
+ax.set_ylim(0, 174)
 ax.axis("off")
 
 # panel grid for the two workflow tiers (taller panels so the enlarged titles
 # clear the in-panel notes)
 PW, PH = 49, 37
 XS = [5, 57.5, 110]
-TIER1, TIER2 = 91, 50          # y of each tier's bottom edge
+TIER1, TIER2 = 125, 84         # y of each tier's bottom edge
+TIER3 = 41                     # the toy states + the matrix they produce
+TIER4 = 5                      # what the matrix is used for
 
 
 def panel(x, y, w, h, title):
@@ -102,9 +104,9 @@ def loop(cx, cy, sl, sr, span=6.2, r=1.15, h=3.4):
 # =====================================================================
 # Title
 # =====================================================================
-ax.text(82, 136.0, "Long-range epigenetic concordance", fontsize=24.8,
+ax.text(82, 170.0, "Long-range epigenetic concordance", fontsize=24.8,
         fontweight="bold", ha="center", va="center")
-ax.text(82, 131.5,
+ax.text(82, 165.5,
         "a per-cell, per-bin signal that separates cell states even when mean "
         "methylation / accessibility is identical",
         fontsize=15.3, color=MUT, ha="center", va="center", style="italic")
@@ -186,48 +188,87 @@ ax.text(cx0 + PW / 2, TIER1 + 2.2, "soft expected counts (no thresholding)",
         ha="center", fontsize=12.3, color=MUT, style="italic")
 
 # =====================================================================
-# Tier 2, panel 4 — long-range vs local baseline
+# Tier 2, panel 4 — the DISTANCE-POOLED expected pool
+#
+# Not "short-range as the baseline".  The expected pool is built from the
+# bin's OWN read ends, re-paired: every non-contact end pair at or beyond
+# d0 is pooled, so E carries the bin's marginal accessibility and its
+# depth while carrying none of its coordination.  A short-range baseline
+# would instead compare two different distance regimes.
 # =====================================================================
 dx = XS[0]
-panel(dx, TIER2, PW, PH, "Long-range vs local baseline")
-axis_y = TIER2 + 12
-ax.annotate("", xy=(dx + 45, axis_y), xytext=(dx + 5, axis_y),
-            arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.4))
-ax.text(dx + 45, axis_y - 3.0, "contact distance", ha="right", fontsize=12.3,
-        color=MUT)
-thx = dx + 21
-ax.plot([thx, thx], [axis_y - 1.4, axis_y + 12], color=ACC, lw=1.4, ls="--")
-ax.text(thx, axis_y + 13, r"$d_0\,(\approx\!1\,\mathrm{kb})$", ha="center",
-        fontsize=12.6, color=ACC)
-ax.plot([dx + 8, dx + 15], [axis_y, axis_y], color=DNA, lw=2.4,
-        solid_capstyle="round")
-arc(dx + 8, dx + 15, axis_y, 3.4, color=MUT, lw=1.6)
-ax.text(dx + 11.5, axis_y - 4.2, "short-range\n(< $d_0$, baseline)",
-        ha="center", va="top", fontsize=12.0, color=MUT)
-ax.plot([dx + 26, dx + 43], [axis_y, axis_y], color=DNA, lw=2.4,
-        solid_capstyle="round")
-arc(dx + 26, dx + 43, axis_y, 7.0, color=ACC, lw=2.0)
-ax.text(dx + 34.5, axis_y - 4.2, "linked\n(long-range)", ha="center",
-        va="top", fontsize=12.6, color=ACC, fontweight="bold")
-by = TIER2 + 22
+panel(dx, TIER2, PW, PH, "Distance-pooled expected")
+# Bracket first, high enough to clear the title; then the axis well below
+# it so the observed arcs above and the re-paired arcs below both fit
+# INSIDE the panel.
+by = TIER2 + 29.5
 ax.plot([dx + 6, dx + 44], [by, by], color=INK, lw=1.1)
 for xx in (dx + 6, dx + 44):
     ax.plot([xx, xx], [by, by - 1.3], color=INK, lw=1.1)
-ax.text(dx + PW / 2, by + 1.0, "aggregate within 250-kb bin", ha="center",
-        va="bottom", fontsize=12.6)
+ax.text(dx + PW / 2, by + 0.9, "aggregate within 250-kb bin", ha="center",
+        va="bottom", fontsize=12.0)
+
+axis_y = TIER2 + 14.5
+ax.annotate("", xy=(dx + 45, axis_y), xytext=(dx + 5, axis_y),
+            arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.4))
+# Below the axis and hard right, where neither the solid arcs above nor
+# the dashed ones below reach.
+ax.text(dx + 45.5, axis_y - 2.4, "distance", ha="right", va="top",
+        fontsize=11.4, color=MUT)
+thx = dx + 13
+ax.plot([thx, thx], [axis_y - 8.0, axis_y + 6.5], color=ACC, lw=1.4, ls="--")
+ax.text(thx, axis_y + 7.2, r"$d_0\,(\approx\!1\,\mathrm{kb})$", ha="center",
+        va="bottom", fontsize=12.0, color=ACC)
+# OBSERVED: real ligations, solid, above the axis.
+ax.plot([dx + 17, dx + 43], [axis_y, axis_y], color=DNA, lw=2.4,
+        solid_capstyle="round")
+arc(dx + 19, dx + 29, axis_y, 4.4, color=ACC, lw=2.0)
+arc(dx + 25, dx + 41, axis_y, 6.2, color=ACC, lw=2.0)
+ax.text(dx + 31, axis_y + 10.4, "observed: linked contacts",
+        ha="center", va="bottom", fontsize=11.7, color=ACC, fontweight="bold")
+# EXPECTED: the SAME ends re-paired, dashed, below the axis.
+for (a_, b_, h_) in ((dx + 18, dx + 34, 2.9), (dx + 22, dx + 27, 1.5),
+                     (dx + 26, dx + 38, 2.2)):
+    xm = (a_ + b_) / 2
+    ax.add_patch(PathPatch(Path([(a_, axis_y - 0.9),
+                                 (xm, axis_y - 0.9 - 2 * h_),
+                                 (b_, axis_y - 0.9)],
+                                [Path.MOVETO, Path.CURVE3, Path.CURVE3]),
+                           fc="none", ec=MUT, lw=1.5, ls=(0, (3, 2)),
+                           zorder=3))
+ax.text(dx + PW / 2, TIER2 + 2.6,
+        "expected: the SAME ends re-paired,\n"
+        r"every separation $\geq d_0$ pooled",
+        ha="center", va="bottom", fontsize=11.4, color=MUT, linespacing=1.25)
 
 # =====================================================================
-# Tier 2, panel 5 — signed long-range concordance Δ
+# Tier 2, panel 5 — the two statistics actually reported
+#
+# C is the magnitude: excess concordant mass over the expected.  The log
+# odds ratio is the direction, referred to the SAME expected pool, which
+# is what makes it marginal-free -- logit(F) - logit(F_exp), i.e. the log
+# odds ratio of F against the log odds ratio of F_exp.
 # =====================================================================
 ex = XS[1]
-panel(ex, TIER2, PW, PH, "Signed long-range concordance")
-ax.text(ex + PW / 2, TIER2 + 24.2,
-        r"$\Delta_{\mathrm{signed}}=(\hat\pi_{\mathrm{co\text{-}open}}-\hat\pi_{\mathrm{co\text{-}closed}})_{\mathrm{linked}}$",
-        ha="center", fontsize=14.4)
-ax.text(ex + PW / 2, TIER2 + 20.0,
-        r"$-\,(\hat\pi_{\mathrm{co\text{-}open}}-\hat\pi_{\mathrm{co\text{-}closed}})_{\mathrm{short\text{-}range}}$",
-        ha="center", fontsize=14.4)
-hm_x0, hm_y0, hm_w, hm_h = ex + 11, TIER2 + 4.5, 27, 12.5
+panel(ex, TIER2, PW, PH, "Long-range concordance")
+ax.text(ex + PW / 2, TIER2 + 29.0,
+        r"$C=(O_{\mathrm{open}}+O_{\mathrm{closed}})-"
+        r"(E_{\mathrm{open}}+E_{\mathrm{closed}})$",
+        ha="center", fontsize=13.8)
+ax.text(ex + PW / 2, TIER2 + 24.6,
+        r"$F=\dfrac{O_{\mathrm{open}}}{O_{\mathrm{open}}+O_{\mathrm{closed}}}"
+        r"\qquad F_{\mathrm{exp}}=\dfrac{E_{\mathrm{open}}}"
+        r"{E_{\mathrm{open}}+E_{\mathrm{closed}}}$",
+        ha="center", fontsize=12.4)
+ax.text(ex + PW / 2, TIER2 + 19.4,
+        r"$L=\mathrm{logit}\,F-\mathrm{logit}\,F_{\mathrm{exp}}"
+        r"=\log\dfrac{O_{\mathrm{open}}}{O_{\mathrm{closed}}}"
+        r"-\log\dfrac{E_{\mathrm{open}}}{E_{\mathrm{closed}}}$",
+        ha="center", fontsize=13.2)
+ax.text(ex + PW / 2, TIER2 + 15.4,
+        "C = magnitude   ·   L = direction (marginal-free)",
+        ha="center", fontsize=11.7, color=MUT, style="italic")
+hm_x0, hm_y0, hm_w, hm_h = ex + 11, TIER2 + 2.6, 27, 10.5
 rng = np.random.default_rng(1)
 nC, nB = 12, 18
 block = np.vstack([rng.normal(0.5, 0.35, (6, nB)),
@@ -241,8 +282,8 @@ ax.text(hm_x0 + hm_w / 2, hm_y0 - 1.6, "bins", ha="center", fontsize=12.0,
         color=MUT)
 ax.text(hm_x0 - 1.4, hm_y0 + hm_h / 2, "cells", rotation=90, va="center",
         ha="right", fontsize=12.0, color=MUT)
-ax.text(hm_x0 + hm_w + 1.4, hm_y0 + hm_h, r"$+$", color="#B2182B", fontsize=15.0,
-        va="top", fontweight="bold")
+ax.text(hm_x0 + hm_w + 1.4, hm_y0 + hm_h, r"$+$", color="#B2182B",
+        fontsize=15.0, va="top", fontweight="bold")
 ax.text(hm_x0 + hm_w + 1.4, hm_y0, r"$-$", color="#2166AC", fontsize=15.0,
         va="bottom", fontweight="bold")
 
@@ -275,66 +316,152 @@ ax.text(fx + PW / 2, TIER2 + 3.0,
 # =====================================================================
 # Tier 3 — the payoff (identical mean, opposite concordance)
 # =====================================================================
-ax.text(74, 43.0,
+ax.text(74, TIER3 + 34.5,
         "Same mean methylation / accessibility, opposite long-range concordance",
-        fontsize=17.2, fontweight="bold", ha="center", va="center")
+        fontsize=16.4, fontweight="bold", ha="center", va="center")
 
-# ---- two toy cell states (left) -----------------------------------------
+
 def state_box(x, y, w, h, color, name, grid, conc):
     ax.add_patch(FancyBboxPatch((x, y), w, h,
                  boxstyle="round,pad=0.0,rounding_size=1.6",
                  fc="white", ec=EDGE, lw=1.2, zorder=1))
-    ax.add_patch(FancyBboxPatch((x + 2.4, y + h - 6.6), 20, 4.6,
+    ax.add_patch(FancyBboxPatch((x + 2.4, y + h - 6.0), 20, 4.4,
                  boxstyle="round,pad=0.0,rounding_size=1.0",
                  fc=color, ec="none", alpha=0.16, zorder=2))
-    ax.text(x + 12.4, y + h - 4.3, name, fontsize=15.3, fontweight="bold",
+    ax.text(x + 12.4, y + h - 3.8, name, fontsize=14.6, fontweight="bold",
             color=color, ha="center", va="center", zorder=3)
-    # 2 x 2 grid of within-cell contact loops (grid[row][col] = (left, right))
     cxs = [x + w * 0.30, x + w * 0.70]
-    cys = [y + h - 13.5, y + h - 22.5]
+    cys = [y + h - 12.6, y + h - 20.4]
     for r, row in zip(cys, grid):
         for c, (sl, sr) in zip(cxs, row):
             loop(c, r, sl, sr)
-    ax.text(x + w / 2, y + 4.2, f"concordance = {conc}", fontsize=15.6,
+    ax.text(x + w / 2, y + 3.4, f"concordance = {conc}", fontsize=14.6,
             fontweight="bold", color=INK, ha="center", va="center")
 
 
-# state 1: both ends agree (co-methylated / co-unmethylated) -> concordance 1
-state_box(5, 8, 33, 32, S1, "cell state 1",
+state_box(5, TIER3, 33, 30, S1, "cell state 1",
           [[(1, 1), (1, 1)], [(0, 0), (0, 0)]], "1.0")
-# state 2: ends disagree (mixed) -> concordance 0, same mean (0.5)
-state_box(41, 8, 33, 32, S2, "cell state 2",
+state_box(41, TIER3, 33, 30, S2, "cell state 2",
           [[(1, 0), (0, 1)], [(1, 0), (0, 1)]], "0.0")
 
-# ---- bridge: apply the workflow -----------------------------------------
-flow(76, 24, 84, 24, color=ACC, lw=2.2)
-ax.text(80, 26.6, "workflow", ha="center", va="bottom", fontsize=11.7,
-        color=ACC, style="italic")
+# The concordance matrix is what every downstream analysis reads, so the
+# panel on the right is the matrix itself rather than one of its outputs.
+ax.add_patch(FancyBboxPatch((86, TIER3), 58, 30,
+             boxstyle="round,pad=0.0,rounding_size=1.6",
+             fc="white", ec=EDGE, lw=1.2, zorder=1))
+ax.text(115, TIER3 + 27.4, "per-cell, per-bin  $C$  and  $L$",
+        fontsize=14.4, fontweight="bold", ha="center", va="top")
+_mx, _my, _mw, _mh = 96, TIER3 + 7.5, 38, 14.5
+rng3 = np.random.default_rng(11)
+_blk = np.vstack([rng3.normal(0.55, 0.34, (7, 26)),
+                  rng3.normal(-0.55, 0.34, (7, 26))])
+_blk[:, ::4] += rng3.normal(0, 0.55, (14, len(range(0, 26, 4))))
+ax.imshow(_blk, cmap="RdBu_r", vmin=-1.5, vmax=1.5, aspect="auto",
+          extent=[_mx, _mx + _mw, _my, _my + _mh], zorder=3)
+ax.add_patch(Rectangle((_mx, _my), _mw, _mh, fc="none", ec=INK, lw=1.0,
+                       zorder=4))
+ax.text(_mx + _mw / 2, _my - 1.6, "bins", ha="center", fontsize=11.7,
+        color=MUT)
+ax.text(_mx - 1.4, _my + _mh / 2, "cells", rotation=90, va="center",
+        ha="right", fontsize=11.7, color=MUT)
+ax.text(115, TIER3 + 3.2, "the input to every analysis below",
+        fontsize=12.0, color=MUT, ha="center", va="center", style="italic")
+flow(76, TIER3 + 15, 84, TIER3 + 15, color=ACC, lw=2.2)
+ax.text(80, TIER3 + 17.4, "workflow", ha="center", va="bottom",
+        fontsize=11.7, color=ACC, style="italic")
 
-# ---- two UMAPs (right): mean overlaps, concordance separates -------------
-def umap_box(x, y, w, h, title, sep, caption):
-    ax.add_patch(FancyBboxPatch((x, y), w, h,
-                 boxstyle="round,pad=0.0,rounding_size=1.6",
+# =====================================================================
+# Tier 4 — what the matrix is used for
+#
+# Five outputs on one strip, because the point is that they all come from
+# the SAME matrix: an embedding, a differential test and its volcano, the
+# bins those calls make, a profile around annotated regions, and the
+# pathways the genes in those bins fall into.
+# =====================================================================
+ax.text(74, TIER4 + 33.0, "Downstream analyses", fontsize=16.4,
+        fontweight="bold", ha="center", va="center")
+
+OW, OGAP = 26.4, 2.6
+OX0 = 5.0
+_orng = np.random.default_rng(21)
+
+
+def out_box(k, title, caption):
+    x = OX0 + k * (OW + OGAP)
+    y = TIER4
+    ax.add_patch(FancyBboxPatch((x, y), OW, 29,
+                 boxstyle="round,pad=0.0,rounding_size=1.4",
                  fc="white", ec=EDGE, lw=1.2, zorder=1))
-    ax.text(x + w / 2, y + h - 2.6, title, fontsize=14.4, fontweight="bold",
+    ax.text(x + OW / 2, y + 27.0, title, fontsize=12.9, fontweight="bold",
             ha="center", va="top")
-    cxc, cyc = x + w / 2, y + h / 2 - 1.5
-    off = w * 0.17
-    rng2 = np.random.default_rng(4)
-    if sep:
-        a = rng2.normal([cxc - off, cyc], [2.4, 3.2], (24, 2))
-        b = rng2.normal([cxc + off, cyc], [2.4, 3.2], (24, 2))
-    else:
-        a = rng2.normal([cxc, cyc], [3.4, 3.2], (24, 2))
-        b = rng2.normal([cxc, cyc], [3.4, 3.2], (24, 2))
-    ax.scatter(a[:, 0], a[:, 1], s=12, c=S1, edgecolors="none", zorder=4)
-    ax.scatter(b[:, 0], b[:, 1], s=12, c=S2, edgecolors="none", zorder=4)
-    ax.text(x + w / 2, y + 2.4, caption, fontsize=12.3, color=MUT,
+    ax.text(x + OW / 2, y + 2.2, caption, fontsize=10.8, color=MUT,
             ha="center", va="center", style="italic")
+    return x, y
 
 
-umap_box(86, 8, 58, 32, "UMAP: signed concordance", True,
-         "the two states separate")
+# --- 1. UMAP ---------------------------------------------------------
+x, y = out_box(0, "UMAP", "cell states separate")
+cxc, cyc = x + OW / 2, y + 14.5
+a = _orng.normal([cxc - 4.6, cyc], [2.0, 2.8], (22, 2))
+b = _orng.normal([cxc + 4.6, cyc], [2.0, 2.8], (22, 2))
+ax.scatter(a[:, 0], a[:, 1], s=8, c=S1, edgecolors="none", zorder=4)
+ax.scatter(b[:, 0], b[:, 1], s=8, c=S2, edgecolors="none", zorder=4)
+
+# --- 2. heatmap ------------------------------------------------------
+x, y = out_box(1, "Heatmap", "differential bins x cells")
+hx, hy, hw, hh = x + 4.5, y + 7.0, OW - 9, 15
+_hb = np.vstack([_orng.normal(0.6, 0.3, (8, 22)),
+                 _orng.normal(-0.6, 0.3, (8, 22))])
+ax.imshow(_hb, cmap="RdBu_r", vmin=-1.5, vmax=1.5, aspect="auto",
+          extent=[hx, hx + hw, hy, hy + hh], zorder=3)
+ax.add_patch(Rectangle((hx, hy), hw, hh, fc="none", ec=INK, lw=1.0, zorder=4))
+
+# --- 3. volcano ------------------------------------------------------
+x, y = out_box(2, "Volcano", "effect size vs FDR")
+vx, vy, vw, vh = x + 5.0, y + 6.5, OW - 10, 15.5
+ax.plot([vx, vx + vw], [vy, vy], color=INK, lw=1.0, zorder=4)
+ax.plot([vx + vw / 2, vx + vw / 2], [vy, vy + vh], color="#9AA0A6", lw=0.9,
+        zorder=3)
+_vx = _orng.normal(0, 1, 260)
+_vy = np.abs(_orng.normal(0, 1, 260)) * 0.8 + 0.35 * np.abs(_vx) ** 2
+_sig = (np.abs(_vx) > 1.5) & (_vy > 1.6)
+_px = vx + vw / 2 + _vx / 3.4 * (vw / 2)
+_py = vy + np.clip(_vy / 4.6, 0, 1) * vh
+ax.scatter(_px[~_sig], _py[~_sig], s=3.2, c="#C6CBD1", edgecolors="none",
+           zorder=4)
+ax.scatter(_px[_sig & (_vx > 0)], _py[_sig & (_vx > 0)], s=4.6, c="#D1495B",
+           edgecolors="none", zorder=5)
+ax.scatter(_px[_sig & (_vx < 0)], _py[_sig & (_vx < 0)], s=4.6, c="#2C6FAF",
+           edgecolors="none", zorder=5)
+ax.plot([vx, vx + vw], [vy + vh * 0.42] * 2, color=MUT, lw=0.9,
+        ls=(0, (3, 2)), zorder=4)
+
+# --- 4. scaled profile -----------------------------------------------
+x, y = out_box(3, "Scaled profile", "PMD / LAD / RT domains")
+px0, py0, pw, ph = x + 4.5, y + 7.0, OW - 9, 15
+ax.plot([px0, px0 + pw], [py0, py0], color=INK, lw=1.0, zorder=4)
+for xx in (px0 + pw * 0.28, px0 + pw * 0.72):
+    ax.plot([xx, xx], [py0, py0 + ph], color=MUT, lw=0.9, ls=(0, (3, 2)),
+            zorder=3)
+_t = np.linspace(0, 1, 120)
+_shape = np.where((_t > 0.28) & (_t < 0.72), 0.30, 0.78)
+for col, off, amp in ((S2, 0.10, 1.0), (S1, -0.06, 0.75)):
+    _yv = (_shape * amp + off) + _orng.normal(0, 0.022, _t.size)
+    ax.plot(px0 + _t * pw, py0 + np.clip(_yv, 0.04, 0.97) * ph, color=col,
+            lw=1.7, zorder=5)
+ax.text(px0 + pw / 2, py0 - 1.5, "start        end", ha="center",
+        fontsize=9.6, color=MUT)
+
+# --- 5. KEGG / GO ----------------------------------------------------
+x, y = out_box(4, "KEGG / GO", "genes in differential bins")
+bx, by0, bw = x + 5.0, y + 7.5, OW - 12
+for k, frac in enumerate((0.95, 0.78, 0.62, 0.48, 0.33)):
+    yy = by0 + (4 - k) * 2.9
+    ax.add_patch(Rectangle((bx, yy), bw * frac, 2.1, fc=ACC,
+                           ec="none", alpha=0.35 + 0.13 * k, zorder=4))
+ax.plot([bx, bx], [by0 - 0.6, by0 + 14.4], color=INK, lw=1.0, zorder=5)
+ax.text(bx + bw / 2, by0 - 2.2, r"$-\log_{10}$ FDR", ha="center",
+        fontsize=9.6, color=MUT)
 
 # =====================================================================
 # flow arrows between tiers / panels
@@ -349,17 +476,18 @@ ax.add_patch(FancyArrowPatch(path=_wrap, arrowstyle="-|>", mutation_scale=15,
                              lw=1.8, color=ACC, zorder=6))
 flow(XS[0] + PW, TIER2 + PH / 2, XS[1], TIER2 + PH / 2)          # P4 -> P5
 flow(XS[1] + PW, TIER2 + PH / 2, XS[2], TIER2 + PH / 2)          # P5 -> P6
-flow(XS[2] + PW / 2, TIER2 - 0.3, 126, 41, rad=0.0, lw=1.8)     # P6 -> UMAP
+flow(XS[2] + PW / 2, TIER2 - 0.3, 115, TIER3 + 30.4, rad=0.0, lw=1.8)
+flow(115, TIER3 - 0.3, 74, TIER4 + 29.6, rad=0.0, lw=1.8)
 
 # =====================================================================
 # legend
 # =====================================================================
-ax.add_patch(Circle((7, 3.6), 1.3, fc=FILL, ec=FILL, lw=1.4))
-ax.add_patch(Circle((45, 3.6), 1.3, fc="white", ec=FILL, lw=1.4))
-ax.text(9.6, 3.6, "methylated / accessible", fontsize=12.9, va="center")
-ax.text(47.6, 3.6, "unmethylated / closed", fontsize=12.9, va="center")
-ax.text(120, 3.6, "each loop = two loci in contact within one cell",
-        fontsize=12.9, va="center", ha="center", color=MUT)
+ax.add_patch(Circle((7, 1.6), 1.3, fc=FILL, ec=FILL, lw=1.4))
+ax.add_patch(Circle((52, 1.6), 1.3, fc="white", ec=FILL, lw=1.4))
+ax.text(9.6, 1.6, "methylated / accessible", fontsize=12.6, va="center")
+ax.text(54.6, 1.6, "unmethylated / closed", fontsize=12.6, va="center")
+ax.text(126, 1.6, "each loop = two loci in contact within one cell",
+        fontsize=12.6, va="center", ha="center", color=MUT)
 
 fig.savefig("figures/figure5a_scheme.png", dpi=300, bbox_inches="tight",
             facecolor="white")
