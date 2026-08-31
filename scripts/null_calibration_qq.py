@@ -351,6 +351,17 @@ def figure(path, table, curves, stat, title, bands=None, band_kind="cell"):
         # thing being measured: the observed's excess over its own null
         # survives, and the diagonal means "observed distributed exactly like
         # its null".  The absolute offset is not lost, it moves to panel (b).
+        # The two numbers panels (b) and (c) carry, printed on the Q-Q
+        # itself so panel (a) can be read (or lifted into a talk) alone.
+        # z is the calibration number -- the null's own median in units of
+        # its robust spread, which panel (a) standardises away by
+        # construction and so cannot otherwise show.
+        _num = {}
+        if table is not None and "run" in getattr(table, "columns", []):
+            for _, _r in table.iterrows():
+                _num[_r["run"]] = (float(_r.get("lambda", np.nan)),
+                                   float(_r.get("null_bias_z", np.nan)))
+
         lim = 0.0
         drew_band = False
         for i, (name, (qx, qy)) in enumerate(curves.items()):
@@ -387,7 +398,16 @@ def figure(path, table, curves, stat, title, bands=None, band_kind="cell"):
                 a.plot(zx, bhi, "-", color="0.45", lw=0.5, zorder=1)
                 lim = max(lim, float(np.max(np.abs(np.r_[blo, bhi]))))
                 drew_band = True
-            a.plot(zx, zy, "-", lw=1.2, color=col, label=name, zorder=3)
+            _lam, _z = _num.get(name, (np.nan, np.nan))
+            lab = name
+            if np.isfinite(_lam) and np.isfinite(_z):
+                # U+2212 on the NUMBER only, so the sign matches the one
+                # matplotlib puts on the tick labels rather than sitting
+                # beside it as a hyphen -- and a run named "dm-shared" keeps
+                # its hyphen.
+                _zs = f"{_z:+.2f}".replace("-", "\u2212")
+                lab = f"{name}   $\\lambda$ {_lam:.2f}   $z$ {_zs}"
+            a.plot(zx, zy, "-", lw=1.2, color=col, label=lab, zorder=3)
             lim = max(lim, float(np.max(np.abs(np.r_[zx, zy]))))
         lim = lim * 1.05 if lim > 0 else 1.0
         a.plot([-lim, lim], [-lim, lim], "--", color="0.55", lw=0.7, zorder=2)
@@ -629,8 +649,12 @@ def main(argv=None) -> int:
     ap.add_argument("--plot-format", default="pdf",
                     choices=["pdf", "png", "svg"])
     ap.add_argument("--title", default="Null calibration")
-    ap.add_argument("--band", choices=["cell", "iid", "none"], default="cell",
-                    help="95%% band on panel (a).  'cell' (default) resamples "
+    ap.add_argument("--band", choices=["cell", "iid", "none"], default="none",
+                    help="95%% band on panel (a).  'none' (default): at the "
+                         "real n an honest band is narrow enough that it "
+                         "crowds the curves without changing the reading, "
+                         "and lambda and the null bias are now printed in "
+                         "the legend instead.  'cell' resamples "
                          "WHOLE CELLS of the drawn null with replacement, so "
                          "the band inherits the within-cell correlation RWR "
                          "creates instead of assuming it away.  'iid' is the "

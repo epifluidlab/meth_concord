@@ -538,3 +538,52 @@ def test_the_band_is_never_drawn_in_a_run_s_own_colour(tmp_path):
         plt.close = real_close
         for n in plt.get_fignums():
             plt.close(n)
+
+
+def test_legend_carries_lambda_and_null_bias_z(tmp_path):
+    """Panel (a) standardises the null's offset away by construction, so z
+    cannot be read off the curve -- printing it in the legend is what makes
+    the panel self-contained.  A hyphenated run name must survive the
+    unicode-minus substitution applied to the number."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    qq = _mod()
+    rng = np.random.default_rng(31)
+    null = rng.normal(0, 1, 20_000)
+    obs = null * 1.2
+    tab = pd.DataFrame([{"run": "dm-shared", "null_bias_z": -0.0612,
+                         "lambda": 1.1734, "spike_ratio": 1.0}])
+    real_close = plt.close
+    plt.close = lambda *a, **k: None
+    try:
+        qq.figure(tmp_path / "f.png", tab, {"dm-shared": qq.qq_points(obs, null)},
+                  "coordination", "t")
+        fig = plt.figure(max(plt.get_fignums()))
+        text = fig.axes[0].get_legend().get_texts()[0].get_text()
+    finally:
+        plt.close = real_close
+        for n in plt.get_fignums():
+            plt.close(n)
+    assert "1.17" in text                      # lambda, 2 dp
+    assert "−0.06" in text                # z, unicode minus
+    assert text.startswith("dm-shared")        # hyphen in the NAME survives
+
+
+def test_the_band_is_off_by_default(tmp_path):
+    """Kept as an option, but not drawn unless asked: at the real n an
+    honest band is narrow enough that it crowds the curves without changing
+    the reading."""
+    qq = _mod()
+    d, _ = _matrix_run(tmp_path / "r", n_cells=40, n_bins=150)
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--run", f"x={d}",
+         "--statistic", "coordination", "--plot-format", "png",
+         "--output-dir", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert (out / "null_qq_coordination.png").exists()
+    help_text = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--help"],
+        capture_output=True, text=True).stdout
+    assert "--band {cell,iid,none}" in help_text        # still available
