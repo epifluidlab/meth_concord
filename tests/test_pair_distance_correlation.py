@@ -549,3 +549,105 @@ def test_the_permutation_stays_inside_its_cell_within_the_bin():
     assert d["r"][0] > 0.95
     assert d["r_null"][0] > 0.9
     assert abs(d["r"][0] - d["r_null"][0]) < 0.15
+
+
+class _Tty(__import__("io").StringIO):
+    def isatty(self):
+        return True
+
+
+def test_progress_rewrites_one_line_on_a_terminal():
+    m = _mod()
+    t = _Tty()
+    b = m.Progress(50, "demo", stream=t)
+    for _ in range(50):
+        b.update()
+    b.close()
+    raw = t.getvalue()
+    assert raw.count("\r") == 50
+    assert raw.count("\n") == 1          # only the final newline
+    assert "50/50 (100.0%)" in raw
+    assert "eta" in raw and "elapsed" in raw
+
+
+def test_progress_does_not_flood_a_redirected_log():
+    """These runs are launched on a cluster with stderr going to a file,
+    where a carriage-return bar writes one line per update -- thousands of
+    them, in a log someone has to read afterwards."""
+    import io
+    m = _mod()
+    f = io.StringIO()                    # not a tty
+    b = m.Progress(500, "demo", stream=f)
+    for _ in range(500):
+        b.update()
+    b.close()
+    assert "\r" not in f.getvalue()
+    assert f.getvalue().count("\n") <= 5, f.getvalue().count("\n")
+    assert "500/500" in f.getvalue()
+
+
+def test_progress_does_not_print_the_final_line_twice():
+    """A duplicate 100% line is noise in a log and a flicker on a screen."""
+    import io
+    m = _mod()
+    f = io.StringIO()
+    b = m.Progress(3, "demo", stream=f, min_interval=0.0)
+    for _ in range(3):
+        b.update()
+    b.close()
+    assert f.getvalue().count("3/3") == 1
+
+
+def test_the_eta_is_elapsed_over_done_times_remaining():
+    """Checked against a fabricated clock rather than by sleeping: the
+    arithmetic is the claim, and a timing test would be slow and flaky."""
+    import io
+    import re
+    import time
+    m = _mod()
+    f = io.StringIO()
+    b = m.Progress(10, "demo", stream=f, min_interval=0.0)
+    b.done = 2
+    b._t0 = time.time() - 20.0           # 20 s for 2 of 10
+    b.update(0, force=True)
+    got = re.findall(r"eta (\S+)", f.getvalue())[-1]
+    assert got in ("1m20s", "1m19s"), got   # 20/2 x 8 = 80 s
+    assert "elapsed 20s" in f.getvalue()
+    b.done = 10
+    b.update(0, force=True)
+    assert re.findall(r"eta (\S+)", f.getvalue())[-1] == "0s"
+
+
+def test_the_elapsed_and_eta_are_formatted_for_reading():
+    m = _mod()
+    b = m.Progress(1, "x")
+    assert b._fmt(0) == "0s"
+    assert b._fmt(45) == "45s"
+    assert b._fmt(60) == "1m00s"
+    assert b._fmt(3599) == "59m59s"
+    assert b._fmt(3600) == "1h00m"
+    assert b._fmt(7 * 3600 + 42 * 60) == "7h42m"
+
+
+def test_both_phases_report_progress(tmp_path):
+    """--threads only ever reached the per-cell read, and the phase after it
+    had no output at all -- so a long run looked hung."""
+    s, gd, hd = _posterior_cells(tmp_path, n_cells=6, n=1500)
+    out, r = _run(tmp_path, s, gd, hd, "prog", "--n-permutations", "20",
+                  "--threads", "2")
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "reading posteriors:" in r.stderr
+    assert "correlations (20 permutations" in r.stderr
+    # The correlation phase names its own size, so a slow run says why.
+    assert "x 4 measures x 5 bins" in r.stderr
+
+
+def test_run_jobs_returns_results_in_order():
+    """The caller zips them against its task list, so completion order must
+    not leak into the result order even though the generator yields as
+    workers finish."""
+    m = _mod()
+    jobs = [(i,) for i in range(25)]
+    got = m.run_jobs(lambda i: i * i, jobs, 4, "sq")
+    assert got == [i * i for i in range(25)]
+    assert m.run_jobs(lambda i: i * i, jobs, 1, "sq") == got

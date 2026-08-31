@@ -153,6 +153,97 @@ def measures_of(vals):
     return out
 
 
+class Progress:
+    """Count, rate and ETA on stderr, for a job whose length is known.
+
+    ONE LINE IN PLACE ON A TERMINAL, A PERIODIC LINE OTHERWISE.  These runs
+    are usually launched on a cluster with stderr redirected to a file, and
+    a carriage-return bar there writes one line per update -- thousands of
+    them, in a log someone has to read afterwards.  Checking isatty costs
+    nothing and is the difference between a usable log and a useless one.
+
+    The ETA is elapsed/done x remaining, which is honest only while the
+    items cost about the same.  They do not here: distance bins differ in
+    how many pairs they hold and cells differ in depth, so the estimate
+    moves.  It is reported as an estimate and the elapsed time beside it is
+    the number that is not.
+    """
+
+    def __init__(self, total, label, stream=None, min_interval=2.0):
+        import time
+        self.total = max(1, int(total))
+        self.label = label
+        self.stream = stream or sys.stderr
+        self.tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.min_interval = 0.0 if self.tty else float(min_interval)
+        self.done = 0
+        self._t0 = time.time()
+        self._last = 0.0
+        self._shown = -1
+
+    def _fmt(self, sec):
+        sec = int(max(0, sec))
+        if sec < 60:
+            return f"{sec}s"
+        if sec < 3600:
+            return f"{sec // 60}m{sec % 60:02d}s"
+        return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+    def update(self, n=1, force=False):
+        import time
+        self.done += int(n)
+        now = time.time()
+        if not force and (now - self._last) < self.min_interval \
+                and self.done < self.total:
+            return
+        self._last = now
+        self._shown = self.done
+        el = now - self._t0
+        frac = self.done / self.total
+        eta = (el / self.done * (self.total - self.done)) if self.done else 0
+        msg = (f"  {self.label}: {self.done:,}/{self.total:,} "
+               f"({frac:5.1%})  elapsed {self._fmt(el)}  "
+               f"eta {self._fmt(eta)}")
+        if self.tty:
+            self.stream.write("\r" + msg + " " * 8)
+        else:
+            self.stream.write(msg + "\n")
+        self.stream.flush()
+
+    def close(self):
+        # Only if the last line drawn is not already the final one -- a
+        # duplicate 100% line is noise in a log and a flicker on a terminal.
+        if self._shown != self.done:
+            self.update(0, force=True)
+        if self.tty:
+            self.stream.write("\n")
+        self.stream.flush()
+
+
+def run_jobs(fn, jobs, n_jobs, label):
+    """Run ``fn(*job)`` over ``jobs``, reporting progress as each finishes.
+
+    joblib's return_as="generator" hands results back as they complete, so
+    the count is real rather than a guess between batches.  Falls back to a
+    plain loop when there is nothing to parallelise.
+    """
+    bar = Progress(len(jobs), label)
+    out = []
+    if int(n_jobs) > 1 and len(jobs) > 1:
+        from joblib import Parallel, delayed
+        gen = Parallel(n_jobs=int(n_jobs), return_as="generator")(
+            delayed(fn)(*j) for j in jobs)
+        for r in gen:
+            out.append(r)
+            bar.update()
+    else:
+        for j in jobs:
+            out.append(fn(*j))
+            bar.update()
+    bar.close()
+    return out
+
+
 def load_exclude(paths):
     """Merged intervals per chromosome, from one or more BED files."""
     if not paths:
@@ -471,7 +562,8 @@ def _bin_result(xb, yb, groups, n_perm, min_pairs, seed):
     return out
 
 
-def correlations(pooled, nb, n_perm, min_pairs, seed, n_jobs=1):
+def correlations(pooled, nb, n_perm, min_pairs, seed, n_jobs=1,
+                 progress=True):
     """Observed correlations, the re-paired null, and an EMPIRICAL p.
 
     THE PARAMETRIC P IS NOT THE ONE TO READ, and both are reported so the
@@ -510,9 +602,13 @@ def correlations(pooled, nb, n_perm, min_pairs, seed, n_jobs=1):
             groups = np.split(o, starts[1:]) if o.size else []
             tasks.append((xb, yb, groups, n_perm, min_pairs, seed + b))
             keys.append((m, b))
-    if int(n_jobs) > 1 and len(tasks) > 1:
+    if progress:
+        got = run_jobs(_bin_result, tasks, n_jobs,
+                       f"correlations ({n_perm} permutations x "
+                       f"{len(_MEASURES)} measures x {nb} bins)")
+    elif int(n_jobs) > 1 and len(tasks) > 1:
         from joblib import Parallel, delayed
-        got = Parallel(n_jobs=int(n_jobs), prefer="processes")(
+        got = Parallel(n_jobs=int(n_jobs))(
             delayed(_bin_result)(*t) for t in tasks)
     else:
         got = [_bin_result(*t) for t in tasks]
@@ -763,11 +859,9 @@ def main(argv=None) -> int:
                  args.min_sites_per_end, args.seed + i, exclude)
                 for i, (_, row) in enumerate(samples.iterrows())]
         fn = collect_cell
-    if args.threads > 1:
-        from joblib import Parallel, delayed
-        got = Parallel(n_jobs=args.threads)(delayed(fn)(*j) for j in jobs)
-    else:
-        got = [fn(*j) for j in jobs]
+    got = run_jobs(fn, jobs, args.threads,
+                   "reading posteriors" if args.posteriors
+                   else "parsing BAMs")
     per_cell = [g[0] for g in got]
     n_pairs_total = sum(g[1] for g in got)
 
