@@ -459,3 +459,93 @@ def test_no_permutations_leaves_the_null_and_empirical_p_undefined():
     d = m.correlations(m.pool_cells([cell], 1), 1, 0, 10, 0)["gg"]
     assert np.isfinite(d["r"][0]) and np.isfinite(d["p"][0])
     assert np.isnan(d["r_null"][0]) and np.isnan(d["emp_p"][0])
+
+
+def test_the_fast_pearson_matches_scipy():
+    """It is the same statistic from precomputed marginal sums, not an
+    approximation -- the permutation loop calls it thousands of times and
+    scipy's version recomputes all five sums plus a p the null discards."""
+    from scipy.stats import pearsonr
+    m = _mod()
+    rng = np.random.default_rng(0)
+    for n in (20, 5_000, 50_000):
+        x = rng.normal(0, 1, n)
+        y = 0.4 * x + rng.normal(0, 1, n)
+        got = m._pearson(x, y, float(n), x.sum(), (x * x).sum(),
+                         y.sum(), (y * y).sum())
+        assert got == pytest.approx(pearsonr(x, y)[0], abs=1e-12)
+    # A flat column gives NaN rather than a divide-by-zero.
+    z = np.ones(50)
+    assert np.isnan(m._pearson(z, rng.normal(0, 1, 50), 50.0, z.sum(),
+                               (z * z).sum(), 0.0, 50.0))
+
+
+def test_spearman_is_pearson_on_ranks_and_a_permutation_permutes_them():
+    """The trick the null loop rests on: rank once per bin, then every
+    permuted Spearman is another dot product."""
+    from scipy.stats import rankdata, spearmanr
+    m = _mod()
+    rng = np.random.default_rng(1)
+    n = 20_000
+    x = rng.normal(0, 1, n)
+    y = 0.35 * x + rng.normal(0, 1, n)
+    rx, ry = rankdata(x), rankdata(y)
+    got = m._pearson(rx, ry, float(n), rx.sum(), (rx * rx).sum(),
+                     ry.sum(), (ry * ry).sum())
+    assert got == pytest.approx(spearmanr(x, y)[0], abs=1e-12)
+    # Permuting y permutes its ranks identically, so the ranks need not be
+    # recomputed inside the loop.
+    p = rng.permutation(n)
+    np.testing.assert_allclose(rankdata(y[p]), ry[p])
+
+
+def test_the_marginal_sums_are_invariant_under_the_permutation():
+    """Which is why the loop touches only the cross-product: a permutation
+    reorders y without changing Σy or Σy²."""
+    rng = np.random.default_rng(2)
+    y = rng.normal(0, 1, 10_000)
+    p = rng.permutation(y.size)
+    assert y[p].sum() == pytest.approx(y.sum(), rel=1e-12)
+    assert (y[p] ** 2).sum() == pytest.approx((y * y).sum(), rel=1e-12)
+
+
+def test_the_result_does_not_depend_on_how_many_workers_ran_it():
+    """Each (measure, bin) is seeded from the bin, not from a shared
+    stream, so fanning them out cannot move a number."""
+    m = _mod()
+    rng = np.random.default_rng(3)
+    nb, n_cells, per = 3, 20, 400
+    per_cell = []
+    for _ in range(n_cells):
+        b = rng.integers(0, nb, per).astype(np.int64)
+        x = rng.normal(0, 1, per)
+        y = 0.3 * x + rng.normal(0, 1, per)
+        per_cell.append({k: (b, x, y) for k, _ in m._MEASURES})
+    pooled = m.pool_cells(per_cell, nb)
+    a = m.correlations(pooled, nb, 20, 10, 0, n_jobs=1)
+    b_ = m.correlations(pooled, nb, 20, 10, 0, n_jobs=4)
+    for key, _ in m._MEASURES:
+        for stat in ("r", "rho", "r_null", "rho_null", "emp_p", "emp_p_rho"):
+            np.testing.assert_allclose(a[key][stat], b_[key][stat],
+                                       equal_nan=True, rtol=1e-12)
+
+
+def test_the_permutation_stays_inside_its_cell_within_the_bin():
+    """A bin's groups are its cells.  Shuffling across them would destroy
+    the cell-level structure the null exists to keep."""
+    m = _mod()
+    rng = np.random.default_rng(4)
+    # Two cells, disjoint value ranges, one bin: if the shuffle crossed
+    # cells the correlation would collapse rather than survive.
+    n = 300
+    b = np.zeros(n, np.int64)
+    x = np.r_[rng.normal(-3, 0.2, n // 2), rng.normal(3, 0.2, n // 2)]
+    y = x + rng.normal(0, 0.2, n)
+    cid = np.r_[np.zeros(n // 2, np.int32), np.ones(n // 2, np.int32)]
+    pooled = {k: (cid, b, x, y) for k, _ in m._MEASURES}
+    d = m.correlations(pooled, 1, 50, 10, 0)["gg"]
+    # The between-cell separation survives into the null, so Δ is small
+    # even though r is near 1.
+    assert d["r"][0] > 0.95
+    assert d["r_null"][0] > 0.9
+    assert abs(d["r"][0] - d["r_null"][0]) < 0.15

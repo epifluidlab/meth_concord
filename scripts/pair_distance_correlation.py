@@ -399,21 +399,83 @@ def pool_cells(per_cell, nb):
     return out
 
 
-def _both_corr(x, y):
-    """(pearson r, its p, spearman rho, its p) for one bin."""
-    from scipy.stats import pearsonr, spearmanr
-    if x.size < 3 or np.ptp(x) == 0 or np.ptp(y) == 0:
-        return np.nan, np.nan, np.nan, np.nan
-    r, pr = pearsonr(x, y)
-    rho, prho = spearmanr(x, y)
-    return float(r), float(pr), float(rho), float(prho)
+def _pearson(x, y, n, sx, sxx, sy, syy):
+    """Pearson r from precomputed marginal sums.  One dot product.
+
+    Σy and Σyy are INVARIANT under a permutation of y -- it only reorders
+    the same values -- so a permutation loop can hoist them out and touch
+    nothing but Σxy.  scipy's pearsonr recomputes all five and a p-value
+    that the null discards.
+    """
+    sxy = float(np.dot(x, y))
+    num = n * sxy - sx * sy
+    den = np.sqrt((n * sxx - sx * sx) * (n * syy - sy * sy))
+    return num / den if den > 0 else np.nan
 
 
-def correlations(pooled, nb, n_perm, min_pairs, seed):
+def _bin_result(xb, yb, groups, n_perm, min_pairs, seed):
+    """Observed and permuted correlations for ONE distance bin.
+
+    SPEARMAN IS PEARSON ON RANKS, and a permutation of y permutes its ranks
+    the same way -- so the ranks are computed ONCE and every null Spearman
+    is another dot product.  Ranking inside the loop instead was the whole
+    cost: measured on 200,000 observations, scipy's spearmanr takes 41 ms
+    against 3.2 ms for the dot, and it was being called n_perm x n_bins
+    times.
+    """
+    from scipy.stats import pearsonr, rankdata, spearmanr
+    out = {k: np.nan for k in ("r", "p", "rho", "p_rho", "r_null",
+                               "rho_null", "emp_p", "emp_p_rho")}
+    out["n"] = float(xb.size)
+    if xb.size < max(3, min_pairs) or np.ptp(xb) == 0 or np.ptp(yb) == 0:
+        return out
+    r, pr = pearsonr(xb, yb)
+    rho, prho = spearmanr(xb, yb)
+    out["r"], out["p"] = float(r), float(pr)
+    out["rho"], out["p_rho"] = float(rho), float(prho)
+    if int(n_perm) <= 0:
+        return out
+
+    rxb, ryb = rankdata(xb), rankdata(yb)
+    n = float(xb.size)
+    sx, sxx = float(xb.sum()), float((xb * xb).sum())
+    sy, syy = float(yb.sum()), float((yb * yb).sum())
+    srx, srxx = float(rxb.sum()), float((rxb * rxb).sum())
+    sry, sryy = float(ryb.sum()), float((ryb * ryb).sum())
+
+    rng = np.random.default_rng(seed)
+    perm = np.arange(xb.size)
+    acc_r = acc_rho = 0.0
+    hit_r = hit_rho = 0
+    seen = 0
+    big = [g for g in groups if g.size > 1]
+    for _ in range(int(n_perm)):
+        for g in big:
+            perm[g] = rng.permutation(g)
+        rr = _pearson(xb, yb[perm], n, sx, sxx, sy, syy)
+        rr_s = _pearson(rxb, ryb[perm], n, srx, srxx, sry, sryy)
+        if np.isfinite(rr):
+            acc_r += rr
+            hit_r += int(abs(rr) >= abs(out["r"]))
+        if np.isfinite(rr_s):
+            acc_rho += rr_s
+            hit_rho += int(abs(rr_s) >= abs(out["rho"]))
+        seen += 1
+    if seen:
+        out["r_null"] = acc_r / seen
+        out["rho_null"] = acc_rho / seen
+        # +1 on both sides: beyond every re-pairing is not impossible, only
+        # beyond what N of them reached.
+        out["emp_p"] = (hit_r + 1.0) / (seen + 1.0)
+        out["emp_p_rho"] = (hit_rho + 1.0) / (seen + 1.0)
+    return out
+
+
+def correlations(pooled, nb, n_perm, min_pairs, seed, n_jobs=1):
     """Observed correlations, the re-paired null, and an EMPIRICAL p.
 
     THE PARAMETRIC P IS NOT THE ONE TO READ, and both are reported so the
-    difference is visible.  pearsonr's p assumes the observations are
+    difference is visible.  scipy's p assumes the observations are
     independent draws; here many come from the same cell, and cells differ
     in global level, so it is anti-conservative for exactly the reason the
     null is per cell.  The empirical p counts how often a re-pairing --
@@ -423,64 +485,46 @@ def correlations(pooled, nb, n_perm, min_pairs, seed):
     Spearman is reported beside Pearson because these are bounded, skewed
     quantities: a posterior piles up near 0 and 1, and a handful of pairs at
     the corners can carry a Pearson that a rank correlation will not.
+
+    Every (measure, bin) is independent, so ``n_jobs`` fans them out.  The
+    per-cell read is not the only parallel phase any more: with four
+    measures and a handful of bins there is real work here, and it used to
+    run on one core while the rest idled.
     """
-    rng = np.random.default_rng(seed)
-    out = {}
+    tasks, keys = [], []
     for m, _ in _MEASURES:
         cid, bins, x, y = pooled[m]
-        res = {k: np.full(nb, np.nan) for k in
-               ("r", "p", "rho", "p_rho", "r_null", "rho_null",
-                "emp_p", "emp_p_rho")}
-        res["n"] = np.zeros(nb)
-        if not bins.size:
-            out[m] = res
-            continue
-        # Permutation groups, built once: the y column moves only inside a
-        # (cell, bin).
-        key = cid.astype(np.int64) * (nb + 1) + bins
-        order = np.argsort(key, kind="stable")
-        gk = key[order]
-        starts = np.flatnonzero(np.r_[True, gk[1:] != gk[:-1]])
-        groups = np.split(order, starts[1:])
         for b in range(nb):
-            sel = bins == b
-            n = int(sel.sum())
-            res["n"][b] = n
-            if n < min_pairs:
+            if not bins.size:
+                tasks.append((np.empty(0), np.empty(0), [], n_perm,
+                              min_pairs, seed + b))
+                keys.append((m, b))
                 continue
-            r, pr, rho, prho = _both_corr(x[sel], y[sel])
-            res["r"][b], res["p"][b] = r, pr
-            res["rho"][b], res["p_rho"][b] = rho, prho
-        if int(n_perm) <= 0:
-            out[m] = res
-            continue
-        acc_r = np.zeros((nb,)); acc_rho = np.zeros((nb,))
-        hit_r = np.zeros(nb); hit_rho = np.zeros(nb); seen = np.zeros(nb)
-        for _ in range(int(n_perm)):
-            ys = y.copy()
-            for g in groups:
-                if g.size > 1:
-                    ys[g] = y[rng.permutation(g)]
-            for b in range(nb):
-                if res["n"][b] < min_pairs:
-                    continue
-                sel = bins == b
-                r, _pr, rho, _prho = _both_corr(x[sel], ys[sel])
-                if np.isfinite(r):
-                    acc_r[b] += r
-                    hit_r[b] += float(abs(r) >= abs(res["r"][b]))
-                if np.isfinite(rho):
-                    acc_rho[b] += rho
-                    hit_rho[b] += float(abs(rho) >= abs(res["rho"][b]))
-                seen[b] += 1
-        ok = seen > 0
-        res["r_null"][ok] = acc_r[ok] / seen[ok]
-        res["rho_null"][ok] = acc_rho[ok] / seen[ok]
-        # +1 on both sides: a correlation beyond every re-pairing cannot be
-        # reported as impossible, only as beyond what N of them reached.
-        res["emp_p"][ok] = (hit_r[ok] + 1.0) / (seen[ok] + 1.0)
-        res["emp_p_rho"][ok] = (hit_rho[ok] + 1.0) / (seen[ok] + 1.0)
-        out[m] = res
+            sel = np.flatnonzero(bins == b)
+            xb, yb = x[sel], y[sel]
+            # Permutation groups: positions WITHIN this bin, one per cell.
+            cb = cid[sel]
+            o = np.argsort(cb, kind="stable")
+            cs = cb[o]
+            starts = np.flatnonzero(np.r_[True, cs[1:] != cs[:-1]])
+            groups = np.split(o, starts[1:]) if o.size else []
+            tasks.append((xb, yb, groups, n_perm, min_pairs, seed + b))
+            keys.append((m, b))
+    if int(n_jobs) > 1 and len(tasks) > 1:
+        from joblib import Parallel, delayed
+        got = Parallel(n_jobs=int(n_jobs), prefer="processes")(
+            delayed(_bin_result)(*t) for t in tasks)
+    else:
+        got = [_bin_result(*t) for t in tasks]
+
+    out = {m: {k: np.full(nb, np.nan) for k in
+               ("r", "p", "rho", "p_rho", "r_null", "rho_null",
+                "emp_p", "emp_p_rho")} for m, _ in _MEASURES}
+    for m, _ in _MEASURES:
+        out[m]["n"] = np.zeros(nb)
+    for (m, b), d in zip(keys, got):
+        for k, v in d.items():
+            out[m][k][b] = v
     return out
 
 
@@ -731,7 +775,7 @@ def main(argv=None) -> int:
     n_used = sum(1 for c in per_cell
                  if any(c[m][0].size for m, _ in _MEASURES))
     res = correlations(pooled, nb, args.n_permutations, args.min_pairs,
-                       args.seed)
+                       args.seed, n_jobs=args.threads)
 
     rows = {"bin_lo": edges[:-1], "bin_hi": edges[1:], "center": centers}
     for m, _ in _MEASURES:
