@@ -230,7 +230,8 @@ def _overlay_fixture(m, gh_small=True):
     for i, g in enumerate(("A", "B", "all")):
         curves = {}
         for k, _ in m._MEASURES:
-            base = {"gg": 0.4 + 0.1 * i, "hh": 0.3, "gh": 0.02 + 0.01 * i}[k]
+            base = {"gg": 0.4 + 0.1 * i, "hh": 0.3, "gh": 0.02 + 0.01 * i,
+                    "cc": 0.05 + 0.01 * i}[k]
             for c, _l in m._CONDS:
                 lv = base if c == "linked" else base * 0.2
                 curves[(k, c)] = (np.full(nb, lv), np.full(nb, 1e6))

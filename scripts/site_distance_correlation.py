@@ -17,6 +17,31 @@ Three site pairings, each a Pearson r on the 0/1 calls (the phi coefficient):
   * HCG–GCH : a CpG site vs a GpC site (cross-context; the shortest-distance
               bin is the "HCG and its next GCH" case)
 
+and one pairing that is NOT site-level:
+
+  * GCH–GCH vs HCG–HCG : among read pairs carrying BOTH contexts on BOTH
+              ends, the correlation between the pair's accessibility
+              concordance and its methylation concordance.  Each end gets
+              a1 = fraction of its GpC sites called accessible and m1 the
+              same for CpG; then gg = a1 a2 + (1 - a1)(1 - a2) is the
+              probability the two ends are in the same accessibility state
+              -- the concordance pipeline's own F -- and hh is its
+              methylation counterpart.  Correlating gg against hh across
+              the pairs in a distance bin asks whether a pair that is
+              co-accessible is also co-methylated.
+
+              A DIFFERENT UNIT.  The three above correlate one cytosine
+              with another and a read pair contributes one observation per
+              site pair; this one correlates the two CONTEXTS with each
+              other and a pair contributes exactly one.  It also needs both
+              contexts on both ends, so its n is smaller and is reported
+              separately.  It replaces HCG-GCH in the third panel -- that
+              curve asks whether methylation at one locus tracks
+              accessibility at ANOTHER, hugs zero an order of magnitude
+              below the others, and is still computed and written to the
+              TSV.  The htslib backend has a fixed three-measure layout and
+              cannot compute it; use --backend python.
+
 Site pairs come from BOTH arms, giving one continuous curve:
   * WITHIN-read  — two sites on the same read  → the short range (≲ read length)
   * CROSS-end    — a site on end 1 × a site on end 2 → the long range (contact)
@@ -143,7 +168,25 @@ except Exception:                                           # pragma: no cover
 
 _MEASURES = (("gg", "GCH–GCH  r(site_i, site_j)"),
              ("hh", "HCG–HCG  r(site_i, site_j)"),
-             ("gh", "HCG–GCH  r(CpG, GpC)  [cross-context]"))
+             ("gh", "HCG–GCH  r(CpG, GpC)  [cross-context]"),
+             ("cc", "GCH–GCH vs HCG–HCG  r(pair concordance)"))
+
+# WHICH MEASURES GET A PANEL.  'gh' correlates a CpG on one end with a GpC
+# on the other, which asks whether methylation at one locus tracks
+# accessibility at another -- a cross-context question, and one whose curve
+# hugs zero an order of magnitude below the others.  'cc' asks the question
+# the panel was wanted for instead: among read pairs that carry BOTH
+# contexts on BOTH ends, does a pair that is co-accessible also tend to be
+# co-methylated, and how does that vary with distance.  'gh' is still
+# computed and written to the TSV, the way 'matched' is.
+_PLOTTED = ("gg", "hh", "cc")
+
+# WHAT THE C++ CORE KNOWS.  _site_dist_core returns a fixed three-measure
+# layout and is a compiled extension, so 'cc' cannot be added to it here.
+# The pure-Python backend computes it; the htslib one leaves it empty and
+# the run says so rather than plotting an all-zero panel as if it were a
+# result.
+_CPP_MEASURES = ("gg", "hh", "gh")
 _CONDS = (("linked", "linked (true partner, all pairs)"),
           ("matched", "linked (true partner, null-eligible pairs)"),
           ("null", "non-linked (±window)"))
@@ -421,11 +464,15 @@ def _pooled_null(res, idxs, edges, args, nb):
                                int(args.seed), len(kept))
     k = len(kept)
     null_pc, match_pc = {}, {}
-    for mi, (mkey, _) in enumerate(_MEASURES):
-        null_pc[mkey] = [np.asarray(out["null_per_cell"][3 * c + mi], np.float64)
-                         for c in range(k)]
-        match_pc[mkey] = [np.asarray(out["matched_per_cell"][3 * c + mi], np.float64)
-                          for c in range(k)]
+    _nm = len(_CPP_MEASURES)
+    for mi, mkey in enumerate(_CPP_MEASURES):
+        null_pc[mkey] = [np.asarray(out["null_per_cell"][_nm * c + mi],
+                                    np.float64) for c in range(k)]
+        match_pc[mkey] = [np.asarray(out["matched_per_cell"][_nm * c + mi],
+                                     np.float64) for c in range(k)]
+    for mkey, _ in _MEASURES:                 # measures the core does not know
+        null_pc.setdefault(mkey, [np.zeros(len(edges) - 1) for _ in range(k)])
+        match_pc.setdefault(mkey, [np.zeros(len(edges) - 1) for _ in range(k)])
     st = [res[i][3][2] for i in kept if len(res[i][3]) > 2]
     return {"null_per_cell": null_pc, "matched_per_cell": match_pc,
             "n_eligible": int(out["n_eligible"]),
@@ -603,6 +650,51 @@ def _pair_sites(pos_a, st_a, pos_b, st_b, edges, same_array, rng, cap):
     return bins, st_a[ia], st_b[ib]
 
 
+def _pair_concordance(c1, c2, edges):
+    """One (distance bin, GCH concordance, HCG concordance) per read pair.
+
+    A DIFFERENT UNIT FROM THE OTHER MEASURES.  Those correlate individual
+    cytosines: one site against another, across every site pair in the bin.
+    This one correlates the two CONTEXTS with each other, and the thing it
+    correlates is a property of the read PAIR -- so a pair contributes one
+    observation, not one per site pair.
+
+    Concordance is the pipeline's own F: with a1, a2 the fraction of GpC
+    sites called accessible on each end,
+
+        gg = a1 a2 + (1 - a1)(1 - a2)
+
+    the probability the two ends are in the SAME accessibility state, and
+    hh the same for CpG methylation.  Correlating gg against hh across the
+    pairs in a distance bin asks whether a pair that is co-accessible is
+    also co-methylated.
+
+    Requires BOTH contexts on BOTH ends -- that is what the question is
+    about, and a pair missing either cannot answer it.  Returns None
+    otherwise, so the eligible set is smaller than for the site-level
+    measures and its n is reported separately.
+    """
+    g1, g2 = c1.get("GCH"), c2.get("GCH")
+    h1, h2 = c1.get("HCG"), c2.get("HCG")
+    for v in (g1, g2, h1, h2):
+        if v is None or v[0].size == 0:
+            return None
+    a1, a2 = float(np.mean(g1[1])), float(np.mean(g2[1]))
+    m1, m2 = float(np.mean(h1[1])), float(np.mean(h2[1]))
+    gg = a1 * a2 + (1.0 - a1) * (1.0 - a2)
+    hh = m1 * m2 + (1.0 - m1) * (1.0 - m2)
+    # The pair's separation, from every site it carries rather than from one
+    # context -- the two contexts tile the same read and either alone would
+    # shift the midpoint.
+    p1 = float(np.mean(np.concatenate([g1[0], h1[0]])))
+    p2 = float(np.mean(np.concatenate([g2[0], h2[0]])))
+    d = abs(p2 - p1)
+    if not (edges[0] <= d <= edges[-1]):
+        return None
+    b = int(np.clip(np.digitize([d], edges)[0] - 1, 0, len(edges) - 2))
+    return b, gg, hh
+
+
 def _add_pair(accs, cond, edges, rng, cap, c1, c2, cross_only=False):
     """Accumulate every measure for one (end1, end2) site-call pair."""
     nb = accs[("gg", cond)].shape[1]
@@ -626,6 +718,12 @@ def _add_pair(accs, cond, edges, rng, cap, c1, c2, cross_only=False):
     go("hh", h1[0], h1[1], h2[0], h2[1], False)
     go("gh", h1[0], h1[1], g2[0], g2[1], False)     # CpG(end1) × GpC(end2)
     go("gh", h2[0], h2[1], g1[0], g1[1], False)     # and the reverse ordering
+    # Pair-level: one observation per read pair, cross-end only by nature.
+    _pc = _pair_concordance(c1, c2, edges)
+    if _pc is not None:
+        _b, _gg, _hh = _pc
+        _accumulate(accs[("cc", cond)], np.array([_b], np.int64),
+                    np.array([_gg]), np.array([_hh]))
     _ = nb
 
 
@@ -670,9 +768,11 @@ def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
         int(anchor_long_cap), int(long_range_bp),
         int(strand_min_evidence), int(null_type), int(anchor_window))
     accs = {}
+    nb_ = len(edges) - 1
     for m, _ in _MEASURES:
         for c, _lab in _CONDS:
-            accs[(m, c)] = np.asarray(res[f"{m}_{c}"], dtype=np.float64)
+            accs[(m, c)] = (np.asarray(res[f"{m}_{c}"], dtype=np.float64)
+                            if m in _CPP_MEASURES else _new_acc(nb_))
     pools = None
     if donor_cap or anchor_cap or anchor_long_cap:
         pools = (dict(res["donors"]), dict(res["anchors"]),
@@ -907,7 +1007,8 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    colors = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c"}
+    colors = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c",
+              "cc": "#7b3f9e"}
     fig, axes = plt.subplots(2, 3, figsize=(15, 8.6), sharex=True)
     # Below ~10bp the site pairs are adjacent-motif artefacts rather than a
     # distance relationship -- most sharply the distance-1 HCG-HCG point, which
@@ -919,7 +1020,9 @@ def _plot(curves, boot, centers, edges, label, n_cells, n_pairs, out, min_pairs,
     def _show(v):
         return np.where(vis, v, np.nan)
 
-    for col, (key, title) in enumerate(_MEASURES):
+    _titles = dict(_MEASURES)
+    for col, key in enumerate(_PLOTTED):
+        title = _titles[key]
         ax = axes[0, col]
         ax.axhline(0, color="0.6", lw=0.8, zorder=0)
         for cond, clabel in _CONDS:
@@ -1118,13 +1221,17 @@ def _plot_groups(per_group, out, metric, min_pairs, plot_min, colors, order):
     import matplotlib.pyplot as plt
 
     # No sharey: GCH-GCH & HCG-HCG get one explicit shared limit per row (set
-    # below), while HCG-GCH (col 2) is autoscaled to its own near-zero range.
+    # below), while the third panel is autoscaled to its own range -- it is a
+    # correlation between two CONTEXTS rather than between two sites, so it
+    # has no reason to live on the same scale as the first two.
     fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.0), sharex=True)
     has_all = "all" in per_group
     lo_x = None
     for row, (cond, rlab) in enumerate((("linked", "concordance (linked)"),
                                         ("delta", "Δ = linked − null"))):
-        for col, (key, title) in enumerate(_MEASURES):
+        _titles = dict(_MEASURES)
+        for col, key in enumerate(_PLOTTED):
+            title = _titles[key]
             ax = axes[row, col]
             ax.axhline(0, color="0.6", lw=0.8, zorder=0)
             for label in order:
@@ -1602,6 +1709,16 @@ def main():
         sys.exit("--backend htslib requested but the extension is not built "
                  "(pip install -e . with htslib + pybind11 available).")
     backend = "htslib (C++)" if use_cpp else "python (pysam)"
+    if use_cpp:
+        _miss = [k for k, _ in _MEASURES if k not in _CPP_MEASURES]
+        if _miss:
+            print(f"  NOTE: the htslib backend computes "
+                  f"{', '.join(_CPP_MEASURES)} only; "
+                  f"{', '.join(_miss)} needs --backend python.  "
+                  f"{_PLOTTED[2]!r} correlates the two CONTEXTS with each "
+                  f"other per read PAIR rather than one site with another, "
+                  f"which the compiled core has no layout for -- its panel "
+                  f"will be empty here rather than wrong.", file=sys.stderr)
     if not use_cpp and not args.max_pairs_per_cell:
         print("  NOTE: the pysam fallback on FULL BAMs is ~100x slower than the "
               "htslib backend; build the extension or set --max-pairs-per-cell.",
