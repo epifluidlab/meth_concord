@@ -224,6 +224,26 @@ struct Acc {
     }
 };
 
+/* Continuous-valued accumulator, for a measure whose x and y are not 0/1.
+ *
+ * Acc above keeps four rows and rebuilds Sxx and Syy from Sx and Sy, which
+ * is exact only for binary calls.  The pair-level concordance is a
+ * probability in [0, 1], so its squares are genuinely different sums and
+ * all six have to be carried. */
+struct AccF {
+    std::vector<double> v;                    // 6 x nb: n, Sx, Sy, Sxx, Syy, Sxy
+    int nb;
+    explicit AccF(int n) : v(6 * (size_t)n, 0.0), nb(n) {}
+    inline void add(int b, double x, double y) {
+        v[(size_t)0 * nb + b] += 1.0;
+        v[(size_t)1 * nb + b] += x;
+        v[(size_t)2 * nb + b] += y;
+        v[(size_t)3 * nb + b] += x * x;
+        v[(size_t)4 * nb + b] += y * y;
+        v[(size_t)5 * nb + b] += x * y;
+    }
+};
+
 static inline int bin_of(const std::vector<double>& edges, int64_t d) {
     double dd = (double)d;
     if (dd < edges.front() || dd > edges.back()) return -1;
@@ -358,7 +378,49 @@ struct PairRec {
 };
 
 /* Accumulate every measure for one (end1, end2) record pair. */
-static void add_pair(Acc& gg, Acc& hh, Acc& gh,
+/* One (bin, GCH concordance, HCG concordance) per READ PAIR.
+ *
+ * A different unit from everything else here: the site-level measures take
+ * one observation per site pair, this takes one per pair.  With a1 the
+ * fraction of end 1's GpC sites called accessible,
+ *
+ *     gg = a1 a2 + (1 - a1)(1 - a2)
+ *
+ * is the probability the two ends are in the same accessibility state --
+ * the concordance pipeline's own F -- and hh is its CpG counterpart.
+ *
+ * Needs BOTH contexts on BOTH ends, which is exactly the question, so a
+ * pair missing either is skipped rather than filled in.  The separation
+ * comes from every site the pair carries: the two contexts tile the same
+ * read and either alone would shift the midpoint. */
+static void add_pair_concordance(AccF& cc,
+                                 const SiteVec& g1, const SiteVec& g2,
+                                 const SiteVec& h1, const SiteVec& h2,
+                                 const std::vector<double>& edges) {
+    if (g1.size() == 0 || g2.size() == 0 || h1.size() == 0 || h2.size() == 0)
+        return;
+    double a1 = 0, a2 = 0, m1 = 0, m2 = 0;
+    for (size_t i = 0; i < g1.size(); ++i) a1 += (double)g1.st[i];
+    for (size_t i = 0; i < g2.size(); ++i) a2 += (double)g2.st[i];
+    for (size_t i = 0; i < h1.size(); ++i) m1 += (double)h1.st[i];
+    for (size_t i = 0; i < h2.size(); ++i) m2 += (double)h2.st[i];
+    a1 /= (double)g1.size(); a2 /= (double)g2.size();
+    m1 /= (double)h1.size(); m2 /= (double)h2.size();
+    const double gg = a1 * a2 + (1.0 - a1) * (1.0 - a2);
+    const double hh = m1 * m2 + (1.0 - m1) * (1.0 - m2);
+    long double p1 = 0, p2 = 0;
+    for (size_t i = 0; i < g1.size(); ++i) p1 += (long double)g1.pos[i];
+    for (size_t i = 0; i < h1.size(); ++i) p1 += (long double)h1.pos[i];
+    for (size_t i = 0; i < g2.size(); ++i) p2 += (long double)g2.pos[i];
+    for (size_t i = 0; i < h2.size(); ++i) p2 += (long double)h2.pos[i];
+    p1 /= (long double)(g1.size() + h1.size());
+    p2 /= (long double)(g2.size() + h2.size());
+    long double dd = p2 > p1 ? p2 - p1 : p1 - p2;
+    int b = bin_of(edges, (int64_t)(dd + 0.5L));
+    if (b >= 0) cc.add(b, gg, hh);
+}
+
+static void add_pair(Acc& gg, Acc& hh, Acc& gh, AccF& cc,
                      const SiteVec& g1, const SiteVec& g2,
                      const SiteVec& h1, const SiteVec& h2,
                      const std::vector<double>& edges, int cap,
@@ -376,10 +438,17 @@ static void add_pair(Acc& gg, Acc& hh, Acc& gh,
     pair_accumulate(hh, h1, h2, false, edges, cap, rng);
     pair_accumulate(gh, h1, g2, false, edges, cap, rng);
     pair_accumulate(gh, h2, g1, false, edges, cap, rng);
+    add_pair_concordance(cc, g1, g2, h1, h2, edges);
 }
 
 /* Re-expand the 4 kept rows into the 6 the Python side reads:
  * n, Sx, Sy, Sxx, Syy, Sxy — with Sxx = Sx and Syy = Sy for 0/1 data. */
+static py::array_t<double> to_numpy(const AccF& a) {
+    py::array_t<double> out({(py::ssize_t)6, (py::ssize_t)a.nb});
+    std::copy(a.v.begin(), a.v.end(), out.mutable_data());
+    return out;
+}
+
 static py::array_t<double> to_numpy(const Acc& a) {
     py::array_t<double> out({(py::ssize_t)6, (py::ssize_t)a.nb});
     double* o = out.mutable_data();
@@ -504,6 +573,7 @@ static py::dict parse_cell_site_distance(
 {
     const int nb = (int)edges.size() - 1;
     Acc gg_l(nb), hh_l(nb), gh_l(nb), gg_n(nb), hh_n(nb), gh_n(nb);
+    AccF cc_l(nb), cc_n(nb);
     // MATCHED: the TRUE partner, but only for the pairs that were null-eligible.
     // The null can only use a pair that HAS another end within +-window, which
     // at single-cell coverage is a minority of pairs and is biased toward
@@ -513,6 +583,7 @@ static py::dict parse_cell_site_distance(
     // cross-end only -- the ONLY difference from the null is whether the
     // partner is the true mate.
     Acc gg_m(nb), hh_m(nb), gh_m(nb);
+    AccF cc_m(nb);
     std::mt19937_64 rng(seed);
     // Separate stream, so adding this arm leaves the linked and null draws --
     // and hence any previously computed result -- bit-identical.
@@ -675,7 +746,7 @@ static py::dict parse_cell_site_distance(
 
         // ---- LINKED ----
         for (const PairRec& p : pairs)
-            add_pair(gg_l, hh_l, gh_l, p.g1, p.g2, p.h1, p.h2, edges,
+            add_pair(gg_l, hh_l, gh_l, cc_l, p.g1, p.g2, p.h1, p.h2, edges,
                      max_site_pairs_per_read, rng, false);
 
         // ---- NULL (distance-matched): same cell, same separation ---------
@@ -750,11 +821,11 @@ static py::dict parse_cell_site_distance(
                     const SiteVec& gb = ends[kb].which ? B.g2 : B.g1;
                     const SiteVec& hb = ends[kb].which ? B.h2 : B.h1;
                     ++n_null_eligible;
-                    add_pair(gg_n, hh_n, gh_n, ga, gb, ha, hb, edges,
+                    add_pair(gg_n, hh_n, gh_n, cc_n, ga, gb, ha, hb, edges,
                              max_site_pairs_per_read, rng, true);
                     // MATCHED: the true pair, over exactly the anchors the
                     // null could place — the like-for-like baseline.
-                    add_pair(gg_m, hh_m, gh_m, pairs[i].g1, pairs[i].g2,
+                    add_pair(gg_m, hh_m, gh_m, cc_m, pairs[i].g1, pairs[i].g2,
                              pairs[i].h1, pairs[i].h2, edges,
                              max_site_pairs_per_read, rng_m, true);
                     break;
@@ -788,12 +859,12 @@ static py::dict parse_cell_site_distance(
                 if (order[k] == i) k = lo + ((k - lo) + 1) % span;
                 const size_t pick = order[k];
                 ++n_null_eligible;
-                add_pair(gg_n, hh_n, gh_n, pairs[i].g1, pairs[pick].g2,
+                add_pair(gg_n, hh_n, gh_n, cc_n, pairs[i].g1, pairs[pick].g2,
                          pairs[i].h1, pairs[pick].h2, edges,
                          max_site_pairs_per_read, rng, true);
                 // Same pair, TRUE partner, cross-end only: the like-for-like
                 // baseline for the null line directly above.
-                add_pair(gg_m, hh_m, gh_m, pairs[i].g1, pairs[i].g2,
+                add_pair(gg_m, hh_m, gh_m, cc_m, pairs[i].g1, pairs[i].g2,
                          pairs[i].h1, pairs[i].h2, edges,
                          max_site_pairs_per_read, rng_m, true);
             }
@@ -838,6 +909,9 @@ static py::dict parse_cell_site_distance(
     }   // GIL reacquired here
 
     py::dict out;
+    out["cc_linked"] = to_numpy(cc_l);
+    out["cc_null"] = to_numpy(cc_n);
+    out["cc_matched"] = to_numpy(cc_m);
     out["gg_linked"] = to_numpy(gg_l);
     out["hh_linked"] = to_numpy(hh_l);
     out["gh_linked"] = to_numpy(gh_l);
@@ -929,6 +1003,11 @@ static py::dict cross_cell_null(py::dict anchors, py::dict donors,
     std::vector<Acc> null_c, match_c;                 // 3 measures x n_cells
     null_c.reserve(3 * (size_t)n_cells); match_c.reserve(3 * (size_t)n_cells);
     for (int i = 0; i < 3 * n_cells; ++i) { null_c.emplace_back(nb); match_c.emplace_back(nb); }
+    // The pair-level concordance is continuous, so it needs its own
+    // six-row accumulator and cannot share the stride-3 binary layout.
+    std::vector<AccF> null_cc, match_cc;              // 1 per cell
+    null_cc.reserve((size_t)n_cells); match_cc.reserve((size_t)n_cells);
+    for (int i = 0; i < n_cells; ++i) { null_cc.emplace_back(nb); match_cc.emplace_back(nb); }
     uint64_t eligible = 0;
 
     {
@@ -976,9 +1055,11 @@ static py::dict cross_cell_null(py::dict anchors, py::dict donors,
         ag1.get(i, g1); ah1.get(i, h1);
         ag2.get(i, g2); ah2.get(i, h2);
         add_pair(null_c[3 * ci + 0], null_c[3 * ci + 1], null_c[3 * ci + 2],
-                 g1, dgv, h1, dhv, edges, max_site_pairs_per_read, rng, true);
+                 null_cc[ci], g1, dgv, h1, dhv, edges,
+                 max_site_pairs_per_read, rng, true);
         add_pair(match_c[3 * ci + 0], match_c[3 * ci + 1], match_c[3 * ci + 2],
-                 g1, g2, h1, h2, edges, max_site_pairs_per_read, rng, true);
+                 match_cc[ci], g1, g2, h1, h2, edges,
+                 max_site_pairs_per_read, rng, true);
     }
     }   // GIL reacquired
 
@@ -988,8 +1069,15 @@ static py::dict cross_cell_null(py::dict anchors, py::dict donors,
         nl.append(to_numpy(null_c[i]));
         ml.append(to_numpy(match_c[i]));
     }
+    py::list ncc, mcc;
+    for (int i = 0; i < n_cells; ++i) {
+        ncc.append(to_numpy(null_cc[i]));
+        mcc.append(to_numpy(match_cc[i]));
+    }
     out["null_per_cell"] = nl;
     out["matched_per_cell"] = ml;
+    out["null_cc_per_cell"] = ncc;
+    out["matched_cc_per_cell"] = mcc;
     out["n_eligible"] = py::int_(eligible);
     out["n_anchors"] = py::int_(na);
     return out;
@@ -1198,9 +1286,12 @@ static py::dict accumulate_contacts(py::dict pairs, py::array_t<int32_t> bin_of_
     const int64_t n = bin_of_pair.size();
 
     std::vector<Acc> gg, hh, gh;
+    std::vector<AccF> cc;
     gg.reserve(n_cells); hh.reserve(n_cells); gh.reserve(n_cells);
+    cc.reserve(n_cells);
     for (int i = 0; i < n_cells; ++i) {
         gg.emplace_back(n_bins); hh.emplace_back(n_bins); gh.emplace_back(n_bins);
+        cc.emplace_back(n_bins);
     }
     uint64_t used = 0;
 
@@ -1220,19 +1311,34 @@ static py::dict accumulate_contacts(py::dict pairs, py::array_t<int32_t> bin_of_
         // cross-context, both orientations, matching the distance analysis
         pair_accumulate_into(gh[c], b1, a2, b, cap, rng);
         pair_accumulate_into(gh[c], b2, a1, b, cap, rng);
+        // The pair-level concordance needs no distance of its own here:
+        // this path is handed the bin the substitute pair belongs to.
+        if (a1.size() && a2.size() && b1.size() && b2.size()) {
+            double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+            for (size_t k = 0; k < a1.size(); ++k) x1 += (double)a1.st[k];
+            for (size_t k = 0; k < a2.size(); ++k) x2 += (double)a2.st[k];
+            for (size_t k = 0; k < b1.size(); ++k) y1 += (double)b1.st[k];
+            for (size_t k = 0; k < b2.size(); ++k) y2 += (double)b2.st[k];
+            x1 /= (double)a1.size(); x2 /= (double)a2.size();
+            y1 /= (double)b1.size(); y2 /= (double)b2.size();
+            cc[c].add(b, x1 * x2 + (1.0 - x1) * (1.0 - x2),
+                         y1 * y2 + (1.0 - y1) * (1.0 - y2));
+        }
     }
     }
 
     py::dict out;
-    py::list lg, lh, lx;
+    py::list lg, lh, lx, lc;
     for (int i = 0; i < n_cells; ++i) {
         lg.append(to_numpy(gg[i]));
         lh.append(to_numpy(hh[i]));
         lx.append(to_numpy(gh[i]));
+        lc.append(to_numpy(cc[i]));
     }
     out["gg_per_cell"] = lg;
     out["hh_per_cell"] = lh;
     out["gh_per_cell"] = lx;
+    out["cc_per_cell"] = lc;
     out["n_used"] = py::int_(used);
     return out;
 }

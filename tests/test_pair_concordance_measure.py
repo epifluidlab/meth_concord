@@ -125,13 +125,34 @@ def test_the_third_panel_is_the_pair_measure_and_gh_is_still_computed():
     assert "gh" in keys
 
 
-def test_the_compiled_core_layout_is_not_assumed_to_cover_it():
-    """_site_dist_core returns a fixed three-measure layout and cannot be
-    extended from here, so indexing it by len(_MEASURES) would read past the
-    end once a fourth measure exists."""
+def test_the_compiled_core_computes_it_too():
+    """It is the same computation the C++ core already does for GCH-GCH and
+    HCG-HCG, with one extra requirement -- both contexts on both ends -- so
+    there was no reason to leave it to the slow backend.  What it could NOT
+    do was share the stride-3 pack: those three measures are 0/1, so the
+    core stores four rows and rebuilds Sxx from Sx, and a continuous x
+    breaks that identity."""
     m = _mod()
-    assert m._CPP_MEASURES == ("gg", "hh", "gh")
-    assert len(m._CPP_MEASURES) < len(m._MEASURES)
+    assert m._CPP_STRIDE3 == ("gg", "hh", "gh")
+    assert "cc" not in m._CPP_STRIDE3
     src = _SCRIPT.read_text()
     assert "3 * c + mi" not in src            # the old hard-coded stride
     assert "_nm * c + mi" in src
+    # No backend-dependent gap left in the Python side.
+    assert "needs --backend python" not in src
+    assert "_new_acc(nb_)" not in src
+
+
+def test_the_cpp_core_carries_the_new_measure():
+    """Every path the core exposes has to produce it, or a run picks up an
+    all-zero panel depending on which null it was asked for."""
+    cpp = (Path(__file__).resolve().parents[1] / "nome_hic_concordance"
+           / "ext" / "site_dist_core.cpp").read_text()
+    for key in ('out["cc_linked"]', 'out["cc_null"]', 'out["cc_matched"]',
+                'out["cc_per_cell"]', 'out["null_cc_per_cell"]',
+                'out["matched_cc_per_cell"]'):
+        assert key in cpp, key
+    # A six-row accumulator, because Sxx == Sx only holds for 0/1 data.
+    assert "struct AccF" in cpp
+    assert "v(6 * (size_t)n, 0.0)" in cpp
+    assert "add_pair_concordance" in cpp

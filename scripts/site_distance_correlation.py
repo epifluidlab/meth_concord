@@ -39,8 +39,7 @@ and one pairing that is NOT site-level:
               curve asks whether methylation at one locus tracks
               accessibility at ANOTHER, hugs zero an order of magnitude
               below the others, and is still computed and written to the
-              TSV.  The htslib backend has a fixed three-measure layout and
-              cannot compute it; use --backend python.
+              TSV.
 
 Site pairs come from BOTH arms, giving one continuous curve:
   * WITHIN-read  — two sites on the same read  → the short range (≲ read length)
@@ -181,12 +180,11 @@ _MEASURES = (("gg", "GCH–GCH  r(site_i, site_j)"),
 # computed and written to the TSV, the way 'matched' is.
 _PLOTTED = ("gg", "hh", "cc")
 
-# WHAT THE C++ CORE KNOWS.  _site_dist_core returns a fixed three-measure
-# layout and is a compiled extension, so 'cc' cannot be added to it here.
-# The pure-Python backend computes it; the htslib one leaves it empty and
-# the run says so rather than plotting an all-zero panel as if it were a
-# result.
-_CPP_MEASURES = ("gg", "hh", "gh")
+# The three measures the C++ core packs into ONE stride-3 array.  'cc' is
+# continuous rather than 0/1, so it needs all six running sums where those
+# rebuild Sxx from Sx, and it travels in its own arrays alongside -- see
+# AccF in ext/site_dist_core.cpp.  Both backends compute every measure.
+_CPP_STRIDE3 = ("gg", "hh", "gh")
 _CONDS = (("linked", "linked (true partner, all pairs)"),
           ("matched", "linked (true partner, null-eligible pairs)"),
           ("null", "non-linked (±window)"))
@@ -464,15 +462,17 @@ def _pooled_null(res, idxs, edges, args, nb):
                                int(args.seed), len(kept))
     k = len(kept)
     null_pc, match_pc = {}, {}
-    _nm = len(_CPP_MEASURES)
-    for mi, mkey in enumerate(_CPP_MEASURES):
+    _nm = len(_CPP_STRIDE3)
+    for mi, mkey in enumerate(_CPP_STRIDE3):
         null_pc[mkey] = [np.asarray(out["null_per_cell"][_nm * c + mi],
                                     np.float64) for c in range(k)]
         match_pc[mkey] = [np.asarray(out["matched_per_cell"][_nm * c + mi],
                                      np.float64) for c in range(k)]
-    for mkey, _ in _MEASURES:                 # measures the core does not know
-        null_pc.setdefault(mkey, [np.zeros(len(edges) - 1) for _ in range(k)])
-        match_pc.setdefault(mkey, [np.zeros(len(edges) - 1) for _ in range(k)])
+    # 'cc' is one array per cell, not part of the stride-3 pack.
+    null_pc["cc"] = [np.asarray(out["null_cc_per_cell"][c], np.float64)
+                     for c in range(k)]
+    match_pc["cc"] = [np.asarray(out["matched_cc_per_cell"][c], np.float64)
+                      for c in range(k)]
     st = [res[i][3][2] for i in kept if len(res[i][3]) > 2]
     return {"null_per_cell": null_pc, "matched_per_cell": match_pc,
             "n_eligible": int(out["n_eligible"]),
@@ -768,11 +768,9 @@ def process_cell_cpp(bam_path, prepared, edges, trim_ends, mapq_min,
         int(anchor_long_cap), int(long_range_bp),
         int(strand_min_evidence), int(null_type), int(anchor_window))
     accs = {}
-    nb_ = len(edges) - 1
     for m, _ in _MEASURES:
         for c, _lab in _CONDS:
-            accs[(m, c)] = (np.asarray(res[f"{m}_{c}"], dtype=np.float64)
-                            if m in _CPP_MEASURES else _new_acc(nb_))
+            accs[(m, c)] = np.asarray(res[f"{m}_{c}"], dtype=np.float64)
     pools = None
     if donor_cap or anchor_cap or anchor_long_cap:
         pools = (dict(res["donors"]), dict(res["anchors"]),
@@ -1709,16 +1707,6 @@ def main():
         sys.exit("--backend htslib requested but the extension is not built "
                  "(pip install -e . with htslib + pybind11 available).")
     backend = "htslib (C++)" if use_cpp else "python (pysam)"
-    if use_cpp:
-        _miss = [k for k, _ in _MEASURES if k not in _CPP_MEASURES]
-        if _miss:
-            print(f"  NOTE: the htslib backend computes "
-                  f"{', '.join(_CPP_MEASURES)} only; "
-                  f"{', '.join(_miss)} needs --backend python.  "
-                  f"{_PLOTTED[2]!r} correlates the two CONTEXTS with each "
-                  f"other per read PAIR rather than one site with another, "
-                  f"which the compiled core has no layout for -- its panel "
-                  f"will be empty here rather than wrong.", file=sys.stderr)
     if not use_cpp and not args.max_pairs_per_cell:
         print("  NOTE: the pysam fallback on FULL BAMs is ~100x slower than the "
               "htslib backend; build the extension or set --max-pairs-per-cell.",
