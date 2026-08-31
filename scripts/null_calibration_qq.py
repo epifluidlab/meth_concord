@@ -32,6 +32,19 @@ it is the offset the observed statistic inherits.  ``lambda`` (observed
 spread over null spread) says how much signal sits above that null, and is
 only worth reading once null_bias_z is small: inflation over a null that is
 itself displaced is not evidence of anything.
+
+THE 95% BAND, and why it is not the order-statistic one.  The k-th smallest
+of n independent draws is exactly Beta(k, n - k + 1), which needs no
+simulation -- and assumes the entries are independent, which after RWR they
+are not.  At the real scale that band spans 0.025% of the plotted range on
+1500 cells x 8000 bins, so it would put every visible wobble outside
+significance; the previous version of this script suppressed it for that
+reason and left the figure with no band at all.  The default instead
+resamples WHOLE CELLS of the drawn null with replacement (``--band cell``),
+which inherits the within-cell correlation rather than assuming it away and
+comes out ~37x wider on the same matrix.  The cell is the unit the rest of
+the pipeline bootstraps on, so the band answers at the same altitude as the
+tests it sits beside.  ``--band iid`` restores the Beta band for comparison.
 """
 
 from __future__ import annotations
@@ -89,7 +102,8 @@ def _mad_sd_raw(x):
     return 1.4826 * float(np.median(np.abs(x - np.median(x))))
 
 
-def load_pair(run_dir, stat, cap=4_000_000, seed=0, min_pairs=0):
+def load_pair(run_dir, stat, cap=4_000_000, seed=0, min_pairs=0,
+              return_matrix=False):
     """The observed statistic and its drawn null, flattened and finite.
 
     Returned as two independent samples rather than paired per (cell, bin):
@@ -141,7 +155,20 @@ def load_pair(run_dir, stat, cap=4_000_000, seed=0, min_pairs=0):
             a = a[rng.choice(a.size, cap, replace=False)]
         return a
 
-    return _flat(obs_df), _flat(null_df), info
+    if not return_matrix:
+        return _flat(obs_df), _flat(null_df), info
+
+    # The cell-resampling band needs the ROWS intact, so the cap has to fall
+    # on whole bins rather than on scattered entries: dropping entries at
+    # random would break exactly the within-cell correlation the band exists
+    # to capture, and hand back the i.i.d. width it is meant to replace.
+    nm = null_df.to_numpy(float)
+    if nm.size > cap and nm.shape[1] > 1:
+        take = max(1, int(cap // max(1, nm.shape[0])))
+        if take < nm.shape[1]:
+            cols = np.sort(rng.choice(nm.shape[1], take, replace=False))
+            nm = nm[:, cols]
+    return _flat(obs_df), _flat(null_df), info, nm
 
 
 def calibration(obs, null):
@@ -210,109 +237,218 @@ def qq_band(obs, null, levels=QQ_LEVELS, alpha=0.05):
     return np.quantile(null, lo), np.quantile(null, hi)
 
 
-def figure(path, table, curves, stat, title, bands=None):
+def qq_band_cells(null_mat, levels=QQ_LEVELS, alpha=0.05, n_boot=200,
+                  seed=0):
+    """95% band for the observed Q-Q curve, RESAMPLING WHOLE CELLS.
+
+    The order-statistic band in :func:`qq_band` is exact for independent
+    entries, and the entries here are not independent: RWR pools evidence
+    across the cell graph, so a cell's bins move together.  At the real
+    scale that band is a hairline -- on 1500 cells x 8000 bins it spans
+    0.025% of the plotted range, which would declare every visible wobble
+    significant.  Resampling cells with replacement inherits the
+    within-cell correlation instead of assuming it away, and comes out 37x
+    wider on the same matrix.
+
+    The resample is of the NULL, not of the observed, so the band keeps its
+    null-hypothesis reading: it is where the observed curve would fall if
+    the observed were a cell-level resample of the null.  The cell is the
+    unit the rest of this pipeline already bootstraps on, so the band and
+    the pipeline's own tests answer at the same altitude.
+    """
+    a = np.asarray(null_mat, float)
+    if a.ndim != 2 or a.shape[0] < 3:
+        return None
+    lv = np.asarray(levels, float)
+    rng = np.random.default_rng(seed)
+    n_cells = a.shape[0]
+    qs = np.empty((int(n_boot), lv.size), float)
+    kept = 0
+    for b in range(int(n_boot)):
+        row = a[rng.integers(0, n_cells, n_cells)].ravel()
+        row = row[np.isfinite(row)]
+        if row.size < 2:
+            continue
+        qs[kept] = np.quantile(row, lv)
+        kept += 1
+    if kept < 3:
+        return None
+    qs = qs[:kept]
+    return (np.percentile(qs, 100 * alpha / 2, axis=0),
+            np.percentile(qs, 100 * (1 - alpha / 2), axis=0))
+
+
+#: Okabe-Ito, colour-blind safe and distinguishable in greyscale.  Journal
+#: figures get printed and photocopied; tab10's default red/green pair does
+#: not survive either.
+_PALETTE = ("#0072B2", "#D55E00", "#009E73", "#CC79A7",
+            "#E69F00", "#56B4E9", "#F0E442", "#000000")
+
+#: A full-width figure in most journals is 180 mm.  Sizing to it here means
+#: the panel is placed at 100% and the type comes out at the size set below,
+#: rather than being scaled by the layout and landing at whatever that gives.
+_FIG_W_IN = 180 / 25.4
+
+_RC = {
+    # TrueType, not Type 3: Type 3 text is not editable in Illustrator and
+    # several journals reject it outright.
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "svg.fonttype": "none",
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 7,
+    "axes.labelsize": 7,
+    "axes.titlesize": 8,
+    "xtick.labelsize": 6.5,
+    "ytick.labelsize": 6.5,
+    "legend.fontsize": 6,
+    "axes.linewidth": 0.6,
+    "xtick.major.width": 0.6,
+    "ytick.major.width": 0.6,
+    "xtick.major.size": 2.5,
+    "ytick.major.size": 2.5,
+    "xtick.direction": "out",
+    "ytick.direction": "out",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "legend.frameon": False,
+    "lines.solid_capstyle": "round",
+}
+
+#: Kept SHORT: a Q-Q curve runs corner to corner, and a legend wide enough
+#: to spell the method out reaches across the panel and covers it.  What
+#: the band is belongs in the caption and in --help.
+_BAND_LABEL = {"cell": "95% band (cells)", "iid": "95% band (i.i.d.)"}
+
+
+def _panel_label(ax, letter):
+    """Bold letter outside the axes, where journals put it."""
+    ax.text(-0.22, 1.04, letter, transform=ax.transAxes, fontsize=9,
+            fontweight="bold", va="bottom", ha="left")
+
+
+def figure(path, table, curves, stat, title, bands=None, band_kind="cell"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(1, 3, figsize=(13.6, 4.3))
-    cm = plt.get_cmap("tab10")
+    with plt.rc_context(_RC):
+        fig, ax = plt.subplots(1, 3, figsize=(_FIG_W_IN, 2.9),
+                               gridspec_kw={"width_ratios": [1.25, 1, 1]})
 
-    a = ax[0]
-    # STANDARDISED ON EACH RUN'S OWN NULL: (q - null_median) / null_madsd.
-    #
-    # Raw quantiles do not work here.  Under --dm-prior separate the whole
-    # distribution is a needle parked on the prior floor -- observed and
-    # drawn null both at about -0.19, spread a small fraction of that -- so
-    # an axis wide enough to reach zero leaves the data as a sliver and the
-    # departure from the diagonal, which is the entire question, invisible.
-    # Runs at different offsets could not be shown together at all.
-    #
-    # Centring and scaling on the NULL, not on the observed, keeps the thing
-    # being measured: the observed's excess over its own null survives, and
-    # the diagonal means "observed distributed exactly like its null".  The
-    # absolute offset is not lost, it moves to panel (b), where it is the
-    # headline rather than a scaling nuisance.
-    lim = 0.0
-    n_thin = 0
-    for i, (name, (qx, qy)) in enumerate(curves.items()):
-        nm = float(np.median(qx))
-        ns = robust_sd(qx)
-        if not (np.isfinite(ns) and ns > 0):
-            continue
-        zx, zy = (qx - nm) / ns, (qy - nm) / ns
-        # 95% band, in the same standardised units.  Drawn only when it is
-        # WIDE ENOUGH TO SEE: n_obs here runs to millions of cell-bins, and
-        # a band a thousandth of an sd wide would read as "every departure
-        # is significant" -- which is exactly the claim the independence
-        # assumption cannot support after RWR.  Better to omit it and say so
-        # than to draw a hairline that flatters the plot.
-        bd = (bands or {}).get(name)
-        if bd is not None:
-            blo, bhi = (bd[0] - nm) / ns, (bd[1] - nm) / ns
-            if float(np.max(bhi - blo)) >= 0.02 * max(
-                    1e-12, float(np.ptp(np.r_[zx, zy]))):
-                a.fill_between(zx, blo, bhi, color=cm(i % 10), alpha=0.15,
-                               lw=0, zorder=0)
-            else:
-                n_thin += 1
-        a.plot(zx, zy, "-", lw=1.5, color=cm(i % 10), label=name)
-        lim = max(lim, float(np.max(np.abs(np.r_[zx, zy]))))
-    lim = lim * 1.05 if lim > 0 else 1.0
-    a.plot([-lim, lim], [-lim, lim], "--", color="0.5", lw=1.0, zorder=0)
-    a.axhline(0, color="0.85", lw=0.8, zorder=0)
-    a.axvline(0, color="0.85", lw=0.8, zorder=0)
-    a.set_xlim(-lim, lim)
-    a.set_ylim(-lim, lim)
-    a.set_xlabel("drawn-null quantiles  (null sd, about the null's median)",
-                 fontsize=8)
-    a.set_ylabel("observed quantiles  (same units)", fontsize=8)
-    a.set_title("a  observed against the model's own null", fontsize=10,
-                loc="left")
-    a.annotate("on the diagonal = distributed like its own null;\n"
-               "where the null itself SITS is panel (b)"
-               + ("\n95% band omitted: n is large enough that it is "
-                  "narrower\nthan the line, and RWR makes the entries "
-                  "non-independent\nanyway" if n_thin else ""),
-               (0.03, 0.97), xycoords="axes fraction", fontsize=6.5,
-               color="0.35", va="top")
-    a.legend(fontsize=6.5, frameon=False, loc="lower right")
+        a = ax[0]
+        # STANDARDISED ON EACH RUN'S OWN NULL: (q - null_median) / null_madsd.
+        #
+        # Raw quantiles do not work here.  Under --dm-prior separate the whole
+        # distribution is a needle parked on the prior floor -- observed and
+        # drawn null both at about -0.19, spread a small fraction of that --
+        # so an axis wide enough to reach zero leaves the data as a sliver and
+        # the departure from the diagonal, which is the entire question,
+        # invisible.  Runs at different offsets could not be shown together.
+        #
+        # Centring and scaling on the NULL, not on the observed, keeps the
+        # thing being measured: the observed's excess over its own null
+        # survives, and the diagonal means "observed distributed exactly like
+        # its null".  The absolute offset is not lost, it moves to panel (b).
+        lim = 0.0
+        drew_band = False
+        for i, (name, (qx, qy)) in enumerate(curves.items()):
+            nm = float(np.median(qx))
+            ns = robust_sd(qx)
+            if not (np.isfinite(ns) and ns > 0):
+                continue
+            col = _PALETTE[i % len(_PALETTE)]
+            zx, zy = (qx - nm) / ns, (qy - nm) / ns
+            bd = (bands or {}).get(name)
+            if bd is not None:
+                blo, bhi = (bd[0] - nm) / ns, (bd[1] - nm) / ns
+                # Drawn WHATEVER its width.  The old code omitted a band
+                # thinner than 2% of the range, which with an i.i.d. band at
+                # millions of cell-bins meant always.  A cell-resampled band
+                # is ~37x wider and is the honest one, so the answer is to
+                # widen the band rather than to hide it; an edge line keeps
+                # it visible even where the fill is sub-pixel.
+                a.fill_between(zx, blo, bhi, color=col, alpha=0.30, lw=0,
+                               zorder=1)
+                a.plot(zx, blo, "-", color=col, lw=0.5, alpha=0.85, zorder=2)
+                a.plot(zx, bhi, "-", color=col, lw=0.5, alpha=0.85, zorder=2)
+                lim = max(lim, float(np.max(np.abs(np.r_[blo, bhi]))))
+                drew_band = True
+            a.plot(zx, zy, "-", lw=1.2, color=col, label=name, zorder=3)
+            lim = max(lim, float(np.max(np.abs(np.r_[zx, zy]))))
+        lim = lim * 1.05 if lim > 0 else 1.0
+        a.plot([-lim, lim], [-lim, lim], "--", color="0.55", lw=0.7, zorder=2)
+        a.set_xlim(-lim, lim)
+        a.set_ylim(-lim, lim)
+        a.set_aspect("equal", adjustable="box")     # a Q-Q must be square
+        a.set_xlabel("Drawn-null quantiles (null SD)")
+        a.set_ylabel("Observed quantiles (null SD)")
+        a.set_title("Observed vs. its own null", loc="left", pad=4)
+        _panel_label(a, "a")
+        handles, labels = a.get_legend_handles_labels()
+        if drew_band and band_kind in _BAND_LABEL:
+            import matplotlib.patches as mpatches
+            handles.append(mpatches.Patch(facecolor="0.6", alpha=0.3, lw=0))
+            labels.append(_BAND_LABEL[band_kind])
+        # A Q-Q curve sweeps corner to corner, so there is no corner a legend
+        # can sit in without touching it; an opaque backing keeps both
+        # readable without pushing the legend out of the panel.
+        a.legend(handles, labels, loc="upper left", handlelength=1.2,
+                 borderpad=0.2, labelspacing=0.3)
+        a.annotate("on the diagonal = distributed like its own null",
+                   (0.5, -0.30), xycoords="axes fraction", fontsize=6,
+                   color="0.35", ha="center")
 
-    a = ax[1]
-    names = list(table["run"])
-    z = table["null_bias_z"].to_numpy(float)
-    cols = ["#2c3e50" if abs(v) < 1 else "#c0392b" for v in z]
-    a.barh(range(len(names)), z, color=cols)
-    a.axvline(0, color="0.3", lw=1.0)
-    for s in (-1, 1):
-        a.axvline(s, color="#c0392b", ls="--", lw=0.9)
-    a.set_yticks(range(len(names)))
-    a.set_yticklabels(names, fontsize=6.5)
-    a.set_xlabel("null_bias_z  (the drawn null's own median / its sd)",
-                 fontsize=8)
-    a.set_title("b  is the null where the model says it is?", fontsize=10,
-                loc="left")
-    a.annotate("no coordination in, so zero out", (0, len(names) - 0.4),
-               fontsize=7, color="#c0392b", ha="center")
+        a = ax[1]
+        names = list(table["run"])
+        z = table["null_bias_z"].to_numpy(float)
+        cols = [_PALETTE[0] if abs(v) < 1 else _PALETTE[1] for v in z]
+        a.barh(range(len(names)), z, color=cols, height=0.6)
+        a.axvline(0, color="0.3", lw=0.8)
+        for sgn in (-1, 1):
+            a.axvline(sgn, color=_PALETTE[1], ls="--", lw=0.7)
+        for yi, v in enumerate(z):
+            a.annotate(f"{v:+.2f}", (v, yi),
+                       xytext=(4 if v >= 0 else -4, 0),
+                       textcoords="offset points", fontsize=6,
+                       va="center", ha="left" if v >= 0 else "right",
+                       color="0.25")
+        a.set_yticks(range(len(names)))
+        a.set_yticklabels(names)
+        a.invert_yaxis()
+        a.set_xlim(-1.15, 1.15)
+        a.set_xlabel("Null bias $z$ (null median / null SD)")
+        a.set_title("Is the null centred?", loc="left", pad=4)
+        _panel_label(a, "b")
+        a.annotate("no coordination in, so zero out", (0.5, -0.30),
+                   xycoords="axes fraction", fontsize=6, color="0.35",
+                   ha="center")
 
-    a = ax[2]
-    lam = table["lambda"].to_numpy(float)
-    ok = np.abs(z) < 1
-    a.scatter(lam[ok], np.arange(len(names))[ok], s=42, color="#2c3e50",
-              label="null within 1 sd of zero")
-    a.scatter(lam[~ok], np.arange(len(names))[~ok], s=42, color="#c0392b",
-              marker="x", label="null displaced -- lambda not readable")
-    a.axvline(1.0, color="0.3", lw=1.0)
-    a.set_yticks(range(len(names)))
-    a.set_yticklabels([""] * len(names))
-    a.set_xlabel("lambda  (observed spread / null spread)", fontsize=8)
-    a.set_title("c  how much sits above that null", fontsize=10, loc="left")
-    a.legend(fontsize=6.5, frameon=False, loc="lower right")
+        a = ax[2]
+        lam = table["lambda"].to_numpy(float)
+        ok = np.abs(z) < 1
+        yy = np.arange(len(names))
+        a.scatter(lam[ok], yy[ok], s=22, color=_PALETTE[0], zorder=3,
+                  label="null within 1 SD of zero")
+        a.scatter(lam[~ok], yy[~ok], s=22, color=_PALETTE[1], marker="x",
+                  linewidths=1.0, zorder=3,
+                  label=r"null displaced — $\lambda$ not readable")
+        a.axvline(1.0, color="0.3", lw=0.8)
+        a.set_yticks(range(len(names)))
+        a.set_yticklabels(names)
+        a.invert_yaxis()
+        a.set_xlabel(r"$\lambda$ (observed spread / null spread)")
+        a.set_title("Spread above the null", loc="left", pad=4)
+        _panel_label(a, "c")
+        a.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22),
+                 handlelength=1.0, borderpad=0.2, labelspacing=0.35,
+                 ncol=1)
 
-    fig.suptitle(f"{title} — {stat}", fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
+        fig.suptitle(f"{title} — {stat}", fontsize=9, y=0.99)
+        fig.tight_layout(w_pad=2.6, rect=(0, 0, 1, 0.93))
+        fig.savefig(path, bbox_inches="tight", dpi=600)
+        plt.close(fig)
 
 
 def load_rank_calibration(run_dir):
@@ -480,6 +616,18 @@ def main(argv=None) -> int:
     ap.add_argument("--plot-format", default="pdf",
                     choices=["pdf", "png", "svg"])
     ap.add_argument("--title", default="Null calibration")
+    ap.add_argument("--band", choices=["cell", "iid", "none"], default="cell",
+                    help="95%% band on panel (a).  'cell' (default) resamples "
+                         "WHOLE CELLS of the drawn null with replacement, so "
+                         "the band inherits the within-cell correlation RWR "
+                         "creates instead of assuming it away.  'iid' is the "
+                         "exact order-statistic (Beta) band, which is correct "
+                         "only for independent entries: at 1500 cells x 8000 "
+                         "bins it spans 0.025%% of the plotted range against "
+                         "0.91%% for 'cell', so it declares every visible "
+                         "wobble significant.  'none' omits it.")
+    ap.add_argument("--band-boot", type=int, default=200, metavar="B",
+                    help="Cell resamples behind --band cell (200).")
     ap.add_argument("--min-pairs", type=int, default=0, metavar="N",
                     help="Drop (cell, bin) entries with fewer than N RAW "
                          "read pairs, from the observed and the drawn null "
@@ -503,17 +651,23 @@ def main(argv=None) -> int:
     for stat in stats:
         curves, bands, sub = {}, {}, []
         for name, d in runs.items():
-            obs, null, li = load_pair(d, stat, seed=args.seed,
-                                      min_pairs=args.min_pairs)
+            got = load_pair(d, stat, seed=args.seed,
+                            min_pairs=args.min_pairs,
+                            return_matrix=args.band == "cell")
+            obs, null, li = got[0], got[1], got[2]
             m = calibration(obs, null)
             m.update(run=name, statistic=stat, **li)
             sub.append(m)
             rows.append(m)
             curves[name] = qq_points(obs, null)
-            bands[name] = qq_band(obs, null)
+            if args.band == "cell":
+                bands[name] = qq_band_cells(got[3], n_boot=args.band_boot,
+                                            seed=args.seed)
+            elif args.band == "iid":
+                bands[name] = qq_band(obs, null)
         tab = pd.DataFrame(sub)
         figure(out / f"null_qq_{stat}.{args.plot_format}", tab, curves,
-               stat, args.title, bands=bands)
+               stat, args.title, bands=bands, band_kind=args.band)
         print(f"  -> null_qq_{stat}.{args.plot_format}", file=sys.stderr)
 
     # ---- The rank's own self-check, where a run wrote one ---------------

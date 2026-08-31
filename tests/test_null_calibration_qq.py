@@ -347,10 +347,15 @@ def test_the_two_sample_band_brackets_a_null_drawn_from_the_null():
     assert float(np.mean((qy2 >= lo) & (qy2 <= hi))) < 0.5
 
 
-def test_a_hairline_band_is_omitted_rather_than_drawn(tmp_path):
-    """n_obs runs to millions of cell-bins here, and a band a thousandth of
-    an sd wide would read as 'every departure is significant' -- a claim the
-    independence assumption cannot support after RWR."""
+def test_a_hairline_band_is_now_drawn_rather_than_omitted(tmp_path):
+    """This used to be omitted, and the reasoning has moved.
+
+    An i.i.d. band a thousandth of an sd wide would read as 'every departure
+    is significant', which the independence assumption cannot support after
+    RWR -- so the old code hid it.  Hiding it left the figure with no band at
+    all at the real scale.  The fix is to widen the band honestly (resample
+    whole cells, ~37x wider) and always draw it, not to suppress the
+    symptom."""
     qq = _mod()
     rng = np.random.default_rng(2)
     null = rng.normal(0, 1, 400_000)
@@ -372,3 +377,121 @@ def test_the_band_is_drawn_when_it_is_wide_enough_to_see(tmp_path):
     lo, hi = qq.qq_band(obs, null)
     qx, _ = qq.qq_points(obs, null)
     assert float(np.max(hi - lo)) > 0.02 * float(np.ptp(qx))
+
+
+# --------------------------------------- the cell-resampled band and style --
+
+def _matrix_run(tmp_path, n_cells=120, n_bins=400, excess=0.0, seed=5):
+    """A run whose entries carry WITHIN-CELL correlation, as RWR leaves them."""
+    rng = np.random.default_rng(seed)
+    d = tmp_path
+    d.mkdir(parents=True, exist_ok=True)
+    cell = rng.normal(0, 0.8, (n_cells, 1))
+    binf = rng.normal(0, 0.4, (1, n_bins))
+    null = cell + binf + rng.normal(0, 1.0, (n_cells, n_bins))
+    obs = null + excess * rng.standard_t(3, (n_cells, n_bins))
+    idx = [f"c{i}" for i in range(n_cells)]
+    col = [f"b{j}" for j in range(n_bins)]
+    pd.DataFrame(obs, index=idx, columns=col).to_parquet(
+        d / "concordance_coordination.parquet")
+    pd.DataFrame(null, index=idx, columns=col).to_parquet(
+        d / "concordance_coordination_null.parquet")
+    return d, null
+
+
+def test_the_cell_band_is_much_wider_than_the_iid_one():
+    """The entire reason the band changed.
+
+    Order statistics assume independent entries.  RWR pools evidence across
+    the cell graph, so a cell's bins move together and the effective sample
+    size is far below n.  Resampling whole cells has to come out wider -- if
+    it ever does not, the band has stopped modelling the dependence and is
+    back to declaring every wobble significant.
+    """
+    qq = _mod()
+    rng = np.random.default_rng(11)
+    mat = rng.normal(0, 0.8, (150, 1)) + rng.normal(0, 1.0, (150, 500))
+    flat = mat.ravel()
+    lo_i, hi_i = qq.order_statistic_ci(qq.QQ_LEVELS, flat.size)
+    w_iid = np.median(np.quantile(flat, hi_i) - np.quantile(flat, lo_i))
+    lo_c, hi_c = qq.qq_band_cells(mat, n_boot=120, seed=0)
+    w_cell = float(np.median(hi_c - lo_c))
+    assert w_cell > 5 * w_iid, (w_cell, w_iid)
+
+
+def test_the_cell_band_brackets_the_nulls_own_quantiles():
+    """A band that did not contain the thing it was built from would be
+    miscalibrated in the direction that hides real departures."""
+    qq = _mod()
+    rng = np.random.default_rng(12)
+    mat = rng.normal(0, 0.7, (200, 1)) + rng.normal(0, 1.0, (200, 600))
+    lo, hi = qq.qq_band_cells(mat, n_boot=200, seed=1)
+    q = np.quantile(mat.ravel(), qq.QQ_LEVELS)
+    inside = float(np.mean((q >= lo) & (q <= hi)))
+    assert inside > 0.9, inside
+    assert np.all(np.diff(lo) >= -1e-9) and np.all(np.diff(hi) >= -1e-9)
+
+
+def test_the_cell_band_needs_more_than_a_couple_of_cells():
+    qq = _mod()
+    assert qq.qq_band_cells(np.zeros((2, 10))) is None
+    assert qq.qq_band_cells(np.zeros(10)) is None          # not a matrix
+
+
+def test_return_matrix_keeps_whole_cells_as_rows(tmp_path):
+    """The cap must fall on bins, not on scattered entries.
+
+    Dropping entries at random would break the very within-cell correlation
+    the band exists to measure and hand back the i.i.d. width.
+    """
+    qq = _mod()
+    d, null = _matrix_run(tmp_path / "r", n_cells=40, n_bins=300)
+    obs, nl, info, mat = qq.load_pair(d, "coordination", return_matrix=True)
+    assert mat.shape[0] == 40                     # every cell kept
+    assert mat.shape[1] == 300
+    obs2, nl2, info2, small = qq.load_pair(d, "coordination", cap=40 * 10,
+                                           return_matrix=True)
+    assert small.shape[0] == 40                   # rows still intact
+    assert small.shape[1] < 300                   # bins are what got dropped
+
+
+def test_band_choices_all_run_and_none_omits_it(tmp_path):
+    qq = _mod()
+    d, _ = _matrix_run(tmp_path / "r", n_cells=60, n_bins=200, excess=0.5)
+    for kind in ("cell", "iid", "none"):
+        out = tmp_path / f"o_{kind}"
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--run", f"x={d}",
+             "--statistic", "coordination", "--band", kind,
+             "--band-boot", "40", "--plot-format", "png",
+             "--output-dir", str(out)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-2000:]
+        assert (out / "null_qq_coordination.png").exists()
+
+
+def test_the_pdf_carries_no_type_3_fonts(tmp_path):
+    """Type 3 text is not editable in Illustrator and several journals
+    reject it outright; pdf.fonttype 42 is what avoids it."""
+    import zlib
+    import re as _re
+    qq = _mod()
+    d, _ = _matrix_run(tmp_path / "r", n_cells=40, n_bins=150)
+    out = tmp_path / "o"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--run", f"x={d}",
+         "--statistic", "coordination", "--band-boot", "30",
+         "--plot-format", "pdf", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2000:]
+    raw = (out / "null_qq_coordination.pdf").read_bytes()
+    blobs = [raw]
+    for mo in _re.finditer(rb"stream\r?\n", raw):
+        s0 = mo.end()
+        e0 = raw.find(b"endstream", s0)
+        try:
+            blobs.append(zlib.decompress(raw[s0:e0]))
+        except Exception:
+            pass
+    joined = b"".join(blobs)
+    assert joined.count(b"/Type3") == 0
+    assert joined.count(b"/FontFile2") > 0        # embedded TrueType
