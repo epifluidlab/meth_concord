@@ -13,7 +13,10 @@ the mean call on end 2, binned by the distance between the two END CENTRES.
 That is the unit a Hi-C contact actually is, and the unit the concordance
 pipeline works in.
 
-Three panels, each a Pearson r over the pairs in a distance bin:
+Four panels.  Each reports BOTH a Pearson r and a Spearman rho over the
+pairs in a distance bin -- these are bounded, skewed quantities, a posterior
+piles up near 0 and 1, and a handful of pairs at the corners can carry a
+Pearson that a rank correlation will not:
 
   GCH-GCH   x = mean GpC call on end 1, y = the same on end 2
   HCG-HCG   x = mean CpG call on end 1, y = the same on end 2
@@ -22,6 +25,22 @@ Three panels, each a Pearson r over the pairs in a distance bin:
             x = (GpC end 1) - (GpC end 2), y = (CpG end 1) - (CpG end 2).
             Correlating the two DIFFERENCES asks whether the accessibility
             gradient across a contact tracks the methylation gradient.
+
+  GCH-HCG   accessibility at ONE end against methylation at the OTHER.
+            Needs GpC on one end and CpG on the other, which is weaker than
+            the panel above -- a pair with GpC only on end 1 and CpG only on
+            end 2 qualifies here and not there.  Both orientations are
+            emitted where both exist, so a pair carrying both contexts on
+            both ends contributes two observations here and one to every
+            other panel, and its n runs higher.
+
+THE P-VALUE TO READ IS THE EMPIRICAL ONE.  scipy's p for either correlation
+assumes the observations are independent draws; many here come from the same
+cell, which is the very reason the null is per cell.  The empirical p counts
+how often a re-pairing reaches the observed correlation, so every one of
+those dependencies is in it.  Both are written to the TSV and the difference
+is often large -- on one synthetic run the cross-context panel came back at
+a parametric 0.023 and an empirical 0.216.
 
 THE NULL IS A RE-PAIRING, WITHIN CELL AND WITHIN DISTANCE BIN.  The y column
 is permuted among the pairs of one (cell, bin), so end 1 of one pair meets
@@ -75,20 +94,27 @@ import pandas as pd
 
 _MEASURES = (("gg", "GCH–GCH  r(end1, end2)"),
              ("hh", "HCG–HCG  r(end1, end2)"),
-             ("gh", "GCH–GCH vs HCG–HCG  r(ΔGpC, ΔCpG)"))
+             ("gh", "GCH–GCH vs HCG–HCG  r(ΔGpC, ΔCpG)"),
+             ("gx", "GCH–HCG  r(GpC one end, CpG the other)"))
 
 
 def pair_values(calls1, calls2, min_sites=1):
-    """Per-end mean call for each context, or NaN where too few sites."""
-    out = {}
-    for ctx in ("GCH", "HCG"):
-        a, b = calls1.get(ctx), calls2.get(ctx)
-        if (a is None or b is None or len(a[1]) < min_sites
-                or len(b[1]) < min_sites):
-            out[ctx] = (np.nan, np.nan)
-        else:
-            out[ctx] = (float(np.mean(a[1])), float(np.mean(b[1])))
-    return out
+    """Per-END mean call for each context, NaN where THAT end is short.
+
+    Independently per end, not per pair.  The cross-context measure needs
+    GpC on one end and CpG on the other, so blanking a context on both ends
+    because one of them lacks it would throw away exactly the pairs that
+    measure exists for.  The both-ends requirement belongs to the measures
+    that actually have it, and is applied in ``measures_of``.
+    """
+    def _one(c, ctx):
+        v = c.get(ctx)
+        if v is None or len(v[1]) < min_sites:
+            return np.nan
+        return float(np.mean(v[1]))
+
+    return {ctx: (_one(calls1, ctx), _one(calls2, ctx))
+            for ctx in ("GCH", "HCG")}
 
 
 def measures_of(vals):
@@ -102,11 +128,28 @@ def measures_of(vals):
     """
     g1, g2 = vals["GCH"]
     h1, h2 = vals["HCG"]
-    out = {"gg": (g1, g2), "hh": (h1, h2)}
+    out = {"gg": (g1, g2) if np.isfinite([g1, g2]).all()
+           else (np.nan, np.nan),
+           "hh": (h1, h2) if np.isfinite([h1, h2]).all()
+           else (np.nan, np.nan)}
     if np.isfinite([g1, g2, h1, h2]).all():
         out["gh"] = (g1 - g2, h1 - h2)
     else:
         out["gh"] = (np.nan, np.nan)
+    # CROSS-CONTEXT, ACROSS ENDS: accessibility at one locus against
+    # methylation at the OTHER.  Needs GpC on one end and CpG on the other,
+    # which is a weaker requirement than 'gh' -- a pair with GpC only on
+    # end 1 and CpG only on end 2 qualifies here and not there.  Both
+    # orientations are emitted where both exist, matching the convention in
+    # scripts/site_distance_correlation.py; a pair carrying both contexts on
+    # both ends therefore contributes two observations to this measure and
+    # one to every other, which is why its n runs higher.
+    cross = []
+    if np.isfinite(g1) and np.isfinite(h2):
+        cross.append((g1, h2))
+    if np.isfinite(g2) and np.isfinite(h1):
+        cross.append((g2, h1))
+    out["gx"] = cross or [(np.nan, np.nan)]
     return out
 
 
@@ -232,6 +275,25 @@ def collect_cell_posteriors(paths, edges, min_sites, exclude):
             got["gh"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
     else:
         got["gh"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
+    # GCH one end against HCG the OTHER.  Step 4 writes a row per pair per
+    # context, so a pair qualifies as soon as it appears in both tables --
+    # the same join as 'gh', but the value taken across ends rather than
+    # within each.  Both orientations, so a pair contributes two rows.
+    if g is not None and h is not None and len(g) and len(h):
+        j = g.merge(h, on=["chrom", "pos1", "pos2"], suffixes=("_g", "_h"))
+        if len(j):
+            keep, b = _binned(j)
+            g1 = j["posterior1_g"].to_numpy(float)[keep]
+            g2 = j["posterior2_g"].to_numpy(float)[keep]
+            h1 = j["posterior1_h"].to_numpy(float)[keep]
+            h2 = j["posterior2_h"].to_numpy(float)[keep]
+            got["gx"] = (np.concatenate([b, b]),
+                         np.concatenate([g1, g2]),
+                         np.concatenate([h2, h1]))
+        else:
+            got["gx"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
+    else:
+        got["gx"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
     n_pairs = max((len(t) for t in tabs.values()), default=0)
     return got, n_pairs
 
@@ -268,11 +330,12 @@ def collect_cell(bam_path, ctx_positions, edges, trim_ends, mapq_min,
         else:
             vals = pair_values(c2, c1, min_sites)
         n_pairs += 1
-        for m, (x, y) in measures_of(vals).items():
-            if np.isfinite(x) and np.isfinite(y):
-                got[m][0].append(b)
-                got[m][1].append(x)
-                got[m][2].append(y)
+        for m, v in measures_of(vals).items():
+            for x, y in (v if isinstance(v, list) else [v]):
+                if np.isfinite(x) and np.isfinite(y):
+                    got[m][0].append(b)
+                    got[m][1].append(x)
+                    got[m][2].append(y)
     return ({m: (np.asarray(v[0], np.int64), np.asarray(v[1], float),
                  np.asarray(v[2], float)) for m, v in got.items()}, n_pairs)
 
@@ -313,82 +376,177 @@ def corr_of(acc, min_pairs):
     return np.where(n >= min_pairs, r, np.nan), n
 
 
-def accumulate_cells(per_cell, nb, n_perm, seed):
-    """Observed and null running sums, pooled ACROSS cells.
+def pool_cells(per_cell, nb):
+    """Stack every cell's observations, keeping which cell each came from.
 
-    The observed correlation pools every eligible pair, which is what "all
-    the pairs in this distance range" means.  The null pools too -- but each
-    cell's y column is permuted WITHIN that cell and within the bin first,
-    so whatever correlation the pooling itself creates (cells differ in
-    global accessibility, so both ends run high together in an open cell)
-    survives into the null instead of being counted as signal.
+    The raw values are kept rather than folded into running sums, because
+    Spearman needs ranks and the null needs a permutation -- neither can be
+    done on a sum.  The cell index rides along because the permutation is
+    per (cell, bin).
+    """
+    out = {}
+    for m, _ in _MEASURES:
+        cid, bb, xx, yy = [], [], [], []
+        for ci, cell in enumerate(per_cell):
+            b, x, y = cell[m]
+            if b.size:
+                cid.append(np.full(b.size, ci, np.int32))
+                bb.append(b); xx.append(x); yy.append(y)
+        out[m] = ((np.concatenate(cid), np.concatenate(bb),
+                   np.concatenate(xx), np.concatenate(yy))
+                  if bb else (np.empty(0, np.int32), np.empty(0, np.int64),
+                              np.empty(0), np.empty(0)))
+    return out
 
-    ``n_perm`` permutations are averaged.  One is an unbiased null but a
-    noisy one, and the null curve is subtracted from every point of the
-    observed.
+
+def _both_corr(x, y):
+    """(pearson r, its p, spearman rho, its p) for one bin."""
+    from scipy.stats import pearsonr, spearmanr
+    if x.size < 3 or np.ptp(x) == 0 or np.ptp(y) == 0:
+        return np.nan, np.nan, np.nan, np.nan
+    r, pr = pearsonr(x, y)
+    rho, prho = spearmanr(x, y)
+    return float(r), float(pr), float(rho), float(prho)
+
+
+def correlations(pooled, nb, n_perm, min_pairs, seed):
+    """Observed correlations, the re-paired null, and an EMPIRICAL p.
+
+    THE PARAMETRIC P IS NOT THE ONE TO READ, and both are reported so the
+    difference is visible.  pearsonr's p assumes the observations are
+    independent draws; here many come from the same cell, and cells differ
+    in global level, so it is anti-conservative for exactly the reason the
+    null is per cell.  The empirical p counts how often a re-pairing --
+    within cell and within bin, so every one of those dependencies survives
+    -- reaches the observed correlation.  Its floor is 1/(n_perm + 1).
+
+    Spearman is reported beside Pearson because these are bounded, skewed
+    quantities: a posterior piles up near 0 and 1, and a handful of pairs at
+    the corners can carry a Pearson that a rank correlation will not.
     """
     rng = np.random.default_rng(seed)
-    obs = {m: np.zeros((6, nb)) for m, _ in _MEASURES}
-    null = {m: np.zeros((6, nb)) for m, _ in _MEASURES}
-    n_cells_used = 0
-    for cell in per_cell:
-        used = False
-        for m, _ in _MEASURES:
-            b, x, y = cell[m]
-            if not b.size:
+    out = {}
+    for m, _ in _MEASURES:
+        cid, bins, x, y = pooled[m]
+        res = {k: np.full(nb, np.nan) for k in
+               ("r", "p", "rho", "p_rho", "r_null", "rho_null",
+                "emp_p", "emp_p_rho")}
+        res["n"] = np.zeros(nb)
+        if not bins.size:
+            out[m] = res
+            continue
+        # Permutation groups, built once: the y column moves only inside a
+        # (cell, bin).
+        key = cid.astype(np.int64) * (nb + 1) + bins
+        order = np.argsort(key, kind="stable")
+        gk = key[order]
+        starts = np.flatnonzero(np.r_[True, gk[1:] != gk[:-1]])
+        groups = np.split(order, starts[1:])
+        for b in range(nb):
+            sel = bins == b
+            n = int(sel.sum())
+            res["n"][b] = n
+            if n < min_pairs:
                 continue
-            used = True
-            obs[m] += _running(b, x, y, nb)
-            for _ in range(max(1, int(n_perm))):
-                null[m] += _running(b, x, shuffle_within(b, y, nb, rng), nb)
-        n_cells_used += int(used)
-    for m, _ in _MEASURES:                       # average the permutations
-        null[m] /= max(1, int(n_perm))
-    return obs, null, n_cells_used
+            r, pr, rho, prho = _both_corr(x[sel], y[sel])
+            res["r"][b], res["p"][b] = r, pr
+            res["rho"][b], res["p_rho"][b] = rho, prho
+        if int(n_perm) <= 0:
+            out[m] = res
+            continue
+        acc_r = np.zeros((nb,)); acc_rho = np.zeros((nb,))
+        hit_r = np.zeros(nb); hit_rho = np.zeros(nb); seen = np.zeros(nb)
+        for _ in range(int(n_perm)):
+            ys = y.copy()
+            for g in groups:
+                if g.size > 1:
+                    ys[g] = y[rng.permutation(g)]
+            for b in range(nb):
+                if res["n"][b] < min_pairs:
+                    continue
+                sel = bins == b
+                r, _pr, rho, _prho = _both_corr(x[sel], ys[sel])
+                if np.isfinite(r):
+                    acc_r[b] += r
+                    hit_r[b] += float(abs(r) >= abs(res["r"][b]))
+                if np.isfinite(rho):
+                    acc_rho[b] += rho
+                    hit_rho[b] += float(abs(rho) >= abs(res["rho"][b]))
+                seen[b] += 1
+        ok = seen > 0
+        res["r_null"][ok] = acc_r[ok] / seen[ok]
+        res["rho_null"][ok] = acc_rho[ok] / seen[ok]
+        # +1 on both sides: a correlation beyond every re-pairing cannot be
+        # reported as impossible, only as beyond what N of them reached.
+        res["emp_p"][ok] = (hit_r[ok] + 1.0) / (seen[ok] + 1.0)
+        res["emp_p_rho"][ok] = (hit_rho[ok] + 1.0) / (seen[ok] + 1.0)
+        out[m] = res
+    return out
 
 
-def figure(path, centers, curves, title, min_pairs):
+def figure(path, centers, res, title):
+    """Two rows: the correlations themselves, then linked minus null.
+
+    Pearson solid, Spearman dashed, in the same colour -- they answer the
+    same question on different scales, and putting them side by side would
+    invite reading a gap between panels as a gap between distances.  A ring
+    marks a bin whose EMPIRICAL p clears 0.05: the parametric p is in the
+    TSV but is anti-conservative here, since many observations come from the
+    same cell.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colors = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#7b3f9e"}
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8.4), sharex=True)
+    colors = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#7b3f9e",
+              "gx": "#2ca02c"}
+    n = len(_MEASURES)
+    fig, axes = plt.subplots(2, n, figsize=(5.0 * n, 8.4), sharex=True,
+                             squeeze=False)
     for col, (key, ttl) in enumerate(_MEASURES):
-        r_o, n_o = curves[(key, "linked")]
-        r_n, _ = curves[(key, "null")]
-        a = axes[0, col]
+        d = res[key]
+        c = colors[key]
+        a = axes[0][col]
         a.axhline(0, color="0.6", lw=0.8, zorder=0)
-        a.plot(centers, r_o, "-o", ms=3, lw=1.6, color=colors[key],
-               label="linked (true pairing)")
-        a.plot(centers, r_n, "--", lw=1.4, color="0.35",
-               label="null (re-paired within cell & bin)")
+        a.plot(centers, d["r"], "-o", ms=3, lw=1.6, color=c, label="Pearson r")
+        a.plot(centers, d["rho"], "--s", ms=3, lw=1.4, color=c, alpha=0.75,
+               label="Spearman ρ")
+        a.plot(centers, d["r_null"], ":", lw=1.3, color="0.35",
+               label="null, Pearson")
+        a.plot(centers, d["rho_null"], ":", lw=1.0, color="0.6",
+               label="null, Spearman")
+        sig = np.isfinite(d["emp_p"]) & (d["emp_p"] <= 0.05)
+        if sig.any():
+            a.plot(np.asarray(centers)[sig], d["r"][sig], "o", ms=8,
+                   mfc="none", mec=c, mew=1.4, zorder=6)
         a.set_xscale("log")
         a.set_title(ttl.split("  ")[0], fontsize=10)
         if col == 0:
-            a.set_ylabel("Pearson r over read pairs", fontsize=9)
-        a.legend(frameon=False, fontsize=7.5)
-        b = axes[1, col]
+            a.set_ylabel("correlation over read pairs", fontsize=9)
+        a.legend(frameon=False, fontsize=7)
+
+        b = axes[1][col]
         b.axhline(0, color="0.6", lw=0.8, zorder=0)
-        b.plot(centers, r_o - r_n, "-o", ms=3, lw=1.6, color=colors[key])
+        b.plot(centers, d["r"] - d["r_null"], "-o", ms=3, lw=1.6, color=c,
+               label="Δ Pearson")
+        b.plot(centers, d["rho"] - d["rho_null"], "--s", ms=3, lw=1.4,
+               color=c, alpha=0.75, label="Δ Spearman")
         b.set_xscale("log")
         b.set_xlabel("distance between end centres (bp)", fontsize=9)
         if col == 0:
-            b.set_ylabel("Δ = linked − null", fontsize=9)
-        # n on the delta panel: the correlation is only as good as the pairs
-        # behind it, and the pair count falls off fast at long range.
+            b.set_ylabel("Δ = linked − re-paired null", fontsize=9)
+        b.legend(frameon=False, fontsize=7)
         tw = b.twinx()
-        tw.plot(centers, n_o, ":", lw=1.0, color="0.6")
+        tw.plot(centers, d["n"], ":", lw=1.0, color="0.6")
         tw.set_yscale("log")
-        tw.set_ylabel("pairs" if col == 2 else "", fontsize=7)
         tw.tick_params(labelsize=6)
-        if col != 2:
+        tw.set_ylabel("observations" if col == n - 1 else "", fontsize=7)
+        if col != n - 1:
             tw.set_yticklabels([])
-        b.axhline(0, color="0.6", lw=0.8, zorder=0)
     for ax in axes.ravel():
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
-    fig.suptitle(title, fontsize=12)
+    fig.suptitle(f"{title}   (rings: empirical p ≤ 0.05)", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
@@ -457,10 +615,14 @@ def main(argv=None) -> int:
     ap.add_argument("--min-pairs", type=int, default=50, metavar="N",
                     help="Bins with fewer eligible pairs report NaN rather "
                          "than a correlation of three points.")
-    ap.add_argument("--n-permutations", type=int, default=5, metavar="N",
-                    help="Re-pairings averaged into the null.  One is "
-                         "unbiased but noisy, and the null is subtracted "
-                         "from every point.")
+    ap.add_argument("--n-permutations", type=int, default=200, metavar="N",
+                    help="Re-pairings, used for BOTH the null curve and the "
+                         "empirical p.  The p is what to read: the "
+                         "parametric one assumes independent observations "
+                         "and many here come from the same cell, so it is "
+                         "anti-conservative for exactly the reason the null "
+                         "is per cell.  Its floor is 1/(N + 1), so 200 "
+                         "resolves 0.005; drop it to 20 for a quick look.")
     ap.add_argument("--exclude-chrom", default=None)
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
@@ -565,37 +727,50 @@ def main(argv=None) -> int:
     per_cell = [g[0] for g in got]
     n_pairs_total = sum(g[1] for g in got)
 
-    obs, null, n_used = accumulate_cells(per_cell, nb, args.n_permutations,
-                                         args.seed)
-    curves = {}
-    for m, _ in _MEASURES:
-        curves[(m, "linked")] = corr_of(obs[m], args.min_pairs)
-        curves[(m, "null")] = corr_of(null[m], args.min_pairs)
+    pooled = pool_cells(per_cell, nb)
+    n_used = sum(1 for c in per_cell
+                 if any(c[m][0].size for m, _ in _MEASURES))
+    res = correlations(pooled, nb, args.n_permutations, args.min_pairs,
+                       args.seed)
 
     rows = {"bin_lo": edges[:-1], "bin_hi": edges[1:], "center": centers}
     for m, _ in _MEASURES:
-        rows[f"{m}_r"] = curves[(m, "linked")][0]
-        rows[f"{m}_n"] = curves[(m, "linked")][1]
-        rows[f"{m}_r_null"] = curves[(m, "null")][0]
-        rows[f"{m}_delta"] = curves[(m, "linked")][0] - curves[(m, "null")][0]
+        d = res[m]
+        rows[f"{m}_n"] = d["n"]
+        rows[f"{m}_pearson_r"] = d["r"]
+        rows[f"{m}_pearson_p"] = d["p"]
+        rows[f"{m}_spearman_rho"] = d["rho"]
+        rows[f"{m}_spearman_p"] = d["p_rho"]
+        rows[f"{m}_pearson_r_null"] = d["r_null"]
+        rows[f"{m}_spearman_rho_null"] = d["rho_null"]
+        rows[f"{m}_pearson_delta"] = d["r"] - d["r_null"]
+        rows[f"{m}_spearman_delta"] = d["rho"] - d["rho_null"]
+        rows[f"{m}_empirical_p_pearson"] = d["emp_p"]
+        rows[f"{m}_empirical_p_spearman"] = d["emp_p_rho"]
     tab = pd.DataFrame(rows)
     tab.to_csv(out / "pair_distance_correlation.tsv", sep="\t", index=False)
     figure(out / f"pair_distance_correlation.{args.plot_format}",
-           centers, curves, args.title, args.min_pairs)
+           centers, res, args.title)
 
     print(f"  {n_pairs_total:,} high-quality cis pairs from {n_used} cells",
           file=sys.stderr)
     for m, lab in _MEASURES:
-        r, n = curves[(m, "linked")]
-        rn, _ = curves[(m, "null")]
-        ok = np.isfinite(r)
+        d = res[m]
+        ok = np.isfinite(d["r"])
         if ok.any():
             j = int(np.flatnonzero(ok)[-1])
             print(f"  {lab.split('  ')[0]:22s} longest bin with >= "
-                  f"{args.min_pairs} pairs: {edges[j]:.0f}-{edges[j+1]:.0f} bp, "
-                  f"r = {r[j]:+.3f}, null {rn[j]:+.3f}, "
-                  f"Δ = {r[j]-rn[j]:+.3f}  (n = {int(n[j]):,})",
-                  file=sys.stderr)
+                  f"{args.min_pairs}: {edges[j]:.0f}-{edges[j+1]:.0f} bp, "
+                  f"n = {int(d['n'][j]):,}\n"
+                  f"    Pearson  r = {d['r'][j]:+.3f}  null {d['r_null'][j]:+.3f}"
+                  f"  Δ = {d['r'][j]-d['r_null'][j]:+.3f}"
+                  f"  empirical p = {d['emp_p'][j]:.3g}"
+                  f"  (parametric {d['p'][j]:.2g})\n"
+                  f"    Spearman ρ = {d['rho'][j]:+.3f}  null "
+                  f"{d['rho_null'][j]:+.3f}"
+                  f"  Δ = {d['rho'][j]-d['rho_null'][j]:+.3f}"
+                  f"  empirical p = {d['emp_p_rho'][j]:.3g}"
+                  f"  (parametric {d['p_rho'][j]:.2g})", file=sys.stderr)
     print(f"  -> {out}/pair_distance_correlation.tsv and "
           f".{args.plot_format}", file=sys.stderr)
     print(f"  The null re-pairs WITHIN cell and WITHIN bin, so a correlation "

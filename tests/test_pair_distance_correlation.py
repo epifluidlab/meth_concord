@@ -118,11 +118,10 @@ def test_shuffling_within_cell_leaves_a_cell_level_offset_in_the_null():
         x = level + rng.normal(0, 0.3, n)
         y = level + rng.normal(0, 0.3, n)
         per_cell.append({"gg": (b, x, y), "hh": (b[:0], x[:0], y[:0]),
-                         "gh": (b[:0], x[:0], y[:0])})
-    obs, null, n_used = m.accumulate_cells(per_cell, 1, 20, 0)
-    r_obs = m.corr_of(obs["gg"], 10)[0][0]
-    r_null = m.corr_of(null["gg"], 10)[0][0]
-    assert n_used == 4
+                         "gh": (b[:0], x[:0], y[:0]),
+                         "gx": (b[:0], x[:0], y[:0])})
+    res = m.correlations(m.pool_cells(per_cell, 1), 1, 20, 10, 0)["gg"]
+    r_obs, r_null = res["r"][0], res["r_null"][0]
     # Pooling alone manufactures a large correlation from nothing.
     assert r_obs > 0.85
     # The within-cell null reproduces it, so the difference is ~0.
@@ -141,10 +140,10 @@ def test_a_real_within_cell_link_survives_the_null():
         x = level + rng.normal(0, 0.5, n)
         y = level + 0.9 * (x - level) + rng.normal(0, 0.25, n)
         per_cell.append({"gg": (b, x, y), "hh": (b[:0], x[:0], y[:0]),
-                         "gh": (b[:0], x[:0], y[:0])})
-    obs, null, _ = m.accumulate_cells(per_cell, 1, 20, 0)
-    d_link = (m.corr_of(obs["gg"], 10)[0][0]
-              - m.corr_of(null["gg"], 10)[0][0])
+                         "gh": (b[:0], x[:0], y[:0]),
+                         "gx": (b[:0], x[:0], y[:0])})
+    r1 = m.correlations(m.pool_cells(per_cell, 1), 1, 20, 10, 0)["gg"]
+    d_link = r1["r"][0] - r1["r_null"][0]
     # The same cells with the link removed, so the two Δ differ only by the
     # thing being measured.  A bare threshold would be reading the size of
     # the cell offset as much as the size of the link.
@@ -154,9 +153,10 @@ def test_a_real_within_cell_link_survives_the_null():
         b = np.zeros(n, np.int64)
         flat.append({"gg": (b, level + rng.normal(0, 0.5, n),
                             level + rng.normal(0, 0.5, n)),
-                     "hh": (b[:0],) * 3, "gh": (b[:0],) * 3})
-    o2, n2, _ = m.accumulate_cells(flat, 1, 20, 0)
-    d_flat = m.corr_of(o2["gg"], 10)[0][0] - m.corr_of(n2["gg"], 10)[0][0]
+                     "hh": (b[:0],) * 3, "gh": (b[:0],) * 3,
+                     "gx": (b[:0],) * 3})
+    r2 = m.correlations(m.pool_cells(flat, 1), 1, 20, 10, 0)["gg"]
+    d_flat = r2["r"][0] - r2["r_null"][0]
     assert abs(d_flat) < 0.05, d_flat
     assert d_link > 0.15, d_link
     assert d_link > 3 * abs(d_flat)
@@ -273,13 +273,14 @@ def test_posteriors_are_used_instead_of_a_bam_pass(tmp_path):
     assert r.returncode == 0, r.stderr[-2500:]
     assert "Step-4 posteriors per end" in r.stderr
     t = pd.read_csv(out / "pair_distance_correlation.tsv", sep="\t")
-    assert {"gg_r", "gg_r_null", "gg_delta", "hh_r", "gh_r"} <= set(t.columns)
+    assert {"gg_pearson_r", "gg_pearson_r_null", "gg_pearson_delta",
+            "hh_spearman_rho", "gh_pearson_r"} <= set(t.columns)
     deep = t[t["gg_n"] >= 200]
     assert len(deep) >= 3
     # The planted within-cell link shows as Δ, and the cell-level offset it
     # is separated from shows as a non-zero null.
-    assert deep["gg_delta"].max() > 0.3
-    assert deep["gg_r_null"].max() > 0.05
+    assert deep["gg_pearson_delta"].max() > 0.3
+    assert deep["gg_pearson_r_null"].max() > 0.05
 
 
 def test_the_third_panel_joins_the_two_contexts_on_the_same_pair(tmp_path):
@@ -363,3 +364,98 @@ def test_posteriors_needs_both_contexts(tmp_path):
         capture_output=True, text=True)
     assert r.returncode != 0
     assert "must define HCG" in r.stderr
+
+
+def test_the_cross_context_measure_needs_one_context_on_each_end():
+    """Weaker than the third panel: a pair with GpC only on end 1 and CpG
+    only on end 2 qualifies here and not there."""
+    m = _mod()
+    # GpC on end 1 only, CpG on end 2 only -- 'gh' cannot use it, 'gx' can.
+    v = m.pair_values(_calls([1, 0], None), _calls(None, [1, 1]))
+    got = m.measures_of(v)
+    assert not np.isfinite(got["gh"]).all()
+    cross = [t for t in got["gx"] if np.isfinite(t).all()]
+    assert len(cross) == 1
+    assert cross[0] == (0.5, 1.0)               # GpC(end1) vs CpG(end2)
+
+
+def test_both_orientations_are_emitted_when_both_exist():
+    """Matching scripts/site_distance_correlation.py: a pair carrying both
+    contexts on both ends contributes TWO observations here and one to every
+    other measure, which is why its n runs higher."""
+    m = _mod()
+    v = m.pair_values(_calls([1, 1], [0, 0]), _calls([0, 0], [1, 1]))
+    got = m.measures_of(v)
+    assert len(got["gx"]) == 2
+    assert set(got["gx"]) == {(1.0, 1.0), (0.0, 0.0)}
+    # ... and exactly one for the others.
+    assert isinstance(got["gg"], tuple) and len(got["gg"]) == 2
+
+
+def test_both_correlations_and_both_p_values_are_reported(tmp_path):
+    import pandas as pd
+    s, gd, hd = _posterior_cells(tmp_path, n_cells=4, n=1500)
+    out, r = _run(tmp_path, s, gd, hd, "corr", "--n-permutations", "30")
+    assert r.returncode == 0, r.stderr[-2500:]
+    t = pd.read_csv(out / "pair_distance_correlation.tsv", sep="\t")
+    for m in ("gg", "hh", "gh", "gx"):
+        for suf in ("pearson_r", "pearson_p", "spearman_rho", "spearman_p",
+                    "pearson_r_null", "spearman_rho_null", "pearson_delta",
+                    "spearman_delta", "empirical_p_pearson",
+                    "empirical_p_spearman", "n"):
+            assert f"{m}_{suf}" in t.columns, f"{m}_{suf}"
+    deep = t[t["gg_n"] >= 200]
+    # Both correlations see the same planted link.
+    assert deep["gg_pearson_delta"].max() > 0.3
+    assert deep["gg_spearman_delta"].max() > 0.3
+    # The cross-context panel gets two observations per eligible pair.
+    assert (deep["gx_n"] == 2 * deep["gh_n"]).all()
+
+
+def test_the_empirical_p_catches_an_anti_conservative_parametric_one():
+    """The parametric p assumes independent observations; here many come
+    from the same cell, which is the very reason the null is per cell.  On a
+    fixture with a cell-level offset and NO within-cell link, pearsonr
+    returns a vanishing p for a correlation the re-pairing reproduces."""
+    m = _mod()
+    rng = np.random.default_rng(7)
+    per_cell = []
+    for level in (-1.2, -0.4, 0.4, 1.2):
+        n = 400
+        b = np.zeros(n, np.int64)
+        per_cell.append({"gg": (b, level + rng.normal(0, 0.3, n),
+                                level + rng.normal(0, 0.3, n)),
+                         "hh": (b[:0],) * 3, "gh": (b[:0],) * 3,
+                         "gx": (b[:0],) * 3})
+    d = m.correlations(m.pool_cells(per_cell, 1), 1, 100, 10, 0)["gg"]
+    assert d["r"][0] > 0.85                     # large, and entirely offset
+    assert d["p"][0] < 1e-50                    # the parametric p believes it
+    assert d["emp_p"][0] > 0.05                 # the re-pairing does not
+    assert d["emp_p_rho"][0] > 0.05
+
+
+def test_the_empirical_p_floor_is_one_over_permutations_plus_one():
+    """A correlation beyond every re-pairing cannot be reported as
+    impossible, only as beyond what N of them reached."""
+    m = _mod()
+    rng = np.random.default_rng(8)
+    n = 600
+    b = np.zeros(n, np.int64)
+    x = rng.normal(0, 1, n)
+    cell = {"gg": (b, x, x * 0.95 + rng.normal(0, 0.2, n)),
+            "hh": (b[:0],) * 3, "gh": (b[:0],) * 3, "gx": (b[:0],) * 3}
+    for n_perm in (9, 49):
+        d = m.correlations(m.pool_cells([cell], 1), 1, n_perm, 10, 0)["gg"]
+        assert d["emp_p"][0] == pytest.approx(1.0 / (n_perm + 1), rel=1e-9)
+
+
+def test_no_permutations_leaves_the_null_and_empirical_p_undefined():
+    m = _mod()
+    rng = np.random.default_rng(9)
+    n = 300
+    b = np.zeros(n, np.int64)
+    cell = {"gg": (b, rng.normal(0, 1, n), rng.normal(0, 1, n)),
+            "hh": (b[:0],) * 3, "gh": (b[:0],) * 3, "gx": (b[:0],) * 3}
+    d = m.correlations(m.pool_cells([cell], 1), 1, 0, 10, 0)["gg"]
+    assert np.isfinite(d["r"][0]) and np.isfinite(d["p"][0])
+    assert np.isnan(d["r_null"][0]) and np.isnan(d["emp_p"][0])
