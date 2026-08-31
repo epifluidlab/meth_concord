@@ -297,7 +297,49 @@ def excluded(regions, chrom, positions):
     return out
 
 
-def collect_cell_posteriors(paths, edges, min_sites, exclude):
+def _excluded_rows(t, exclude):
+    """Boolean mask over a posterior table: EITHER end in an excluded region.
+
+    Vectorised per chromosome and written back by position rather than by
+    label -- the first version called index.get_indexer inside the groupby,
+    which is a hash lookup per row on a table with millions of them.
+    """
+    if exclude is None or not len(t):
+        return np.zeros(len(t), bool)
+    drop = np.zeros(len(t), bool)
+    chrom = t["chrom"].to_numpy()
+    p1 = t["pos1"].to_numpy(np.int64)
+    p2 = t["pos2"].to_numpy(np.int64)
+    for c in pd.unique(chrom):
+        sel = np.flatnonzero(chrom == c)
+        drop[sel] = (excluded(exclude, c, p1[sel])
+                     | excluded(exclude, c, p2[sel]))
+    return drop
+
+
+def _cap(arrs, max_n, rng):
+    """Uniformly subsample the parallel arrays of one measure.
+
+    THIS IS WHAT BOUNDS MEMORY.  Every cell's observations are held until
+    the permutation runs -- the null needs the raw values, and a permutation
+    cannot be done on a running sum -- so an uncapped cohort accumulates
+    every cis pair of every cell at once.  A 1,577-cell run was OOM-killed
+    part way through the read for exactly this reason, with
+    --max-pairs-per-cell honoured on the BAM path and silently ignored here.
+
+    Uniform over rows, so the distance distribution survives: capping the
+    long-range bin alone would change the axis.
+    """
+    b, x, y = arrs
+    if not max_n or b.size <= max_n:
+        return arrs
+    k = rng.choice(b.size, int(max_n), replace=False)
+    k.sort()
+    return b[k], x[k], y[k]
+
+
+def collect_cell_posteriors(paths, edges, min_sites, exclude, max_pairs=0,
+                            seed=0):
     """One cell → {measure: (bins, x, y)} from Step-4 posteriors.
 
     THE VALUES ARE THE MIXTURE MODEL'S POSTERIORS, not per-end means of 0/1
@@ -305,13 +347,19 @@ def collect_cell_posteriors(paths, edges, min_sites, exclude):
     an end with two sites carries the model's belief about it instead of a
     bare 0, 0.5 or 1.
 
-    ``paths`` is {context: parquet}.  The third measure needs the SAME read
-    pair in both contexts, so the two tables are joined on (chrom, pos1,
-    pos2) -- Step 4 writes one row per pair per context, and the join is
-    exactly "pairs carrying both contexts on both ends".  The first two
-    measures use their own context's table whole, so they keep the pairs the
-    join would drop.
+    ``paths`` is {context: parquet}.  The third and fourth measures need the
+    SAME read pair in both contexts, so the two tables are joined on
+    (chrom, pos1, pos2) -- Step 4 writes one row per pair per context, and
+    the join is exactly "pairs carrying both contexts on both ends".  ONE
+    join serves both; doing it twice doubled the most expensive step in the
+    function.  The first two measures use their own context's table whole,
+    so they keep the pairs the join would drop.
+
+    Values come back as float32.  A posterior has nowhere near seven
+    significant digits and every one of them is held until the permutation
+    runs, so the second half of a float64 is memory spent on nothing.
     """
+    rng = np.random.default_rng(seed)
     nb = len(edges) - 1
     cols = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
     tabs = {}
@@ -321,15 +369,10 @@ def collect_cell_posteriors(paths, edges, min_sites, exclude):
         t = pd.read_parquet(path, columns=cols)
         t = t[(t["n1"] >= min_sites) & (t["n2"] >= min_sites)]
         t = t[np.isfinite(t["posterior1"]) & np.isfinite(t["posterior2"])]
+        t = t.reset_index(drop=True)
         if exclude is not None and len(t):
-            drop = np.zeros(len(t), bool)
-            for c, sub in t.groupby("chrom", sort=False):
-                idx = sub.index
-                bad = (excluded(exclude, c, sub["pos1"].to_numpy())
-                       | excluded(exclude, c, sub["pos2"].to_numpy()))
-                drop[t.index.get_indexer(idx)] = bad
-            t = t[~drop]
-        tabs[ctx] = t.reset_index(drop=True)
+            t = t[~_excluded_rows(t, exclude)].reset_index(drop=True)
+        tabs[ctx] = t
 
     def _binned(t):
         d = np.abs(t["pos2"].to_numpy(np.int64) - t["pos1"].to_numpy(np.int64))
@@ -337,54 +380,43 @@ def collect_cell_posteriors(paths, edges, min_sites, exclude):
         b = np.clip(np.digitize(d[keep], edges) - 1, 0, nb - 1).astype(np.int64)
         return keep, b
 
+    empty = (np.empty(0, np.int64), np.empty(0, np.float32),
+             np.empty(0, np.float32))
     got = {}
     for m, ctx in (("gg", "GCH"), ("hh", "HCG")):
         t = tabs.get(ctx)
         if t is None or not len(t):
-            got[m] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
+            got[m] = empty
             continue
         keep, b = _binned(t)
-        # Leftmost end first, so a difference's sign is consistent later.
-        p1 = t["posterior1"].to_numpy(float)[keep]
-        p2 = t["posterior2"].to_numpy(float)[keep]
-        lo = t["pos1"].to_numpy(np.int64)[keep] <= t["pos2"].to_numpy(np.int64)[keep]
-        got[m] = (b, np.where(lo, p1, p2), np.where(lo, p2, p1))
+        p1 = t["posterior1"].to_numpy(np.float32)[keep]
+        p2 = t["posterior2"].to_numpy(np.float32)[keep]
+        lo = (t["pos1"].to_numpy(np.int64)[keep]
+              <= t["pos2"].to_numpy(np.int64)[keep])
+        got[m] = _cap((b, np.where(lo, p1, p2), np.where(lo, p2, p1)),
+                      max_pairs, rng)
 
     g, h = tabs.get("GCH"), tabs.get("HCG")
+    got["gh"] = got["gx"] = empty
     if g is not None and h is not None and len(g) and len(h):
         j = g.merge(h, on=["chrom", "pos1", "pos2"], suffixes=("_g", "_h"))
         if len(j):
             keep, b = _binned(j)
             lo = (j["pos1"].to_numpy(np.int64)[keep]
                   <= j["pos2"].to_numpy(np.int64)[keep])
-            gd = (j["posterior1_g"].to_numpy(float)[keep]
-                  - j["posterior2_g"].to_numpy(float)[keep])
-            hd = (j["posterior1_h"].to_numpy(float)[keep]
-                  - j["posterior2_h"].to_numpy(float)[keep])
-            got["gh"] = (b, np.where(lo, gd, -gd), np.where(lo, hd, -hd))
-        else:
-            got["gh"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
-    else:
-        got["gh"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
-    # GCH one end against HCG the OTHER.  Step 4 writes a row per pair per
-    # context, so a pair qualifies as soon as it appears in both tables --
-    # the same join as 'gh', but the value taken across ends rather than
-    # within each.  Both orientations, so a pair contributes two rows.
-    if g is not None and h is not None and len(g) and len(h):
-        j = g.merge(h, on=["chrom", "pos1", "pos2"], suffixes=("_g", "_h"))
-        if len(j):
-            keep, b = _binned(j)
-            g1 = j["posterior1_g"].to_numpy(float)[keep]
-            g2 = j["posterior2_g"].to_numpy(float)[keep]
-            h1 = j["posterior1_h"].to_numpy(float)[keep]
-            h2 = j["posterior2_h"].to_numpy(float)[keep]
-            got["gx"] = (np.concatenate([b, b]),
-                         np.concatenate([g1, g2]),
-                         np.concatenate([h2, h1]))
-        else:
-            got["gx"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
-    else:
-        got["gx"] = (np.empty(0, np.int64), np.empty(0), np.empty(0))
+            g1 = j["posterior1_g"].to_numpy(np.float32)[keep]
+            g2 = j["posterior2_g"].to_numpy(np.float32)[keep]
+            h1 = j["posterior1_h"].to_numpy(np.float32)[keep]
+            h2 = j["posterior2_h"].to_numpy(np.float32)[keep]
+            gd, hd = g1 - g2, h1 - h2
+            got["gh"] = _cap((b, np.where(lo, gd, -gd),
+                              np.where(lo, hd, -hd)), max_pairs, rng)
+            # GCH one end against HCG the OTHER, both orientations, so a
+            # pair contributes two rows here and one everywhere else.
+            got["gx"] = _cap((np.concatenate([b, b]),
+                              np.concatenate([g1, g2]),
+                              np.concatenate([h2, h1])),
+                             2 * max_pairs if max_pairs else 0, rng)
     n_pairs = max((len(t) for t in tabs.values()), default=0)
     return got, n_pairs
 
@@ -751,7 +783,19 @@ def main(argv=None) -> int:
                          "eligible set is the intersection.")
     ap.add_argument("--trim-ends", type=int, default=5)
     ap.add_argument("--mapq-min", type=int, default=30)
-    ap.add_argument("--max-pairs-per-cell", type=int, default=0)
+    ap.add_argument("--max-pairs-per-cell", type=int, default=0,
+                    metavar="N",
+                    help="Cap the observations kept per cell per measure "
+                         "(0 = unlimited).  THIS IS WHAT BOUNDS MEMORY.  "
+                         "Every cell's values are held until the permutation "
+                         "runs -- the null needs the raw values, and a "
+                         "permutation cannot be done on a running sum -- so "
+                         "an uncapped cohort holds every cis pair of every "
+                         "cell at once.  A 1,577-cell run was OOM-killed "
+                         "part way through the read for exactly this.  The "
+                         "subsample is uniform over rows, so the distance "
+                         "distribution survives.  Applies to both inputs; "
+                         "on the BAM path it also stops the parse early.")
     ap.add_argument("--min-pairs", type=int, default=50, metavar="N",
                     help="Bins with fewer eligible pairs report NaN rather "
                          "than a correlation of three points.")
@@ -844,7 +888,8 @@ def main(argv=None) -> int:
             if not any(v.exists() for v in paths.values()):
                 missing.append(row["cell_name"])
                 continue
-            jobs.append((paths, edges, args.min_sites_per_end, exclude))
+            jobs.append((paths, edges, args.min_sites_per_end, exclude,
+                         args.max_pairs_per_cell, args.seed + len(jobs)))
         if missing:
             print(f"  {len(missing)} of {len(samples)} cells have no "
                   f"posterior file and are skipped (first: "
@@ -865,6 +910,13 @@ def main(argv=None) -> int:
     per_cell = [g[0] for g in got]
     n_pairs_total = sum(g[1] for g in got)
 
+    _obs = sum(int(c[m][0].size) for c in per_cell for m, _ in _MEASURES)
+    _gb = _obs * (8 + 4 + 4) / 1e9        # int64 bin + two float32
+    print(f"  {_obs:,} observations held ({_gb:.2f} GB); the null needs the "
+          f"raw values, so they stay resident until the permutation runs"
+          + ("" if args.max_pairs_per_cell else
+             ".  --max-pairs-per-cell is 0 (unlimited) -- set it if this "
+             "grows past your memory"), file=sys.stderr)
     pooled = pool_cells(per_cell, nb)
     n_used = sum(1 for c in per_cell
                  if any(c[m][0].size for m, _ in _MEASURES))

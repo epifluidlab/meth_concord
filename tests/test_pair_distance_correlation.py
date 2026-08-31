@@ -651,3 +651,112 @@ def test_run_jobs_returns_results_in_order():
     got = m.run_jobs(lambda i: i * i, jobs, 4, "sq")
     assert got == [i * i for i in range(25)]
     assert m.run_jobs(lambda i: i * i, jobs, 1, "sq") == got
+
+
+def test_max_pairs_per_cell_bounds_what_is_held(tmp_path):
+    """The null needs the raw values, so every cell's stay resident until
+    the permutation runs -- an uncapped cohort holds every cis pair of every
+    cell at once, which is how a 1,577-cell run was OOM-killed part way
+    through the read."""
+    m = _mod()
+    s, gd, hd = _posterior_cells(tmp_path, n_cells=1, n=6000)
+    paths = {"GCH": gd / "c0.posteriors.parquet",
+             "HCG": hd / "c0.posteriors.parquet"}
+    edges = np.logspace(2, 7, 6)
+    full, _ = m.collect_cell_posteriors(paths, edges, 1, None)
+    cap, _ = m.collect_cell_posteriors(paths, edges, 1, None, max_pairs=500,
+                                       seed=0)
+    assert full["gg"][0].size > 2000
+    assert cap["gg"][0].size == 500
+    assert cap["hh"][0].size == 500
+    # The cross-context measure emits both orientations, so its cap is
+    # doubled with it rather than halving its coverage.
+    assert cap["gx"][0].size == 1000
+    # Uniform over rows, so the distance distribution survives -- capping
+    # the long-range bin alone would change the axis.
+    fb = np.bincount(full["gg"][0], minlength=5) / full["gg"][0].size
+    cb = np.bincount(cap["gg"][0], minlength=5) / cap["gg"][0].size
+    assert np.max(np.abs(fb - cb)) < 0.08, (fb, cb)
+
+
+def test_capping_barely_moves_the_correlation(tmp_path):
+    """So the memory bound is close to free: measured, an uncapped run gave
+    r = 0.826 and a 200-per-cell cap gave 0.851."""
+    import pandas as pd
+    s, gd, hd = _posterior_cells(tmp_path, n_cells=6, n=6000)
+    got = {}
+    for cap in (0, 300):
+        extra = [] if cap == 0 else ["--max-pairs-per-cell", str(cap)]
+        out, r = _run(tmp_path, s, gd, hd, f"cap{cap}",
+                      "--n-permutations", "20", *extra)
+        assert r.returncode == 0, r.stderr[-2000:]
+        t = pd.read_csv(out / "pair_distance_correlation.tsv", sep="\t")
+        row = t.iloc[t["gg_n"].idxmax()]
+        got[cap] = (row["gg_pearson_r"], row["gg_pearson_delta"],
+                    int(row["gg_n"]))
+    assert got[300][2] < got[0][2] / 3
+    assert abs(got[300][0] - got[0][0]) < 0.08
+    assert abs(got[300][1] - got[0][1]) < 0.10
+
+
+def test_the_two_contexts_are_joined_once_not_twice():
+    """The join is the most expensive step in the function and the third and
+    fourth measures need the same one."""
+    import inspect
+    src = inspect.getsource(_mod().collect_cell_posteriors)
+    assert src.count("g.merge(h") == 1
+
+
+def test_the_values_are_kept_as_float32():
+    """A posterior has nowhere near seven significant digits, and every one
+    of them is held until the permutation runs."""
+    m = _mod()
+    import pandas as pd
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    s, gd, hd = _posterior_cells(d, n_cells=1, n=800)
+    got, _ = m.collect_cell_posteriors(
+        {"GCH": gd / "c0.posteriors.parquet",
+         "HCG": hd / "c0.posteriors.parquet"}, np.logspace(2, 7, 6), 1, None)
+    for key in ("gg", "hh", "gh", "gx"):
+        assert got[key][1].dtype == np.float32, key
+        assert got[key][2].dtype == np.float32, key
+
+
+def test_the_exclusion_mask_is_computed_without_a_per_row_lookup():
+    """The first version called index.get_indexer inside the groupby, which
+    is a hash lookup per row on a table with millions of them."""
+    import inspect
+    import pandas as pd
+    m = _mod()
+    # Parsed, not grepped: the comment explaining why it is gone contains
+    # the name, and the first version of this test failed on its own prose.
+    import ast as _ast
+    tree = _ast.parse(_SCRIPT.read_text())
+    calls = {n.attr for n in _ast.walk(tree)
+             if isinstance(n, _ast.Attribute)}
+    assert "get_indexer" not in calls
+    reg = m.load_exclude(None)
+    assert reg is None
+    bed = Path(__import__("tempfile").mkdtemp()) / "e.bed"
+    bed.write_text("chr1\t1000\t2000\nchr2\t0\t100\n")
+    reg = m.load_exclude([str(bed)])
+    t = pd.DataFrame({"chrom": ["chr1", "chr1", "chr2", "chr3"],
+                      "pos1": [1500, 50, 500, 1500],
+                      "pos2": [9000, 60, 50, 1500]})
+    got = m._excluded_rows(t, reg)
+    # row 0: pos1 inside chr1; row 2: pos2 inside chr2; the rest are clear.
+    assert got.tolist() == [True, False, True, False]
+    assert not m._excluded_rows(t, None).any()
+
+
+def test_the_run_reports_how_much_it_is_holding(tmp_path):
+    s, gd, hd = _posterior_cells(tmp_path, n_cells=4, n=1200)
+    out, r = _run(tmp_path, s, gd, hd, "held", "--n-permutations", "10")
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "observations held" in r.stderr
+    assert "--max-pairs-per-cell is 0 (unlimited)" in r.stderr
+    out2, r2 = _run(tmp_path, s, gd, hd, "held2", "--n-permutations", "10",
+                    "--max-pairs-per-cell", "200")
+    assert "observations held" in r2.stderr
+    assert "unlimited" not in r2.stderr
