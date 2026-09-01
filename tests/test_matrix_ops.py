@@ -251,3 +251,79 @@ def test_zero_variance_column_zscore_is_zero(tmp_path):
     np.testing.assert_array_equal(z["chr1:0"].to_numpy(), np.zeros(4))
 
 
+
+
+# ------------------------------------------------- matrix_norm='none' --
+
+def _small(nan_at=None):
+    import numpy as _np
+    import pandas as _pd
+    rng = _np.random.default_rng(0)
+    X = rng.normal(5.0, 2.0, (12, 8))          # non-zero mean, non-unit sd
+    X[:, 0] *= 10.0                            # one bin on a wildly different scale
+    if nan_at is not None:
+        X[nan_at] = _np.nan
+    return _pd.DataFrame(X, index=[f"c{i}" for i in range(12)],
+                         columns=[f"b{j}" for j in range(8)])
+
+
+def test_none_leaves_the_bins_on_their_own_scale(tmp_path):
+    """The point of 'none': z-score rescales every bin to unit variance and
+    QN keeps only the within-bin ordering, either of which undoes a
+    correction that works through the VALUES."""
+    import numpy as np
+    from nome_hic_concordance import matrix_ops
+    df = _small()
+    out = {}
+    for mn in ("none", "zscore", "quantile"):
+        out[mn] = matrix_ops.process_concordance_matrix(
+            df, min_cell_coverage=0.0, output_dir=str(tmp_path / mn),
+            matrix_norm=mn, save_outputs=False)["zscore"]
+    sd = out["none"].std(axis=0).to_numpy()
+    assert sd.max() / sd.min() > 5, "bin scales should NOT be equalised"
+    assert np.allclose(out["zscore"].std(axis=0).to_numpy(), 1.0, atol=1e-6)
+    assert not np.allclose(out["none"].to_numpy(), out["zscore"].to_numpy())
+    assert not np.allclose(out["none"].to_numpy(), out["quantile"].to_numpy())
+
+
+def test_none_still_imputes_nans(tmp_path):
+    """'none' means no PER-BIN step, not 'raw' -- the NaN imputation and the
+    per-cell step still run, and a NaN reaching the SVD would raise."""
+    import numpy as np
+    from nome_hic_concordance import matrix_ops
+    got = matrix_ops.process_concordance_matrix(
+        _small(nan_at=(2, 3)), min_cell_coverage=0.0,
+        output_dir=str(tmp_path), matrix_norm="none", save_outputs=False)
+    assert np.isfinite(got["zscore"].to_numpy()).all()
+
+
+def test_none_does_not_alias_the_imputed_matrix(tmp_path):
+    """They are returned separately and saved separately; two names for one
+    frame breaks the first caller that mutates either."""
+    from nome_hic_concordance import matrix_ops
+    got = matrix_ops.process_concordance_matrix(
+        _small(), min_cell_coverage=0.0, output_dir=str(tmp_path),
+        matrix_norm="none", save_outputs=False)
+    assert got["zscore"] is not got["imputed"]
+    got["zscore"].iloc[0, 0] = -999.0
+    assert got["imputed"].iloc[0, 0] != -999.0
+
+
+def test_an_unknown_matrix_norm_lists_all_three(tmp_path):
+    import pytest as _pytest
+    from nome_hic_concordance import matrix_ops
+    with _pytest.raises(ValueError, match="'zscore', 'quantile' or 'none'"):
+        matrix_ops.process_concordance_matrix(
+            _small(), min_cell_coverage=0.0, output_dir=str(tmp_path),
+            matrix_norm="nope", save_outputs=False)
+
+
+def test_both_clis_offer_none():
+    from nome_hic_concordance import cli, comparison_cli
+    a = cli.parse_args(["--samples", "x", "--reference", "y",
+                        "--output-dir", "z", "--matrix-norm", "none"])
+    assert a.matrix_norm == "none"
+    b = comparison_cli.parse_args(
+        ["--samples", "x", "--output-dir", "z",
+         "--concordance-matrix", "g=p.parquet", "--matrix-norm", "none"])
+    assert b.matrix_norm == "none"

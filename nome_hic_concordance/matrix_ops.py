@@ -222,9 +222,25 @@ def process_concordance_matrix(
             qn_centered, index=filtered.index, columns=filtered.columns,
         )
         logger.info("Per-bin normalization: quantile (rank-based)")
+    elif matrix_norm == "none":
+        # No per-bin step.  The per-CELL normalization and the NaN imputation
+        # above still ran, so this is "leave the bins on their own scale",
+        # not "raw".  It is the right choice when a correction upstream works
+        # through the VALUES: per-bin QN keeps only the within-bin ordering of
+        # cells and discards the magnitudes, and z-scoring rescales every bin
+        # to unit variance, which flattens the differences in spread a
+        # value-based correction just created.
+        # .copy(), not an alias: `imputed` is saved separately and is
+        # re-centred in place below, and two names for one frame is a bug
+        # waiting for the first caller that mutates either.
+        normalized = imputed.copy()
+        logger.info("Per-bin normalization: none (bins left on their own "
+                    "scale; per-cell normalization and NaN imputation still "
+                    "applied)")
     else:
         raise ValueError(
-            f"matrix_norm must be 'zscore' or 'quantile', got {matrix_norm!r}"
+            f"matrix_norm must be 'zscore', 'quantile' or 'none', got "
+            f"{matrix_norm!r}"
         )
 
     # Step 4 (optional): per-cell mean re-centering AFTER per-bin normalization.
@@ -242,7 +258,16 @@ def process_concordance_matrix(
     # ``M' = M - row_means - col_means + grand_mean``
     # specialised to the case col_means ≈ 0, giving simply
     # ``M' = M - row_means``.  Closed-form, one shot, ~5 lines.
+    # Under matrix_norm='none' the column means are NOT ~0, so subtracting
+    # the row means is plain per-cell centring rather than the double
+    # centring the derivation above describes.  Still well defined and still
+    # what the flag asks for; it just is not the same identity.
     if post_norm_recenter:
+        if matrix_norm == "none":
+            logger.info(
+                "post_norm_recenter with matrix_norm='none': the bins are "
+                "not per-bin centred, so this is per-cell centring rather "
+                "than the double centring it performs after QN.")
         row_shifts = normalized.mean(axis=1)
         normalized = normalized.sub(row_shifts, axis=0)
         logger.info(

@@ -236,12 +236,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="COMMA-SEPARATED group order for the UMAP legends, e.g. "
                         "'IT-L2/3,IT-L4,ODC'.  Groups not listed are appended in "
                         "data order; names not in the data are ignored.")
-    p.add_argument("--matrix-norm", choices=["zscore", "quantile"],
+    p.add_argument("--matrix-norm", choices=["zscore", "quantile", "none"],
                    default="quantile",
                    help="Per-bin normalization applied to every matrix before "
                         "the UMAP.  'quantile' = rank-based QN (matches the "
                         "nome_hic_concordance signed default); 'zscore' = "
-                        "classical.")
+                        "classical; 'none' skips the per-bin step, leaving "
+                        "the bins on their own scale (the per-cell step and "
+                        "the NaN imputation still run).  Reach for 'none' "
+                        "when the input carries a correction that works "
+                        "through the VALUES -- QN keeps only the within-bin "
+                        "ordering of cells, so it discards exactly what such "
+                        "a correction changed.")
     p.add_argument("--per-cell-norm", choices=["off", "rank", "center"],
                    default="rank",
                    help="Per-cell normalization applied to EVERY matrix before "

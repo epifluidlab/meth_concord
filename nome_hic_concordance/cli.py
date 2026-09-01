@@ -138,12 +138,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'both' = compute and save both matrices in one run.",
     )
     parser.add_argument(
-        "--matrix-norm", choices=["auto", "zscore", "quantile"], default="quantile",
+        "--matrix-norm", choices=["auto", "zscore", "quantile", "none"],
+        default="quantile",
         help="Per-bin normalization across cells in Step 7.  'zscore' "
              "for the classical pipeline; 'quantile' for rank-based QN, matching "
              "the bulk-style preprocessing that's robust to outliers in sparse "
-             "single-cell data.  'auto' resolves to 'quantile' for "
-             "--concordance-method signed, 'zscore' otherwise.",
+             "single-cell data.  'none' skips the per-bin step entirely -- "
+             "the per-cell normalization and NaN imputation still run, so "
+             "this is 'leave the bins on their own scale', not 'raw'.  Use "
+             "it when a correction upstream works through the VALUES: "
+             "rank-based QN keeps only the within-bin ordering of cells and "
+             "discards the magnitudes, and z-scoring rescales every bin to "
+             "unit variance, either of which can undo such a correction.  "
+             "'auto' resolves to 'quantile' for --concordance-method signed, "
+             "'zscore' otherwise.",
     )
     parser.add_argument(
         "--concordance-formula", choices=["auto", "dm", "mle"], default="auto",
