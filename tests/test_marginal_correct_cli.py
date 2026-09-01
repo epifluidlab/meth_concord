@@ -214,3 +214,51 @@ def test_no_null_present_is_not_an_error(run_dir):
     stem = "concordance_coordination.margreg_k3.method1_local"
     assert (d / f"{stem}.parquet").exists()
     assert not (d / f"{stem}_null.parquet").exists()
+
+
+# ---------------------------------------------- --residual-only (the HCG path) --
+
+def test_residual_only_writes_the_plain_resid_names(run_dir):
+    """HCG needs stage 3 alone: it transferred across replicates at 0.79
+    untouched, so no marginal correction -- but the residual is still the
+    sharper quantity, and both contexts should be reported the same way."""
+    d, sp = _with_null(run_dir)
+    _run([str(d), str(sp), "--batch-col", "exp_batch", "--residual-only"])
+    for stat in ("coordination", "direction_logor"):
+        assert (d / f"concordance_{stat}.resid.parquet").exists(), stat
+        assert (d / f"concordance_{stat}.resid_null.parquet").exists(), stat
+    # and NOTHING with the marginal-correction stem
+    assert list(d.glob("*margreg*")) == []
+
+
+def test_residual_only_actually_removes_the_baseline(run_dir):
+    d, sp = _with_null(run_dir)
+    _run([str(d), str(sp), "--batch-col", "exp_batch", "--residual-only"])
+    raw = pd.read_parquet(d / "concordance_direction_logor.parquet")
+    res = pd.read_parquet(d / "concordance_direction_logor.resid.parquet")
+    base = pd.read_parquet(d / "accessibility_mean.parquet")
+    assert np.abs(raw.to_numpy(float) - res.to_numpy(float)).max() > 1e-9
+    # the residual carries no remaining baseline slope, per bin
+    B = base.to_numpy(float) - base.to_numpy(float).mean(0, keepdims=True)
+    R = res.to_numpy(float) - res.to_numpy(float).mean(0, keepdims=True)
+    assert np.abs((B * R).sum(0)).max() < 1e-6 * max(1.0, np.abs(R).sum())
+
+
+def test_residual_only_needs_no_marginal_matrix(run_dir):
+    """--marginal is unused in this mode, so a missing one must not fail:
+    an HCG run has no reason to have produced a corrected marginal."""
+    d, sp = _with_null(run_dir)
+    (d / "concordance_marginal.parquet").unlink()
+    (d / "concordance_marginal_null.parquet").unlink()
+    _run([str(d), str(sp), "--batch-col", "exp_batch", "--residual-only"])
+    assert (d / "concordance_direction_logor.resid.parquet").exists()
+
+
+def test_the_qq_script_finds_the_residual_only_pair(run_dir):
+    """null_calibration_qq builds concordance_<stat>_null.parquet, so
+    '<stat>.resid' has to resolve to '.resid.parquet' and '.resid_null'."""
+    d, sp = _with_null(run_dir)
+    _run([str(d), str(sp), "--batch-col", "exp_batch", "--residual-only"])
+    stat = "direction_logor.resid"
+    assert (d / f"concordance_{stat}.parquet").exists()
+    assert (d / f"concordance_{stat}_null.parquet").exists()

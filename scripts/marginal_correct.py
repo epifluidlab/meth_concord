@@ -88,6 +88,18 @@ def main(argv=None) -> int:
                          "'logit' at every k on the real data.")
     ap.add_argument("--no-residual", action="store_true",
                     help="Skip the stage-3 residual output.")
+    ap.add_argument("--residual-only", action="store_true",
+                    help="Skip the marginal stages and write ONLY the "
+                         "residual against the baseline(s): "
+                         "concordance_<stat>.resid.parquet.  This is the HCG "
+                         "path.  HCG concordance transferred across "
+                         "replicates at 0.79 untouched, so it needs no "
+                         "marginal correction -- but the residual, "
+                         "coordination beyond what accessibility and "
+                         "compartment predict, is still the sharper "
+                         "quantity to report, and both contexts should be "
+                         "reported on the same footing.  --marginal and "
+                         "--batch-col are unused in this mode.")
     ap.add_argument("--output-dir", default=None,
                     help="Where to write (default: the input directory).")
     a = ap.parse_args(argv)
@@ -97,8 +109,9 @@ def main(argv=None) -> int:
     d = Path(a.concordance_dir)
     out_dir = Path(a.output_dir) if a.output_dir else d
     out_dir.mkdir(parents=True, exist_ok=True)
-    marg = _load(Path(a.marginal) if a.marginal
-                 else d / "concordance_marginal.parquet", "marginal matrix")
+    marg = (None if a.residual_only else
+            _load(Path(a.marginal) if a.marginal
+                  else d / "concordance_marginal.parquet", "marginal matrix"))
     base = _load(Path(a.baseline) if a.baseline
                  else d / "accessibility_mean.parquet", "baseline matrix")
     extra = [_load(Path(p), "extra baseline") for p in (a.extra_baseline or [])]
@@ -110,11 +123,15 @@ def main(argv=None) -> int:
         raise SystemExit(f"--batch-col {a.batch_col!r} not in {a.samples} "
                          f"(has {list(s.columns)})")
     batch = s.set_index(cell)[a.batch_col].astype(str)
-    n_lev = batch.nunique()
-    logger.info(f"{n_lev} replicate level(s) in {a.batch_col!r}: "
-                f"{sorted(batch.unique())[:6]}")
-    if n_lev < 2:
-        logger.warning("Only one replicate level; stage 2 is a no-op.")
+    if a.residual_only:
+        logger.info("--residual-only: stages 1 and 2 skipped; writing the "
+                    "residual against the baseline(s) only.")
+    else:
+        n_lev = batch.nunique()
+        logger.info(f"{n_lev} replicate level(s) in {a.batch_col!r}: "
+                    f"{sorted(batch.unique())[:6]}")
+        if n_lev < 2:
+            logger.warning("Only one replicate level; stage 2 is a no-op.")
 
     stats = [x.strip() for x in a.stats.split(",") if x.strip()]
     written = []
@@ -125,7 +142,8 @@ def main(argv=None) -> int:
             continue
         M = pd.read_parquet(src)
         logger.info(f"{stat}: {M.shape[0]} cells x {M.shape[1]} bins")
-        stem = f"concordance_{stat}.margreg_k{a.factor_k}.method1_local"
+        stem = (f"concordance_{stat}" if a.residual_only else
+                f"concordance_{stat}.margreg_k{a.factor_k}.method1_local")
 
         # The DRAWN NULL has to go through the IDENTICAL correction, driven
         # by its own marginal.  A corrected observed plotted against an
@@ -134,7 +152,9 @@ def main(argv=None) -> int:
         pairs = [("", M, marg)]
         null_src = d / f"concordance_{stat}_null.parquet"
         null_marg_p = d / "concordance_marginal_null.parquet"
-        if null_src.exists():
+        if null_src.exists() and a.residual_only:
+            pairs.append(("_null", pd.read_parquet(null_src), None))
+        elif null_src.exists():
             if not null_marg_p.exists():
                 logger.warning(
                     f"{null_src.name} exists but "
@@ -146,16 +166,19 @@ def main(argv=None) -> int:
                               pd.read_parquet(null_marg_p)))
 
         for suffix, Mx, Px in pairs:
-            two = two_stage(Mx, Px, batch, baseline=base, k=a.factor_k,
-                            anchor_k=a.anchor_k, transform=a.transform,
-                            n_pcs=a.protect_pcs)
-            p2 = out_dir / f"{stem}{suffix}.parquet"
-            two.to_parquet(p2)
-            written.append(p2)
-            moved = float(np.nanmean(np.abs(two.to_numpy(float)
-                                            - Mx.to_numpy(float))))
-            logger.info(f"  two-stage   -> {p2.name}  "
-                        f"mean |shift| {moved:.4f}")
+            if a.residual_only:
+                two = Mx
+            else:
+                two = two_stage(Mx, Px, batch, baseline=base, k=a.factor_k,
+                                anchor_k=a.anchor_k, transform=a.transform,
+                                n_pcs=a.protect_pcs)
+                p2 = out_dir / f"{stem}{suffix}.parquet"
+                two.to_parquet(p2)
+                written.append(p2)
+                moved = float(np.nanmean(np.abs(two.to_numpy(float)
+                                                - Mx.to_numpy(float))))
+                logger.info(f"  two-stage   -> {p2.name}  "
+                            f"mean |shift| {moved:.4f}")
             if not a.no_residual:
                 three = stage3_residual(two, [base] + extra)
                 # ".resid_null", not ".resid.parquet_null" -- the Q-Q script
