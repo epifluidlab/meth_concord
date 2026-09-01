@@ -826,6 +826,9 @@ def run_comparison(
     harmony_theta=None,
     concordance_batch_labels=None,
     concordance_batch_correction: str = "none",
+    marginal_matrix=None,
+    marginal_correct: bool = False,
+    marginal_correct_k: int = 5,
 ) -> dict:
     """Run the full §4.2 suite; write summary.json; return the headline dict."""
     out = ensure_dir(output_dir)
@@ -885,6 +888,45 @@ def run_comparison(
         summary["concordance_batch_correction"] = {
             "method": concordance_batch_correction,
             "applied_on": "raw_matrix_per_bin", "matrices": sorted(touched)}
+
+    # Marginal correction, at the same stage and for the same reason: the
+    # batch is in the concordance VALUES, so it has to go before any
+    # normalisation.  Different from --concordance-batch-correction in what
+    # it removes -- that one takes a batch term, this one takes the leading
+    # factors of the pair-derived marginal the values inherit.  On GCH the
+    # batch term family topped out at cross-replicate purity 0.29 of the
+    # within-replicate value while this reached 0.72.
+    if marginal_matrix is not None and marginal_correct:
+        from .marginal_correction import two_stage
+        if batch_labels is None:
+            logger.warning(
+                "--marginal-correct needs --batch-column to know which cells "
+                "are which replicate; skipping.")
+        else:
+            _bl = (batch_labels.iloc[:, 0]
+                   if isinstance(batch_labels, pd.DataFrame)
+                   else batch_labels).astype(str)
+            _base = next((matrices[b] for b in baseline_names
+                          if b in matrices), None)
+            if _base is None:
+                logger.warning(
+                    "--marginal-correct has no baseline matrix to protect the "
+                    "biology with; stage 1 INVERTS unprotected (measured "
+                    "0.142 -> 0.083), so this is skipped.  Pass "
+                    "--baseline-matrix.")
+            else:
+                done = []
+                for name in [n for n in concordance_names if n in matrices]:
+                    matrices[name] = two_stage(
+                        matrices[name], marginal_matrix, _bl,
+                        baseline=_base, k=marginal_correct_k)
+                    done.append(name)
+                summary["marginal_correct"] = {
+                    "k": int(marginal_correct_k),
+                    "applied_on": "raw_matrix_before_normalization",
+                    "matrices": sorted(done)}
+                logger.info(f"Marginal correction (k={marginal_correct_k}) "
+                            f"applied to {sorted(done)}")
 
     # (a) Marginal.
     summary["marginal"] = marginal_analysis(

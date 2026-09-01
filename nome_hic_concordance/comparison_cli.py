@@ -178,6 +178,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "when they should differ from --batch-column; accepts "
                         "a COMMA-SEPARATED list.  Defaults to --batch-column, "
                         "so the common case stays one flag.")
+    p.add_argument("--marginal-matrix", type=str, default=None,
+                   metavar="PATH",
+                   help="concordance_marginal.parquet, enabling "
+                        "--marginal-correct.")
+    p.add_argument("--marginal-correct", action="store_true",
+                   help="Remove the leading factors of --marginal-matrix from "
+                        "every --concordance-matrix before normalization, "
+                        "protecting the baseline, then align replicates with "
+                        "local matching in the corrected space.  GCH ONLY: "
+                        "long-range GCH concordance did not transfer between "
+                        "biological replicates (cross-replicate cell-type "
+                        "purity 0.31 of the within-replicate value) while "
+                        "mean accessibility on the same cells transferred at "
+                        "0.93, and the carrier is the pair-derived marginal.  "
+                        "HCG transferred at 0.79 untouched and must NOT be "
+                        "corrected.  Needs --batch-column and "
+                        "--baseline-matrix.  Equivalent to feeding in a "
+                        "matrix pre-built by scripts/marginal_correct.py.")
+    p.add_argument("--marginal-correct-k", type=int, default=5, metavar="K",
+                   help="Marginal factors removed (5).  Swept on the real "
+                        "data: cross/within peaked at k=5 and k=8, but k=8 "
+                        "already cost within-replicate purity.")
     p.add_argument("--concordance-batch-correction",
                    choices=["none", "center", "zscore", "combat", "harmony"],
                    default="none",
@@ -400,6 +422,10 @@ def main(argv: list[str] | None = None) -> int:
         concordance_batch_labels=concordance_batch_labels,
         concordance_batch_correction=args.concordance_batch_correction,
         harmony_theta=args.harmony_theta,
+        marginal_matrix=(pd.read_parquet(args.marginal_matrix)
+                         if args.marginal_matrix else None),
+        marginal_correct=args.marginal_correct,
+        marginal_correct_k=args.marginal_correct_k,
         per_cell_norm=args.per_cell_norm,
         post_norm_recenter=args.post_norm_recenter == "on",
         plot_format=args.plot_format,

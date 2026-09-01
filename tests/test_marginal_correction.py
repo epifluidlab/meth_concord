@@ -273,3 +273,67 @@ def test_a_single_bin_matrix_is_returned_unchanged_with_a_warning(caplog):
     assert np.allclose(s1.to_numpy(float), M.to_numpy(float))
     assert np.allclose(s2.to_numpy(float), M.to_numpy(float))
     assert "at least 2 cells and 2 bins" in caplog.text
+
+
+# ------------------------------------- nome_hic_compare --marginal-correct --
+
+def _compare_inputs(tmp_path, n=40, nb=60):
+    rng = np.random.default_rng(3)
+    cells = [f"c{i}" for i in range(n)]
+    cols = [f"chr1:{j}" for j in range(nb)]
+    bt = np.array(["A"] * (n // 2) + ["B"] * (n // 2))
+    bio = rng.normal(0, 1, (n, nb))
+    f = dict(index=cells, columns=cols)
+    d = tmp_path
+    pd.DataFrame(bio + rng.normal(0, .2, (n, nb)), **f).to_parquet(d / "base.parquet")
+    pd.DataFrame(bio + rng.normal(0, .5, (n, nb)), **f).to_parquet(d / "conc.parquet")
+    pd.DataFrame(np.clip(0.35 + .05 * bio
+                         + np.where(bt == "A", .05, -.05)[:, None], .02, .98),
+                 **f).to_parquet(d / "marg.parquet")
+    sp = d / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "exp_batch": bt,
+                  "group": np.resize(["T1", "T2"], n)}).to_csv(
+        sp, sep="\t", index=False)
+    return d, sp
+
+
+def test_compare_marginal_correct_records_what_it_did(tmp_path):
+    """The summary has to say the correction ran, with its k -- otherwise a
+    corrected and an uncorrected run are indistinguishable afterwards."""
+    import json
+    import subprocess
+    import sys as _sys
+    d, sp = _compare_inputs(tmp_path)
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [_sys.executable, "-m", "nome_hic_concordance.comparison_cli",
+         "--baseline-matrix", str(d / "base.parquet"),
+         "--concordance-matrix", f"gch={d / 'conc.parquet'}",
+         "--samples", str(sp), "--output-dir", str(out),
+         "--marginal-matrix", str(d / "marg.parquet"),
+         "--marginal-correct", "--marginal-correct-k", "2",
+         "--batch-column", "exp_batch", "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    got = json.load(open(out / "summary.json")).get("marginal_correct")
+    assert got is not None, "summary.json did not record the correction"
+    assert got["k"] == 2 and got["matrices"] == ["gch"]
+
+
+def test_compare_marginal_correct_refuses_without_a_baseline(tmp_path):
+    """Unprotected, stage 1 inverts (0.142 -> 0.083 measured).  Silently
+    running it without a baseline would make things worse while looking
+    like it worked."""
+    import subprocess
+    import sys as _sys
+    d, sp = _compare_inputs(tmp_path)
+    out = tmp_path / "out2"
+    r = subprocess.run(
+        [_sys.executable, "-m", "nome_hic_concordance.comparison_cli",
+         "--concordance-matrix", f"gch={d / 'conc.parquet'}",
+         "--samples", str(sp), "--output-dir", str(out),
+         "--marginal-matrix", str(d / "marg.parquet"),
+         "--marginal-correct", "--batch-column", "exp_batch",
+         "--plot-format", "png"],
+        capture_output=True, text=True)
+    assert "no baseline matrix to protect" in r.stderr
