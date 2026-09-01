@@ -340,7 +340,17 @@ def harmonize_embedding(
     n_cells, n_comp = scores.shape
     batch_df = _coerce_batch_df(batch_labels, pd.RangeIndex(n_cells))
     # Nothing to align if every cell shares one batch level in every variable.
+    # SAY SO.  Returning silently makes a no-op indistinguishable from a
+    # correction that ran and did not help, which is the difference between
+    # "my batch variable never reached harmony" and "batch and biology are
+    # confounded here" -- and the first is a one-flag fix.
     if all(batch_df[c].nunique() < 2 for c in batch_df.columns):
+        logger.warning(
+            "Harmony had nothing to correct: every cell shares one level in "
+            "%s, so the embedding is returned unchanged.  If that is not what "
+            "you expected, the batch labels did not reach it -- check the "
+            "column name and that its values vary across the cells in this "
+            "matrix.", list(batch_df.columns))
         return scores
     try:
         import harmonypy as hm
