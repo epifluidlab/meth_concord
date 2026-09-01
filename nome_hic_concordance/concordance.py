@@ -2825,17 +2825,34 @@ def compute_signed_concordance_matrix(
                         logger.warning(f"marginal correction: no "
                                        f"{_stat!r} component; skipping.")
                         continue
-                    _two = two_stage(components[_stat], _marg, _bl,
-                                     baseline=accessibility_df,
-                                     k=marginal_correct_k)
                     _stem = (f"concordance_{_stat}."
                              f"margreg_k{marginal_correct_k}.method1_local")
-                    _two.to_parquet(out_path / f"{_stem}.parquet")
-                    stage3_residual(_two, [accessibility_df]).to_parquet(
-                        out_path / f"{_stem}.resid.parquet")
+                    # The DRAWN NULL gets the IDENTICAL correction, driven by
+                    # its own marginal.  A corrected observed plotted against
+                    # an uncorrected null would put the correction itself on
+                    # the Q-Q, and the departure would measure what we did
+                    # rather than what is there.
+                    _jobs = [("", components[_stat], _marg)]
+                    if (null_components is not None
+                            and _stat in null_components
+                            and "marginal" in null_components):
+                        _jobs.append(("_null", null_components[_stat],
+                                      null_components["marginal"]))
+                    for _sfx, _obs, _pm in _jobs:
+                        _two = two_stage(_obs, _pm, _bl,
+                                         baseline=accessibility_df,
+                                         k=marginal_correct_k)
+                        _two.to_parquet(out_path / f"{_stem}{_sfx}.parquet")
+                        stage3_residual(_two, [accessibility_df]).to_parquet(
+                            out_path / f"{_stem}.resid{_sfx}.parquet")
+                    _wrote = "".join(f", {_stem}{x}.parquet"
+                                     for x, _, _ in _jobs)
                     logger.info(
-                        f"Marginal correction ({_stat}): wrote "
-                        f"{_stem}.parquet and {_stem}.resid.parquet")
+                        f"Marginal correction ({_stat}): wrote{_wrote} and "
+                        f"the matching .resid sibling(s)"
+                        + ("" if len(_jobs) > 1 else
+                           "  (no drawn null to correct; --emit-null writes "
+                           "one, and the Q-Q needs it)"))
         if null_components is not None:
             for _name, _df in null_components.items():
                 _df.to_parquet(

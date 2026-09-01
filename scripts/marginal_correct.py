@@ -125,23 +125,47 @@ def main(argv=None) -> int:
             continue
         M = pd.read_parquet(src)
         logger.info(f"{stat}: {M.shape[0]} cells x {M.shape[1]} bins")
-        two = two_stage(M, marg, batch, baseline=base, k=a.factor_k,
-                        anchor_k=a.anchor_k, transform=a.transform,
-                        n_pcs=a.protect_pcs)
         stem = f"concordance_{stat}.margreg_k{a.factor_k}.method1_local"
-        p2 = out_dir / f"{stem}.parquet"
-        two.to_parquet(p2)
-        written.append(p2)
-        moved = float(np.nanmean(np.abs(two.to_numpy(float)
-                                        - M.to_numpy(float))))
-        logger.info(f"  two-stage   -> {p2.name}  mean |shift| {moved:.4f}")
-        if not a.no_residual:
-            three = stage3_residual(two, [base] + extra)
-            p3 = out_dir / f"{stem}.resid.parquet"
-            three.to_parquet(p3)
-            written.append(p3)
-            logger.info(f"  three-stage -> {p3.name}  "
-                        f"(residual against {1 + len(extra)} baseline(s))")
+
+        # The DRAWN NULL has to go through the IDENTICAL correction, driven
+        # by its own marginal.  A corrected observed plotted against an
+        # uncorrected null would put the correction itself on the Q-Q, and
+        # the departure would measure what we did rather than what is there.
+        pairs = [("", M, marg)]
+        null_src = d / f"concordance_{stat}_null.parquet"
+        null_marg_p = d / "concordance_marginal_null.parquet"
+        if null_src.exists():
+            if not null_marg_p.exists():
+                logger.warning(
+                    f"{null_src.name} exists but "
+                    f"{null_marg_p.name} does not, so the null cannot be "
+                    f"corrected the same way; skipping it.  Re-run Step 5 "
+                    f"with --emit-null so the null components are written.")
+            else:
+                pairs.append(("_null", pd.read_parquet(null_src),
+                              pd.read_parquet(null_marg_p)))
+
+        for suffix, Mx, Px in pairs:
+            two = two_stage(Mx, Px, batch, baseline=base, k=a.factor_k,
+                            anchor_k=a.anchor_k, transform=a.transform,
+                            n_pcs=a.protect_pcs)
+            p2 = out_dir / f"{stem}{suffix}.parquet"
+            two.to_parquet(p2)
+            written.append(p2)
+            moved = float(np.nanmean(np.abs(two.to_numpy(float)
+                                            - Mx.to_numpy(float))))
+            logger.info(f"  two-stage   -> {p2.name}  "
+                        f"mean |shift| {moved:.4f}")
+            if not a.no_residual:
+                three = stage3_residual(two, [base] + extra)
+                # ".resid_null", not ".resid.parquet_null" -- the Q-Q script
+                # builds its null path as f"concordance_{stat}_null.parquet",
+                # so the suffix has to sit at the very end of the stem.
+                p3 = out_dir / f"{stem}.resid{suffix}.parquet"
+                three.to_parquet(p3)
+                written.append(p3)
+                logger.info(f"  three-stage -> {p3.name}  "
+                            f"(residual against {1 + len(extra)} baseline(s))")
     if not written:
         raise SystemExit("nothing written; check --stats against the "
                          "concordance_*.parquet files present")

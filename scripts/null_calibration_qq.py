@@ -643,8 +643,17 @@ def main(argv=None) -> int:
                     help="A 05_concordance directory from a step-5 run made "
                          "with --emit-null.  Repeat to compare settings.")
     ap.add_argument("--statistic", action="append", default=None,
-                    choices=list(STATS),
-                    help="Default: coordination and direction_logor.")
+                    metavar="NAME",
+                    help="Default: coordination and direction_logor.  Any "
+                         "NAME for which concordance_NAME.parquet and "
+                         "concordance_NAME_null.parquet both exist works, so "
+                         "the corrected matrices can be plotted directly: "
+                         "--statistic direction_logor.margreg_k5.method1_local "
+                         "or ...method1_local.resid.  The null must have been "
+                         "corrected the SAME way (scripts/marginal_correct.py "
+                         "does that), or the departure from the diagonal is "
+                         "the correction rather than the signal.  Known "
+                         f"uncorrected statistics: {', '.join(STATS)}.")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--plot-format", default="pdf",
                     choices=["pdf", "png", "svg"])

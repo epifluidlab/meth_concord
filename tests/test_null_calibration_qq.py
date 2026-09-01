@@ -587,3 +587,48 @@ def test_the_band_is_off_by_default(tmp_path):
         [sys.executable, str(_SCRIPT), "--help"],
         capture_output=True, text=True).stdout
     assert "--band {cell,iid,none}" in help_text        # still available
+
+
+def test_corrected_matrices_can_be_plotted_by_name(tmp_path):
+    """--statistic takes any NAME with matching observed and null files, so
+    the marginal-corrected matrices need no special case here.  Their null
+    must have been corrected the same way; scripts/marginal_correct.py does
+    that, and plotting a corrected observed against an uncorrected null
+    would put the correction on the Q-Q instead of the signal."""
+    rng = np.random.default_rng(4)
+    n, nb = 60, 80
+    idx = [f"c{i}" for i in range(n)]
+    cols = [f"chr1:{j}" for j in range(nb)]
+    d = tmp_path / "05"
+    d.mkdir()
+    stat = "direction_logor.margreg_k5.method1_local"
+    null = rng.normal(0, 1, (n, nb))
+    pd.DataFrame(null, index=idx, columns=cols).to_parquet(
+        d / f"concordance_{stat}_null.parquet")
+    pd.DataFrame(null * 1.3, index=idx, columns=cols).to_parquet(
+        d / f"concordance_{stat}.parquet")
+    out = tmp_path / "qq"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--run", f"gch={d}",
+         "--statistic", stat, "--plot-format", "png",
+         "--output-dir", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert (out / f"null_qq_{stat}.png").exists()
+    tab = pd.read_csv(out / "null_calibration.tsv", sep="\t")
+    assert set(tab["statistic"]) == {stat}
+    # lambda must see the inflation planted above
+    assert float(tab["lambda"].iloc[0]) > 1.15
+
+
+def test_an_unknown_statistic_still_names_the_missing_file(tmp_path):
+    """Relaxing --statistic from a choices list means a typo now reaches the
+    loader; it has to say which file it wanted."""
+    d = tmp_path / "05"
+    d.mkdir()
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--run", f"gch={d}",
+         "--statistic", "typo_here", "--plot-format", "png",
+         "--output-dir", str(tmp_path / "qq")],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "concordance_typo_here.parquet" in r.stderr

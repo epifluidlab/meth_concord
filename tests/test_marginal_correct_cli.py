@@ -148,3 +148,69 @@ def test_one_replicate_level_warns_rather_than_failing(run_dir, tmp_path):
                  ).to_csv(sp, sep="\t", index=False)
     r = _run([str(d), str(sp), "--batch-col", "exp_batch", "-k", "3"])
     assert "one replicate level" in r.stderr.lower()
+
+
+# ------------------------- the drawn null gets the SAME correction --------
+
+def _with_null(run_dir):
+    """Add drawn-null siblings, as --emit-null writes them."""
+    d, sp, cells, cols = run_dir
+    rng = np.random.default_rng(1)
+    n, nb = len(cells), len(cols)
+    f = dict(index=cells, columns=cols)
+    for stat in ("coordination", "direction_logor"):
+        pd.DataFrame(rng.normal(0, 1, (n, nb)), **f).to_parquet(
+            d / f"concordance_{stat}_null.parquet")
+    pd.DataFrame(np.clip(0.35 + 0.03 * rng.normal(0, 1, (n, nb)), .02, .98),
+                 **f).to_parquet(d / "concordance_marginal_null.parquet")
+    return d, sp
+
+
+def test_the_null_is_corrected_alongside_the_observed(run_dir):
+    """A corrected observed against an UNCORRECTED null would put the
+    correction itself on the Q-Q, and the departure from the diagonal would
+    measure what we did rather than what is there."""
+    d, sp = _with_null(run_dir)
+    _run([str(d), str(sp), "--batch-col", "exp_batch", "-k", "3"])
+    stem = "concordance_direction_logor.margreg_k3.method1_local"
+    for name in (f"{stem}.parquet", f"{stem}_null.parquet",
+                 f"{stem}.resid.parquet", f"{stem}.resid_null.parquet"):
+        assert (d / name).exists(), name
+    # the corrected null must differ from the raw null: same treatment, and
+    # a file that came through unchanged means the correction did not run
+    raw = pd.read_parquet(d / "concordance_direction_logor_null.parquet")
+    got = pd.read_parquet(d / f"{stem}_null.parquet")
+    assert np.abs(raw.to_numpy(float) - got.to_numpy(float)).max() > 1e-9
+
+
+def test_the_null_names_are_what_the_qq_script_looks_for(run_dir):
+    """null_calibration_qq builds f"concordance_{stat}_null.parquet", so the
+    _null suffix has to sit at the very END of the stem -- ".resid_null",
+    not ".resid.parquet_null"."""
+    d, sp = _with_null(run_dir)
+    _run([str(d), str(sp), "--batch-col", "exp_batch", "-k", "3"])
+    for stat in ("direction_logor.margreg_k3.method1_local",
+                 "direction_logor.margreg_k3.method1_local.resid"):
+        assert (d / f"concordance_{stat}.parquet").exists(), stat
+        assert (d / f"concordance_{stat}_null.parquet").exists(), stat
+
+
+def test_a_null_without_its_marginal_is_skipped_with_a_reason(run_dir):
+    """The null can only be corrected by its OWN marginal; without it the
+    honest move is to skip rather than reuse the observed one."""
+    d, sp = _with_null(run_dir)
+    (d / "concordance_marginal_null.parquet").unlink()
+    r = _run([str(d), str(sp), "--batch-col", "exp_batch", "-k", "3"])
+    assert "cannot be corrected the same way" in r.stderr
+    stem = "concordance_direction_logor.margreg_k3.method1_local"
+    assert (d / f"{stem}.parquet").exists()
+    assert not (d / f"{stem}_null.parquet").exists()
+
+
+def test_no_null_present_is_not_an_error(run_dir):
+    """A run without --emit-null still gets its observed matrices."""
+    d, sp, _, _ = run_dir
+    _run([str(d), str(sp), "--batch-col", "exp_batch", "-k", "3"])
+    stem = "concordance_coordination.margreg_k3.method1_local"
+    assert (d / f"{stem}.parquet").exists()
+    assert not (d / f"{stem}_null.parquet").exists()
