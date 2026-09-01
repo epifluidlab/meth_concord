@@ -395,3 +395,35 @@ def test_compare_marginal_correct_refuses_without_a_baseline(tmp_path):
          "--plot-format", "png"],
         capture_output=True, text=True)
     assert "no baseline matrix to protect" in r.stderr
+
+
+def test_step5_marginal_correct_also_corrects_the_drawn_null(tmp_path):
+    """--emit-null must give the corrected matrices a corrected null.
+
+    Without it null_calibration_qq has nothing valid to plot the corrected
+    statistic against, and plotting it against the UNCORRECTED null would
+    put the correction itself on the Q-Q.
+    """
+    cells = [f"cell{i}" for i in range(8)]
+    bl = pd.Series(["A"] * 4 + ["B"] * 4, index=cells, name="exp_batch")
+    out = _step5(tmp_path, batch_labels=bl, marginal_correct=True,
+                 marginal_correct_k=2, emit_null=True)
+    for stat in ("coordination", "direction_logor"):
+        stem = f"concordance_{stat}.margreg_k2.method1_local"
+        assert (out / f"{stem}.parquet").exists(), stat
+        assert (out / f"{stem}_null.parquet").exists(), f"{stat}: null missing"
+        assert (out / f"{stem}.resid_null.parquet").exists(), stat
+    # the plain drawn null must still be written too
+    assert (out / "concordance_direction_logor_null.parquet").exists()
+    assert (out / "concordance_marginal_null.parquet").exists()
+
+
+def test_step5_says_so_when_there_is_no_null_to_correct(tmp_path, caplog):
+    import logging
+    cells = [f"cell{i}" for i in range(8)]
+    bl = pd.Series(["A"] * 4 + ["B"] * 4, index=cells, name="exp_batch")
+    with caplog.at_level(logging.INFO):
+        out = _step5(tmp_path, batch_labels=bl, marginal_correct=True,
+                     marginal_correct_k=2)
+    assert not list(out.glob("*margreg*_null.parquet"))
+    assert "no drawn null to correct" in caplog.text
