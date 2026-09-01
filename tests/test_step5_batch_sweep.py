@@ -127,9 +127,22 @@ def test_flag_defaults_off():
 
 def test_step7_resolution_is_shared_not_duplicated():
     """The sweep scores through _resolve_step7_params so a swept setting is
-    judged under the same normalization the real Step 7 applies."""
+    judged under the same normalization the real Step 7 applies.
+
+    skip_top_svd is 0 under the signed default because that default is now
+    MLE, and skipping the leading component was measured not to help MLE
+    (kNN ~flat) on the original comparison and again on a re-run.  It is 1
+    for DM, where dropping the low-coverage confound lifted full-set kNN
+    0.884 -> 0.937.  Both directions are pinned here: the resolution reads
+    the RAW --concordance-formula argument nowhere any more, so a change to
+    what 'auto' means must not silently change the skip.
+    """
     a = cli.parse_args(["--samples", "x", "--reference", "y",
                         "--output-dir", "z", "--concordance-method", "signed"])
     got = cli._resolve_step7_params(a)
     assert got["matrix_norm"] == "quantile" and got["per_cell_norm"] == "rank"
-    assert got["skip_top_svd"] == 1 and got["n_svd"] == 10
+    assert got["skip_top_svd"] == 0 and got["n_svd"] == 10
+    dm = cli.parse_args(["--samples", "x", "--reference", "y",
+                         "--output-dir", "z", "--concordance-method", "signed",
+                         "--concordance-formula", "dm"])
+    assert cli._resolve_step7_params(dm)["skip_top_svd"] == 1

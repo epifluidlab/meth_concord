@@ -70,6 +70,24 @@ def _as_float(df: pd.DataFrame, fill: float = 0.0) -> np.ndarray:
     return np.nan_to_num(df.to_numpy(float), nan=fill)
 
 
+def _too_small(X: np.ndarray, what: str) -> bool:
+    """A factorisation needs at least 2 cells AND 2 bins.
+
+    Sparse contexts really do reduce to one usable bin after coverage
+    filtering, and TruncatedSVD raises on a single feature.  Returning the
+    matrix untouched with a warning is the honest response: there is no
+    factor structure to remove, and a correction that silently did nothing
+    would be indistinguishable from one that worked.
+    """
+    if min(X.shape) < 2:
+        logger.warning(
+            "%s is %d x %d; a factorisation needs at least 2 cells and 2 "
+            "bins, so this stage is skipped and the matrix returned "
+            "unchanged.", what, X.shape[0], X.shape[1])
+        return True
+    return False
+
+
 def marginal_transform(P: np.ndarray, how: str = "d") -> np.ndarray:
     """Put the marginal on the scale the correction fits.
 
@@ -102,6 +120,8 @@ def protect_design(baseline: pd.DataFrame | None, index: pd.Index,
         return None
     from sklearn.decomposition import TruncatedSVD
     X = _as_float(baseline.reindex(index))
+    if _too_small(X, "protect_design baseline"):
+        return None
     X = X - X.mean(0, keepdims=True)
     k = max(1, min(int(n_pcs), min(X.shape) - 1))
     Z = TruncatedSVD(n_components=k, random_state=seed).fit_transform(X)
@@ -124,6 +144,8 @@ def stage1_marginal(matrix: pd.DataFrame, marginal: pd.DataFrame,
     idx = matrix.index
     P = _as_float(marginal.reindex(index=idx, columns=matrix.columns), fill=0.5)
     X = marginal_transform(P, transform)
+    if _too_small(X, "stage1 marginal"):
+        return matrix.copy()
     Xc = X - X.mean(0, keepdims=True)
     kk = max(1, min(int(k), min(Xc.shape) - 1))
     U = TruncatedSVD(n_components=kk, random_state=seed).fit_transform(Xc)
@@ -163,6 +185,8 @@ def stage2_local(matrix: pd.DataFrame, reference: pd.DataFrame,
                        "align, returning the matrix unchanged.", levels)
         return matrix.copy()
     R = _as_float(reference.reindex(idx))
+    if _too_small(R, "stage2 reference"):
+        return matrix.copy()
     R = R - R.mean(0, keepdims=True)
     kk = max(1, min(int(n_pcs), min(R.shape) - 1))
     Z = TruncatedSVD(n_components=kk, random_state=seed).fit_transform(R)

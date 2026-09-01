@@ -1708,6 +1708,10 @@ def compute_signed_concordance_matrix(
     min_bin_coverage: float = 0.0,
     statistic: str = "signed",
     concordance_formula: str = "mle",
+    marginal_correct: bool = False,
+    marginal_correct_k: int = 5,
+    marginal_correct_stats: tuple[str, ...] = ("coordination",
+                                               "direction_logor"),
     baseline: str = "short-range",
     concordance_combine: str = "signed-diff",
     dm_window_mb: float = 0.0,
@@ -2798,6 +2802,40 @@ def compute_signed_concordance_matrix(
         for _name, _df in components.items():
             _df.to_parquet(out_path / f"concordance_{_name}.parquet")
             _df.to_csv(out_path / f"concordance_{_name}.tsv", sep="\t")
+
+        # Optional marginal correction, written ALONGSIDE the uncorrected
+        # matrices rather than replacing them: the correction is specific to
+        # GCH (HCG transfers across replicates untouched at 0.79), it is a
+        # two-stage procedure whose second stage anchors on the first, and a
+        # reader has to be able to compare the two.  See
+        # nome_hic_concordance.marginal_correction for the measurements.
+        if marginal_correct:
+            if batch_labels is None:
+                logger.warning(
+                    "--marginal-correct needs --batch-column to know which "
+                    "cells are which replicate; skipping.")
+            else:
+                from .marginal_correction import stage3_residual, two_stage
+                _bl = (batch_labels.iloc[:, 0]
+                       if isinstance(batch_labels, pd.DataFrame)
+                       else batch_labels).astype(str)
+                _marg = components.get("marginal")
+                for _stat in marginal_correct_stats:
+                    if _stat not in components:
+                        logger.warning(f"marginal correction: no "
+                                       f"{_stat!r} component; skipping.")
+                        continue
+                    _two = two_stage(components[_stat], _marg, _bl,
+                                     baseline=accessibility_df,
+                                     k=marginal_correct_k)
+                    _stem = (f"concordance_{_stat}."
+                             f"margreg_k{marginal_correct_k}.method1_local")
+                    _two.to_parquet(out_path / f"{_stem}.parquet")
+                    stage3_residual(_two, [accessibility_df]).to_parquet(
+                        out_path / f"{_stem}.resid.parquet")
+                    logger.info(
+                        f"Marginal correction ({_stat}): wrote "
+                        f"{_stem}.parquet and {_stem}.resid.parquet")
         if null_components is not None:
             for _name, _df in null_components.items():
                 _df.to_parquet(

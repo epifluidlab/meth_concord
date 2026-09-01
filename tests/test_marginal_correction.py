@@ -210,3 +210,66 @@ def test_inputs_are_realigned_not_assumed_to_match(planted):
     a = mc.stage1_marginal(planted["M"], planted["P"], None, k=2)
     b = mc.stage1_marginal(planted["M"], shuffled, None, k=2)
     assert np.allclose(a.to_numpy(float), b.to_numpy(float))
+
+
+# --------------------------------------------- the Step-5 --marginal-correct --
+
+def _step5(tmp_path, batch_labels=None, **kw):
+    """Run Step 5 on the shared focal-active fixture."""
+    from tests.test_signed_concordance import _focal_active_paths
+    from nome_hic_concordance import concordance as cc
+    src, out = tmp_path / "src", tmp_path / "05"
+    src.mkdir(parents=True, exist_ok=True)
+    cc.compute_signed_concordance_matrix(
+        _focal_active_paths(src, n_cells=8), bin_size=1000, min_distance=100,
+        min_gch_sites=2, baseline="distance-pooled", dm_prior="shared",
+        output_dir=str(out), save_outputs=True, use_rwr=False,
+        batch_labels=batch_labels, **kw)
+    return out
+
+
+def test_step5_marginal_correct_is_off_by_default(tmp_path):
+    out = _step5(tmp_path)
+    assert list(out.glob("*margreg*")) == []
+
+
+def test_step5_marginal_correct_writes_both_stages(tmp_path):
+    cells = [f"cell{i}" for i in range(8)]
+    bl = pd.Series(["A"] * 4 + ["B"] * 4, index=cells, name="exp_batch")
+    out = _step5(tmp_path, batch_labels=bl, marginal_correct=True,
+                 marginal_correct_k=2)
+    for stat in ("coordination", "direction_logor"):
+        stem = f"concordance_{stat}.margreg_k2.method1_local"
+        assert (out / f"{stem}.parquet").exists(), stat
+        assert (out / f"{stem}.resid.parquet").exists(), stat
+    # and the uncorrected originals must SURVIVE, not be replaced
+    assert (out / "concordance_coordination.parquet").exists()
+
+
+def test_step5_marginal_correct_needs_batch_labels(tmp_path, caplog):
+    """Without them there is no replicate to align, and silently writing an
+    unchanged 'corrected' matrix would be worse than skipping."""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        out = _step5(tmp_path, batch_labels=None, marginal_correct=True)
+    assert list(out.glob("*margreg*")) == []
+    assert "needs --batch-column" in caplog.text
+
+
+def test_a_single_bin_matrix_is_returned_unchanged_with_a_warning(caplog):
+    """Sparse contexts really do reduce to one usable bin after coverage
+    filtering, and TruncatedSVD raises on a single feature.  Returning the
+    matrix untouched and SAYING SO is the honest response -- a silent no-op
+    is indistinguishable from a correction that worked."""
+    import logging
+    idx = [f"c{i}" for i in range(6)]
+    M = pd.DataFrame(np.arange(6.0).reshape(6, 1), index=idx, columns=["b0"])
+    P = pd.DataFrame(np.full((6, 1), 0.4), index=idx, columns=["b0"])
+    batch = pd.Series(["A", "A", "A", "B", "B", "B"], index=idx)
+    with caplog.at_level(logging.WARNING):
+        s1 = mc.stage1_marginal(M, P, None, k=2)
+        s2 = mc.stage2_local(M, M, batch, k=2)
+        assert mc.protect_design(M, M.index, 5) is None
+    assert np.allclose(s1.to_numpy(float), M.to_numpy(float))
+    assert np.allclose(s2.to_numpy(float), M.to_numpy(float))
+    assert "at least 2 cells and 2 bins" in caplog.text

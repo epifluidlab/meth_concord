@@ -479,6 +479,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "MLE plug-in.  The run reports the gap either way.",
     )
     parser.add_argument(
+        "--marginal-correct", action="store_true",
+        help="Also write marginal-corrected copies of the coordination and "
+             "direction_logor matrices (GCH only).  Long-range GCH "
+             "concordance did not transfer between biological replicates "
+             "(cross-replicate cell-type purity 0.31 of the within-replicate "
+             "value) while mean accessibility on the SAME cells transferred "
+             "at 0.93; the carrier is the pair-derived marginal, which "
+             "differs between preparations (0.267 against 0.346) where the "
+             "dense accessibility estimate does not.  Writes "
+             "concordance_<stat>.margreg_k<K>.method1_local.parquet and a "
+             ".resid sibling ALONGSIDE the uncorrected matrices, never "
+             "replacing them.  Needs --batch-column.  Do NOT use on HCG: it "
+             "transferred at 0.79 uncorrected, and correcting a matrix that "
+             "does not need it can only cost signal.")
+    parser.add_argument(
+        "--marginal-correct-k", type=int, default=5, metavar="K",
+        help="Marginal factors removed by --marginal-correct (5).  Swept on "
+             "the real data: cross/within peaked at 0.575 (k=5) and 0.581 "
+             "(k=8), but k=8 already cost within-replicate purity and past "
+             "it the erosion is steady, so 5 is the last k where "
+             "cross-purity more than doubles with the biology intact.")
+    parser.add_argument(
         "--dm-dist-bin-bp", type=int, default=10_000,
         help="Distance-bin width (bp) for the distance-matched expected "
              "(10 kb).",
@@ -1716,6 +1738,8 @@ def run_context(
                 min_bin_coverage=args.min_bin_coverage,
                 statistic=args.concordance_statistic or "signed",
                 concordance_formula=concordance_formula,
+                marginal_correct=args.marginal_correct,
+                marginal_correct_k=args.marginal_correct_k,
                 baseline=args.baseline,
                 concordance_combine=concordance_combine,
                 dm_window_mb=args.dm_window_mb,
@@ -1759,6 +1783,12 @@ def run_context(
                     min_bin_coverage=args.min_bin_coverage,
                     statistic=args.concordance_statistic or "signed",
                     concordance_formula=concordance_formula,
+                    # NOT marginal_correct: the sweep runs one Step 5 per
+                    # batch-correction method into the same directory, so
+                    # every variant would write the same corrected filenames
+                    # over the last one.  The correction is orthogonal to
+                    # what the sweep compares; run it afterwards on the
+                    # chosen setting.
                     baseline=args.baseline,
                     concordance_combine=concordance_combine,
                     dm_window_mb=args.dm_window_mb,
