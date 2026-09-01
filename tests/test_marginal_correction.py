@@ -160,6 +160,64 @@ def test_stage_3_residual_is_orthogonal_to_its_baselines(planted):
     assert num < 1e-6 * max(1.0, float(np.abs(R).sum())), num
 
 
+def test_stage_3_residual_still_has_something_left_in_it():
+    """ORTHOGONALITY ALONE IS NOT ENOUGH, and this is not hypothetical.
+
+    An all-zero matrix is orthogonal to everything, so the check above
+    passed while the implementation regressed each bin on the WHOLE baseline
+    matrix -- a design with more columns than cells, which lstsq fits
+    exactly.  The residual came back at 1e-15 and within-replicate purity
+    read 0.123 against a chance level of 0.115.  The shape here is the real
+    regime, bins far outnumbering cells, where that degeneracy bites.
+    """
+    rng = np.random.default_rng(11)
+    n, nb = 120, 400                      # bins >> cells, as in the data
+    idx = [f"c{i}" for i in range(n)]
+    cols = [f"b{j}" for j in range(nb)]
+    shared = rng.normal(0, 1, (n, nb))
+    base = pd.DataFrame(shared + rng.normal(0, 1, (n, nb)),
+                        index=idx, columns=cols)
+    M = pd.DataFrame(shared + rng.normal(0, 1, (n, nb)),
+                     index=idx, columns=cols)
+    out = mc.stage3_residual(M, [base])
+    kept = float(np.nanstd(out.to_numpy(float))
+                 / np.nanstd(M.to_numpy(float)))
+    assert kept > 0.5, ("the residual was annihilated, not computed", kept)
+
+
+def test_stage_3_matches_a_plain_per_bin_regression():
+    """Pinned against the model comparison.variance_partition fits:
+    y_j = a_j + b_j * base_j, one regression per bin."""
+    rng = np.random.default_rng(12)
+    n, nb = 90, 30
+    idx = [f"c{i}" for i in range(n)]
+    cols = [f"b{j}" for j in range(nb)]
+    base = pd.DataFrame(rng.normal(0, 1, (n, nb)), index=idx, columns=cols)
+    M = pd.DataFrame(rng.normal(0, 1, (n, nb)), index=idx, columns=cols)
+    got = mc.stage3_residual(M, [base]).to_numpy(float)
+    B, Y = base.to_numpy(float), M.to_numpy(float)
+    for j in range(nb):
+        x = np.column_stack([np.ones(n), B[:, j]])
+        beta, *_ = np.linalg.lstsq(x, Y[:, j], rcond=None)
+        assert np.allclose(got[:, j], Y[:, j] - x @ beta, atol=1e-8), j
+
+
+def test_stage_3_handles_a_constant_baseline_bin():
+    """A bin whose baseline never varies gives a singular system; the right
+    answer is a zero slope, not an exception."""
+    rng = np.random.default_rng(13)
+    n, nb = 50, 12
+    idx = [f"c{i}" for i in range(n)]
+    cols = [f"b{j}" for j in range(nb)]
+    B = rng.normal(0, 1, (n, nb))
+    B[:, 3] = 2.0                          # constant across cells
+    out = mc.stage3_residual(
+        pd.DataFrame(rng.normal(0, 1, (n, nb)), index=idx, columns=cols),
+        [pd.DataFrame(B, index=idx, columns=cols)])
+    assert np.isfinite(out.to_numpy(float)).all()
+    assert np.nanstd(out.to_numpy(float)[:, 3]) > 0.5
+
+
 def test_three_stage_runs_and_keeps_the_frame(planted):
     out = mc.three_stage(planted["M"], planted["P"], planted["batch"],
                          baseline=planted["base"], k=3)

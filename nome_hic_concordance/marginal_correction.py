@@ -215,16 +215,26 @@ def stage3_residual(matrix: pd.DataFrame,
     (0.309 -> 0.703 against 0.266 -> 0.479 for the un-residualised matrix).
     """
     idx = matrix.index
-    cols = [np.ones(len(idx))]
-    for b in baselines:
-        X = _as_float(b.reindex(idx))
-        X = (X - X.mean(0, keepdims=True))
-        sd = X.std(0, keepdims=True)
-        cols.append(np.divide(X, sd, out=np.zeros_like(X), where=sd > 1e-12))
-    D = np.column_stack(cols)
     Y = _as_float(matrix)
-    beta, *_ = np.linalg.lstsq(D, Y, rcond=None)
-    return pd.DataFrame(Y - D @ beta, index=idx, columns=matrix.columns
+    # PER BIN: bin j's values are regressed on the SAME bin's baseline
+    # value, exactly as comparison.variance_partition does it.  Stacking the
+    # whole baseline matrix as predictors instead gives a design with more
+    # columns than cells (9548 + 1 against 1577 here), which lstsq fits
+    # exactly -- the "residual" comes back at 1e-15 and every downstream
+    # metric reads as noise.  That is not a subtle failure: within-replicate
+    # purity fell to 0.123 against a chance level of 0.115.
+    P = [_as_float(b.reindex(index=idx, columns=matrix.columns))
+         for b in baselines]
+    Yc = Y - Y.mean(0, keepdims=True)
+    Xc = np.stack([p - p.mean(0, keepdims=True) for p in P], axis=0)
+    XtX = np.einsum("anj,bnj->jab", Xc, Xc)          # (bins, k, k)
+    Xty = np.einsum("anj,nj->ja", Xc, Yc)            # (bins, k)
+    # pinv rather than solve: a bin whose baseline is constant across cells
+    # gives a singular system, and the right answer there is a zero slope,
+    # not an exception.
+    beta = np.einsum("jab,jb->ja", np.linalg.pinv(XtX), Xty)
+    resid = Yc - np.einsum("ja,anj->nj", beta, Xc)
+    return pd.DataFrame(resid, index=idx, columns=matrix.columns
                         ).where(matrix.notna())
 
 
