@@ -80,7 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "(only applied when processing context HCG). "
                              "HCG (CpG) sites are typically sparser than GCH, "
                              "so 2 is a good floor.")
-    add_exclude_chrom_arg(parser)
+    add_exclude_chrom_arg(parser, default=["chrX,chrY"])
     parser.add_argument("--bin-size", type=int, default=250_000,
                         help="Genomic bin size in bp.")
     parser.add_argument("--min-pairs-per-bin", type=int, default=None,
@@ -154,7 +154,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "'zscore' otherwise.",
     )
     parser.add_argument(
-        "--concordance-formula", choices=["auto", "dm", "mle"], default="auto",
+        "--concordance-formula", choices=["auto", "dm", "mle"], default="mle",
         help="Per-(cell, bin) rate estimator for --concordance-method signed. "
              "'dm' = Dirichlet-Multinomial posterior mean (k+α)/(n+α_total): "
              "calibrated, but on post-RWR counts it double-shrinks (RWR already "
@@ -199,7 +199,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--concordance-combine",
         choices=["auto", "signed-diff", "log2-ratio", "linked-only",
                  "concordant-diff", "concordant-signed", "direction-logor"],
-        default="concordant-signed",
+        default="direction-logor",
         help="How the long-range observed (O) and baseline (E) co-state rates "
              "are combined.  'signed-diff' = "
              "(O_open−O_closed)−(E_open−E_closed) (legacy; NOTE with an O/E null "
@@ -357,7 +357,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "with scripts/null_calibration_qq.py.",
     )
     parser.add_argument(
-        "--null-draws", type=int, default=1, metavar="K",
+        "--null-draws", type=int, default=3, metavar="K",
         help="How many independent null replicates to draw per (cell, bin) "
              "with --emit-null.  One is enough for a Q-Q plot; a RANK needs "
              "more, because K draws alone can only resolve a p down to "
@@ -552,7 +552,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "for pearson and betabinom (legacy).",
     )
     parser.add_argument(
-        "--plot-format", type=str, default="png",
+        "--plot-format", type=str, default="pdf",
         choices=["png", "pdf", "svg"],
         help="Figure format for the step-7 UMAP and SVD-scree plots. "
              "'pdf' (or 'svg') writes a vector figure for publication; "

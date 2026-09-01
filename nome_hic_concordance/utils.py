@@ -136,15 +136,28 @@ def bin_label_chrom(label: str) -> str:
     return s.rsplit(":", 1)[0] if ":" in s else s
 
 
-def add_exclude_chrom_arg(parser) -> None:
-    """Register --exclude-chrom identically across the CLIs."""
+def add_exclude_chrom_arg(parser, default=None) -> None:
+    """Register --exclude-chrom across the CLIs, with a per-CLI default.
+
+    The default differs on purpose.  nome_hic_concordance applies this to
+    chrom_sizes AND the context tables before every step, so excluding chrM
+    there removes it from the binning and no chrM bin ever reaches
+    accessibility_mean.parquet or concordance_marginal.parquet -- which is
+    the enzyme-efficiency covariate scripts/chrm_regress.py reads.
+    Downstream tools filter matrices that are already built, so excluding it
+    there costs nothing.
+    """
     parser.add_argument(
-        "--exclude-chrom", action="append", default=None, metavar="CHROM",
+        "--exclude-chrom", action="append", default=default, metavar="CHROM",
         help="Contigs to drop from the analysis. Repeatable and/or "
              "comma-separated: --exclude-chrom chrM,chrX --exclude-chrom chrY. "
              "chrM/M/MT and chr1/1 are matched interchangeably, and a value "
              "matching no contig warns rather than silently doing nothing. "
-             "Use 'chrM,chrX,chrY' to restrict the analysis to autosomes.")
+             "Use 'chrM,chrX,chrY' to restrict the analysis to autosomes.  "
+             "Defaults to 'chrX,chrY' in nome_hic_concordance -- chrM is kept "
+             "because it is not chromatinised and so is the enzyme-efficiency "
+             "control (see scripts/chrm_regress.py); pass chrM explicitly to "
+             "drop it.  Downstream tools default to 'chrM,chrX,chrY'.")
 
 
 def report_excluded(excluded: set[str], present, kind: str = "contig"):

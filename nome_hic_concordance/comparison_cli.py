@@ -144,7 +144,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="cells × bins concordance parquet to test, as "
                         "NAME=PATH (repeatable), e.g. gch=.../concordance_signed.parquet "
                         "hcg=.../concordance_signed.parquet.")
-    add_exclude_chrom_arg(p)
+    add_exclude_chrom_arg(p, default=["chrM,chrX,chrY"])
     p.add_argument("--samples", default=None,
                    help="samples TSV with 'cell'/'cell_name' + 'group' "
                         "labels (enables silhouette/kNN-purity + classifier).")
@@ -260,7 +260,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "(fixes the non-commutativity of per-cell rank + per-bin "
                         "QN).  Use 'on' with --per-cell-norm rank to match "
                         "nome_hic_concordance's signed step-7 stack.")
-    p.add_argument("--plot-format", choices=["png", "pdf", "svg"], default="png",
+    p.add_argument("--plot-format", choices=["png", "pdf", "svg"], default="pdf",
                    help="Figure format for the UMAP and SVD-scree plots. "
                         "'pdf'/'svg' write vector figures.")
     p.add_argument("--n-svd", type=int, default=10,

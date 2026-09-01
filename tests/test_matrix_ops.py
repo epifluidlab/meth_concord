@@ -327,3 +327,66 @@ def test_both_clis_offer_none():
         ["--samples", "x", "--output-dir", "z",
          "--concordance-matrix", "g=p.parquet", "--matrix-norm", "none"])
     assert b.matrix_norm == "none"
+
+
+# ------------------------------------------------------- shipped defaults --
+
+def test_the_shipped_defaults_are_what_the_manuscript_runs_use():
+    """Pinned so a future edit cannot move them silently.  Each was chosen
+    from a measurement recorded in the flag's own help text."""
+    from nome_hic_concordance import cli, comparison_cli
+    a = cli.parse_args(["--samples", "x", "--reference", "y",
+                        "--output-dir", "z"])
+    assert a.concordance_formula == "mle"
+    assert a.plot_format == "pdf"
+    assert a.concordance_combine == "direction-logor"
+    assert a.null_draws == 3
+    b = comparison_cli.parse_args(
+        ["--samples", "x", "--output-dir", "z",
+         "--concordance-matrix", "g=p.parquet"])
+    assert b.plot_format == "pdf"
+
+
+def test_skip_top_svd_resolves_to_zero_under_the_mle_default():
+    """Left as 'auto' rather than hard-coded 0: it already gives 0 for the
+    shipped MLE default, and pinning 0 would silently take the skip away
+    from DM, where dropping the low-coverage confound lifted full-set kNN
+    0.884 -> 0.937."""
+    from nome_hic_concordance import cli
+    base = ["--samples", "x", "--reference", "y", "--output-dir", "z",
+            "--concordance-method", "signed"]
+    assert cli._resolve_step7_params(cli.parse_args(base))["skip_top_svd"] == 0
+    dm = cli.parse_args(base + ["--concordance-formula", "dm"])
+    assert cli._resolve_step7_params(dm)["skip_top_svd"] == 1
+
+
+def test_chrm_is_kept_upstream_and_dropped_downstream():
+    """nome_hic_concordance applies --exclude-chrom to the BINNING, so
+    excluding chrM there would leave no chrM bin in accessibility_mean or
+    concordance_marginal -- and no covariate for scripts/chrm_regress.py.
+    Downstream tools filter already-built matrices, where it costs nothing.
+    """
+    from nome_hic_concordance import cli, comparison_cli
+    from nome_hic_concordance.utils import parse_exclude_chroms
+    a = cli.parse_args(["--samples", "x", "--reference", "y",
+                        "--output-dir", "z"])
+    up = parse_exclude_chroms(a.exclude_chrom)
+    b = comparison_cli.parse_args(
+        ["--samples", "x", "--output-dir", "z",
+         "--concordance-matrix", "g=p.parquet"])
+    down = parse_exclude_chroms(b.exclude_chrom)
+    assert not any(c.lower().lstrip("chr") == "m" for c in up), up
+    assert any(c.lower().lstrip("chr") == "m" for c in down), down
+    for s in (up, down):                      # sex chromosomes go from both
+        assert any(c.lower().lstrip("chr") == "x" for c in s)
+        assert any(c.lower().lstrip("chr") == "y" for c in s)
+
+
+def test_exclude_chrom_is_still_overridable():
+    from nome_hic_concordance import cli
+    from nome_hic_concordance.utils import parse_exclude_chroms
+    a = cli.parse_args(["--samples", "x", "--reference", "y",
+                        "--output-dir", "z",
+                        "--exclude-chrom", "chrM,chrX,chrY"])
+    got = parse_exclude_chroms(a.exclude_chrom)
+    assert any(c.lower().lstrip("chr") == "m" for c in got)
