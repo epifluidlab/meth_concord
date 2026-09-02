@@ -2155,3 +2155,101 @@ def test_the_thin_depth_warning_keys_on_the_statistic_not_the_context(
     # passed for coordination too.
     assert "NOT RELIABLE" in lo
     assert "NOT RELIABLE" not in co
+
+
+# --------------------------- a corrected statistic under --from-counts ----
+
+def _corrected_counts_run(tmp_path, with_correction=True, k_shift=0.5):
+    """A Step-5-shaped directory: counts, a raw matrix, and a corrected one."""
+    rng = np.random.default_rng(3)
+    n, nb = 24, 40
+    cells = [f"c{i}" for i in range(n)]
+    cols = [f"chr1:{j * 250000}" for j in range(nb)]
+    d = tmp_path / "05"
+    (d / "counts").mkdir(parents=True)
+    n_link = rng.integers(4, 30, (n, nb)).astype(float)
+    for key, val in (("n_linked", n_link),
+                     ("k_open", n_link * 0.4),
+                     ("k_closed", n_link * 0.3),
+                     ("k_mixed", n_link * 0.3),
+                     ("n_dm", n_link),
+                     ("k_dm_open", n_link * 0.35),
+                     ("k_dm_closed", n_link * 0.35),
+                     ("k_dm_mixed", n_link * 0.30)):
+        pd.DataFrame(val, index=cells, columns=cols).to_parquet(
+            d / "counts" / f"{key}.parquet")
+    raw = pd.DataFrame(rng.normal(0, 1, (n, nb)), index=cells, columns=cols)
+    raw.to_parquet(d / "concordance_direction_logor.parquet")
+    if with_correction:
+        # a KNOWN constant shift, so the pooled effect is predictable
+        (raw - k_shift).to_parquet(
+            d / "concordance_direction_logor.margreg_k5.method1_local.parquet")
+    pd.DataFrame({"cell_name": cells, "bam_path": ["x"] * n,
+                  "cell_type": np.resize(["a", "b"], n)}).to_csv(
+        tmp_path / "s.tsv", sep="\t", index=False)
+    pd.DataFrame([("chr1", 2_000_000, 6_000_000)]).to_csv(
+        tmp_path / "R.bed", sep="\t", header=False, index=False)
+    return d
+
+
+def _corrected_counts_cmd(tmp_path, d, stat, out):
+    return [sys.executable, str(_SCRIPT),
+            "--matrix", f"gch={d / 'concordance_direction_logor.parquet'}",
+            "--from-counts", str(d / "counts"),
+            "--from-counts-statistic", stat,
+            "--samples", str(tmp_path / "s.tsv"),
+            "--group", "A=a", "--group", "B=b",
+            "--region", f"R={tmp_path / 'R.bed'}",
+            "--output-dir", str(out), "--plot-format", "png"]
+
+
+def test_a_corrected_statistic_pools_the_base_and_subtracts_the_shift(tmp_path):
+    """The whole point: the pooled estimate stays unbiased -- it is still
+    built from summed counts -- and the correction rides on top as an
+    additive term pooled over the same bins."""
+    d = _corrected_counts_run(tmp_path, k_shift=0.5)
+    plain, corr = tmp_path / "plain", tmp_path / "corr"
+    r1 = subprocess.run(_corrected_counts_cmd(tmp_path, d, "direction_logor", plain),
+                        capture_output=True, text=True)
+    assert r1.returncode == 0, r1.stderr[-2000:]
+    r2 = subprocess.run(
+        _corrected_counts_cmd(tmp_path, d,
+                    "direction_logor.margreg_k5.method1_local", corr),
+        capture_output=True, text=True)
+    assert r2.returncode == 0, r2.stderr[-2000:]
+    assert "correction direction_logor.margreg_k5.method1_local" in r2.stdout
+    a = pd.read_csv(plain / "scaled_profile_gch.tsv", sep="\t")
+    b = pd.read_csv(corr / "scaled_profile_gch.tsv", sep="\t")
+    key = ["region", "group"]
+    a, b = a.sort_values(key).reset_index(drop=True), b.sort_values(key).reset_index(drop=True)
+    # raw - corrected was a constant +0.5, so every LEVEL drops by exactly
+    # that much...
+    for c in ("mean_body", "mean_flank"):
+        assert np.allclose(a[c] - b[c], 0.5, atol=1e-8), (c, (a[c] - b[c]).tolist())
+    # ...and the body-minus-flank CONTRAST is untouched, because a constant
+    # shift cancels in a difference.  A correction that moved the contrast
+    # would be changing the shape, not the level.
+    assert np.allclose(a["body_minus_flank"], b["body_minus_flank"], atol=1e-8)
+    # the pooled estimate itself is unchanged in kind: same cells pooled
+    assert (a["n_cells"] == b["n_cells"]).all()
+
+
+def test_a_missing_corrected_matrix_says_which_file_and_who_writes_it(tmp_path):
+    d = _corrected_counts_run(tmp_path, with_correction=False)
+    r = subprocess.run(
+        _corrected_counts_cmd(tmp_path, d,
+                    "direction_logor.margreg_k5.method1_local",
+                    tmp_path / "o"), capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "margreg_k5.method1_local.parquet" in r.stderr
+    assert "marginal_correct.py" in r.stderr
+
+
+def test_an_unpoolable_base_is_still_refused(tmp_path):
+    """Relaxing the choices list must not let a non-statistic through."""
+    d = _corrected_counts_run(tmp_path)
+    r = subprocess.run(
+        _corrected_counts_cmd(tmp_path, d, "not_a_stat.margreg_k5.method1_local",
+                    tmp_path / "o"), capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "which statistic" in r.stderr or "not_a_stat" in r.stderr

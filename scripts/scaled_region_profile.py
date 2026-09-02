@@ -182,6 +182,48 @@ COUNT_KEYS = ("k_open", "k_closed", "k_mixed", "n_linked",
 POOLABLE = frozenset(_dc(*(np.zeros(1),) * 4))
 
 
+def split_corrected_statistic(stat):
+    """Split 'direction_logor.margreg_k5.method1_local' into base + suffix.
+
+    Returns ``(base, suffix)`` with suffix ``None`` when the name is a plain
+    statistic.  The base has to be poolable; the suffix names the pair of
+    bin-level matrices whose difference is the correction.
+    """
+    if not stat or "." not in stat:
+        return stat, None
+    base, suffix = stat.split(".", 1)
+    return base, suffix
+
+
+def load_correction(counts_dir, base, suffix, index, columns):
+    """The additive correction, as (raw - corrected) at bin level.
+
+    Both matrices sit beside the counts directory, named by the same
+    convention scripts/marginal_correct.py writes.  Aligned onto the run's
+    cells and bins so it pools over exactly the bins the counts do.
+    """
+    import numpy as _np
+    d = Path(counts_dir)
+    root = d.parent if d.name == "counts" else d
+    raw_p = root / f"concordance_{base}.parquet"
+    cor_p = root / f"concordance_{base}.{suffix}.parquet"
+    missing = [str(x) for x in (raw_p, cor_p) if not x.exists()]
+    if missing:
+        sys.exit(
+            f"--from-counts-statistic {base}.{suffix} needs BOTH the raw and "
+            f"the corrected bin-level matrix beside the counts; missing:\n  "
+            + "\n  ".join(missing)
+            + f"\n  scripts/marginal_correct.py writes the corrected one.")
+    raw = pd.read_parquet(raw_p).reindex(index=index, columns=columns)
+    cor = pd.read_parquet(cor_p).reindex(index=index, columns=columns)
+    delta = raw.to_numpy(float) - cor.to_numpy(float)
+    n_fin = int(_np.isfinite(delta).sum())
+    print(f"  correction {base}.{suffix}: mean |shift| "
+          f"{float(_np.nanmean(_np.abs(delta))):.4f} over {n_fin:,} "
+          f"(cell, bin) entries, pooled per position alongside the counts")
+    return delta
+
+
 def _counts_dir(d):
     d = Path(d)
     return d / "counts" if (d / "counts").is_dir() else d
@@ -372,7 +414,7 @@ def _pooled_stat(counts, cols, alpha, stat, _dc_fn=None, keep=None,
 
 def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
                     null_counts=None, reference="none", min_pairs=0,
-                    formula="mle"):
+                    formula="mle", correction=None):
     """Sum the counts at each position, THEN compute the statistic once.
 
     Averaging a per-bin statistic over a region is not the region's
@@ -454,6 +496,18 @@ def pooled_profiles(counts, rows, bin_idx, pos_idx, total, alpha, stat,
         v, n_l = _pooled_stat(counts, cols, alpha, stat,
                               decompose_components, keep=keep_bins,
                               formula=formula)
+        if correction is not None:
+            # The marginal correction is ADDITIVE in the statistic's own
+            # units, so the pooled corrected value is the pooled raw value
+            # minus the correction pooled over the same bins.  Correcting
+            # the pooled statistic directly instead would mean estimating
+            # the marginal's factors over ~50 scaled positions rather than
+            # ~9500 bins, where a k tuned at bin resolution removes a tenth
+            # of the column space rather than a twentieth of a percent --
+            # not the same operation, and not the one that was validated.
+            with _np.errstate(invalid="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                v = v - _np.nanmean(correction[:, cols], axis=1)
         if reference != "none" and null_counts:
             nv = _np.stack([
                 _pooled_stat(nc, cols, alpha, stat, decompose_components,
@@ -553,7 +607,9 @@ def group_profile(M, ct, members, bin_idx, pos_idx, total, conf=0.95,
                          for nc in pooled.get("null") or []],
             reference=pooled.get("reference", "none"),
             min_pairs=pooled.get("min_pairs", 0),
-            formula=pooled.get("formula", "mle"))
+            formula=pooled.get("formula", "mle"),
+            correction=(None if pooled.get("correction") is None
+                        else pooled["correction"][rows]))
     else:
         P, idx, n_bins, n_pairs = cell_profiles(M, ct, members, bin_idx,
                                                 pos_idx, total)
@@ -943,7 +999,7 @@ def main(argv=None) -> int:
                          "is the per-cell control that matters for a "
                          "profile.")
     ap.add_argument("--from-counts-statistic", default=None,
-                    choices=sorted(POOLABLE),
+                    metavar="NAME",
                     help="Which statistic to build from the pooled counts.  "
                          "Default: read from the --matrix filename.  Any "
                          "component decompose_components emits works -- they "
@@ -954,7 +1010,22 @@ def main(argv=None) -> int:
                          "here, because this list is taken from "
                          "decompose_components at import so the two cannot "
                          "drift, and every statistic in it can be "
-                         "null-referenced.")
+                         "null-referenced."
+                         "  A name may carry a CORRECTION SUFFIX, e.g. "
+                         "direction_logor.margreg_k5.method1_local or "
+                         "...method1_local.resid.  Counts cannot rebuild a "
+                         "corrected statistic -- the correction acts on the "
+                         "assembled cells x bins matrix, after imputation -- "
+                         "so the base is pooled from counts as usual and the "
+                         "correction is subtracted as an additive term, "
+                         "pooled over the same bins, from the two bin-level "
+                         "matrices beside the counts.  That keeps the "
+                         "unbiased pooled estimate AND the correction as it "
+                         "was tuned: estimating the marginal's factors over "
+                         "~50 scaled positions instead would remove a tenth "
+                         "of the column space rather than a fiftieth of a "
+                         "percent, which is not the same operation.  "
+                         f"Poolable bases: {', '.join(sorted(POOLABLE))}.")
     ap.add_argument("--null-reference", choices=list(NULL_REFERENCES),
                     default="none",
                     help="Reference the POOLED statistic to a drawn null "
@@ -1371,17 +1442,37 @@ def main(argv=None) -> int:
         _stat = args.from_counts_statistic or statistic_of(mpath)
         if mpath is None:
             _stat = args.from_counts_statistic
+        # A statistic may carry a correction suffix, e.g.
+        # direction_logor.margreg_k5.method1_local[.resid].  Counts cannot
+        # rebuild a corrected statistic -- the correction acts on the
+        # assembled cells x bins matrix, after imputation -- so the base is
+        # pooled from counts as usual and the correction is applied to the
+        # pooled value as an additive term, taken from the two bin-level
+        # matrices that already exist.  That keeps the unbiased pooled
+        # estimate AND the correction as it was actually tuned.
+        _stat, _corr_suffix = split_corrected_statistic(_stat)
         if _stat not in POOLABLE:
             sys.exit(f"--from-counts cannot tell which statistic "
                      f"{Path(mpath).name!r} holds; pass "
                      f"--from-counts-statistic.")
         _alpha = load_prior(args.from_counts)
+        _correction = None
+        if _corr_suffix:
+            _correction = load_correction(args.from_counts, _stat,
+                                          _corr_suffix, M.index, M.columns)
+            if args.null_reference != "none":
+                print(f"  WARNING --null-reference {args.null_reference} with "
+                      f"a corrected statistic: the drawn null is pooled from "
+                      f"counts and carries NO correction, so the two are "
+                      f"subtracted on different footings.  Read the "
+                      f"referenced curve with that in mind.", file=sys.stderr)
         _pooled = {"counts": load_counts(args.from_counts, M.index,
                                          M.columns),
                    "alpha": _alpha, "stat": _stat,
                    "reference": args.null_reference,
                    "min_pairs": int(args.min_pairs),
-                   "formula": args.from_counts_formula}
+                   "formula": args.from_counts_formula,
+                   "correction": _correction}
         if args.min_pairs > 0:
             _nl = _pooled["counts"]["n_linked"]
             _kept = float(np.mean(_nl >= float(args.min_pairs)))
