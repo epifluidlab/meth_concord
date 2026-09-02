@@ -4781,3 +4781,95 @@ def test_the_density_is_binned_over_the_view_not_the_outliers():
     n_tight = len(set(np.round(tight[:5_000], 6).tolist()))
     assert n_wide < 20, n_wide
     assert n_tight > 500, n_tight
+
+
+# ------------------------------------------------------- --blacklist-bed --
+
+def _bl_inputs(tmp_path, n_bins_drop=10):
+    """The end-to-end fixture, plus a blacklist covering the first N bins."""
+    X, ct, batch, _ = _data(seed=1, n_per=60)
+    samples = [f"cell{i}" for i in range(len(ct))]
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    mat = tmp_path / "gch.parquet"
+    pd.DataFrame(X, index=samples, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": samples, "bam_path": ["x"] * len(ct),
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["batch2" if b == 0 else "scNH" for b in batch]}
+                 ).to_csv(stab, sep="\t", index=False)
+    bl = tmp_path / "bl.bed"
+    pd.DataFrame([("chr1", i * 250000, (i + 1) * 250000)
+                  for i in range(n_bins_drop)]).to_csv(
+        bl, sep="\t", header=False, index=False)
+    return mat, stab, bl, len(bins)
+
+
+def _run_marker(args):
+    return subprocess.run([sys.executable, str(_SCRIPT)] + args,
+                          capture_output=True, text=True)
+
+
+def test_blacklisted_bins_never_reach_the_outputs(tmp_path):
+    """A blacklisted bin is an artefact, not a low signal: left in, it can be
+    called differential and then drawn as a result.  So the filter has to
+    reach the emitted BEDs, not only the test."""
+    mat, stab, bl, _ = _bl_inputs(tmp_path)
+    out = tmp_path / "out"
+    r = _run_marker(["--matrix", f"gch={mat}", "--samples", str(stab),
+                     "--cell-type-column", "cell_type",
+                     "--batch-column", "sample", "--n-bins", "30",
+                     "--n-permutations", "40", "--output-dir", str(out),
+                     "--plot-format", "png", "--blacklist-bed", str(bl)])
+    assert r.returncode == 0, r.stderr[-2500:]
+    dropped = {f"chr1:{i * 250000}" for i in range(10)}
+    beds = list(out.glob("bin_scores_gch*.bed"))
+    assert beds, "no BED written"
+    for b in beds:
+        got = pd.read_csv(b, sep="\t", comment="#")
+        labels = {f"{c}:{s}" for c, s in zip(got["chrom"].astype(str),
+                                             got["start"].astype(int))}
+        assert not (labels & dropped), (b.name, sorted(labels & dropped)[:3])
+
+
+def test_the_run_says_how_many_bins_went(tmp_path):
+    mat, stab, bl, _ = _bl_inputs(tmp_path)
+    r = _run_marker(["--matrix", f"gch={mat}", "--samples", str(stab),
+                     "--cell-type-column", "cell_type",
+                     "--batch-column", "sample", "--n-bins", "30",
+                     "--n-permutations", "40",
+                     "--output-dir", str(tmp_path / "o"),
+                     "--plot-format", "png", "--blacklist-bed", str(bl)])
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "blacklist dropped 10" in r.stderr
+
+
+def test_a_blacklist_matching_nothing_warns(tmp_path):
+    """An empty filter and a clean genome look identical downstream, so the
+    usual cause -- chromosome naming -- has to be said out loud."""
+    mat, stab, _, _ = _bl_inputs(tmp_path)
+    bad = tmp_path / "other_contig.bed"
+    pd.DataFrame([("chrZZ", 0, 250000)]).to_csv(bad, sep="\t", header=False,
+                                                index=False)
+    r = _run_marker(["--matrix", f"gch={mat}", "--samples", str(stab),
+                     "--cell-type-column", "cell_type",
+                     "--batch-column", "sample", "--n-bins", "30",
+                     "--n-permutations", "40",
+                     "--output-dir", str(tmp_path / "o"),
+                     "--plot-format", "png", "--blacklist-bed", str(bad)])
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "matched NO bin" in r.stderr
+
+
+def test_without_the_flag_nothing_is_dropped(tmp_path):
+    mat, stab, _, n_bins = _bl_inputs(tmp_path)
+    out = tmp_path / "out"
+    r = _run_marker(["--matrix", f"gch={mat}", "--samples", str(stab),
+                     "--cell-type-column", "cell_type",
+                     "--batch-column", "sample", "--n-bins", "30",
+                     "--n-permutations", "40", "--output-dir", str(out),
+                     "--plot-format", "png"])
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert "blacklist dropped" not in r.stderr
+    allbed = out / "bin_scores_gch.all.bed"
+    got = pd.read_csv(allbed, sep="\t", comment="#")
+    assert len(got) == n_bins

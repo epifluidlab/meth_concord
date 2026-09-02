@@ -3746,6 +3746,20 @@ def main():
                          "lib_batch) is drawn but its legend is replaced by a "
                          "count; at/below it, the legend wraps into columns of "
                          "12.  Colours on the strip stay consistent regardless.")
+    ap.add_argument("--blacklist-bed", action="append", default=None,
+                    metavar="BED",
+                    help="Repeatable.  Drop every bin overlapping these "
+                         "regions -- ENCODE blacklist, custom masks -- before "
+                         "anything is computed or drawn, so the filter "
+                         "reaches the differential tests, the heatmaps, the "
+                         "volcano and the emitted BEDs alike.  A blacklisted "
+                         "bin is not a low signal, it is an artefact, and "
+                         "leaving it in lets it be called differential and "
+                         "then drawn as a result.  Matched against the bin "
+                         "grid by overlap, so partial overlap drops the bin; "
+                         "the run says how many bins went, and WARNS if the "
+                         "file matched none -- an empty filter and a clean "
+                         "genome look identical downstream.")
     ap.add_argument("--matrix-norm", default="quantile",
                     choices=["quantile", "zscore", "none"],
                     help="Per-bin normalisation, matching the pipeline "
@@ -3781,7 +3795,8 @@ def main():
     from nome_hic_concordance.cli import load_samples
     from nome_hic_concordance.utils import (bin_label_chrom, chrom_excluded,
                                             ensure_dir, parse_exclude_chroms)
-    from nome_hic_concordance.blacklist import infer_bin_size
+    from nome_hic_concordance.blacklist import (drop_blacklisted_bins,
+                                                infer_bin_size)
 
     samples = load_samples(args.samples)
     for col in (args.cell_type_column, *args.batch_column.split(",")):
@@ -3940,6 +3955,26 @@ def main():
         if excl:
             M = M[[b for b in M.columns
                    if not chrom_excluded(bin_label_chrom(b), excl)]]
+        # Applied to the MATRIX, before anything is computed or drawn, so the
+        # filter reaches the tests, the heatmaps, the volcano and the emitted
+        # BEDs alike.  --from-counts reindexes onto these columns, so the raw
+        # counts follow without a second filter that could drift from this
+        # one.
+        if args.blacklist_bed:
+            _before = M.shape[1]
+            M = drop_blacklisted_bins(M, args.blacklist_bed, who=f"{name}")
+            _gone = _before - M.shape[1]
+            # Reported here rather than left to the library's logger: this
+            # script does not configure logging, so that INFO line goes
+            # nowhere and the run looks as though no filter was applied.
+            if _gone:
+                print(f"  {name}: blacklist dropped {_gone:,} of "
+                      f"{_before:,} bins", file=sys.stderr)
+            else:
+                print(f"  {name}: WARNING the blacklist matched NO bin of "
+                      f"{_before:,}.  Check the chromosome naming and the "
+                      f"coordinates -- an empty filter and a clean genome "
+                      f"look identical downstream.", file=sys.stderr)
         if M.shape[0] < 2 * args.min_cells_per_group * args.min_groups:
             print(f"  {name}: only {M.shape[0]} matched cells — skipped",
                   file=sys.stderr)
