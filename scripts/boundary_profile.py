@@ -76,7 +76,13 @@ def read_bed(path, merge=False, keep_class=None):
                        dtype=str)
     skip = 1 if str(head.iloc[0, 1]).lower() in ("start", "chromstart") else 0
     col, labels = _class_column(p, skip)
-    if col is not None and keep_class is None:
+    # Only when the file is being read as DOMAINS.  The hazard this guards
+    # against is merging a genome partition into one interval per chromosome
+    # -- which is what the message says -- and that cannot happen for a bin
+    # grid, which is never merged.  A bin-score BED legitimately carries
+    # extra columns (a boolean 'selected' flag among them), and refusing to
+    # read it as a universe made the docstring's own example fail.
+    if col is not None and keep_class is None and merge:
         raise SystemExit(
             f"{p} has a class column (column {col + 1}) holding "
             f"{', '.join(labels)}.\n"
@@ -86,13 +92,17 @@ def read_bed(path, merge=False, keep_class=None):
             f"chromosome ends.\n"
             f"  Name the class you want:  --boundary \"LABEL={p}::CLASS\"  "
             f"e.g. ::{labels[0]}")
-    use = [0, 1, 2] if col is None else [0, 1, 2, col]
-    names = (["chrom", "start", "end"] if col is None
+    # A class column is only READ when it is going to be used to select.
+    # Reading it otherwise leaves _class set with keep_class None, and the
+    # filter below then rejects every row for not matching 'None'.
+    take_class = col is not None and keep_class is not None
+    use = [0, 1, 2] if not take_class else [0, 1, 2, col]
+    names = (["chrom", "start", "end"] if not take_class
              else ["chrom", "start", "end", "_class"])
     df = pd.read_csv(p, sep="\t", header=None, skiprows=skip, comment="#",
                      compression="infer", usecols=use, names=names,
                      dtype={0: str, 1: np.int64, 2: np.int64})
-    if col is not None:
+    if take_class:
         want = str(keep_class)
         hit = df["_class"].astype(str) == want
         if not hit.any():

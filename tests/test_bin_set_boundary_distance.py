@@ -177,3 +177,65 @@ def test_no_domain_at_all_is_refused(inputs):
               "--bin-set", f"GCH:variable={d / 'sel.bed'}",
               "--output-dir", str(d / "o")], ok=False)
     assert "nothing to measure against" in r.stderr
+
+
+# ------------------------- a bin-score BED is not a genome partition -------
+
+def _scored_bed(path, n=30):
+    """The shape scripts/celltype_marker_bins.py writes: chrom/start/end plus
+    name, score, strand, two values, and a boolean 'selected' flag."""
+    rows = [("chr1", i * 250_000, (i + 1) * 250_000, f"b{i}", 0.5, ".",
+             1.0, 2.0, bool(i % 3 == 0)) for i in range(n)]
+    pd.DataFrame(rows).to_csv(path, sep="\t", header=False, index=False)
+    return str(path)
+
+
+def test_a_scored_bin_bed_reads_as_bins(tmp_path):
+    """The class-column guard exists to stop a genome PARTITION being merged
+    into one interval per chromosome.  A bin grid is never merged, and a
+    bin-score BED legitimately carries a boolean column -- refusing to read
+    it as a universe made boundary_profile's own docstring example fail."""
+    m = _mod()
+    bp = m._boundary_mod()
+    f = _scored_bed(tmp_path / "bin_scores.all.bed")
+    got = bp.read_bed(f)
+    assert list(got.columns) == ["chrom", "start", "end"]
+    assert len(got) == 30
+
+
+def test_the_same_file_as_domains_is_still_refused(tmp_path):
+    """The guard must keep working where it matters: merged, that file
+    becomes one interval per chromosome and the profile measures contig
+    ends."""
+    m = _mod()
+    bp = m._boundary_mod()
+    f = _scored_bed(tmp_path / "bin_scores.all.bed")
+    with pytest.raises(SystemExit, match="class column"):
+        bp.read_bed(f, merge=True)
+
+
+def test_naming_the_class_still_selects_and_merges(tmp_path):
+    m = _mod()
+    bp = m._boundary_mod()
+    f = _scored_bed(tmp_path / "bin_scores.all.bed")
+    got = bp.read_bed(f, merge=True, keep_class="True")
+    assert 0 < len(got) <= 10
+
+
+def test_the_cli_accepts_scored_bin_beds_end_to_end(tmp_path):
+    """The failure the user actually hit: --background pointed at a real
+    bin_scores.all.bed and the run died before measuring anything."""
+    d = tmp_path
+    _scored_bed(d / "all.bed", n=60)
+    _scored_bed(d / "sel.bed", n=20)
+    _bed(d / "lad.bed", [("chr1", 5_000_000, 7_500_000)])
+    out = d / "out"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT),
+         "--background", f"GCH={d / 'all.bed'}",
+         "--bin-set", f"GCH:variable={d / 'sel.bed'}",
+         "--domain", f"cLAD={d / 'lad.bed'}",
+         "--plot-format", "png", "--output-dir", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2500:]
+    assert (out / "boundary_distance.tsv").exists()
