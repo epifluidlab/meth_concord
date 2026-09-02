@@ -3950,7 +3950,23 @@ def main():
             comp_path = _find_compartment(path)
         M = pd.read_parquet(path)
         M.index = M.index.astype(str)
+        _n_matrix = M.shape[0]
         keep = [c for c in M.index if c in ct_of]
+        # Say WHICH side is short when most cells fall away.  "only 16
+        # matched cells" names the symptom; the usual cause is that the
+        # matrix and the sample sheet disagree about cell naming, and
+        # nothing in that message would tell you so.
+        if len(keep) < 0.5 * _n_matrix:
+            _miss = [c for c in M.index if c not in ct_of]
+            print(f"  {name}: {len(keep):,} of {_n_matrix:,} matrix cells "
+                  f"carry a {args.cell_type_column!r} in --samples "
+                  f"({len(ct_of):,} cells there).\n"
+                  f"    unmatched matrix cells look like: "
+                  f"{_miss[:3]}\n"
+                  f"    --samples cells look like:        "
+                  f"{list(ct_of)[:3]}\n"
+                  f"    If those two do not look like the same naming, that "
+                  f"is the problem, not the data.", file=sys.stderr)
         M = M.loc[keep]
         if excl:
             M = M[[b for b in M.columns
@@ -3975,8 +3991,11 @@ def main():
                       f"{_before:,}.  Check the chromosome naming and the "
                       f"coordinates -- an empty filter and a clean genome "
                       f"look identical downstream.", file=sys.stderr)
-        if M.shape[0] < 2 * args.min_cells_per_group * args.min_groups:
-            print(f"  {name}: only {M.shape[0]} matched cells — skipped",
+        _need = 2 * args.min_cells_per_group * args.min_groups
+        if M.shape[0] < _need:
+            print(f"  {name}: only {M.shape[0]} matched cells, need "
+                  f"{_need} (2 x --min-cells-per-group {args.min_cells_per_group}"
+                  f" x --min-groups {args.min_groups}) — skipped",
                   file=sys.stderr)
             continue
 

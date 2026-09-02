@@ -4873,3 +4873,48 @@ def test_without_the_flag_nothing_is_dropped(tmp_path):
     allbed = out / "bin_scores_gch.all.bed"
     got = pd.read_csv(allbed, sep="\t", comment="#")
     assert len(got) == n_bins
+
+
+def test_a_cell_name_mismatch_says_which_side_is_short(tmp_path):
+    """'only 16 matched cells' names the symptom, not the cause.
+
+    The usual cause is that the matrix and the sample sheet disagree about
+    cell naming, and nothing in that message would tell you so -- it reads
+    like the data is thin when the two files simply do not join.
+    """
+    X, ct, batch, _ = _data(seed=1, n_per=60)
+    bins = [f"chr1:{i * 250000}" for i in range(X.shape[1])]
+    # all but the first 16 use a naming the sheet has never heard of
+    mat_cells = [f"cell{i}" if i < 16 else f"plate1_{i}" for i in range(len(ct))]
+    mat = tmp_path / "hcg.parquet"
+    pd.DataFrame(X, index=mat_cells, columns=bins).to_parquet(mat)
+    stab = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": [f"cell{i}" for i in range(len(ct))],
+                  "bam_path": ["x"] * len(ct),
+                  "cell_type": [f"CT{c}" for c in ct],
+                  "sample": ["batch2" if b == 0 else "scNH" for b in batch]}
+                 ).to_csv(stab, sep="\t", index=False)
+    r = _run_marker(["--matrix", f"hcg={mat}", "--samples", str(stab),
+                     "--cell-type-column", "cell_type",
+                     "--batch-column", "sample", "--n-bins", "30",
+                     "--n-permutations", "20",
+                     "--output-dir", str(tmp_path / "out"),
+                     "--plot-format", "png"])
+    assert "16 of 240 matrix cells" in r.stderr
+    assert "plate1_" in r.stderr and "cell0" in r.stderr      # both sides shown
+    assert "same naming" in r.stderr
+    # and the skip line now says what the threshold actually is
+    assert "--min-cells-per-group" in r.stderr
+
+
+def test_a_matching_run_does_not_emit_the_mismatch_warning(tmp_path):
+    """It must fire on a real mismatch only, or it becomes noise."""
+    mat, stab, _, _ = _bl_inputs(tmp_path)
+    r = _run_marker(["--matrix", f"gch={mat}", "--samples", str(stab),
+                     "--cell-type-column", "cell_type",
+                     "--batch-column", "sample", "--n-bins", "30",
+                     "--n-permutations", "20",
+                     "--output-dir", str(tmp_path / "out"),
+                     "--plot-format", "png"])
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "same naming" not in r.stderr
