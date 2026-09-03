@@ -1,0 +1,239 @@
+"""Rank-1 test on the 2x2 GCH/HCG cross-covariance (Part B of the design).
+
+The simulator draws from the Section 1 model with known parameters, so the
+estimator is checked against a truth rather than against itself.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from nome_hic_concordance import rank1_joint as rj
+
+
+import contextlib
+import warnings
+
+
+@contextlib.contextmanager
+def _no_warning():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        yield
+
+
+def simulate(n=4000, rho_u=0.6, lam_g=1.0, lam_h=-0.8, noise=0.5,
+             rank2=0.0, seed=0):
+    """Section 1: theta = mu + lambda * u + eta, u correlated across ends.
+
+    ``rank2`` injects Cov(eta_A, eta_B) on the HCG residual only -- coordination
+    the shared axis cannot explain, which is the alternative the test exists to
+    detect.
+    """
+    rng = np.random.default_rng(seed)
+    cov = np.array([[1.0, rho_u], [rho_u, 1.0]])
+    u = rng.multivariate_normal([0, 0], cov, size=n)
+    eh = rng.multivariate_normal([0, 0], [[1.0, rank2], [rank2, 1.0]], size=n)
+    tA = np.column_stack([lam_g * u[:, 0] + noise * rng.normal(size=n),
+                          lam_h * u[:, 0] + noise * eh[:, 0]])
+    tB = np.column_stack([lam_g * u[:, 1] + noise * rng.normal(size=n),
+                          lam_h * u[:, 1] + noise * eh[:, 1]])
+    v = np.full((n, 2), 1e-4)
+    return tA, tB, v, v
+
+
+# ----------------------------------------------------------- accumulators --
+
+def test_sharded_accumulation_equals_a_single_pass():
+    """All 20 fields are additive; sharding must not change the answer."""
+    tA, tB, vA, vB = simulate(n=600, seed=1)
+    one = rj.accumulate(rj.new_acc(), tA, tB, vA, vB)
+    parts = [rj.accumulate(rj.new_acc(), tA[s], tB[s], vA[s], vB[s])
+             for s in (slice(0, 137), slice(137, 400), slice(400, 600))]
+    assert np.allclose(one, rj.merge(*parts), rtol=1e-12, atol=1e-12)
+    # and merging is order-independent
+    assert np.allclose(rj.merge(*parts), rj.merge(*parts[::-1]))
+
+
+def test_moments_recover_the_planted_cross_covariance():
+    tA, tB, vA, vB = simulate(n=200_000, rho_u=0.5, lam_g=1.0, lam_h=-0.8,
+                              noise=0.3, seed=2)
+    m = rj.moments(rj.accumulate(rj.new_acc(), tA, tB, vA, vB))
+    # Sigma_AB = rho_u * u u^T with u = (lam_g, lam_h)
+    want = 0.5 * np.outer([1.0, -0.8], [1.0, -0.8])
+    assert np.allclose(m["S_AB"], want, atol=0.02), (m["S_AB"], want)
+
+
+def test_the_weight_depends_on_variance_only_not_on_the_level():
+    """A posterior near 0.5 may be uninformative OR a genuine intermediate
+    state, so the weight must not read the level -- down-weighting |theta -
+    0.5| conflates the two.  Asserted on BEHAVIOUR: hold the variances fixed,
+    move theta, and the weighted total must not move.  (An earlier version
+    grepped the source and passed on the docstring, which explains the rule.)
+    """
+    rng = np.random.default_rng(12)
+    v = rng.uniform(0.01, 0.2, size=(500, 2))
+    near_half = np.full((500, 2), 0.5)
+    extreme = np.column_stack([np.zeros(500), np.ones(500)])
+    w_half = rj.accumulate(rj.new_acc(), near_half, near_half, v, v)[0]
+    w_ext = rj.accumulate(rj.new_acc(), extreme, extreme, v, v)[0]
+    assert w_half == pytest.approx(w_ext, rel=1e-12)
+
+
+# ---------------------------------------------------- the determinant test --
+
+def test_the_zero_of_D_is_what_whitening_preserves():
+    """The design's test list asks for 'D invariant under whitening'.  It is
+    NOT -- D = 2det/||.||_F^2 rescales, because the Frobenius norm is not
+    multiplicative under M -> A M B.  What whitening preserves is the RANK,
+    hence D's ZERO, which is exactly what Section B.3 argues and all the
+    hypothesis needs.  Both halves are pinned here so neither claim drifts.
+    """
+    rng = np.random.default_rng(3)
+    for _ in range(20):
+        A, B = rng.normal(size=(2, 2)), rng.normal(size=(2, 2))
+        rank1 = np.outer(rng.normal(size=2), rng.normal(size=2))
+        assert abs(rj.det_statistic(rank1)) < 1e-12
+        assert abs(rj.det_statistic(A @ rank1 @ B)) < 1e-12   # zero survives
+    full = rng.normal(size=(2, 2))
+    A, B = rng.normal(size=(2, 2)), rng.normal(size=(2, 2))
+    assert not np.isclose(rj.det_statistic(full),
+                          rj.det_statistic(A @ full @ B), atol=1e-3)
+
+
+def test_D_is_bounded_and_signed():
+    assert rj.det_statistic(np.eye(2)) == pytest.approx(1.0)
+    assert rj.det_statistic(np.array([[0.0, 1.0], [1.0, 0.0]])) == pytest.approx(-1.0)
+    assert rj.det_statistic(np.zeros((2, 2))) == 0.0
+
+
+def test_D_is_scale_free():
+    rng = np.random.default_rng(4)
+    M = rng.normal(size=(2, 2))
+    assert rj.det_statistic(M) == pytest.approx(rj.det_statistic(7.5 * M))
+
+
+# -------------------------------------------------------------- whitening --
+
+def test_rho_are_invariant_to_swapping_the_two_marks():
+    """Relabelling gch/hcg transposes the pattern; the canonical
+    correlations are properties of the pair and must not move."""
+    tA, tB, vA, vB = simulate(n=5000, seed=5)
+    def rhos(a, b, va, vb):
+        m = rj.moments(rj.accumulate(rj.new_acc(), a, b, va, vb))
+        w = rj.whiten(m["S_AA"], m["S_BB"], m["S_AB"], m["V_A"], m["V_B"])
+        c = rj.canonical(w["R"])
+        return c["rho1"], c["rho2"]
+    a = rhos(tA, tB, vA, vB)
+    b = rhos(tA[:, ::-1], tB[:, ::-1], vA[:, ::-1], vB[:, ::-1])
+    assert np.allclose(a, b, atol=1e-9), (a, b)
+
+
+def test_pd_clipping_flags_and_leaves_good_matrices_alone():
+    good = rj.whiten(np.eye(2), np.eye(2), 0.3 * np.eye(2),
+                     np.zeros(2), np.zeros(2))
+    assert good["flag_pd_clipped"] is False
+    # disattenuation drives a variance negative -- the min-hcg-sites 1 case
+    bad = rj.whiten(np.diag([1.0, 0.2]), np.eye(2), 0.3 * np.eye(2),
+                    np.array([0.0, 0.9]), np.zeros(2))
+    assert bad["flag_pd_clipped"] is True
+    assert bad["reliability_hcg"] < 0          # reported, not silently repaired
+
+
+def test_reliabilities_are_the_disattenuated_share():
+    w = rj.whiten(np.diag([1.0, 1.0]), np.eye(2), 0.2 * np.eye(2),
+                  np.array([0.25, 0.5]), np.zeros(2))
+    assert w["reliability_gch"] == pytest.approx(0.75)
+    assert w["reliability_hcg"] == pytest.approx(0.50)
+
+
+# ---------------------------------------------------------- sign patterns --
+
+@pytest.mark.parametrize("lam_h,rho_u,want", [
+    (-0.8, +0.6, "shared_state"),
+    (-0.8, -0.6, "opposite_state"),
+    (+0.8, +0.6, "coupled_same"),
+    (+0.8, -0.6, "coupled_opposite"),
+])
+def test_all_four_valid_sign_patterns_are_recovered(lam_h, rho_u, want):
+    """Three of the four would score as failures against any single
+    'pattern is correct' boolean, which is why there isn't one."""
+    tA, tB, vA, vB = simulate(n=60_000, rho_u=rho_u, lam_h=lam_h,
+                              noise=0.3, seed=6)
+    m = rj.moments(rj.accumulate(rj.new_acc(), tA, tB, vA, vB))
+    got = rj.sign_pattern(m["S_AA"], m["S_AB"])
+    assert got["rank1_pattern_class"] == want, got
+    assert got["sign_lambda_h"] == int(np.sign(lam_h))
+    assert got["sign_rho_u"] == int(np.sign(rho_u))
+
+
+# ---------------------------------------------------------------- the null --
+
+def test_rank1_data_gives_no_excess_and_a_large_p():
+    tA, tB, vA, vB = simulate(n=3000, rank2=0.0, seed=7)
+    r = rj.conditional_rank1_null(tA, tB, vA, vB, n_boot=200, seed=0)
+    assert r["D_null_mean"] > 0, "the null mean must be positive at finite n"
+    assert abs(r["D_excess"]) < 0.15, r
+    assert r["p_rank1"] > 0.05, r
+
+
+def test_injected_rank2_structure_is_detected():
+    """Cov(eta_A, eta_B) on the HCG residual is coordination the shared axis
+    cannot carry -- the alternative, and the headline class."""
+    tA, tB, vA, vB = simulate(n=3000, rank2=0.7, seed=8)
+    r = rj.conditional_rank1_null(tA, tB, vA, vB, n_boot=200, seed=0)
+    assert r["D_excess"] > 0.1, r
+    assert r["p_rank1"] < 0.05, r
+
+
+def test_the_null_expectation_is_positive_so_the_raw_value_misleads():
+    """The design names this the most likely route to a false headline: at
+    finite n both |D| and rho2 are positive under the null, so a raw value
+    makes every bin in the genome read as rank-2."""
+    tA, tB, vA, vB = simulate(n=400, rank2=0.0, seed=9)
+    r = rj.conditional_rank1_null(tA, tB, vA, vB, n_boot=200, seed=0)
+    assert r["D_null_mean"] > 0.02, r
+    assert r["rho2_null_mean"] > 0.0, r
+    # The excess is what may be reported.  At rank-1 truth it sits near zero
+    # while the raw |D| does not, which is the whole point: a bin reading
+    # |D| = 0.1 is unremarkable once its own null mean is subtracted.
+    assert abs(r["D_excess"]) < r["D_null_mean"], r
+
+
+def test_a_permutation_p_is_never_exactly_zero():
+    tA, tB, vA, vB = simulate(n=2000, rank2=0.9, seed=10)
+    r = rj.conditional_rank1_null(tA, tB, vA, vB, n_boot=50, seed=0)
+    assert r["p_rank1"] >= 1.0 / 51.0
+
+
+def test_the_rank2_injection_uses_a_valid_covariance():
+    """rank2=1.5 asks numpy for a non-PSD covariance and it silently returns
+    something anyway.  Keep the injection inside the valid range."""
+    with pytest.warns(None) if False else _no_warning():
+        simulate(n=50, rank2=0.9, seed=0)
+
+
+def test_null_p_values_are_not_grossly_anticonservative():
+    """A non-uniform QQ under rank-1 truth would invalidate every rank-2
+    call.  Loose bound: this is a smoke test, not the full B.7.4 panel."""
+    ps = []
+    for s in range(24):
+        tA, tB, vA, vB = simulate(n=1500, rank2=0.0, seed=100 + s)
+        ps.append(rj.conditional_rank1_null(tA, tB, vA, vB, n_boot=100,
+                                            seed=s)["p_rank1"])
+    ps = np.array(ps)
+    # calibrated, not merely non-anticonservative: the fix that made this
+    # pass was mapping the shuffled null back into theta space, since D is
+    # not whitening-invariant.  Before it, every p sat above 0.74.
+    assert (ps < 0.05).mean() <= 0.20, ps
+    assert 0.3 < ps.mean() < 0.7, ps.mean()
+
+
+def test_strata_confine_the_shuffle():
+    tA, tB, vA, vB = simulate(n=800, seed=11)
+    strata = np.repeat([0, 1, 2, 3], 200)
+    r = rj.conditional_rank1_null(tA, tB, vA, vB, n_boot=50, seed=0,
+                                  strata=strata)
+    assert np.isfinite(r["D_null"]).all()
+    assert r["D_null"].size == 50
