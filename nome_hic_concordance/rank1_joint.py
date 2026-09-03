@@ -142,6 +142,123 @@ def moments(acc) -> dict:
             "N_eff": (W ** 2 / a["W2"]) if a["W2"] > 0 else 0.0}
 
 
+#: Which marks each moment field needs present.  ``gA`` is GCH on the anchor
+#: end, ``hB`` is HCG on the partner end.  Used only by the pairwise mode.
+FIELD_REQUIRES = {
+    "W": (), "W2": (),
+    "S_A_g": ("gA",), "S_A_h": ("hA",), "S_B_g": ("gB",), "S_B_h": ("hB",),
+    "Q_AA_gg": ("gA",), "Q_AA_gh": ("gA", "hA"), "Q_AA_hh": ("hA",),
+    "Q_BB_gg": ("gB",), "Q_BB_gh": ("gB", "hB"), "Q_BB_hh": ("hB",),
+    "Q_AB_gg": ("gA", "gB"), "Q_AB_gh": ("gA", "hB"),
+    "Q_AB_hg": ("hA", "gB"), "Q_AB_hh": ("hA", "hB"),
+    "V_A_g": ("gA",), "V_A_h": ("hA",), "V_B_g": ("gB",), "V_B_h": ("hB",),
+}
+
+
+def new_acc_pairwise() -> np.ndarray:
+    """A pairwise-complete accumulator: 20 weighted sums plus 20 weight sums.
+
+    Section B.4's ``moment_mode='pairwise'``.  Each moment entry is averaged
+    over the contacts that carry the marks THAT ENTRY needs, so an end with
+    GCH but no HCG still contributes to the gg entries -- which with
+    ``--min-hcg-sites 1`` is substantially more data than complete-case.
+
+    The cost is that the entries no longer share a sample.  Sigma_AA can come
+    back non-PSD, the eigenvalue clipping in :func:`whiten` then fires and is
+    flagged, and the two modes can disagree.  That is why the design asks for
+    both to be reported rather than for one to be chosen.
+    """
+    return np.zeros(2 * len(ACC_FIELDS), dtype=np.float64)
+
+
+def accumulate_pairwise(acc, theta_A, theta_B, v_A, v_B, present_A, present_B,
+                        weights=None) -> np.ndarray:
+    """Add contacts to a pairwise accumulator, in place.
+
+    ``present_*`` are (n, 2) booleans: is (gch, hcg) observed on that end.
+    A value whose mark is absent must never reach a sum, so it is zeroed
+    rather than trusted -- an unobserved posterior equals the prior mean, and
+    the prior mean is not a measurement.
+    """
+    theta_A = np.atleast_2d(np.asarray(theta_A, float))
+    theta_B = np.atleast_2d(np.asarray(theta_B, float))
+    v_A = np.atleast_2d(np.asarray(v_A, float))
+    v_B = np.atleast_2d(np.asarray(v_B, float))
+    pA = np.atleast_2d(np.asarray(present_A, bool))
+    pB = np.atleast_2d(np.asarray(present_B, bool))
+    if weights is None:
+        weights = 1.0 / (np.where(pA, v_A, 0).sum(1)
+                         + np.where(pB, v_B, 0).sum(1) + 1e-12)
+    w = np.asarray(weights, float).ravel()
+
+    have = {"gA": pA[:, 0], "hA": pA[:, 1], "gB": pB[:, 0], "hB": pB[:, 1]}
+    val = {
+        "W": np.ones_like(w), "W2": w,
+        "S_A_g": theta_A[:, 0], "S_A_h": theta_A[:, 1],
+        "S_B_g": theta_B[:, 0], "S_B_h": theta_B[:, 1],
+        "Q_AA_gg": theta_A[:, 0] ** 2,
+        "Q_AA_gh": theta_A[:, 0] * theta_A[:, 1],
+        "Q_AA_hh": theta_A[:, 1] ** 2,
+        "Q_BB_gg": theta_B[:, 0] ** 2,
+        "Q_BB_gh": theta_B[:, 0] * theta_B[:, 1],
+        "Q_BB_hh": theta_B[:, 1] ** 2,
+        "Q_AB_gg": theta_A[:, 0] * theta_B[:, 0],
+        "Q_AB_gh": theta_A[:, 0] * theta_B[:, 1],
+        "Q_AB_hg": theta_A[:, 1] * theta_B[:, 0],
+        "Q_AB_hh": theta_A[:, 1] * theta_B[:, 1],
+        "V_A_g": v_A[:, 0], "V_A_h": v_A[:, 1],
+        "V_B_g": v_B[:, 0], "V_B_h": v_B[:, 1],
+    }
+    n_f = len(ACC_FIELDS)
+    for i, f in enumerate(ACC_FIELDS):
+        need = FIELD_REQUIRES[f]
+        ok = np.ones(len(w), bool)
+        for m in need:
+            ok &= have[m]
+        wf = np.where(ok, w, 0.0)
+        acc[i] += float((wf * val[f]).sum())
+        acc[n_f + i] += float(wf.sum())
+    return acc
+
+
+def moments_pairwise(acc) -> dict:
+    """Second moments from a pairwise accumulator.
+
+    Each entry is divided by ITS OWN weight, and each mean is taken over the
+    subset that entry saw.  Means from different subsets is what makes this
+    approximate; it is the definition of pairwise-complete, not a shortcut.
+    """
+    a = np.asarray(acc, float)
+    n_f = len(ACC_FIELDS)
+    s = dict(zip(ACC_FIELDS, a[:n_f]))
+    wt = dict(zip(ACC_FIELDS, a[n_f:]))
+    if wt["W"] <= 0:
+        raise ValueError("empty accumulator: no weight was added")
+
+    def avg(f):
+        return s[f] / wt[f] if wt[f] > 0 else np.nan
+
+    mu_A = np.array([avg("S_A_g"), avg("S_A_h")])
+    mu_B = np.array([avg("S_B_g"), avg("S_B_h")])
+    S_AA = np.array([
+        [avg("Q_AA_gg") - mu_A[0] ** 2, avg("Q_AA_gh") - mu_A[0] * mu_A[1]],
+        [avg("Q_AA_gh") - mu_A[0] * mu_A[1], avg("Q_AA_hh") - mu_A[1] ** 2]])
+    S_BB = np.array([
+        [avg("Q_BB_gg") - mu_B[0] ** 2, avg("Q_BB_gh") - mu_B[0] * mu_B[1]],
+        [avg("Q_BB_gh") - mu_B[0] * mu_B[1], avg("Q_BB_hh") - mu_B[1] ** 2]])
+    S_AB = np.array([
+        [avg("Q_AB_gg") - mu_A[0] * mu_B[0], avg("Q_AB_gh") - mu_A[0] * mu_B[1]],
+        [avg("Q_AB_hg") - mu_A[1] * mu_B[0], avg("Q_AB_hh") - mu_A[1] * mu_B[1]]])
+    V_A = np.array([avg("V_A_g"), avg("V_A_h")])
+    V_B = np.array([avg("V_B_g"), avg("V_B_h")])
+    W = wt["W"]
+    W2 = s["W2"]
+    return {"mu_A": mu_A, "mu_B": mu_B, "S_AA": S_AA, "S_BB": S_BB,
+            "S_AB": S_AB, "V_A": V_A, "V_B": V_B, "W": W,
+            "N_eff": (W ** 2 / W2) if W2 > 0 else 0.0,
+            "entry_weights": wt}
+
+
 def det_statistic(S_AB) -> float:
     """``D = 2 det / ||.||_F^2`` -- zero iff rank 1, and needs no correction.
 
@@ -325,3 +442,227 @@ def conditional_rank1_null(theta_A, theta_B, v_A, v_B, weights=None,
         "D_null": D_null, "rho2_null": r2_null,
         "flag_pd_clipped": wh["flag_pd_clipped"], "N_eff": m["N_eff"],
     }
+
+
+def mate_shuffle_null(theta_A, theta_B, v_A, v_B, weights=None,
+                      n_boot=200, seed=0, strata=None, floor=1e-6):
+    """Section B.6.1 -- H0: no coordination at all.
+
+    Reassign mates within stratum.  This is the WRONG null for the rank-1
+    question, because it destroys rho1 along with everything else; it exists
+    to answer "is this bin coordinated at all", and as the B.7.5 sanity check
+    that rho1 under it sits at zero.
+
+    Returns ``z_mate_shuffle``, the standardised distance of the observed rho1
+    from that null.
+    """
+    rng = np.random.default_rng(seed)
+    theta_A = np.atleast_2d(np.asarray(theta_A, float))
+    theta_B = np.atleast_2d(np.asarray(theta_B, float))
+    v_A = np.atleast_2d(np.asarray(v_A, float))
+    v_B = np.atleast_2d(np.asarray(v_B, float))
+    w = (None if weights is None else np.asarray(weights, float).ravel())
+
+    m = moments(accumulate(new_acc(), theta_A, theta_B, v_A, v_B, w))
+    rho1_obs = canonical(whiten(m["S_AA"], m["S_BB"], m["S_AB"],
+                                m["V_A"], m["V_B"], floor)["R"])["rho1"]
+
+    n = theta_A.shape[0]
+    groups = ([np.arange(n)] if strata is None
+              else [np.flatnonzero(np.asarray(strata) == u)
+                    for u in np.unique(np.asarray(strata))])
+
+    null = np.empty(int(n_boot))
+    for b in range(int(n_boot)):
+        idx = np.arange(n)
+        for g in groups:
+            if g.size > 1:
+                idx[g] = rng.permutation(g)
+        m2 = moments(accumulate(new_acc(), theta_A, theta_B[idx],
+                                v_A, v_B[idx], w))
+        null[b] = canonical(whiten(m2["S_AA"], m2["S_BB"], m2["S_AB"],
+                                   m2["V_A"], m2["V_B"], floor)["R"])["rho1"]
+    sd = float(np.std(null, ddof=1)) if n_boot > 1 else 0.0
+    return {
+        "rho1": rho1_obs,
+        "rho1_mate_shuffle_mean": float(np.mean(null)),
+        "z_mate_shuffle": float((rho1_obs - np.mean(null)) / sd) if sd > 0
+                          else np.nan,
+        "rho1_mate_shuffle_null": null,
+    }
+
+
+def cell_block_bootstrap(per_cell_accs, n_boot=500, seed=0, floor=1e-6,
+                         ci=(2.5, 97.5)):
+    """Section B.6.3 -- resample CELLS with replacement, not contacts.
+
+    Reads from one cell share its coverage, its conversion efficiency and its
+    cell type, so they are not independent replicates; a contact-level
+    bootstrap would give intervals that are far too narrow.  Resampling whole
+    per-cell accumulators and re-summing is exact, because every field is
+    additive -- no contact is revisited.
+
+    Parameters
+    ----------
+    per_cell_accs : sequence of accumulator arrays
+        One per cell contributing to this (group, bin, stratum).
+
+    Returns
+    -------
+    dict with percentile intervals for rho1, rho2 and D, and the count of
+    resamples that could not be evaluated (a draw may hold too few cells to
+    give a positive-weight accumulator).
+    """
+    accs = [np.asarray(a, float) for a in per_cell_accs]
+    n_cells = len(accs)
+    out = {"n_cells": n_cells}
+    if n_cells < 2:
+        # One cell is not a sample of cells.  A bootstrap over it would return
+        # a zero-width interval, which reads as certainty rather than as the
+        # absence of replication.
+        for k in ("rho1", "rho2", "D"):
+            out[f"{k}_ci_lo"] = np.nan
+            out[f"{k}_ci_hi"] = np.nan
+        out["n_boot_failed"] = int(n_boot)
+        return out
+
+    rng = np.random.default_rng(seed)
+    stack = np.vstack(accs)
+    draws = {"rho1": [], "rho2": [], "D": []}
+    failed = 0
+    for _ in range(int(n_boot)):
+        pick = rng.integers(0, n_cells, n_cells)
+        acc = stack[pick].sum(axis=0)
+        try:
+            m = moments(acc)
+            cn = canonical(whiten(m["S_AA"], m["S_BB"], m["S_AB"],
+                                  m["V_A"], m["V_B"], floor)["R"])
+        except (ValueError, np.linalg.LinAlgError):
+            failed += 1
+            continue
+        draws["rho1"].append(cn["rho1"])
+        draws["rho2"].append(cn["rho2"])
+        draws["D"].append(det_statistic(m["S_AB"]))
+    for k, v in draws.items():
+        if len(v) >= 2:
+            lo, hi = np.percentile(v, ci)
+            out[f"{k}_ci_lo"], out[f"{k}_ci_hi"] = float(lo), float(hi)
+        else:
+            out[f"{k}_ci_lo"] = out[f"{k}_ci_hi"] = np.nan
+    out["n_boot_failed"] = failed
+    return out
+
+
+#: Section B.8 bin classes.  II is the headline: coordination the shared
+#: open/closed axis does not explain.
+BIN_CLASSES = {
+    "I": "shared_axis_coordination",
+    "II": "mark_specific_beyond_axis",
+    "III": "uncoordinated",
+    "IV": "anti_assortative",
+}
+
+
+def bin_class(rho1_significant: bool, rank1_rejected: bool,
+              sign_rho_u: int) -> str:
+    """Section B.8 class from the two tests and the coordination sign.
+
+    IV is checked before II because an anti-assortative bin is a real reading
+    of the model (ends in opposite states), not a failure -- and it is still
+    rank 1, so calling it II would put an ordinary finding in the headline
+    class.
+    """
+    if not rho1_significant:
+        return "III"
+    if sign_rho_u < 0:
+        return "IV"
+    return "II" if rank1_rejected else "I"
+
+
+def summarize(acc, per_cell_accs=None, theta_A=None, theta_B=None,
+              v_A=None, v_B=None, weights=None, strata=None,
+              n_boot_null=500, n_boot_mate=200, n_boot_ci=500, seed=0,
+              floor=1e-6, alpha_rho1=0.05, alpha_rank1=0.05,
+              error_convention="raw", moment_mode="complete",
+              gch_norm="location", min_neff=30.0):
+    """One Section B.8 row from an accumulator and the contacts behind it.
+
+    ``acc`` carries the moments; the raw contact arrays are needed only for
+    the two resampling nulls, and ``per_cell_accs`` only for the cell-block
+    interval.  Anything not supplied comes back as NaN rather than being
+    silently replaced by a contact-level substitute.
+    """
+    m = moments(acc)
+    wh = whiten(m["S_AA"], m["S_BB"], m["S_AB"], m["V_A"], m["V_B"], floor)
+    cn = canonical(wh["R"])
+    row = {
+        "n_contacts": float(m["W"]), "N_eff": m["N_eff"],
+        "D": det_statistic(m["S_AB"]),
+        "rho1": cn["rho1"], "rho2": cn["rho2"],
+        "rho2_over_rho1": cn["rho2_over_rho1"],
+        "asymmetry_frob": cn["asymmetry_frob"],
+        "asymmetry_angle": cn["asymmetry_angle"],
+        "reliability_gch": wh["reliability_gch"],
+        "reliability_hcg": wh["reliability_hcg"],
+        "flag_pd_clipped": wh["flag_pd_clipped"],
+        "flag_low_neff": bool(m["N_eff"] < min_neff),
+        "error_convention": error_convention,
+        "moment_mode": moment_mode,
+        "gch_norm": gch_norm,
+    }
+    row.update(sign_pattern(m["S_AA"], m["S_AB"]))
+
+    # w_A = Sigma_AA^(-1/2) u1 and w_B likewise: the per-end directions the
+    # shared axis actually loads on, in the original (gch, hcg) basis.
+    w_A = wh["W_A"] @ cn["u1"]
+    w_B = wh["W_B"] @ cn["v1"]
+    row.update({
+        "w_A_gch": float(w_A[0]), "w_A_hcg": float(w_A[1]),
+        "w_B_gch": float(w_B[0]), "w_B_hcg": float(w_B[1]),
+        "phi_A": float(np.degrees(np.arctan2(w_A[1], w_A[0]))),
+        "phi_B": float(np.degrees(np.arctan2(w_B[1], w_B[0]))),
+        "sigma_AB_gg": float(m["S_AB"][0, 0]),
+        "sigma_AB_gh": float(m["S_AB"][0, 1]),
+        "sigma_AB_hg": float(m["S_AB"][1, 0]),
+        "sigma_AB_hh": float(m["S_AB"][1, 1]),
+    })
+
+    have_contacts = theta_A is not None and theta_B is not None
+    if have_contacts:
+        nul = conditional_rank1_null(theta_A, theta_B, v_A, v_B, weights,
+                                     n_boot_null, seed, strata, floor)
+        for k in ("D_null_mean", "D_excess", "p_rank1", "rho2_null_mean",
+                  "rho2_excess", "p_rho2"):
+            row[k] = nul[k]
+        ms = mate_shuffle_null(theta_A, theta_B, v_A, v_B, weights,
+                               n_boot_mate, seed + 1, strata, floor)
+        row["z_mate_shuffle"] = ms["z_mate_shuffle"]
+        row["rho1_mate_shuffle_mean"] = ms["rho1_mate_shuffle_mean"]
+    else:
+        for k in ("D_null_mean", "D_excess", "p_rank1", "rho2_null_mean",
+                  "rho2_excess", "p_rho2", "z_mate_shuffle",
+                  "rho1_mate_shuffle_mean"):
+            row[k] = np.nan
+
+    if per_cell_accs is not None:
+        boot = cell_block_bootstrap(per_cell_accs, n_boot_ci, seed + 2, floor)
+        row["n_cells"] = boot["n_cells"]
+        for k in ("rho1", "rho2", "D"):
+            row[f"{k}_ci_lo"] = boot[f"{k}_ci_lo"]
+            row[f"{k}_ci_hi"] = boot[f"{k}_ci_hi"]
+    else:
+        row["n_cells"] = np.nan
+        for k in ("rho1", "rho2", "D"):
+            row[f"{k}_ci_lo"] = row[f"{k}_ci_hi"] = np.nan
+
+    # rho1 "significant" uses the mate-shuffle z, which is the test for
+    # coordination at all; the rank test is a separate p and a separate axis.
+    z = row["z_mate_shuffle"]
+    rho1_sig = bool(np.isfinite(z) and abs(z) >= 1.959963984540054)
+    rank1_rejected = bool(np.isfinite(row["p_rank1"])
+                          and row["p_rank1"] < alpha_rank1)
+    row["rho1_significant"] = rho1_sig
+    row["rank1_rejected"] = rank1_rejected
+    row["bin_class"] = bin_class(rho1_sig, rank1_rejected, row["sign_rho_u"])
+    row["bin_class_label"] = BIN_CLASSES[row["bin_class"]]
+    return row

@@ -237,3 +237,167 @@ def test_strata_confine_the_shuffle():
                                   strata=strata)
     assert np.isfinite(r["D_null"]).all()
     assert r["D_null"].size == 50
+
+
+# ------------------------------------------------- B.6.1 the mate shuffle ---
+
+def test_mate_shuffle_destroys_rho1(rank1_sim=None):
+    """B.7.5: rho1 under the mate shuffle must sit at zero.  It is the wrong
+    null for the RANK question precisely because it destroys rho1 too."""
+    tA, tB, vA, vB = simulate(n=1500, seed=21)
+    out = rj.mate_shuffle_null(tA, tB, vA, vB, n_boot=120, seed=3)
+    assert out["rho1"] > 0.15, "the simulation must be coordinated at all"
+    assert abs(out["rho1_mate_shuffle_mean"]) < out["rho1"] / 2, (
+        "shuffling mates must collapse rho1 toward zero")
+    assert out["z_mate_shuffle"] > 3
+
+
+def test_mate_shuffle_finds_nothing_when_there_is_nothing():
+    """Uncoordinated ends must not produce a significant z."""
+    rng = np.random.default_rng(7)
+    n = 1200
+    tA = rng.normal(size=(n, 2))
+    tB = rng.normal(size=(n, 2))
+    v = np.full((n, 2), 0.05)
+    out = rj.mate_shuffle_null(tA, tB, v, v, n_boot=150, seed=4)
+    assert abs(out["z_mate_shuffle"]) < 3.5, out["z_mate_shuffle"]
+
+
+def test_mate_shuffle_respects_strata():
+    """Shuffling across strata would mix distance regimes and manufacture a
+    null that is easier to beat than the truth."""
+    tA, tB, vA, vB = simulate(n=800, seed=22)
+    s = np.arange(800) % 4
+    out = rj.mate_shuffle_null(tA, tB, vA, vB, n_boot=60, seed=5, strata=s)
+    assert np.isfinite(out["z_mate_shuffle"])
+
+
+# ------------------------------------------- B.6.3 the cell-block bootstrap ---
+
+def _per_cell(n_cells=12, per=150, seed=30):
+    accs, rng = [], np.random.default_rng(seed)
+    for c in range(n_cells):
+        tA, tB, vA, vB = simulate(n=per, seed=int(rng.integers(1 << 30)))
+        accs.append(rj.accumulate(rj.new_acc(), tA, tB, vA, vB))
+    return accs
+
+
+def test_bootstrap_interval_brackets_the_point_estimate():
+    accs = _per_cell()
+    m = rj.moments(rj.merge(*accs))
+    rho1 = rj.canonical(rj.whiten(m["S_AA"], m["S_BB"], m["S_AB"],
+                                  m["V_A"], m["V_B"])["R"])["rho1"]
+    out = rj.cell_block_bootstrap(accs, n_boot=300, seed=1)
+    assert out["rho1_ci_lo"] <= rho1 <= out["rho1_ci_hi"]
+    assert out["n_cells"] == 12
+
+
+def test_bootstrap_resamples_cells_not_contacts():
+    """A contact-level bootstrap would give a far narrower interval; pin that
+    the cell-block one is wider on data with real between-cell spread."""
+    rng = np.random.default_rng(11)
+    accs = []
+    for c in range(15):
+        # Each cell gets its own coordination strength -- between-cell spread
+        # a contact-level resample cannot see.
+        tA, tB, vA, vB = simulate(n=200, rho_u=float(rng.uniform(0.2, 0.9)),
+                                  seed=int(rng.integers(1 << 30)))
+        accs.append(rj.accumulate(rj.new_acc(), tA, tB, vA, vB))
+    cell = rj.cell_block_bootstrap(accs, n_boot=400, seed=2)
+    width_cell = cell["rho1_ci_hi"] - cell["rho1_ci_lo"]
+
+    # Same total contacts, but the cell identity thrown away: split the pooled
+    # data into arbitrary blocks of equal size.
+    pooled = rj.merge(*accs)
+    fake = [pooled / len(accs)] * len(accs)
+    flat = rj.cell_block_bootstrap(fake, n_boot=400, seed=2)
+    width_flat = flat["rho1_ci_hi"] - flat["rho1_ci_lo"]
+    assert width_cell > width_flat, (
+        f"cell-block interval {width_cell:.4f} must exceed the interval that "
+        f"ignores between-cell spread {width_flat:.4f}")
+
+
+def test_one_cell_gives_no_interval_rather_than_a_zero_width_one():
+    """A zero-width interval reads as certainty; the honest answer is that
+    there is no replication to resample."""
+    accs = _per_cell(n_cells=1)
+    out = rj.cell_block_bootstrap(accs, n_boot=50, seed=3)
+    assert np.isnan(out["rho1_ci_lo"]) and np.isnan(out["rho1_ci_hi"])
+    assert out["n_boot_failed"] == 50
+
+
+# ------------------------------------------------------ B.8 classification ---
+
+def test_anti_assortative_is_class_iv_not_the_headline_class():
+    """IV is a real reading of the model and is still rank 1.  Calling it II
+    would put an ordinary finding in the headline class."""
+    assert rj.bin_class(True, False, -1) == "IV"
+    assert rj.bin_class(True, True, -1) == "IV", (
+        "the sign is checked before the rank test on purpose")
+
+
+def test_the_headline_class_needs_both_coordination_and_rank_rejection():
+    assert rj.bin_class(True, True, +1) == "II"
+    assert rj.bin_class(True, False, +1) == "I"
+    assert rj.bin_class(False, True, +1) == "III", (
+        "rank-2 without coordination at all is not a finding")
+    assert rj.bin_class(False, False, +1) == "III"
+
+
+def test_every_class_has_a_label():
+    for c in ("I", "II", "III", "IV"):
+        assert c in rj.BIN_CLASSES
+
+
+# ------------------------------------------------------------ B.8 the row ---
+
+def test_summarize_emits_every_design_column():
+    tA, tB, vA, vB = simulate(n=900, seed=40)
+    accs = _per_cell(n_cells=6, per=150, seed=41)
+    acc = rj.accumulate(rj.new_acc(), tA, tB, vA, vB)
+    row = rj.summarize(acc, per_cell_accs=accs, theta_A=tA, theta_B=tB,
+                       v_A=vA, v_B=vB, n_boot_null=40, n_boot_mate=40,
+                       n_boot_ci=60, seed=1)
+    want = {
+        "n_contacts", "n_cells", "N_eff",
+        "D", "D_null_mean", "D_excess", "p_rank1",
+        "rho1", "rho1_ci_lo", "rho1_ci_hi", "z_mate_shuffle",
+        "rho2", "rho2_null_mean", "rho2_excess", "rho2_over_rho1",
+        "w_A_gch", "w_A_hcg", "w_B_gch", "w_B_hcg", "phi_A", "phi_B",
+        "sign_lambda_h", "sign_rho_u", "rank1_pattern_class",
+        "asymmetry_frob", "asymmetry_angle",
+        "sigma_AB_gg", "sigma_AB_gh", "sigma_AB_hg", "sigma_AB_hh",
+        "reliability_gch", "reliability_hcg",
+        "flag_pd_clipped", "flag_low_neff",
+        "error_convention", "moment_mode", "gch_norm", "bin_class",
+    }
+    assert want <= set(row), f"missing: {sorted(want - set(row))}"
+
+
+def test_summarize_without_contacts_reports_nan_not_a_substitute():
+    """The nulls need the raw contacts.  Quietly falling back to something
+    computable from the accumulator alone would report a p-value that answers
+    a different question."""
+    tA, tB, vA, vB = simulate(n=400, seed=42)
+    acc = rj.accumulate(rj.new_acc(), tA, tB, vA, vB)
+    row = rj.summarize(acc)
+    assert np.isnan(row["p_rank1"]) and np.isnan(row["z_mate_shuffle"])
+    assert np.isnan(row["rho1_ci_lo"])
+    assert row["bin_class"] == "III", "no test run means no claim"
+    assert np.isfinite(row["D"]) and np.isfinite(row["rho1"])
+
+
+def test_w_vectors_live_in_the_original_mark_basis():
+    """w_A = Sigma_AA^(-1/2) u1 -- the direction the shared axis loads on in
+    (gch, hcg), not in the whitened basis where the angle is meaningless."""
+    tA, tB, vA, vB = simulate(n=1200, seed=43)
+    acc = rj.accumulate(rj.new_acc(), tA, tB, vA, vB)
+    m = rj.moments(acc)
+    wh = rj.whiten(m["S_AA"], m["S_BB"], m["S_AB"], m["V_A"], m["V_B"])
+    cn = rj.canonical(wh["R"])
+    row = rj.summarize(acc)
+    want = wh["W_A"] @ cn["u1"]
+    assert row["w_A_gch"] == pytest.approx(want[0])
+    assert row["w_A_hcg"] == pytest.approx(want[1])
+    assert row["phi_A"] == pytest.approx(
+        np.degrees(np.arctan2(want[1], want[0])))
