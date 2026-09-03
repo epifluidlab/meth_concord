@@ -354,13 +354,29 @@ def grid_index(bin_id, stratum, n_bins: int, n_strata: int):
     return cell, n_cells, bin_of_cell, stratum_of_cell
 
 
+def prior_variance(alpha, beta):
+    """Variance the fitted prior implies for a grid cell: ``mu(1-mu)/(nu+1)``.
+
+    This -- not the per-END posterior variance -- is the "bin-level variance"
+    A.3.4 names.  Dividing by the posterior sd would rescale each end by its
+    own coverage, which is a per-observation reweighting, not a normalization
+    of the bin; the ablation would then be testing the wrong thing.
+    """
+    alpha = np.maximum(np.asarray(alpha, dtype=float), 1e-12)
+    beta = np.maximum(np.asarray(beta, dtype=float), 1e-12)
+    nu = alpha + beta
+    mu = alpha / nu
+    return mu * (1.0 - mu) / (nu + 1.0)
+
+
 def normalize(theta, mu, var=None, mode: str = "location"):
     """Centre (and, only as the B.7.6 ablation, rescale) a per-end value.
 
     ``location`` -- the default and the one A.3.4 argues for -- subtracts the
     distance-pooled expectation and stops.  ``full`` additionally divides by
-    the per-grid-cell standard deviation; it exists so the ablation can be run,
-    not because it is a sensible default.  ``none`` returns ``theta`` unchanged.
+    the GRID-CELL standard deviation (see :func:`prior_variance`); it exists so
+    the ablation can be run, not because it is a sensible default.  ``none``
+    returns ``theta`` unchanged.
     """
     if mode not in GCH_NORM_CHOICES:
         raise ValueError(f"gch_norm must be one of {GCH_NORM_CHOICES}; "
@@ -372,6 +388,6 @@ def normalize(theta, mu, var=None, mode: str = "location"):
     if mode == "location":
         return centred
     if var is None:
-        raise ValueError("gch_norm='full' needs the per-cell variance")
+        raise ValueError("gch_norm='full' needs the grid-cell variance")
     sd = np.sqrt(np.maximum(np.asarray(var, dtype=float), 1e-12))
     return centred / sd

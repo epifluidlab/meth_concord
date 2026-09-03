@@ -56,6 +56,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from nome_hic_concordance import figure_style  # noqa: E402
+
 STATS = ("coordination", "direction_logor", "direction_excess",
          "directional_corrected", "direction")
 
@@ -278,43 +282,12 @@ def qq_band_cells(null_mat, levels=QQ_LEVELS, alpha=0.05, n_boot=200,
             np.percentile(qs, 100 * (1 - alpha / 2), axis=0))
 
 
-#: Okabe-Ito, colour-blind safe and distinguishable in greyscale.  Journal
-#: figures get printed and photocopied; tab10's default red/green pair does
-#: not survive either.
-_PALETTE = ("#0072B2", "#D55E00", "#009E73", "#CC79A7",
-            "#E69F00", "#56B4E9", "#F0E442", "#000000")
+# Style lives in nome_hic_concordance.figure_style so the Part B diagnostic
+# panels come out matching these; the values are unchanged.
+_PALETTE = figure_style.PALETTE
+_FIG_W_IN = figure_style.FIG_W_IN
+_RC = figure_style.RC
 
-#: A full-width figure in most journals is 180 mm.  Sizing to it here means
-#: the panel is placed at 100% and the type comes out at the size set below,
-#: rather than being scaled by the layout and landing at whatever that gives.
-_FIG_W_IN = 180 / 25.4
-
-_RC = {
-    # TrueType, not Type 3: Type 3 text is not editable in Illustrator and
-    # several journals reject it outright.
-    "pdf.fonttype": 42,
-    "ps.fonttype": 42,
-    "svg.fonttype": "none",
-    "font.family": "sans-serif",
-    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-    "font.size": 7,
-    "axes.labelsize": 7,
-    "axes.titlesize": 8,
-    "xtick.labelsize": 6.5,
-    "ytick.labelsize": 6.5,
-    "legend.fontsize": 6,
-    "axes.linewidth": 0.6,
-    "xtick.major.width": 0.6,
-    "ytick.major.width": 0.6,
-    "xtick.major.size": 2.5,
-    "ytick.major.size": 2.5,
-    "xtick.direction": "out",
-    "ytick.direction": "out",
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-    "legend.frameon": False,
-    "lines.solid_capstyle": "round",
-}
 
 #: Kept SHORT: a Q-Q curve runs corner to corner, and a legend wide enough
 #: to spell the method out reaches across the panel and covers it.  What

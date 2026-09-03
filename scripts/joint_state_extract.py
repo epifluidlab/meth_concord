@@ -346,8 +346,15 @@ def run_baseline(args, cp, marks, root: Path, out_root: Path,
             d[f"theta_{key}"] = mean
             d[f"var_{key}"] = var
             d[f"mu_{key}"] = mu
+            # The GRID-CELL sd, persisted so the B.7.6 normalization
+            # ablation is a column division downstream rather than a
+            # re-extraction.
+            pv = jb.prior_variance(
+                np.where(cid >= 0, alpha[i][np.maximum(cid, 0)], g_alpha[i]),
+                np.where(cid >= 0, beta[i][np.maximum(cid, 0)], g_beta[i]))
+            d[f"prior_sd_{key}"] = np.sqrt(pv)
             mode = args.gch_norm if m.upper() == "GCH" else "location"
-            d[f"centred_{key}"] = jb.normalize(mean, mu, var, mode=mode)
+            d[f"centred_{key}"] = jb.normalize(mean, mu, pv, mode=mode)
         out = out_root / s_.parent.name / s_.name
         out.parent.mkdir(parents=True, exist_ok=True)
         d.to_parquet(out, index=False)

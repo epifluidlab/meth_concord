@@ -31,26 +31,14 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nome_hic_concordance import rank1_joint as rj                # noqa: E402
+from nome_hic_concordance.rank1_units import (                    # noqa: E402
+    FLAGGED_STRATA, STRATA, STRATUM_NAMES, pair_ends, stratum_of, weights_for)
 from nome_hic_concordance.distance_stats import fdr               # noqa: E402
 from nome_hic_concordance.samples_manifest import (               # noqa: E402
     add_manifest_args, load_from_args, safe_name)
 from nome_hic_concordance.utils import ensure_dir, setup_logging  # noqa: E402
 
 logger = logging.getLogger("rank1_joint_state")
-
-#: Section B.1 strata.  Named and fixed rather than log-spaced: the 1-10 kb
-#: stratum is FLAGGED (residual self-ligation lives there) rather than dropped,
-#: and trans is its own stratum, never folded into the widest cis one.
-STRATA = [
-    ("1-10kb", 1e3, 1e4, True),
-    ("10-100kb", 1e4, 1e5, False),
-    ("100kb-1Mb", 1e5, 1e6, False),
-    ("1-10Mb", 1e6, 1e7, False),
-    (">10Mb", 1e7, np.inf, False),
-    ("trans", np.nan, np.nan, False),
-]
-STRATUM_NAMES = [s[0] for s in STRATA]
-FLAGGED_STRATA = {s[0] for s in STRATA if s[3]}
 
 OUT_NAME = "04_rank1.parquet"
 
@@ -82,6 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-cap-pct", type=float, default=99.0,
                    help="Within-stratum percentile the B.2 weight is capped "
                         "at, so one very deep contact cannot carry a bin.")
+    p.add_argument("--min-gch-sites", type=int, default=0,
+                   help="Require this many GCH sites on BOTH ends.  0 keeps "
+                        "whatever Part A wrote.")
+    p.add_argument("--min-hcg-sites", type=int, default=0,
+                   help="Require this many HCG sites on BOTH ends.  Applied "
+                        "HERE, not by re-extracting: Part A emits "
+                        "permissively precisely so this ablation (B.7.7) is a "
+                        "filter rather than another pass over the BAMs.")
+    p.add_argument("--gch-norm", default=None,
+                   choices=("location", "full", "none"),
+                   help="Override Part A's centring using the persisted "
+                        "prior_sd columns (B.7.6).  Default: use the "
+                        "centred_* columns as written.")
     p.add_argument("--min-contacts", type=int, default=30)
     p.add_argument("--min-neff", type=float, default=30.0)
     p.add_argument("--require-conversion-pass", action="store_true",
@@ -100,77 +101,24 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-# ------------------------------------------------------------------- units ---
+def recentre(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """Re-derive centred_gch under a different --gch-norm (B.7.6).
 
-def stratum_of(distance, is_cis) -> np.ndarray:
-    """Section B.1 stratum name per contact."""
-    d = np.asarray(distance, float)
-    cis = np.asarray(is_cis, bool)
-    out = np.full(len(d), "", dtype=object)
-    out[~cis] = "trans"
-    for name, lo, hi, _ in STRATA[:-1]:
-        m = cis & (d >= lo) & (d < hi)
-        out[m] = name
+    Part A persists theta, mu and the grid-cell sd, so the ablation is a column
+    division here rather than a second pass over every BAM.  Only GCH moves:
+    A.3.4 is about GCH normalization, and rescaling HCG as well would change
+    two things at once and make the comparison unreadable.
+    """
+    out = df.copy()
+    if mode == "none":
+        out["centred_gch"] = out["theta_gch"]
+    elif mode == "location":
+        out["centred_gch"] = out["theta_gch"] - out["mu_gch"]
+    else:
+        sd = out["prior_sd_gch"].to_numpy()
+        out["centred_gch"] = ((out["theta_gch"] - out["mu_gch"]).to_numpy()
+                              / np.maximum(sd, 1e-6))
     return out
-
-
-def pair_ends(df: pd.DataFrame, bin_size: int) -> pd.DataFrame:
-    """One row per (contact, orientation): anchor end A, partner end B.
-
-    Section B.1: every contact appears once per end, so a bin sees every
-    contact that touches it with that end as the anchor.  When both ends land
-    in the same bin the contact contributes both orientations; they are marked
-    so nothing downstream treats them as two independent observations.
-    """
-    e1 = df[df["end_idx"] == 1].set_index(["cell_id", "pair_idx"])
-    e2 = df[df["end_idx"] == 2].set_index(["cell_id", "pair_idx"])
-    common = e1.index.intersection(e2.index)
-    if not len(common):
-        return pd.DataFrame()
-    e1, e2 = e1.loc[common], e2.loc[common]
-
-    def side(a, b, tag):
-        pos = np.minimum(a["pos_5p"].to_numpy(), a["pos_3p"].to_numpy())
-        out = pd.DataFrame({
-            "cell_id": a.index.get_level_values(0),
-            "pair_idx": a.index.get_level_values(1),
-            "anchor_bin": pos // bin_size,
-            "orientation": tag,
-            "contact_dist": a["contact_dist"].to_numpy(),
-            "is_cis": a["is_cis"].to_numpy(),
-            "conversion_pass": (a["conversion_pass"].to_numpy()
-                                & b["conversion_pass"].to_numpy()),
-        })
-        for side_tag, frame in (("A", a), ("B", b)):
-            for mark in ("gch", "hcg"):
-                out[f"{side_tag}_{mark}"] = frame[f"centred_{mark}"].to_numpy()
-                out[f"{side_tag}_v_{mark}"] = frame[f"var_{mark}"].to_numpy()
-                out[f"{side_tag}_n_{mark}"] = frame[f"n_{mark}"].to_numpy()
-        return out
-
-    both = side(e1, e2, 1)
-    flip = side(e2, e1, 2)
-    out = pd.concat([both, flip], ignore_index=True)
-    same = out.groupby(["cell_id", "pair_idx"])["anchor_bin"].transform("nunique")
-    out["both_ends_in_bin"] = same == 1
-    out["stratum"] = stratum_of(out["contact_dist"], out["is_cis"])
-    return out[out["stratum"] != ""].reset_index(drop=True)
-
-
-def weights_for(u: pd.DataFrame, cap_pct: float) -> np.ndarray:
-    """Section B.2 inverse total-variance weight, capped within stratum.
-
-    Deliberately NOT a function of |theta - 0.5|: a posterior near 0.5 may be
-    uninformative or a genuine intermediate state, and one weight cannot tell
-    the two apart.
-    """
-    v = (u["A_v_gch"] + u["A_v_hcg"] + u["B_v_gch"] + u["B_v_hcg"]).to_numpy()
-    w = 1.0 / (v + 1e-12)
-    for s in pd.unique(u["stratum"]):
-        m = (u["stratum"] == s).to_numpy()
-        if m.sum() > 1:
-            w[m] = np.minimum(w[m], np.percentile(w[m], cap_pct))
-    return w
 
 
 # ------------------------------------------------------------------- driver ---
@@ -266,6 +214,15 @@ def run(args, manifest) -> pd.DataFrame:
                         chrom, f"{n0 - len(df):,}", f"{n0:,}")
         df["group"] = df["cell_id"].map(cell_group)
         df = df[df["group"].notna()]
+        if args.min_gch_sites or args.min_hcg_sites:
+            n0 = len(df)
+            keep = ((df["n_gch"] >= args.min_gch_sites)
+                    & (df["n_hcg"] >= args.min_hcg_sites))
+            df = df[keep]
+            logger.info("  %s: site minima dropped %s/%s ends",
+                        chrom, f"{n0 - len(df):,}", f"{n0:,}")
+        if args.gch_norm is not None:
+            df = recentre(df, args.gch_norm)
         if not len(df):
             continue
 
@@ -335,24 +292,20 @@ def write_beds(out: pd.DataFrame, out_dir: Path) -> list[str]:
 def qc_tables(out: pd.DataFrame, out_dir: Path) -> dict:
     """The Section B.7 acceptance criteria that are computable from the rows.
 
-    B.7.1 coverage flatness and B.7.3 conversion association need
-    contact-level stratification and are emitted by --moment-mode/--chrom
-    re-runs; what is here is B.7.2 (distance decay), B.7.5 (mate-shuffle
-    sanity) and the class census.
+    B.7.2 (distance decay), B.7.5 (mate-shuffle sanity) and the class census
+    are computable from the rows alone, so they land here.  The rest of
+    Section B.7 -- the contact-level panels, the null calibration and the two
+    ablations -- is ``scripts/rank1_diagnostics.py``.  Both use the SAME
+    functions from ``rank1_diagnostics``, so the summary here cannot drift
+    from the one on the figure.
     """
-    qc = ensure_dir(out_dir / "qc")
-    decay = (out.groupby(["group", "stratum"])
-                .agg(rho1=("rho1", "median"), rho2=("rho2", "median"),
-                     D=("D", "median"), D_excess=("D_excess", "median"),
-                     n=("rho1", "size")).reset_index())
-    decay["stratum"] = pd.Categorical(decay["stratum"],
-                                      categories=STRATUM_NAMES, ordered=True)
-    decay = decay.sort_values(["group", "stratum"])
-    decay.to_csv(qc / "B72_distance_decay.tsv", sep="\t", index=False)
+    from nome_hic_concordance import rank1_diagnostics as dx
 
-    mate = (out.groupby("group")["rho1_mate_shuffle_mean"]
-               .agg(["median", "mean", "std", "size"]).reset_index())
-    mate.to_csv(qc / "B75_mate_shuffle_rho1.tsv", sep="\t", index=False)
+    qc = ensure_dir(out_dir / "qc")
+    dx.distance_decay(out, STRATUM_NAMES).to_csv(
+        qc / "B72_distance_decay.tsv", sep="\t", index=False)
+    dx.mate_shuffle_sanity(out).to_csv(
+        qc / "B75_mate_shuffle_rho1.tsv", sep="\t", index=False)
 
     census = (out.groupby(["group", "bin_class", "bin_class_label"])
                  .size().rename("n_bins").reset_index())
@@ -393,6 +346,9 @@ def main(argv=None) -> int:
         "moment_mode": args.moment_mode,
         "error_convention": args.error_convention,
         "bin_size": args.bin_size, "alpha": args.alpha,
+        "min_gch_sites": args.min_gch_sites,
+        "min_hcg_sites": args.min_hcg_sites,
+        "gch_norm_override": args.gch_norm,
         "strata": STRATUM_NAMES, "flagged_strata": sorted(FLAGGED_STRATA),
         "beds": beds, "qc": qc,
         "manifest": manifest.metadata(),
