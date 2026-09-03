@@ -313,3 +313,124 @@ def test_grid_layout_needs_no_normalisation_and_says_nothing(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         assert m.main(args) == 0
     assert "share a scale" not in caplog.text
+
+
+# ------------------------------------------------------- --signal-ratio --
+
+def _rt_fixture(tmp_path, n=120, span=250_000):
+    """Early high in the first half, late high in the second, so log2(late/
+    early) is a known -2 / +2 split."""
+    pytest.importorskip("pyBigWig")
+    import pyBigWig
+    bins = [("chr1", i * span, (i + 1) * span) for i in range(n)]
+
+    def w(name, rows):
+        pd.DataFrame(rows).to_csv(tmp_path / name, sep="\t", header=False,
+                                  index=False)
+        return str(tmp_path / name)
+
+    w("all.bed", bins)
+    w("sel.bed", bins[:30])              # early half  -> log2 = -2
+    w("stab.bed", bins[n // 2:n // 2 + 30])   # late half -> log2 = +2
+    half = n // 2
+    for nm, vals in (("early", np.r_[np.full(half, 1.6), np.full(half, 0.4)]),
+                     ("late", np.r_[np.full(half, 0.4), np.full(half, 1.6)])):
+        bw = pyBigWig.open(str(tmp_path / f"{nm}.bw"), "w")
+        bw.addHeader([("chr1", n * span)])
+        st = list(range(0, n * span, span))
+        bw.addEntries(["chr1"] * n, st, ends=[x + span for x in st],
+                      values=[float(v) for v in vals])
+        bw.close()
+    return tmp_path
+
+
+def _run_ratio(d, extra, out):
+    return subprocess.run(
+        [sys.executable, str(_SCRIPT),
+         "--background", f"GCH={d / 'all.bed'}",
+         "--bin-set", f"GCH:variable={d / 'sel.bed'}",
+         "--bin-set", f"GCH:invariant={d / 'stab.bed'}",
+         "--signal-track", f"early={d / 'early.bw'}",
+         "--signal-track", f"late={d / 'late.bw'}",
+         "--plot-format", "png", "--output-dir", str(out)] + extra,
+        capture_output=True, text=True)
+
+
+def test_the_ratio_replaces_its_two_source_tracks(tmp_path):
+    """Two tracks answering one question read better as one axis; leaving the
+    sources in would keep asking the reader to divide by eye."""
+    d = _rt_fixture(tmp_path)
+    out = tmp_path / "o"
+    r = _run_ratio(d, ["--signal-ratio", "RT=late/early"], out)
+    assert r.returncode == 0, r.stderr[-2000:]
+    t = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t")
+    assert set(t["track"]) == {"RT"}
+
+
+def test_the_ratio_values_are_log2_of_the_two_tracks(tmp_path):
+    d = _rt_fixture(tmp_path)
+    out = tmp_path / "o"
+    _run_ratio(d, ["--signal-ratio", "RT=late/early"], out)
+    t = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t").set_index("bin_set")
+    # variable sits in the early half: log2(0.4/1.6) = -2
+    assert t.loc["variable", "median_set"] == pytest.approx(-2.0, abs=1e-6)
+    # invariant in the late half: log2(1.6/0.4) = +2
+    assert t.loc["invariant", "median_set"] == pytest.approx(2.0, abs=1e-6)
+
+
+def test_linear_scale_gives_the_plain_ratio(tmp_path):
+    d = _rt_fixture(tmp_path)
+    out = tmp_path / "o"
+    _run_ratio(d, ["--signal-ratio", "RT=late/early",
+                   "--ratio-scale", "linear"], out)
+    t = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t").set_index("bin_set")
+    assert t.loc["variable", "median_set"] == pytest.approx(0.25, abs=1e-6)
+    assert t.loc["invariant", "median_set"] == pytest.approx(4.0, abs=1e-6)
+
+
+def test_keep_source_tracks_keeps_all_three(tmp_path):
+    d = _rt_fixture(tmp_path)
+    out = tmp_path / "o"
+    _run_ratio(d, ["--signal-ratio", "RT=late/early",
+                   "--keep-source-tracks"], out)
+    t = pd.read_csv(out / "bin_set_signal_stats.tsv", sep="\t")
+    assert set(t["track"]) == {"RT", "early", "late"}
+
+
+def test_a_non_positive_bin_is_dropped_not_clipped(tmp_path):
+    """log2 of a zero-signal bin is undefined.  Inventing a value would put a
+    made-up number into the distribution AND the test."""
+    m = _mod()
+    raw = {"late": np.array([1.0, 2.0, 0.0, 4.0]),
+           "early": np.array([1.0, 0.0, 2.0, 2.0])}
+    got = m.apply_ratios(raw, [("RT", "late", "early")], "log2")
+    assert np.isfinite(got["RT"]).tolist() == [True, False, False, True]
+    assert got["RT"][0] == pytest.approx(0.0)
+    assert got["RT"][3] == pytest.approx(1.0)
+
+
+def test_an_unknown_track_name_lists_what_is_available(tmp_path):
+    d = _rt_fixture(tmp_path)
+    r = _run_ratio(d, ["--signal-ratio", "RT=late/typo"], tmp_path / "o")
+    assert r.returncode != 0
+    assert "typo" in r.stderr and "early" in r.stderr
+
+
+def test_a_malformed_spec_shows_the_expected_form(tmp_path):
+    d = _rt_fixture(tmp_path)
+    r = _run_ratio(d, ["--signal-ratio", "late_over_early"], tmp_path / "o")
+    assert r.returncode != 0
+    assert "LABEL=NUMERATOR/DENOMINATOR" in r.stderr
+
+
+def test_the_y_label_says_it_is_a_ratio(tmp_path):
+    """The axis is no longer a signal level; labelling it 'per-bin mean
+    signal' would invite reading a log ratio as an intensity."""
+    m = _mod()
+    d = _rt_fixture(tmp_path)
+    mbe = m._enrich_mod()
+    got = m.gather({"GCH": str(d / "all.bed")},
+                   {("GCH", "variable"): str(d / "sel.bed")},
+                   {"early": str(d / "early.bw"), "late": str(d / "late.bw")},
+                   mbe, "none", ratios=[("RT", "late", "early")])
+    assert got["GCH"]["ylabel"] == "log2(late / early)"

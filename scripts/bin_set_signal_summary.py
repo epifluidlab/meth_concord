@@ -153,7 +153,64 @@ def normalise(val, mode, background_mask):
     raise ValueError(mode)
 
 
-def gather(backgrounds, bin_sets, tracks, mbe, normalize="none"):
+def parse_ratio(spec):
+    """'LABEL=NUM/DEN' -> (label, numerator, denominator)."""
+    if "=" not in spec or "/" not in spec.split("=", 1)[1]:
+        sys.exit(f"--signal-ratio expects LABEL=NUMERATOR/DENOMINATOR, got "
+                 f"{spec!r}  e.g. RT=NPC_late/NPC_early")
+    label, rhs = spec.split("=", 1)
+    num, den = rhs.split("/", 1)
+    return label.strip(), num.strip(), den.strip()
+
+
+def apply_ratios(raw, ratios, scale="log2", keep_sources=False, ctx=""):
+    """Replace paired tracks with their per-bin ratio.
+
+    Two tracks that answer one question are better read as one axis: early
+    and late replication timing are not independent quantities, and plotting
+    them side by side asks the reader to do the division by eye across two
+    panels with different y-ranges.
+
+    log2 by default.  A raw ratio of two non-negative bigWig means is
+    heavily right-skewed and its box plot compresses everything below 1 into
+    a sliver, which is the half of the axis where "earlier than average"
+    lives.  log2 makes the two directions symmetric about 0.
+
+    A bin where either track is non-positive has no defined log ratio and
+    becomes NaN rather than a clipped value -- the downstream test and the
+    box plot both drop non-finite bins, so an invented number would quietly
+    enter the distribution.
+    """
+    out = dict(raw)
+    used = set()
+    for label, num, den in ratios:
+        for t in (num, den):
+            if t not in raw:
+                sys.exit(f"--signal-ratio {label}: no --signal-track named "
+                         f"{t!r} (have: {', '.join(sorted(raw))})")
+        a = np.asarray(raw[num], float)
+        b = np.asarray(raw[den], float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if scale == "log2":
+                v = np.where((a > 0) & (b > 0), np.log2(a / b), np.nan)
+            else:
+                v = np.where(b > 0, a / b, np.nan)
+        n_bad = int((~np.isfinite(v)).sum())
+        if n_bad:
+            logger.warning(
+                f"{ctx}{label}: {n_bad:,} of {v.size:,} bins have no defined "
+                f"ratio ({num} or {den} non-positive) and are dropped from "
+                f"the distribution and the test.")
+        out[label] = v
+        used |= {num, den}
+    if ratios and not keep_sources:
+        for t in used:
+            out.pop(t, None)
+    return out
+
+
+def gather(backgrounds, bin_sets, tracks, mbe, normalize="none",
+           ratios=(), ratio_scale="log2", keep_sources=False):
     """Per-bin signal for every (context, track), plus each set's membership.
 
     Returns ``{context: {"values": {track: array}, "sets": {label: mask},
@@ -166,6 +223,8 @@ def gather(backgrounds, bin_sets, tracks, mbe, normalize="none"):
         pos = {k: i for i, k in enumerate(key)}
         raw = {label: mbe._signal_bin_means(bins, path)
                for label, path in tracks.items()}
+        raw = apply_ratios(raw, ratios, ratio_scale, keep_sources,
+                           ctx=f"{ctx}:")
         sets = {}
         for (c, label), sp in bin_sets.items():
             if c != ctx:
@@ -194,6 +253,12 @@ def gather(backgrounds, bin_sets, tracks, mbe, normalize="none"):
         values, ylab = {}, "per-bin mean signal"
         for label, v in raw.items():
             values[label], ylab = normalise(v, normalize, ~any_set)
+        if ratios and normalize == "none":
+            # The axis is no longer a signal level, and saying otherwise
+            # would invite reading a log ratio as an intensity.
+            ylab = ("log2(" + ratios[0][1] + " / " + ratios[0][2] + ")"
+                    if ratio_scale == "log2"
+                    else ratios[0][1] + " / " + ratios[0][2])
         out[ctx] = {"bins": bins, "values": values, "sets": sets,
                     "raw": raw, "ylabel": ylab}
     return out
@@ -425,6 +490,26 @@ def main(argv=None) -> int:
     ap.add_argument("--signal-track", action="append", required=True,
                     metavar="LABEL=BW|BEDGRAPH",
                     help="A continuous track (bigWig or bedGraph).  Repeatable.")
+    ap.add_argument("--signal-ratio", action="append", default=None,
+                    metavar="LABEL=NUM/DEN",
+                    help="Repeatable.  Derive a track as the per-bin ratio of "
+                         "two --signal-track labels, e.g. "
+                         "--signal-ratio RT=NPC_late/NPC_early.  Early and "
+                         "late replication timing are not independent "
+                         "quantities, and plotting them side by side asks the "
+                         "reader to do the division by eye across panels with "
+                         "different y-ranges.  The two source tracks are "
+                         "REPLACED by the ratio unless --keep-source-tracks; "
+                         "a bin where either is non-positive has no defined "
+                         "ratio and is dropped rather than clipped.")
+    ap.add_argument("--ratio-scale", choices=["log2", "linear"],
+                    default="log2",
+                    help="log2 (default) makes 'earlier' and 'later' "
+                         "symmetric about 0.  A raw ratio of two non-negative "
+                         "means is right-skewed and compresses everything "
+                         "below 1 into a sliver -- which is half the axis.")
+    ap.add_argument("--keep-source-tracks", action="store_true",
+                    help="Also plot the tracks a --signal-ratio consumed.")
     ap.add_argument("--track-group", action="append", default=None,
                     metavar="GROUP=t1,t2",
                     help="Group the tracks into panel rows explicitly.  Without "
@@ -459,6 +544,7 @@ def main(argv=None) -> int:
 
     backgrounds = dict(_parse_pair(s, "--background") for s in args.background)
     tracks = dict(_parse_pair(s, "--signal-track") for s in args.signal_track)
+    ratios = [parse_ratio(x) for x in (args.signal_ratio or [])]
     bin_sets = {}
     for spec in args.bin_set:
         ctx, label, path = _parse_labelled(spec, "--bin-set")
@@ -482,7 +568,9 @@ def main(argv=None) -> int:
             "the difference between the two assays rather than between the bin "
             "sets.  --normalize log2-median is the usual fix.")
     mbe = _enrich_mod()
-    data = gather(backgrounds, bin_sets, tracks, mbe, args.normalize)
+    data = gather(backgrounds, bin_sets, tracks, mbe, args.normalize,
+                  ratios=ratios, ratio_scale=args.ratio_scale,
+                  keep_sources=args.keep_source_tracks)
     stats = stats_table(data, rules)
     stats.to_csv(out_dir / "bin_set_signal_stats.tsv", sep="\t", index=False)
     path = out_dir / f"bin_set_signal_summary.{args.plot_format}"
