@@ -367,9 +367,11 @@ def test_compare_cli_norm_and_plot_flags():
     assert a.per_cell_norm == "rank" and a.post_norm_recenter == "on"
     assert a.plot_format == "pdf"
     d = cmp_args(["--output-dir", "o"])
-    # Defaults mirror the nome_hic_concordance signed step-7 stack.
+    # Defaults mirror the nome_hic_concordance signed step-7 stack.  The
+    # figures go into a Nature Methods submission, so pdf is the default and
+    # png is opt-in.
     assert (d.per_cell_norm, d.post_norm_recenter, d.plot_format) == (
-        "rank", "on", "png")
+        "rank", "on", "pdf")
     with pytest.raises(SystemExit):
         cmp_args(["--output-dir", "o", "--plot-format", "jpeg"])
 
@@ -393,7 +395,7 @@ def test_cli_n_svd_none_is_auto_but_explicit_zero_is_honoured():
 
 def test_cli_plot_format_default_and_choices():
     assert parse_args(["--samples", "s.tsv", "--output-dir", "o"]).plot_format \
-        == "png"
+        == "pdf"
     assert parse_args(["--samples", "s.tsv", "--output-dir", "o",
                        "--plot-format", "pdf"]).plot_format == "pdf"
     with pytest.raises(SystemExit):

@@ -179,3 +179,18 @@ def report_excluded(excluded: set[str], present, kind: str = "contig"):
         log.warning(f"--exclude-chrom matched no {kind} for: "
                        f"{', '.join(sorted(unmatched))}")
     return kept
+
+
+def manifest_text(path: str | Path) -> "io.StringIO":
+    """Manifest text with WHOLE-LINE ``#`` comments dropped.
+
+    Deliberately not pandas' ``comment='#'``: that also strips INLINE ``#...``,
+    which silently truncates a row at a hex colour like ``#FF9A4C`` -- blanking
+    that field *and every column to its right* (so --color-column and the batch
+    columns all came back NaN).  Only full-line comments are removed here, which
+    keeps ``#`` usable inside a field.
+    """
+    import io
+    with open(path) as fh:
+        kept = [ln for ln in fh if not ln.lstrip().startswith("#")]
+    return io.StringIO("".join(kept))

@@ -120,15 +120,20 @@ def extract_cell(
         "read_id": list(raw["read_id"]),
         "cell_id": cell_id,
         "end_idx": np.asarray(raw["end_idx"], dtype=np.int8),
-        "chrom": pd.Categorical.from_codes(
-            chrom_idx, categories=names) if len(chrom_idx) else
-            pd.Categorical([], categories=names),
+        # Plain strings, deliberately not a Categorical.  The output is
+        # sharded by chromosome, so each file would carry a different category
+        # list, parquet would dictionary-encode them at different index widths
+        # (int8 here, int32 there), and reading the directory back as one table
+        # fails to merge the field.  One chromosome per file makes the column
+        # constant anyway, and parquet dictionary-encodes repeated strings.
+        "chrom": (np.asarray(names, dtype=object)[chrom_idx]
+                  if len(chrom_idx) else np.empty(0, dtype=object)),
         "pos_5p": np.asarray(raw["pos_5p"], dtype=np.int64),
         "pos_3p": np.asarray(raw["pos_3p"], dtype=np.int64),
         "strand": np.where(np.asarray(raw["is_reverse"]).astype(bool), "-", "+"),
-        "conv_strand": pd.Categorical(
+        "conv_strand": np.array(
             [STRAND_NAMES[int(v)] for v in np.asarray(raw["conv_strand"])],
-            categories=list(STRAND_NAMES.values())),
+            dtype=object),
         "mapq": np.asarray(raw["mapq"], dtype=np.int16),
     }
     for i, mark in enumerate(marks):
@@ -172,3 +177,81 @@ def conversion_rate(df: pd.DataFrame, level: str = "molecule") -> pd.Series:
     with np.errstate(invalid="ignore", divide="ignore"):
         rate = np.where(n > 0, 1.0 - k / np.maximum(n, 1), np.nan)
     return pd.Series(rate, index=idx, name="conversion_rate")
+
+
+def extract_cell_to_shards(
+    bam_path: str,
+    cell_id: str,
+    context_positions,
+    output_root,
+    *,
+    marks=DEFAULT_MARKS,
+    snp_positions=None,
+    min_gch_sites: int = 2,
+    min_hcg_sites: int = 1,
+    min_conversion: float = 0.95,
+    blacklist_bed: str | None = None,
+    **extract_kw,
+):
+    """One cell: extract, mark conversion, apply the A.1 site rule, shard.
+
+    Module level on purpose.  A worker function defined inside a script is
+    pickled by value, and joblib's loky backend then fails to un-serialize it
+    when the script was loaded any way other than as ``__main__``.  Keeping it
+    importable also means ``--threads`` behaves the same however the CLI is
+    invoked.
+
+    Returns ``(cell_id, [written paths], stats)``.
+    """
+    import time
+    from pathlib import Path as _Path
+
+    t0 = time.time()
+    df = extract_cell(bam_path, context_positions, cell_id=cell_id,
+                      marks=marks, snp_positions=snp_positions, **extract_kw)
+    stats = dict(df.attrs.get("stats", {}))
+    n_raw = len(df)
+
+    if len(df):
+        # A.3.5 -- mark, never drop.  Incomplete conversion inflates both marks
+        # at BOTH ends of one molecule, so the unit is the molecule and the
+        # artifact is invisible to a within-cell mate shuffle.
+        rate = conversion_rate(df, level="molecule")
+        df["conversion_rate"] = df["pair_idx"].map(rate).astype(float)
+        df["conversion_pass"] = (
+            df["conversion_rate"].fillna(0.0) >= min_conversion)
+
+        # A.1 -- an end passing EITHER site minimum is written.
+        a, b = f"n_{marks[0].lower()}", f"n_{marks[1].lower()}"
+        keep = (df[a] >= min_gch_sites) | (df[b] >= min_hcg_sites)
+        stats["n_ends_below_site_minima"] = int((~keep).sum())
+        df = df.loc[keep].reset_index(drop=True)
+
+    if blacklist_bed and len(df):
+        # The pipeline's existing read-level filter tests midpoints; both
+        # endpoints are tested here, which is strictly stronger.
+        from .blacklist import _positions_in_blacklist, load_blacklist_bed
+        bl = load_blacklist_bed(blacklist_bed)
+        chrom = df["chrom"].astype(str).to_numpy()
+        hit = (_positions_in_blacklist(chrom, df["pos_5p"].to_numpy(), bl)
+               | _positions_in_blacklist(chrom, df["pos_3p"].to_numpy(), bl))
+        stats["n_ends_blacklisted"] = int(np.asarray(hit).sum())
+        df = df.loc[~np.asarray(hit)].reset_index(drop=True)
+
+    root = _Path(output_root)
+    written = []
+    for chrom, sub in df.groupby("chrom", observed=True, sort=True):
+        out = root / f"chrom={chrom}" / f"{cell_id}.parquet"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # The chromosome is the Hive partition key, so it must NOT also be a
+        # column in the file: pyarrow reads the directory as a dataset, types
+        # the partition key as dictionary<string>, and refuses to merge it with
+        # a plain string column of the same name.  Dropping it here is the
+        # convention, and reading the directory back restores it.
+        sub.drop(columns=["chrom"]).reset_index(drop=True).to_parquet(
+            out, index=False)
+        written.append(str(out))
+
+    stats.update(n_ends_raw=n_raw, n_ends_written=len(df),
+                 elapsed_s=round(time.time() - t0, 1))
+    return cell_id, written, stats

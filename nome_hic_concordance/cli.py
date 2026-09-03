@@ -28,7 +28,7 @@ from . import (
     visualization,
 )
 from .utils import (add_exclude_chrom_arg, add_include_chrom_arg,
-                    chrom_excluded, chrom_key, ensure_dir,
+                    chrom_excluded, chrom_key, ensure_dir, manifest_text,
                     parse_exclude_chroms, parse_include_chroms,
                     report_excluded, setup_logging)
 
@@ -856,18 +856,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _manifest_text(path: str) -> io.StringIO:
-    """Manifest text with WHOLE-LINE ``#`` comments dropped.
-
-    Deliberately not pandas' ``comment='#'``: that also strips INLINE ``#...``,
-    which silently truncates a row at a hex colour like ``#FF9A4C`` — blanking
-    that field *and every column to its right* (so --color-column and the batch
-    columns all came back NaN).  Only full-line comments are removed here, which
-    keeps ``#`` usable inside a field.
-    """
-    with open(path) as fh:
-        kept = [ln for ln in fh if not ln.lstrip().startswith("#")]
-    return io.StringIO("".join(kept))
+#: Moved to utils so the joint-state manifest loader shares one implementation
+#: of the inline-``#`` trap rather than growing a second.
+_manifest_text = manifest_text
 
 
 def load_samples(path: str) -> pd.DataFrame:
