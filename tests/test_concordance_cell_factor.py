@@ -174,6 +174,14 @@ def level_run(tmp_path):
     prof = rng.normal(0, 0.03, (8, nb))
     bio = prof[t_idx] + rng.normal(0, 0.02, (n, nb))
     pd.DataFrame(bio, **frame).to_parquet(d / "concordance_bioC.parquet")
+    # A null that shares the level-driven structure, as the drawn null does,
+    # and two real matrices against it: one with nothing more, one with a
+    # cell-type profile on top.  All three separate cell types on their own.
+    base = r * (1 - 2 * p) / (p * (1 - p))
+    for nm, extra in (("nullL", 0.0), ("sharedL", 0.0),
+                      ("realL", rng.normal(0, 0.03, (8, nb))[t_idx])):
+        pd.DataFrame(base + extra + rng.normal(0, 0.02, (n, nb)),
+                     **frame).to_parquet(d / f"concordance_{nm}.parquet")
     sp = tmp_path / "s.tsv"
     pd.DataFrame({"cell_name": cells, "cell_type": types}).to_csv(
         sp, sep="\t", index=False)
@@ -213,3 +221,37 @@ def test_level_test_needs_four_cell_types(run):
     """Three cell-type means cannot carry a correlation worth reporting."""
     s = _summary(run, "bio")
     assert not s["kind"].str.startswith("level_tracking").any()
+
+
+def test_only_structure_beyond_the_null_survives_the_difference(level_run):
+    """The drawn null shares whatever the pipeline makes on its own; what
+    separates cell types in real - null is beyond it."""
+    d, sp, tmp = level_run
+    m = _mod()
+    null = str(d / "concordance_nullL.parquet")
+    argv = ["--matrix", f"sharedL={d / 'concordance_sharedL.parquet'}",
+            "--null", f"sharedL={null}",
+            "--matrix", f"realL={d / 'concordance_realL.parquet'}",
+            "--null", f"realL={null}",
+            "--samples", str(sp), "--cell-type-column", "cell_type",
+            "--top-bins", "100", "-o", str(tmp / "out" / "cf"),
+            "--plot-format", "png"]
+    assert m.main(argv) == 0
+    s = pd.read_csv(tmp / "out" / "cf.summary.tsv", sep="\t")
+    chance = _get(s, "sharedL", "purity", "knn_chance")
+    # on their own, all of them separate cell types -- through the level
+    for nm in ("sharedL", "sharedL_null", "realL"):
+        assert _get(s, nm, "purity", "knn_purity") > chance + 0.3, nm
+    assert _get(s, "sharedL_minus_null", "purity",
+                "knn_purity") < chance + 0.1
+    assert _get(s, "realL_minus_null", "purity", "knn_purity") > chance + 0.4
+
+
+def test_a_null_for_an_unnamed_matrix_is_refused(level_run):
+    d, sp, tmp = level_run
+    m = _mod()
+    with pytest.raises(SystemExit):
+        m.main(["--matrix", f"a={d / 'concordance_bioC.parquet'}",
+                "--null", f"b={d / 'concordance_nullL.parquet'}",
+                "--samples", str(sp), "--cell-type-column", "cell_type",
+                "-o", str(tmp / "out" / "cf")])

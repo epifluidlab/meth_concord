@@ -61,6 +61,17 @@ over all bins and over the --top-bins most cell-type-variable ones (the kind
 a marker heatmap draws).  Same bin well above other bins means the
 statistic's blocks follow each bin's own methylation.
 
+None of this says whether the structure is COORDINATION.  The drawn null
+does: step 5 carries it through the same counts, prior, imputation and
+expected side with no coordination, so whatever it shares with the real
+matrix the pipeline makes on its own.  --null NAME=PATH pairs a matrix with
+its null and adds two analyses, NAME_null and NAME_minus_null (real minus
+null, cell-bin by cell-bin), and every analysis reports kNN cell-type purity
+on its leading components against chance.  The factor real and null share
+cancels in the difference, so purity there is cell-type structure beyond
+what the pipeline produces without coordination.  A heatmap is worth
+drawing from a matrix only if that number is clearly above chance.
+
 Usage:
   concordance_cell_factor.py \\
       --matrix gch=.../context_GCH/05_concordance/concordance_coordination.margreg_k5.method1_local.resid.parquet \\
@@ -270,13 +281,31 @@ def eta2(x, groups) -> float:
     return float(((means - s.mean()) ** 2).sum() / tot)
 
 
-def analyse(name: str, path: str, cell_type: pd.Series,
-            batches: pd.DataFrame, args, out_dir: Path):
-    """Factor + covariates for one matrix -> (cells, bins, summary rows)."""
-    from nome_hic_concordance.comparison import _prep_matrix
-    mpath = Path(path)
-    raw = pd.read_parquet(mpath)
+def load_matrix(path) -> pd.DataFrame:
+    raw = pd.read_parquet(path)
     raw.index = raw.index.astype(str)
+    return raw
+
+
+def minus(real: pd.DataFrame, null: pd.DataFrame) -> pd.DataFrame:
+    """real - null on the cells and bins both carry; NaN where either is."""
+    cells = real.index.intersection(null.index)
+    bins = real.columns.intersection(null.columns)
+    return real.loc[cells, bins] - null.loc[cells, bins]
+
+
+def analyse(name: str, path: str, cell_type: pd.Series,
+            batches: pd.DataFrame, args, out_dir: Path,
+            raw: pd.DataFrame | None = None):
+    """Factor + covariates for one matrix -> (cells, bins, summary rows).
+
+    ``raw`` overrides the matrix read from ``path`` (used for real - null);
+    the step-5 sidecars are always looked up from ``path``.
+    """
+    from nome_hic_concordance.comparison import _prep_matrix
+    from nome_hic_concordance.metrics import knn_chance, knn_purity
+    mpath = Path(path)
+    raw = load_matrix(mpath) if raw is None else raw.copy()
     n_matrix = raw.shape[0]
     raw = raw.loc[[c for c in raw.index if c in cell_type.index]]
     excl = parse_exclude_chroms(args.exclude_chrom)
@@ -346,6 +375,12 @@ def analyse(name: str, path: str, cell_type: pd.Series,
         rows.append({"matrix": name, "kind": "rho_bins", "covariate": c,
                      "value": spearman(bins_df["PC1_loading"], bins_df[c]),
                      "note": "PC1 loading vs bin"})
+    k_pcs = max(1, min(args.n_pcs, scores.shape[1]))
+    rows.append({"matrix": name, "kind": "purity", "covariate": "knn_purity",
+                 "value": knn_purity(scores[:, :k_pcs], ct),
+                 "note": f"cell type, k=15 on {k_pcs} components"})
+    rows.append({"matrix": name, "kind": "purity", "covariate": "knn_chance",
+                 "value": knn_chance(ct), "note": "sum of squared shares"})
     top = type_variable_bins(normed, ct, args.top_bins)
     for scope, vals in level_tracking(raw.loc[:, retained], level, ct,
                                       top).items():
@@ -371,6 +406,9 @@ def verdict(summary: pd.DataFrame, name: str) -> str:
     eta = s[s["kind"] == "eta2"]
     lines.append("  PC1 between groups (eta2): " + ", ".join(
         f"{r.covariate} {r.value:.2f}" for r in eta.itertuples()))
+    if (s["kind"] == "purity").any():
+        lines.append(f"  cell-type kNN purity {get('purity', 'knn_purity'):.2f}"
+                     f" (chance {get('purity', 'knn_chance'):.2f})")
     within = s[s["kind"] == "rho_within_type"].dropna(subset=["value"])
     within = within.reindex(within["value"].abs().sort_values(
         ascending=False).index)
@@ -449,6 +487,11 @@ def main(argv=None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--matrix", action="append", required=True,
                     metavar="NAME=PATH")
+    ap.add_argument("--null", action="append", default=None,
+                    metavar="NAME=PATH",
+                    help="The drawn null for --matrix NAME (e.g. "
+                         "concordance_direction_logor_null.parquet).  Adds "
+                         "NAME_null and NAME_minus_null to the analysis.")
     ap.add_argument("--samples", required=True)
     ap.add_argument("--cell-column", default=None,
                     help="Cell id column (default: cell_name, cell or "
@@ -493,12 +536,31 @@ def main(argv=None) -> int:
     out_prefix = Path(args.output_prefix)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     all_cells, all_bins, rows = [], [], []
-    for spec in args.matrix:
-        if "=" not in spec:
-            sys.exit(f"--matrix expects NAME=PATH, got {spec!r}")
-        name, path = spec.split("=", 1)
+    def _specs(values, flag):
+        out = {}
+        for spec in values or []:
+            if "=" not in spec:
+                sys.exit(f"{flag} expects NAME=PATH, got {spec!r}")
+            k, v = spec.split("=", 1)
+            out[k] = v
+        return out
+
+    matrices = _specs(args.matrix, "--matrix")
+    nulls = _specs(args.null, "--null")
+    stray = [k for k in nulls if k not in matrices]
+    if stray:
+        sys.exit(f"--null given for {stray}, which no --matrix names")
+    jobs = []
+    for name, path in matrices.items():
+        jobs.append((name, path, None))
+        if name in nulls:
+            null = load_matrix(nulls[name])
+            jobs.append((f"{name}_null", path, null))
+            jobs.append((f"{name}_minus_null", path,
+                         minus(load_matrix(path), null)))
+    for name, path, raw in jobs:
         c, b, r = analyse(name, path, cell_type, batches, args,
-                          out_prefix.parent)
+                          out_prefix.parent, raw=raw)
         all_cells.append(c)
         all_bins.append(b)
         rows += r
@@ -512,6 +574,17 @@ def main(argv=None) -> int:
          formats=[f for f in args.plot_format.split(",") if f])
     for name in dict.fromkeys(summary["matrix"]):
         print(verdict(summary, name))
+    for name in nulls:
+        def pur(m):
+            v = summary[(summary["matrix"] == m) & (summary["kind"] == "purity")
+                        & (summary["covariate"] == "knn_purity")]["value"]
+            return float(v.iloc[0]) if len(v) else float("nan")
+        chance = summary[(summary["matrix"] == name)
+                         & (summary["covariate"] == "knn_chance")]["value"]
+        print(f"{name} against its null: cell-type purity real "
+              f"{pur(name):.2f}, null {pur(name + '_null'):.2f}, real - null "
+              f"{pur(name + '_minus_null'):.2f} (chance "
+              f"{float(chance.iloc[0]):.2f})")
     return 0
 
 
