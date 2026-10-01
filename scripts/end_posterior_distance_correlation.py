@@ -35,6 +35,14 @@ Nulls mirror the site-level script:
         restricted to cells sharing --null-match-column (e.g.
         exp_batch,plate_batch,lib_batch), so a donor never crosses a batch.
 
+Both nulls stay on the anchor's CHROMOSOME.  Ends are placed on a genome-wide
+coordinate (chromosome code x 2^33 + position) before any window is searched,
+so "two loci d apart" means two loci d apart in cis.  Before this, a cell's
+ends were sorted by position alone and a partner "10 kb away" was usually the
+same coordinate on another chromosome: on a 19-autosome cell, 93.6% of the
+distance-matched null pairs crossed chromosomes, at every distance, so the
+long-range null was effectively a trans baseline.
+
 Under either scope a draw that would re-create a real ligation is refused: read
 pairs carry run-wide identifiers, so two donor ends belonging to one read pair
 are recognised as such even when the pool spans hundreds of cells and the pair
@@ -52,6 +60,14 @@ between the two files is the point: one is resampled, the other parametric.
 With --group-column, a figure and table are written per cell-type group as well
 as for the pooled "all".
 
+--per-cell on (default) also asks whether concordance is detectable inside
+EACH cell -- panel a's contrast, one cell at a time, beyond --per-cell-min-
+distance (1 kb).  Writes end_posterior_percell.tsv (cell x mark: delta, its
+block-bootstrap SE, z, and a negative control from a second independent null
+draw) and end_posterior_percell.<fmt>, the Figure 5c panel.  See
+nome_hic_concordance/percell_existence.py for why the SE is a block bootstrap
+and why the control is a second null draw.
+
     python scripts/end_posterior_distance_correlation.py \\
         --posteriors GCH=output/signed_250kb_rwr/context_GCH/04_posteriors \\
         --posteriors HCG=output/signed_250kb_rwr/context_HCG/04_posteriors \\
@@ -66,6 +82,7 @@ import argparse
 import gzip
 import logging
 import sys
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -81,6 +98,7 @@ from nome_hic_concordance.distance_stats import (      # noqa: E402
     accumulate, bootstrap_delta, build_edges, corr_from_acc, fdr,
     fisher_z_cell, fisher_z_pooled, new_acc, stars)
 from nome_hic_concordance.progress import Progress      # noqa: E402
+from nome_hic_concordance import percell_existence as pce  # noqa: E402
 
 logger = logging.getLogger("end_posterior_dist")
 
@@ -101,6 +119,43 @@ _PAIR_STRIDE = 1 << 32
 
 def _pair_base(cell_index: int) -> int:
     return int(cell_index) * _PAIR_STRIDE
+
+
+#: Per-chromosome offset for genome-wide coordinates.  2^33 bp is far beyond
+#: any chromosome plus the widest search window (anchor window + max
+#: distance), so no null window can reach a neighbouring chromosome; and the
+#: largest code times this still fits int64 and float64 exactly.
+_GENOME_STRIDE = 1 << 33
+
+
+def _chrom_code(name) -> int:
+    """Stable integer per chromosome NAME, identical in every process.
+
+    Built from the name rather than from a dict filled on first sight: the
+    process backend and the pooled donor pool both need two different cells
+    to agree on a chromosome's code without sharing state.
+    """
+    c = _canon(name).upper()
+    if c.isdigit():
+        return int(c)
+    special = {"X": 1001, "Y": 1002, "M": 1003, "MT": 1003}
+    if c in special:
+        return special[c]
+    return 2000 + zlib.crc32(c.encode()) % 100_000
+
+
+def genome_coords(chrom, pos) -> np.ndarray:
+    """``code(chrom) * 2^33 + pos`` as int64, so position sorts stay in cis."""
+    pos = np.asarray(pos, dtype=np.int64)
+    ch = pd.Series(chrom)
+    if isinstance(ch.dtype, pd.CategoricalDtype):
+        lut = np.array([_chrom_code(c) for c in ch.cat.categories],
+                       dtype=np.int64)
+        codes = lut[ch.cat.codes.to_numpy()]
+    else:
+        names, inv = np.unique(ch.astype(str).to_numpy(), return_inverse=True)
+        codes = np.array([_chrom_code(c) for c in names], dtype=np.int64)[inv]
+    return codes * _GENOME_STRIDE + pos
 
 
 # ---------------------------------------------------------------- exclusion --
@@ -285,9 +340,12 @@ def joined_pairs(per_ctx: dict[str, pd.DataFrame]):
     j = h.merge(g, on=["chrom", "pos1", "pos2"], suffixes=("_h", "_g"))
     if j.empty:
         return None
-    return j.rename(columns={"distance_h": "distance"})[
+    j = j.rename(columns={"distance_h": "distance"})[
         ["chrom", "pos1", "pos2", "distance",
          "p1_h", "p2_h", "p1_g", "p2_g"]]
+    # Genome-wide coordinates for the null searches; pos1/pos2 stay raw.
+    return j.assign(gpos1=genome_coords(j["chrom"], j["pos1"]),
+                    gpos2=genome_coords(j["chrom"], j["pos2"]))
 
 
 def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]],
@@ -305,7 +363,11 @@ def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]],
     so that a pooled donor pool spanning many cells stays unambiguous.
     """
     n = len(df)
-    pos = np.concatenate([df["pos1"].to_numpy(), df["pos2"].to_numpy()])
+    # Genome-wide coordinates when the caller has them (joined_pairs always
+    # adds them), so the donor table never interleaves chromosomes.
+    c1, c2 = (("gpos1", "gpos2") if "gpos1" in df.columns
+              else ("pos1", "pos2"))
+    pos = np.concatenate([df[c1].to_numpy(), df[c2].to_numpy()])
     ids = base + np.arange(n, dtype=np.int64)
     pi = np.concatenate([ids, ids])
     order = np.argsort(pos, kind="stable")
@@ -603,11 +665,12 @@ def _init_worker(paths, edges, args, pools, batch_of, merged, excl_chrom):
 
 
 def _worker(job):
-    """Only (cell, index) crosses the process boundary per task."""
-    cell, i = job
+    """Only (cell, index[, want_percell]) crosses the process boundary."""
+    cell, i = job[0], job[1]
+    want = bool(job[2]) if len(job) > 2 else False
     return _accumulate_cell(cell, i, _W["paths"], _W["edges"], _W["args"],
                             _W["pools"], _W["batch_of"], _W["merged"],
-                            _W["excl_chrom"])
+                            _W["excl_chrom"], want)
 
 
 def _drain(results, accs, per_cell, total, label):
@@ -635,7 +698,7 @@ def _drain(results, accs, per_cell, total, label):
 
 
 def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
-                     merged, excl_chrom):
+                     merged, excl_chrom, want_percell=False):
     """One cell's contribution, as its own accumulators.
 
     Returned rather than added in place so the cells can run on a thread pool
@@ -677,31 +740,20 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
     if args.null_scope == "pooled":
         pool = pools.get(bkey)
         if pool is None:
+            if want_percell:
+                accs["_percell"] = _percell_blocks(j, d, None, None, edges,
+                                                   args)
             return accs, n_pairs, 0
         d_pos, d_vals, d_pi = pool
     else:
         d_pos, d_vals, d_pi = a_pos, a_vals, a_pi
 
-    if args.null_type == "distance-matched":
-        got = _null_indices_distance_matched(
-            j["pos1"].to_numpy(), d, d_pos, d_pi, edges, rng,
-            args.null_window, args.null_anchor_window)
-        if got is None:
-            return accs, n_pairs, 0
-        ka, kb, dn = got
-        xa = {k: v[ka] for k, v in d_vals.items()}
-        xb = {k: v[kb] for k, v in d_vals.items()}
-    else:
-        got = _null_indices_locus_matched(
-            j["pos2"].to_numpy(), j["pos1"].to_numpy(),
-            base + np.arange(len(j), dtype=np.int64),
-            d_pos, d_pi, rng, args.null_window)
-        if got is None:
-            return accs, n_pairs, 0
-        ai, kb, dn = got
-        # end 1 stays with the anchor; end 2 comes from the donor pool
-        xa = {"g": j["p1_g"].to_numpy()[ai], "h": j["p1_h"].to_numpy()[ai]}
-        xb = {k: v[kb] for k, v in d_vals.items()}
+    drawn = _draw_null(j, d, d_pos, d_vals, d_pi, base, edges, args, rng)
+    if drawn is None:
+        if want_percell:
+            accs["_percell"] = _percell_blocks(j, d, None, None, edges, args)
+        return accs, n_pairs, 0
+    xa, xb, dn, null_anchor = drawn
 
     keep = (dn >= edges[0]) & (dn <= edges[-1])
     if keep.any():
@@ -713,7 +765,91 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
         accumulate(accs[("gh", "null")], bn, xa["h"][keep], xb["g"][keep])
         accumulate(accs[("gh", "null")], bn, xa["g"][keep], xb["h"][keep])
         n_null = int(keep.sum())
+
+    if want_percell:
+        # A SECOND, independent null draw on its own generator, so the arm
+        # above -- and with it every panel a number -- is bit-identical with
+        # or without --per-cell.
+        rng2 = np.random.default_rng([args.seed, seed_i, 2])
+        drawn2 = _draw_null(j, d, d_pos, d_vals, d_pi, base, edges, args, rng2)
+        accs["_percell"] = _percell_blocks(j, d, drawn, drawn2, edges, args)
     return accs, n_pairs, n_null
+
+
+def _draw_null(j, d, d_pos, d_vals, d_pi, base, edges, args, rng):
+    """One null re-pairing: ``(xa, xb, distance, anchor_genome_pos)`` or None.
+
+    One helper for both draws, so the per-cell control is built exactly the
+    way panel a's null is.
+    """
+    if args.null_type == "distance-matched":
+        got = _null_indices_distance_matched(
+            j["gpos1"].to_numpy(), d, d_pos, d_pi, edges, rng,
+            args.null_window, args.null_anchor_window)
+        if got is None:
+            return None
+        ka, kb, dn = got
+        xa = {k: v[ka] for k, v in d_vals.items()}
+        xb = {k: v[kb] for k, v in d_vals.items()}
+        return xa, xb, dn, d_pos[ka]
+    got = _null_indices_locus_matched(
+        j["gpos2"].to_numpy(), j["gpos1"].to_numpy(),
+        base + np.arange(len(j), dtype=np.int64),
+        d_pos, d_pi, rng, args.null_window)
+    if got is None:
+        return None
+    ai, kb, dn = got
+    # end 1 stays with the anchor; end 2 comes from the donor pool
+    xa = {"g": j["p1_g"].to_numpy()[ai], "h": j["p1_h"].to_numpy()[ai]}
+    xb = {k: v[kb] for k, v in d_vals.items()}
+    return xa, xb, dn, j["gpos1"].to_numpy()[ai]
+
+
+def _percell_blocks(j, d, drawn, drawn2, edges, args):
+    """Per-genomic-block raw sums for each arm, beyond the per-cell floor.
+
+    Blocks are --per-cell-block wide on the genome-wide coordinate, so a block
+    never spans two chromosomes.  The bootstrap resamples these, which is what
+    carries the spatial dependence between pairs into the per-cell SE.
+    """
+    lo = max(float(args.per_cell_min_distance), float(edges[0]))
+    hi = float(edges[-1])
+    B = int(args.per_cell_block)
+    out = {}
+
+    lk = (d >= lo) & (d <= hi)
+    blk = j["gpos1"].to_numpy()[lk] // B
+    g1, g2 = j["p1_g"].to_numpy()[lk], j["p2_g"].to_numpy()[lk]
+    h1, h2 = j["p1_h"].to_numpy()[lk], j["p2_h"].to_numpy()[lk]
+    linked = {
+        "gg": pce.block_sums(blk, g1, g2),
+        "hh": pce.block_sums(blk, h1, h2),
+        "gh": pce.block_sums(np.concatenate([blk, blk]),
+                             np.concatenate([h1, h2]),
+                             np.concatenate([g2, g1])),
+    }
+
+    def arm(dr):
+        if dr is None:
+            return None
+        xa, xb, dn, anchor = dr
+        k = (dn >= lo) & (dn <= hi)
+        bb = anchor[k] // B
+        return {
+            "gg": pce.block_sums(bb, xa["g"][k], xb["g"][k]),
+            "hh": pce.block_sums(bb, xa["h"][k], xb["h"][k]),
+            "gh": pce.block_sums(np.concatenate([bb, bb]),
+                                 np.concatenate([xa["h"][k], xa["g"][k]]),
+                                 np.concatenate([xb["g"][k], xb["h"][k]])),
+        }
+
+    null, null2 = arm(drawn), arm(drawn2)
+    empty = (np.empty(0, np.int64), np.empty((0, 6)))
+    for m in ("gg", "hh", "gh"):
+        out[m] = {"L": linked[m],
+                  "N": null[m] if null else empty,
+                  "N2": null2[m] if null2 else None}
+    return out
 
 
 def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
@@ -777,7 +913,7 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
 
 
 def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
-              merged=None, excl_chrom=(), executor=None):
+              merged=None, excl_chrom=(), executor=None, percell=None):
     nb = len(edges) - 1
     accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
     pools = ({} if args.null_scope != "pooled"
@@ -786,7 +922,8 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
 
     n_pairs = n_null = 0
     per_cell: list = []   # kept for the cell-level bootstrap
-    jobs = [(c, i) for i, c in enumerate(cells)]
+    want = percell is not None
+    jobs = [(c, i, want) for i, c in enumerate(cells)]
     if executor is not None and len(cells) > 1:
         # The pool is created once for the whole run and reused across groups.
         # Only ProcessPoolExecutor.map honours chunksize; threads ignore it.
@@ -813,13 +950,13 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
             out = _drain(executor.map(
                 lambda ci: _accumulate_cell(ci[0], ci[1], paths, edges, args,
                                             pools, batch_of, merged,
-                                            excl_chrom), jobs),
+                                            excl_chrom, ci[2]), jobs),
                          accs, per_cell, len(jobs), label)
         n_pairs, n_null = out
     else:
-        for c, i in jobs:
+        for c, i, w in jobs:
             a, np_, nn_ = _accumulate_cell(c, i, paths, edges, args, pools,
-                                           batch_of, merged, excl_chrom)
+                                           batch_of, merged, excl_chrom, w)
             for k in accs:
                 accs[k] += a[k]
             per_cell.append(a)
@@ -913,7 +1050,51 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                 args, note, fisher=fz)
     logger.info(f"  {label}: {n_pairs:,} linked and {n_null:,} null "
                 f"end-pairs; wrote {tsv}")
+    if want:
+        write_percell(cells, per_cell, args, out_dir, percell)
     return curves, centers
+
+
+def write_percell(cells, per_cell, args, out_dir, meta):
+    """end_posterior_percell.tsv and the Figure 5c panel from it.
+
+    ``per_cell[i]`` belongs to ``cells[i]``: both _drain and the serial loop
+    keep job order (executor.map preserves it).
+    """
+    rows = []
+    for i, (cell, acc) in enumerate(zip(cells, per_cell)):
+        blocks = acc.get("_percell")
+        if not blocks:
+            continue
+        for m, arms in blocks.items():
+            st = pce.percell_stats(arms["L"], arms["N"], arms.get("N2"),
+                                   n_boot=args.per_cell_bootstrap,
+                                   seed=args.seed + i,
+                                   min_pairs=args.per_cell_min_pairs)
+            rows.append({"cell_id": cell,
+                         "group": meta["group_of"].get(cell, "all"),
+                         "mark": pce.MEASURE_TO_MARK[m], **st})
+    if not rows:
+        logger.warning("  per-cell: no cell produced a usable row")
+        return None
+    df = pce.add_q(pd.DataFrame(rows))
+    df["min_distance"] = int(args.per_cell_min_distance)
+    tsv = Path(out_dir) / "end_posterior_percell.tsv"
+    df.to_csv(tsv, sep="\t", index=False)
+    for mark, d in df.groupby("mark"):
+        ok = d["z"].notna()
+        logger.info(
+            f"  per-cell {mark}: {int((d['q'] < 0.05).sum()):,}/{int(ok.sum()):,}"
+            f" cells q<0.05; negative control {int((d['q_null'] < 0.05).sum()):,}")
+    plotted = df[df["mark"].isin(pce.MARKS) & df["z"].notna()
+                 & df["z_null"].notna()]
+    if len(plotted):
+        pce.plot(plotted, group_order=meta.get("order"),
+                 group_colors=meta.get("colors"),
+                 out_prefix=str(Path(out_dir) / "end_posterior_percell"),
+                 formats=(args.plot_format,))
+    logger.info(f"  wrote {tsv}")
+    return df
 
 
 def main(argv=None) -> int:
@@ -1004,6 +1185,29 @@ def main(argv=None) -> int:
                     help="Multiple-testing adjustment across every bin and "
                          "measure in a figure.  'bh' assumes positive "
                          "dependence, which adjacent distance bins have.")
+    ap.add_argument("--per-cell", choices=["on", "off"], default="on",
+                    help="Also test each cell on its own (Figure 5c): panel "
+                         "a's delta per cell, a block-bootstrap SE, and a "
+                         "second independent null draw as the negative "
+                         "control.  Panel a's numbers do not change either "
+                         "way.")
+    ap.add_argument("--per-cell-min-distance", type=int, default=1000,
+                    help="Per-cell test uses pairs at least this far apart "
+                         "(1 kb): below it most pairs are the two ends of one "
+                         "unligated fragment, not contacts.")
+    ap.add_argument("--per-cell-block", type=int, default=10_000_000,
+                    help="Genomic block (bp) the per-cell bootstrap resamples "
+                         "(10 Mb), so pairs that share a domain move together.")
+    ap.add_argument("--per-cell-bootstrap", type=int, default=200)
+    ap.add_argument("--per-cell-min-pairs", type=int, default=100,
+                    help="A cell needs this many pairs in BOTH arms, beyond "
+                         "--per-cell-min-distance, to be tested.")
+    ap.add_argument("--group-order", default=None,
+                    help="Comma-delimited group order for the per-cell panel; "
+                         "names may contain '/', so only ',' splits.")
+    ap.add_argument("--color-column", default=None,
+                    help="Per-group colour column in --samples for the "
+                         "per-cell panel.")
     ap.add_argument("--max-cells", type=int, default=0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--plot-format", choices=["pdf", "png", "svg"],
@@ -1085,14 +1289,33 @@ def main(argv=None) -> int:
                     f"{args.backend}(s), pool reused across groups.")
     elif args.backend == "auto":            # serial: nothing to choose
         args.backend = "thread"
+    percell = None
+    if args.per_cell == "on":
+        idx = samples.set_index(args.cell_column)
+        group_of = ({c: str(idx[args.group_column].get(c, "NA")) for c in cells}
+                    if args.group_column else {})
+        order = ([g.strip() for g in args.group_order.split(",") if g.strip()]
+                 if args.group_order else None)
+        colors = None
+        if args.color_column and args.group_column:
+            if args.color_column not in samples.columns:
+                raise SystemExit(f"--color-column {args.color_column!r} not in "
+                                 f"--samples")
+            colors = (samples.dropna(subset=[args.color_column])
+                      .groupby(args.group_column)[args.color_column].first()
+                      .astype(str).to_dict())
+        percell = {"group_of": group_of, "order": order, "colors": colors}
     try:
         per_group = {}
         for label, gcells in groups.items():
             safe = label.replace("/", "_").replace(" ", "_")
             logger.info(f"--- {label} ({len(gcells)} cells) ---")
+            # Per-cell statistics depend on the cell, not on the group being
+            # summarised, so they are computed once: in the "all" pass.
             per_group[label] = run_group(
                 gcells, paths, edges, args, safe, out_dir, batch_of, merged,
-                excl_chrom, executor)
+                excl_chrom, executor,
+                percell=percell if label == "all" else None)
         overlay = out_dir / f"end_posterior_dist_by_group.{args.plot_format}"
         if _figure_by_group(per_group, overlay, args):
             logger.info(f"wrote {overlay}  "

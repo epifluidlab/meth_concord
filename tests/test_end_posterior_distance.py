@@ -805,3 +805,198 @@ def test_auto_switches_to_processes_once_past_the_threshold(tmp_path):
     assert m._PROCESS_FROM_CELLS > 8      # the fixture must land below it
     _, err = _run_cli(tmp_path, ["--n-threads", "2", "--max-cells", "8"])
     assert "--backend auto -> thread" in err
+
+
+# ------------------------------------------------- nulls stay in cis (fix) ---
+
+def _multi_chrom_pairs(seed=0, n_chrom=19, n=4000):
+    """Ends on many chromosomes over the SAME coordinate range, as a real
+    genome has them -- the case a single-chromosome fixture cannot see."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for c in range(1, n_chrom + 1):
+        p1 = rng.integers(0, 80_000_000, n)
+        d = (10 ** rng.uniform(3, 7, n)).astype(np.int64)
+        rows.append(pd.DataFrame({
+            "chrom": f"chr{c}", "pos1": p1, "pos2": p1 + d,
+            "distance": d.astype(float),
+            "p1_h": rng.random(n), "p2_h": rng.random(n),
+            "p1_g": rng.random(n), "p2_g": rng.random(n)}))
+    j = pd.concat(rows, ignore_index=True)
+    j["chrom"] = j["chrom"].astype("category")
+    return j
+
+
+def _chrom_of(m, gpos):
+    return np.asarray(gpos) // m._GENOME_STRIDE
+
+
+def test_distance_matched_null_never_crosses_chromosomes():
+    """"Two loci d apart" is a cis statement.  With ends sorted by raw position
+    a partner 10 kb away was usually the same coordinate on another
+    chromosome; on 19 chromosomes 9 in 10 null pairs were trans."""
+    m = _mod()
+    j = _multi_chrom_pairs()
+    j = j.assign(gpos1=m.genome_coords(j["chrom"], j["pos1"]),
+                 gpos2=m.genome_coords(j["chrom"], j["pos2"]))
+    cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
+    d_pos, _, d_pi = m.end_table(j, cols, 0)
+    edges = m.build_edges(1000, 10_000_000, 8)
+    ka, kb, dn = m._null_indices_distance_matched(
+        j["gpos1"].to_numpy(), j["distance"].to_numpy(), d_pos, d_pi, edges,
+        np.random.default_rng(1), 1000, 10_000_000)
+    assert ka.size > 0.9 * len(j)
+    assert (_chrom_of(m, d_pos[ka]) == _chrom_of(m, d_pos[kb])).all(), (
+        "a distance-matched null pair crossed chromosomes")
+    assert (dn <= 10_000_000 + 1).all()
+
+
+def test_the_raw_position_version_did_cross_chromosomes():
+    """Pins what the fix fixed, so a regression back to raw positions fails
+    here rather than quietly re-flattening panel a's long-range null."""
+    m = _mod()
+    j = _multi_chrom_pairs(seed=2)
+    pos = np.concatenate([j["pos1"].to_numpy(), j["pos2"].to_numpy()])
+    chrom = np.concatenate([j["chrom"].to_numpy(), j["chrom"].to_numpy()])
+    pi = np.concatenate([np.arange(len(j))] * 2)
+    o = np.argsort(pos, kind="stable")
+    edges = m.build_edges(1000, 10_000_000, 8)
+    ka, kb, _ = m._null_indices_distance_matched(
+        j["pos1"].to_numpy(), j["distance"].to_numpy(), pos[o], pi[o], edges,
+        np.random.default_rng(1), 1000, 10_000_000)
+    assert (chrom[o][ka] != chrom[o][kb]).mean() > 0.8
+
+
+def test_locus_matched_null_never_crosses_chromosomes():
+    m = _mod()
+    j = _multi_chrom_pairs(seed=3)
+    j = j.assign(gpos1=m.genome_coords(j["chrom"], j["pos1"]),
+                 gpos2=m.genome_coords(j["chrom"], j["pos2"]))
+    d_pos, _, d_pi = m.end_table(j, {"g": ("p1_g", "p2_g")}, 0)
+    ai, kb, _ = m._null_indices_locus_matched(
+        j["gpos2"].to_numpy(), j["gpos1"].to_numpy(),
+        np.arange(len(j), dtype=np.int64), d_pos, d_pi,
+        np.random.default_rng(4), 1000)
+    anchor_chrom = _chrom_of(m, j["gpos1"].to_numpy()[ai])
+    assert (anchor_chrom == _chrom_of(m, d_pos[kb])).all()
+
+
+def test_chrom_codes_are_stable_and_distinct():
+    m = _mod()
+    names = [f"chr{i}" for i in range(1, 20)] + ["chrX", "chrY", "chrM"]
+    codes = [m._chrom_code(c) for c in names]
+    assert len(set(codes)) == len(codes)
+    assert m._chrom_code("chr7") == m._chrom_code("7")
+    assert m._chrom_code("chrM") == m._chrom_code("MT")
+    assert m._chrom_code("chrUn_JH584304") == m._chrom_code("chrUn_JH584304")
+
+
+def test_one_chromosome_draws_are_unchanged_by_the_shift():
+    """Genome coordinates only add a constant on one chromosome, so every
+    existing single-chromosome result is bit-identical."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    pos = np.sort(rng.integers(0, 5_000_000, 4000)).astype(np.int64)
+    pi = np.arange(4000) // 2
+    anchors, dist = pos[::2], rng.integers(1000, 100_000, 2000).astype(float)
+    edges = m.build_edges(100, 1_000_000, 8)
+    shift = m._chrom_code("chr1") * m._GENOME_STRIDE
+    a = m._null_indices_distance_matched(anchors, dist, pos, pi, edges,
+                                         np.random.default_rng(5), 1000, 10**7)
+    b = m._null_indices_distance_matched(anchors + shift, dist, pos + shift,
+                                         pi, edges, np.random.default_rng(5),
+                                         1000, 10**7)
+    for x, y in zip(a, b):
+        assert np.array_equal(x, y)
+
+
+# ------------------------------------------------------- per-cell (Fig. 5c) ---
+
+_PERCELL = ["--per-cell-block", "50000", "--per-cell-min-distance", "500",
+            "--per-cell-min-pairs", "50", "--per-cell-bootstrap", "100",
+            "--group-column", "group"]
+
+
+def test_per_cell_table_and_panel_are_written(tmp_path):
+    _, out = _run(tmp_path, _PERCELL)
+    t = pd.read_csv(out / "end_posterior_percell.tsv", sep="\t")
+    for c in ("cell_id", "group", "mark", "n_pairs", "n_blocks", "r_linked",
+              "r_null", "delta", "se", "z", "r_null2", "delta_null",
+              "se_null", "z_null", "q", "q_null", "min_distance"):
+        assert c in t.columns, c
+    assert set(t["mark"]) == {"GCH", "HCG", "HCG-GCH"}
+    assert len(t) == 8 * 3, "one row per cell per mark"
+    assert set(t["group"]) == {"A", "B"}
+    assert (out / "end_posterior_percell.png").exists()
+
+
+def test_per_cell_finds_the_planted_concordance(tmp_path):
+    """The fixture plants a shared latent per pair (strong for GCH)."""
+    _, out = _run(tmp_path, _PERCELL)
+    t = pd.read_csv(out / "end_posterior_percell.tsv", sep="\t")
+    g = t[t["mark"] == "GCH"]
+    assert (g["delta"] > 0).all()
+    assert (g["z"] > 3).mean() > 0.7
+    assert (g["se"] > 0).all()
+
+
+def test_panel_a_is_identical_with_or_without_per_cell(tmp_path):
+    """The control draw runs on its own generator, so switching the per-cell
+    output on must not move a single panel a number."""
+    on, _ = _run(tmp_path / "on", _PERCELL)
+    off, _ = _run(tmp_path / "off", ["--per-cell", "off"])
+    pd.testing.assert_frame_equal(on, off)
+
+
+def test_per_cell_off_writes_nothing_extra(tmp_path):
+    _, out = _run(tmp_path, ["--per-cell", "off"])
+    assert not (out / "end_posterior_percell.tsv").exists()
+
+
+def test_negative_control_is_calibrated():
+    """Two independent null re-pairings, put through the same per-cell test,
+    must look like N(0,1) -- otherwise the panel's headline count is not
+    interpretable."""
+    from nome_hic_concordance import percell_existence as pce
+    rng = np.random.default_rng(10)
+    zs = []
+    for cell in range(300):
+        k, per = 40, 60
+        blocks = np.repeat(np.arange(k), per)
+        def arm():
+            x = rng.normal(size=k * per)
+            y = rng.normal(size=k * per)
+            return pce.block_sums(blocks, x, y)
+        st = pce.percell_stats(arm(), arm(), arm(), n_boot=150, seed=cell)
+        zs.append(st["z_null"])
+    zs = np.array(zs)
+    assert abs(zs.mean()) < 0.25, zs.mean()
+    assert 0.75 < zs.std() < 1.3, zs.std()
+
+
+def test_block_bootstrap_widens_the_se_when_pairs_share_a_block():
+    """Pairs in one domain share state; a 1/sqrt(n) SE treats them as
+    independent and calls every cell significant.  The block bootstrap must
+    see the dependence."""
+    from nome_hic_concordance import percell_existence as pce
+    rng = np.random.default_rng(11)
+    k, per = 40, 60
+    blocks = np.repeat(np.arange(k), per)
+
+    def arm(shared):
+        u = np.repeat(rng.normal(size=k), per) if shared else 0.0
+        x = u + rng.normal(size=k * per)
+        y = u + rng.normal(size=k * per)
+        return pce.block_sums(blocks, x, y)
+
+    indep = pce.percell_stats(arm(False), arm(False), n_boot=300, seed=1)
+    clustered = pce.percell_stats(arm(True), arm(True), n_boot=300, seed=1)
+    assert clustered["se"] > 1.5 * indep["se"]
+
+
+def test_a_thin_cell_reports_nan_not_zero():
+    from nome_hic_concordance import percell_existence as pce
+    few = pce.block_sums(np.zeros(10, int), np.arange(10.0), np.arange(10.0))
+    st = pce.percell_stats(few, few, min_pairs=100)
+    assert np.isnan(st["delta"]) and np.isnan(st["z"])
+    assert st["n_pairs"] == 10
