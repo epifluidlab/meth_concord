@@ -1025,7 +1025,10 @@ def test_a_cell_without_hcg_still_counts_for_gch(tmp_path):
                        "--posteriors", f"HCG={tmp_path / 'HCG'}",
                        "--samples", sp, "--min-pairs", "50",
                        "--plot-format", "png", "--output-dir", str(o),
-                       "--pair-set", mode] + _PERCELL) == 0
+                       "--pair-set", mode,
+                       # follow --pair-set, so this compares the two SETS;
+                       # by default the per-cell test is per-mark either way
+                       "--per-cell-pair-set", "same"] + _PERCELL) == 0
         out[mode] = pd.read_csv(o / "end_posterior_percell.tsv", sep="\t")
     g_pm = set(out["per-mark"].query("mark == 'GCH'")["cell_id"])
     g_jt = set(out["joint"].query("mark == 'GCH'")["cell_id"])
@@ -1134,3 +1137,128 @@ def test_explicit_min_sites_still_applies_to_both_marks():
     assert m._min_sites(a) == {"GCH": 3, "HCG": 3}
     b = argparse.Namespace(min_sites=None, min_sites_gch=2, min_sites_hcg=1)
     assert m._min_sites(b) == {"GCH": 2, "HCG": 1}
+
+
+# ------------------------------- --null-chrom any reproduces the original ---
+
+_REPRO = ["--pair-set", "joint", "--min-sites", "2", "--null-chrom", "any",
+          "--delta-arm", "linked"]
+
+
+def _multi_chrom_fixture(root, n_cells=8, seed=3):
+    rng = np.random.default_rng(seed)
+    for ctx in ("GCH", "HCG"):
+        (root / ctx).mkdir(parents=True, exist_ok=True)
+    cells = [f"c{i}" for i in range(n_cells)]
+    for c in cells:
+        rows = []
+        for ch in range(1, 7):
+            for _ in range(100):
+                p1 = int(rng.integers(0, 30_000_000))
+                d = int(10 ** rng.uniform(2, 6.8))
+                rows.append((f"chr{ch}", p1, p1 + d, d))
+        for ctx in ("GCH", "HCG"):
+            recs = []
+            for chrom, p1, p2, d in rows:
+                u = rng.normal()
+                f = lambda: float(1 / (1 + np.exp(                    # noqa
+                    -(u * 0.8 + rng.normal(0, 0.7)))))
+                recs.append({"chrom": chrom, "pos1": p1, "pos2": p2,
+                             "n1": 4, "n2": 4, "distance": d,
+                             "posterior1": f(), "posterior2": f()})
+            pd.DataFrame(recs).to_parquet(root / ctx / f"{c}.posteriors.parquet")
+    sp = root / "s.tsv"
+    pd.DataFrame({"cell_name": cells,
+                  "group": np.repeat(["A", "B"], n_cells // 2)}).to_csv(
+        sp, sep="\t", index=False)
+    return str(sp)
+
+
+def _main_on(m, root, sp, out, extra):
+    return m.main(["--posteriors", f"GCH={root / 'GCH'}",
+                   "--posteriors", f"HCG={root / 'HCG'}", "--samples", sp,
+                   "--min-pairs", "20", "--plot-format", "png",
+                   "--n-threads", "1", "--n-bootstrap", "100",
+                   "--output-dir", str(out)] + extra)
+
+
+def test_reproduction_flags_match_the_original_script_exactly(tmp_path):
+    """--pair-set joint --min-sites 2 --null-chrom any --delta-arm linked must
+    give the ORIGINAL panel a, column for column, on several chromosomes --
+    the case where the old and new nulls actually differ."""
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    probe = subprocess.run(["git", "-C", str(root), "show",
+                            "d5d3cf1:scripts/end_posterior_distance_correlation.py"],
+                           capture_output=True, text=True)
+    if probe.returncode != 0:
+        pytest.skip("original revision not available in this checkout")
+    orig_path = tmp_path / "orig_epd.py"
+    orig_path.write_text(probe.stdout)
+    spec = importlib.util.spec_from_file_location("orig_epd", orig_path)
+    orig = importlib.util.module_from_spec(spec)
+    sys.modules["orig_epd"] = orig
+    spec.loader.exec_module(orig)
+
+    sp = _multi_chrom_fixture(tmp_path)
+    assert _main_on(orig, tmp_path, sp, tmp_path / "old", []) == 0
+    m = _mod()
+    assert _main_on(m, tmp_path, sp, tmp_path / "new",
+                    _REPRO + ["--per-cell", "off"]) == 0
+    a = pd.read_csv(tmp_path / "old" / "end_posterior_dist_all.tsv", sep="\t")
+    b = pd.read_csv(tmp_path / "new" / "end_posterior_dist_all.tsv", sep="\t")
+    shared = [c for c in a.columns if c in b.columns]
+    assert len(shared) > 30
+    for c in shared:
+        assert a[c].equals(b[c]), c
+
+
+def test_panel_a_is_untouched_by_a_separate_per_cell_pass(tmp_path):
+    """Panel c runs on per-mark pairs while panel a reproduces the joint
+    original; its draws use their own generators, so switching it on must not
+    move panel a."""
+    m = _mod()
+    sp = _multi_chrom_fixture(tmp_path)
+    assert _main_on(m, tmp_path, sp, tmp_path / "on", _REPRO + _PERCELL) == 0
+    assert _main_on(m, tmp_path, sp, tmp_path / "off",
+                    _REPRO + ["--per-cell", "off"]) == 0
+    pd.testing.assert_frame_equal(
+        pd.read_csv(tmp_path / "on" / "end_posterior_dist_all.tsv", sep="\t"),
+        pd.read_csv(tmp_path / "off" / "end_posterior_dist_all.tsv", sep="\t"))
+
+
+def test_per_cell_keeps_per_mark_pairs_when_panel_a_is_joint(tmp_path):
+    m = _mod()
+    sp = _fixture(tmp_path)
+    _drop_hcg(tmp_path, ["c0", "c1"])
+    out = tmp_path / "out"
+    assert m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
+                   "--posteriors", f"HCG={tmp_path / 'HCG'}", "--samples", sp,
+                   "--min-pairs", "50", "--plot-format", "png",
+                   "--output-dir", str(out)] + _REPRO + _PERCELL) == 0
+    t = pd.read_csv(out / "end_posterior_percell.tsv", sep="\t")
+    assert {"c0", "c1"} <= set(t.query("mark == 'GCH'")["cell_id"])
+
+
+def test_null_chrom_any_crosses_chromosomes_and_same_does_not():
+    import argparse
+    m = _mod()
+    j = _multi_chrom_pairs(seed=9)
+    j = j.assign(gpos1=m.genome_coords(j["chrom"], j["pos1"]),
+                 gpos2=m.genome_coords(j["chrom"], j["pos2"]))
+    cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
+    edges = m.build_edges(1000, 10_000_000, 8)
+    d = j["distance"].to_numpy()
+    frac = {}
+    for mode in ("same", "any"):
+        a = argparse.Namespace(null_type="distance-matched", null_window=1000,
+                               null_anchor_window=10_000_000, null_chrom=mode)
+        d_pos, d_vals, d_pi = m.end_table(j, cols, 0, m._coords(a))
+        xa, xb, dn, anchor, aidx = m._draw_null(
+            j, d, cols, d_pos, d_vals, d_pi, 0, edges, a,
+            np.random.default_rng(2))
+        # chromosome of each null end, read off the genome coordinate
+        frac[mode] = float(((xa["_gpos"] // m._GENOME_STRIDE)
+                            != (xb["_gpos"] // m._GENOME_STRIDE)).mean())
+    assert frac["same"] == 0.0
+    assert frac["any"] > 0.8

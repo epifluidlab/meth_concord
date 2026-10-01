@@ -421,7 +421,7 @@ def joined_pairs(per_ctx: dict[str, pd.DataFrame]):
 
 
 def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]],
-              base: int = 0):
+              base: int = 0, coords: str = "genome"):
     """Both ends of every pair, sorted by position.
 
     ``cols`` maps an output name to the (end-1, end-2) column pair, so one call
@@ -431,21 +431,35 @@ def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]],
     re-create a real ligation.  Both ends of a pair carry the SAME id, so the
     check also stops an end from being paired with itself.
 
+    ``coords="genome"`` sorts on the genome-wide coordinate when the frame has
+    one, so a null window never reaches another chromosome; ``"raw"`` sorts on
+    the per-chromosome position, which is the ORIGINAL behaviour behind
+    ``--null-chrom any``.  Either way the genome coordinate rides along as
+    ``vals["_gpos"]`` when available, so a null pair can still be placed in a
+    genomic block.
+
     ``base`` offsets the ids into a run-wide namespace (see :func:`_pair_base`)
     so that a pooled donor pool spanning many cells stays unambiguous.
     """
     n = len(df)
-    # Genome-wide coordinates when the caller has them (joined_pairs always
-    # adds them), so the donor table never interleaves chromosomes.
-    c1, c2 = (("gpos1", "gpos2") if "gpos1" in df.columns
+    have_g = "gpos1" in df.columns
+    c1, c2 = (("gpos1", "gpos2") if coords == "genome" and have_g
               else ("pos1", "pos2"))
     pos = np.concatenate([df[c1].to_numpy(), df[c2].to_numpy()])
     ids = base + np.arange(n, dtype=np.int64)
     pi = np.concatenate([ids, ids])
     order = np.argsort(pos, kind="stable")
-    vals = {name: np.concatenate([df[c1].to_numpy(), df[c2].to_numpy()])[order]
-            for name, (c1, c2) in cols.items()}
+    vals = {name: np.concatenate([df[a].to_numpy(), df[b].to_numpy()])[order]
+            for name, (a, b) in cols.items()}
+    if have_g:
+        vals["_gpos"] = np.concatenate([df["gpos1"].to_numpy(),
+                                        df["gpos2"].to_numpy()])[order]
     return pos[order], vals, pi[order]
+
+
+def _coords(args) -> str:
+    """'genome' (partners on the same chromosome) or 'raw' (any chromosome)."""
+    return "raw" if getattr(args, "null_chrom", "same") == "any" else "genome"
 
 
 # -------------------------------------------------------------------- nulls --
@@ -589,11 +603,13 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None,
                              figsize=(5.2 * len(_MEASURES), 8), sharex=True)
     for j, (key, title) in enumerate(_MEASURES):
         ax = axes[0, j]
+        # MATCHED is not drawn: it sits on top of LINKED wherever the null
+        # places most anchors and only adds an unreadable third line.  It is
+        # in the TSV, and Δ uses it when --delta-arm matched.
         style = {"linked": dict(marker="o", ls="-", alpha=1.0, lw=1.6),
-                 "matched": dict(marker="", ls=":", alpha=0.9, lw=1.4),
                  "null": dict(marker="", ls="--", alpha=0.6, lw=1.6)}
         for cond, clab in _CONDS:
-            if (key, cond) not in curves:
+            if cond not in style or (key, cond) not in curves:
                 continue
             r, n = curves[(key, cond)]
             ax.plot(centers, r, label=clab, color=_COLOR[key], ms=3.0,
@@ -779,6 +795,15 @@ def _drain(results, accs, per_cell, total, label):
     return n_pairs, n_null
 
 
+def _percell_set_of(args):
+    """Pair sets the per-cell test runs on.  Per-mark by default whatever
+    --pair-set says: the per-cell test needs every usable pair a cell has, and
+    unlike panel a it has no earlier figure to reproduce."""
+    if getattr(args, "per_cell_pair_set", "per-mark") == "same":
+        return _SET_OF[getattr(args, "pair_set", "joint")]
+    return _SET_OF["per-mark"]
+
+
 def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
                      merged, excl_chrom, want_percell=False):
     """One cell's contribution, as its own accumulators.
@@ -791,13 +816,15 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
 
     One null draw per PAIR SET, shared by every measure computed on that set.
     Under --pair-set joint that is a single draw feeding all three measures,
-    exactly as before, and the generator is consumed in the same order -- so
-    joint mode reproduces earlier runs bit for bit.
+    exactly as before, consumed from the generator in the same order -- so with
+    --null-chrom any the panel a numbers reproduce the original run exactly.
 
     Three arms per measure: LINKED (every true pair), MATCHED (the true pairs
-    the null managed to place a partner for) and NULL.  The null can only use
-    an anchor that has a donor in reach, so it is scored on a subset of loci;
-    MATCHED is the like-for-like comparison, and the one Δ uses by default.
+    the null managed to place a partner for) and NULL.
+
+    The per-cell test may run on DIFFERENT pair sets from panel a (per-mark by
+    default).  When it does, it gets its own pass with its own generators, so
+    panel a is untouched by it.
     """
     rng = np.random.default_rng(args.seed + seed_i)
     nb = len(edges) - 1
@@ -805,15 +832,29 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
     n_pairs = n_null = 0
 
     set_of = _SET_OF[getattr(args, "pair_set", "joint")]
+    a_sets = sorted(set(set_of.values()))
+    pc_set_of = _percell_set_of(args) if want_percell else None
+    separate = want_percell and pc_set_of != set_of
+    pc_sets = sorted(set(pc_set_of.values())) if separate else []
     per_ctx = _load_cell(paths, cell, _min_sites(args), merged, excl_chrom)
-    frames = set_frames(per_ctx, sorted(set(set_of.values())))
+    frames = set_frames(per_ctx, sorted(set(a_sets) | set(pc_sets)))
+    blocks = {} if want_percell else None
     if not frames:
+        if want_percell:
+            accs["_percell"] = blocks
         return accs, 0, 0
 
     base = _pair_base(seed_i)
     bkey = batch_of.get(cell, "") if batch_of else ""
-    blocks = {} if want_percell else None
-    for sk in sorted(frames):
+
+    def donors(sk, own):
+        if args.null_scope == "pooled":
+            return (pools.get(sk) or {}).get(bkey)
+        return own
+
+    # ---- panel a: one pass per panel-a pair set, generator order unchanged.
+    present = [sk for sk in a_sets if sk in frames]
+    for ix, sk in enumerate(present):
         j = frames[sk]
         cols = _SET_COLS[sk]
         measures = [m for m, _ in _MEASURES if set_of[m] == sk]
@@ -825,18 +866,13 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
                 accumulate(accs[(m, "linked")], bins[keep], x[keep], y[keep])
         n_pairs += int(keep.sum())
 
-        a_pos, a_vals, a_pi = end_table(j, cols, base)
-        if args.null_scope == "pooled":
-            pool = (pools.get(sk) or {}).get(bkey)
-            if pool is None:
-                if want_percell:
-                    blocks.update(_percell_blocks(j, d, cols, measures, None,
-                                                  None, edges, args))
-                continue
-            d_pos, d_vals, d_pi = pool
-        else:
-            d_pos, d_vals, d_pi = a_pos, a_vals, a_pi
-
+        pool = donors(sk, end_table(j, cols, base, _coords(args)))
+        if pool is None:
+            if want_percell and not separate:
+                blocks.update(_percell_blocks(j, d, cols, measures, None,
+                                              None, edges, args))
+            continue
+        d_pos, d_vals, d_pi = pool
         drawn = _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges,
                            args, rng)
         if drawn is not None:
@@ -856,16 +892,37 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
                     accumulate(accs[(m, "matched")], bins[mi], x, y)
             n_null += int(nkeep.sum())
 
-        if want_percell:
+        if want_percell and not separate:
             # A SECOND, independent null draw on its own generator, so the
             # arm above -- and with it every panel a number -- is identical
             # with or without --per-cell.
-            rng2 = np.random.default_rng([args.seed, seed_i, 2,
-                                          sorted(frames).index(sk)])
+            rng2 = np.random.default_rng([args.seed, seed_i, 2, ix])
             drawn2 = _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges,
                                 args, rng2)
             blocks.update(_percell_blocks(j, d, cols, measures, drawn,
                                           drawn2, edges, args))
+
+    # ---- per-cell on its own pair sets: separate generators throughout.
+    for ix, sk in enumerate(s_ for s_ in pc_sets if s_ in frames):
+        j = frames[sk]
+        cols = _SET_COLS[sk]
+        measures = [m for m, _ in _MEASURES if pc_set_of[m] == sk]
+        d = j["distance"].to_numpy()
+        pool = donors(sk, end_table(j, cols, base, _coords(args)))
+        if pool is None:
+            blocks.update(_percell_blocks(j, d, cols, measures, None, None,
+                                          edges, args))
+            continue
+        d_pos, d_vals, d_pi = pool
+        r1 = np.random.default_rng([args.seed, seed_i, 3, ix])
+        r2 = np.random.default_rng([args.seed, seed_i, 4, ix])
+        drawn = _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges,
+                           args, r1)
+        drawn2 = _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges,
+                            args, r2)
+        blocks.update(_percell_blocks(j, d, cols, measures, drawn, drawn2,
+                                      edges, args))
+
     if want_percell:
         accs["_percell"] = blocks
     return accs, n_pairs, n_null
@@ -879,19 +936,22 @@ def _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges, args, rng):
     the matched arm is built from.  One helper for both draws, so the
     per-cell control is built exactly the way panel a's null is.
     """
+    raw = _coords(args) == "raw"
+    p1 = j["pos1" if raw else "gpos1"].to_numpy()
+    p2 = j["pos2" if raw else "gpos2"].to_numpy()
     if args.null_type == "distance-matched":
         got = _null_indices_distance_matched(
-            j["gpos1"].to_numpy(), d, d_pos, d_pi, edges, rng,
+            p1, d, d_pos, d_pi, edges, rng,
             args.null_window, args.null_anchor_window, return_anchors=True)
         if got is None:
             return None
         ka, kb, dn, aidx = got
         xa = {k: v[ka] for k, v in d_vals.items()}
         xb = {k: v[kb] for k, v in d_vals.items()}
-        return xa, xb, dn, d_pos[ka], aidx
+        anchor = d_vals["_gpos"][ka] if "_gpos" in d_vals else d_pos[ka]
+        return xa, xb, dn, anchor, aidx
     got = _null_indices_locus_matched(
-        j["gpos2"].to_numpy(), j["gpos1"].to_numpy(),
-        base + np.arange(len(j), dtype=np.int64),
+        p2, p1, base + np.arange(len(j), dtype=np.int64),
         d_pos, d_pi, rng, args.null_window)
     if got is None:
         return None
@@ -958,7 +1018,10 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
     the join no longer pins the GIL.
     """
     set_of = _SET_OF[getattr(args, "pair_set", "joint")]
-    sets = sorted(set(set_of.values()))
+    sets = set(set_of.values())
+    if getattr(args, "per_cell", "off") == "on":
+        sets |= set(_percell_set_of(args).values())
+    sets = sorted(sets)
     ms = _min_sites(args)
 
     def _one(job):
@@ -970,7 +1033,8 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
         key = batch_of.get(cell, "") if batch_of else ""
         # Same enumeration as run_group's job list, so a cell's ids here and
         # in its own pass agree without either side recording an offset.
-        return key, {sk: end_table(f, _SET_COLS[sk], _pair_base(ci))
+        return key, {sk: end_table(f, _SET_COLS[sk], _pair_base(ci),
+                                   _coords(args))
                      for sk, f in frames.items()}
 
     jobs = list(enumerate(cells))
@@ -1150,7 +1214,12 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
     note = (f"{args.null_type}, --null-scope {args.null_scope}"
             + (f", donors matched on {args.null_match_column}"
                if args.null_match_column and args.null_scope == "pooled"
-               else ""))
+               else "")
+            # Said on the figure itself, so the legend cannot drift from it:
+            # under --null-chrom any most null partners are on another
+            # chromosome, i.e. matched coordinate offset, not distance.
+            + (", null partners on any chromosome"
+               if getattr(args, "null_chrom", "same") == "any" else ""))
     _figure(curves, centers, label,
             Path(out_dir) / f"end_posterior_dist_{label}.{args.plot_format}",
             args, note, boot)
@@ -1267,6 +1336,21 @@ def main(argv=None) -> int:
                          "on the last set -- comparable across panels, but a "
                          "cell with no HCG output then drops out of GCH-GCH "
                          "and GCH-GCH is restricted to CpG-rich ends.")
+    ap.add_argument("--null-chrom", choices=["same", "any"], default="same",
+                    help="'same' (default): null partners on the anchor's own "
+                         "chromosome, so 'matched distance' is a genomic "
+                         "distance.  'any': the ORIGINAL behaviour -- ends "
+                         "sorted by per-chromosome position, so most partners "
+                         "sit on another chromosome at a similar coordinate.  "
+                         "Denser donors, but the null is then 'same cell, "
+                         "matched coordinate offset', and should be described "
+                         "that way.")
+    ap.add_argument("--per-cell-pair-set", choices=["per-mark", "same"],
+                    default="per-mark",
+                    help="Pair sets for the per-cell test.  'per-mark' "
+                         "(default) whatever --pair-set is, because the "
+                         "per-cell test needs every usable pair a cell has; "
+                         "'same' follows --pair-set.")
     ap.add_argument("--delta-arm", choices=["matched", "linked"],
                     default="matched",
                     help="Arm Δ is taken against the null with.  'matched' "
@@ -1393,6 +1477,13 @@ def main(argv=None) -> int:
         args.exclude_bed,
         [c.strip() for c in args.exclude_chrom.split(",") if c.strip()])
 
+    if args.null_chrom == "any":
+        logger.warning(
+            "--null-chrom any: null partners are drawn by per-chromosome "
+            "position, so most lie on ANOTHER chromosome at a similar "
+            "coordinate.  The non-linked curve is then 'same cell, matched "
+            "coordinate offset', not 'matched genomic distance' -- describe it "
+            "that way in the legend and Methods.")
     if args.fisher_z == "pooled":
         logger.warning(
             "--fisher-z pooled treats every end pair as an independent "
