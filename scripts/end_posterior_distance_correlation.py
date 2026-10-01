@@ -353,7 +353,7 @@ def _min_sites(args):
         return {"GCH": int(explicit), "HCG": int(explicit)}
     g = getattr(args, "min_sites_gch", None)
     h = getattr(args, "min_sites_hcg", None)
-    return {"GCH": int(2 if g is None else g), "HCG": int(1 if h is None else h)}
+    return {"GCH": int(2 if g is None else g), "HCG": int(2 if h is None else h)}
 
 
 def set_frames(per_ctx: dict[str, pd.DataFrame], sets):
@@ -1250,10 +1250,14 @@ def main(argv=None) -> int:
                          "Unset: --min-sites-gch / --min-sites-hcg apply.")
     ap.add_argument("--min-sites-gch", type=int, default=2,
                     help="Minimum GCH sites per END (2).")
-    ap.add_argument("--min-sites-hcg", type=int, default=1,
-                    help="Minimum HCG sites per END (1).  CpGs are sparse: "
-                         "requiring 2 on both ends keeps a small, CpG-rich "
-                         "minority of pairs.")
+    ap.add_argument("--min-sites-hcg", type=int, default=2,
+                    help="Minimum HCG sites per END (2, as before).  1 keeps "
+                         "roughly twice the pairs, but an end called from a "
+                         "single CpG has a near-binary posterior, which "
+                         "attenuates every HCG correlation -- the raw linked "
+                         "curve at 100 bp fell from 0.75 to 0.54 at 1.  Use 1 "
+                         "for the per-cell test if depth is the limit, never "
+                         "silently for the panel a curve.")
     ap.add_argument("--pair-set", choices=["per-mark", "joint"],
                     default="per-mark",
                     help="'per-mark' (default): GCH-GCH from every "
