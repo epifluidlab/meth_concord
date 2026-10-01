@@ -97,10 +97,12 @@ def simulate(seed: int = 0) -> pd.DataFrame:
                 se = np.sqrt(1.0 / n + 1.0 / (3 * n))
                 true = rng.normal(delta_mu[mark][g], delta_sd[mark])
                 delta = true + rng.normal(0.0, se)
+                z_null = rng.normal(0.0, 1.0)
                 rows.append({
                     "cell_id": cid, "group": g, "mark": mark, "n_pairs": n,
                     "delta": delta, "se": se, "z": delta / se,
-                    "z_null": rng.normal(0.0, 1.0), "simulated": True,
+                    "z_null": z_null, "delta_null": z_null * se,
+                    "simulated": True,
                 })
     return pd.DataFrame(rows)
 

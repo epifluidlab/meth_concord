@@ -130,3 +130,21 @@ def test_pdf_embeds_truetype_not_type3(tmp_path):
     raw = (tmp_path / "c.pdf").read_bytes()
     assert b"/Type3" not in raw
     assert b"/FontFile2" in raw or b"/Type0" in raw
+
+
+def test_sign_test_reads_the_share_of_cells_above_zero():
+    from nome_hic_concordance.percell_existence import sign_test
+    st = sign_test(np.r_[np.full(75, 0.1), np.full(25, -0.1)])
+    assert st["n"] == 100 and st["k"] == 75
+    assert st["frac"] == pytest.approx(0.75)
+    assert st["p"] < 1e-5
+    null = sign_test(np.r_[np.full(50, 0.1), np.full(50, -0.1)])
+    assert null["p"] > 0.4
+
+
+def test_exponents_are_mathtext_not_unicode_superscripts():
+    """Arial has no superscript digits; they printed as empty boxes."""
+    from nome_hic_concordance.percell_existence import fmt_p
+    s = fmt_p(3e-40)
+    assert "$^{-40}$" in s
+    assert not any(ch in s for ch in "⁰¹²³⁻")

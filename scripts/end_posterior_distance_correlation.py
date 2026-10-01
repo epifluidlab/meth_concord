@@ -106,7 +106,20 @@ _MEASURES = (("gg", "GCH–GCH  r(end$_i$, end$_j$)"),
              ("hh", "HCG–HCG  r(end$_i$, end$_j$)"),
              ("gh", "HCG–GCH  r(end$_i$, end$_j$)  [cross-context]"))
 _CONDS = (("linked", "linked (true partner)"),
+          ("matched", "matched (pairs the null placed)"),
           ("null", "non-linked"))
+
+#: Which pair set each measure is computed on.  "per-mark" uses every pair
+#: informative for the mark(s) a measure needs; "joint" puts all three on the
+#: pairs informative for BOTH marks at both ends, as before -- which kept a
+#: cell with no HCG output out of GCH-GCH altogether and restricted GCH-GCH to
+#: CpG-rich ends.
+_SET_OF = {"per-mark": {"gg": "GCH", "hh": "HCG", "gh": "joint"},
+           "joint": {"gg": "joint", "hh": "joint", "gh": "joint"}}
+#: End values each pair set carries: name -> (end-1 column, end-2 column).
+_SET_COLS = {"GCH": {"g": ("p1", "p2")},
+             "HCG": {"h": ("p1", "p2")},
+             "joint": {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}}
 _COLOR = {"gg": "#1f77b4", "hh": "#d62728", "gh": "#2ca02c"}
 
 # Pair identifiers must be unique across the WHOLE run, not just within a cell,
@@ -278,10 +291,12 @@ def _load_cell(paths: dict[str, Path], cell: str, min_sites: int,
         p = d / f"{cell}.posteriors.parquet"
         if not p.exists():
             continue
+        ms = (min_sites.get(ctx, 2) if isinstance(min_sites, dict)
+              else min_sites)
         df = pq.read_table(p, columns=["chrom", "pos1", "pos2", "n1", "n2",
                                        "distance", "posterior1", "posterior2"]
                            ).to_pandas(categories=["chrom"])
-        df = df[(df["n1"] >= min_sites) & (df["n2"] >= min_sites)
+        df = df[(df["n1"] >= ms) & (df["n2"] >= ms)
                 & df["posterior1"].notna() & df["posterior2"].notna()]
         if df.empty:
             continue
@@ -324,6 +339,63 @@ def _pair_frames(per_ctx: dict[str, pd.DataFrame]):
             frames["gh"].append((j["p1_h"].to_numpy(), j["p2_g"].to_numpy(), d))
             frames["gh"].append((j["p2_h"].to_numpy(), j["p1_g"].to_numpy(), d))
     return frames
+
+
+def _min_sites(args):
+    """Per-context minimum sites per END.
+
+    ``--min-sites`` given explicitly still applies to both, so older commands
+    mean what they meant; otherwise GCH and HCG take their own floors.  A
+    minimal args object (the tests build them) falls back to ``min_sites``.
+    """
+    explicit = getattr(args, "min_sites", None)
+    if explicit is not None:
+        return {"GCH": int(explicit), "HCG": int(explicit)}
+    g = getattr(args, "min_sites_gch", None)
+    h = getattr(args, "min_sites_hcg", None)
+    return {"GCH": int(2 if g is None else g), "HCG": int(1 if h is None else h)}
+
+
+def set_frames(per_ctx: dict[str, pd.DataFrame], sets):
+    """One frame per pair set, each carrying genome-wide coordinates.
+
+    "GCH" / "HCG" are that context's own pairs; "joint" is the join of both.
+    A set with no rows is simply absent, so a cell with GCH but no HCG output
+    still contributes GCH-GCH.
+    """
+    out = {}
+    for s in sets:
+        if s == "joint":
+            f = joined_pairs(per_ctx)
+        else:
+            f = per_ctx.get(s)
+            if f is not None and len(f):
+                f = f.assign(gpos1=genome_coords(f["chrom"], f["pos1"]),
+                             gpos2=genome_coords(f["chrom"], f["pos2"]))
+        if f is not None and len(f):
+            out[s] = f
+    return out
+
+
+def _linked_xy(m, frame, cols, idx=None):
+    """(x, y) arrays of the linked arm of measure ``m`` (gh: both orders)."""
+    def col(name, end):
+        v = frame[cols[name][end]].to_numpy()
+        return v if idx is None else v[idx]
+    if m == "gg":
+        return [(col("g", 0), col("g", 1))]
+    if m == "hh":
+        return [(col("h", 0), col("h", 1))]
+    return [(col("h", 0), col("g", 1)), (col("h", 1), col("g", 0))]
+
+
+def _null_xy(m, xa, xb):
+    """(x, y) arrays of a null arm of measure ``m`` from donor values."""
+    if m == "gg":
+        return [(xa["g"], xb["g"])]
+    if m == "hh":
+        return [(xa["h"], xb["h"])]
+    return [(xa["h"], xb["g"]), (xa["g"], xb["h"])]
 
 
 def joined_pairs(per_ctx: dict[str, pd.DataFrame]):
@@ -380,7 +452,7 @@ def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]],
 
 def _null_indices_distance_matched(anchor_pos, anchor_dist, d_pos, d_pi,
                                    edges, rng, window, anchor_window,
-                                   max_rounds=16):
+                                   max_rounds=16, return_anchors=False):
     """Indices (ka, kb) into the donor end table for a distance-matched null.
 
     Returning INDICES rather than values is what lets one re-pairing serve
@@ -446,6 +518,10 @@ def _null_indices_distance_matched(anchor_pos, anchor_dist, d_pos, d_pi,
         return None
     ka_f, kb_f = ka_out[placed], kb_out[placed]
     dist = np.abs(d_pos[kb_f].astype(np.int64) - d_pos[ka_f].astype(np.int64))
+    if return_anchors:
+        # Which REAL pairs got a null partner -- the matched arm is those
+        # pairs, so linked and null are compared on the same loci set.
+        return ka_f, kb_f, dist.astype(float), np.flatnonzero(placed)
     return ka_f, kb_f, dist.astype(float)
 
 
@@ -513,12 +589,15 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None,
                              figsize=(5.2 * len(_MEASURES), 8), sharex=True)
     for j, (key, title) in enumerate(_MEASURES):
         ax = axes[0, j]
+        style = {"linked": dict(marker="o", ls="-", alpha=1.0, lw=1.6),
+                 "matched": dict(marker="", ls=":", alpha=0.9, lw=1.4),
+                 "null": dict(marker="", ls="--", alpha=0.6, lw=1.6)}
         for cond, clab in _CONDS:
+            if (key, cond) not in curves:
+                continue
             r, n = curves[(key, cond)]
-            ax.plot(centers, r, label=clab, color=_COLOR[key], lw=1.6,
-                    marker="o" if cond == "linked" else "", ms=3.0,
-                    ls="-" if cond == "linked" else "--",
-                    alpha=1.0 if cond == "linked" else 0.6)
+            ax.plot(centers, r, label=clab, color=_COLOR[key], ms=3.0,
+                    **style[cond])
         ax.axhline(0, color="#9AA0A6", lw=0.8)
         ax.set_title(title, fontsize=11)
         ax.set_ylabel("Pearson r of end posteriors" if j == 0 else "")
@@ -536,10 +615,11 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None,
                     else "Δz = z(r$_{linked}$) − z(r$_{null}$)")
             ylab = "Δz (Fisher)"
         else:
-            delta = curves[(key, "linked")][0] - curves[(key, "null")][0]
+            arm = getattr(args, "delta_arm", "linked")
+            delta = curves[(key, arm)][0] - curves[(key, "null")][0]
             lo, hi, pv, q = boot.get(key, (None, None, None, None))
-            band, line = "95% CI (cell bootstrap)", "Δ = linked − null"
-            ylab = "Δ = linked − null"
+            band, line = "95% CI (cell bootstrap)", f"Δ = {arm} − null"
+            ylab = f"Δ = {arm} − null"
         if lo is not None:
             axd.fill_between(centers, lo, hi, color=_COLOR[key], alpha=0.18,
                              lw=0, label=band)
@@ -601,10 +681,11 @@ def _figure_by_group(per_group, out_path, args, colors=None):
             ax = axes[row, j]
             for g in labels:
                 curves, centers = per_group[g]
+                arm = getattr(args, "delta_arm", "linked")
                 if what == "linked":
                     y = curves[(key, "linked")][0]
                 else:
-                    y = (curves[(key, "linked")][0]
+                    y = (curves[(key, arm)][0]
                          - curves[(key, "null")][0])
                 ax.plot(centers, y, lw=1.4, color=colors[g], label=g,
                         marker="o", ms=2.5, alpha=0.9)
@@ -615,7 +696,8 @@ def _figure_by_group(per_group, out_path, args, colors=None):
                 ax.set_ylabel("linked r" if j == 0 else "")
             else:
                 ax.set_xlabel("genomic distance between the two ends (bp)")
-                ax.set_ylabel("Δ = linked − null" if j == 0 else "")
+                ax.set_ylabel(f"Δ = {getattr(args, 'delta_arm', 'linked')}"
+                              f" − null" if j == 0 else "")
         # Shared y-scale per row so the groups are visually comparable.
     for row in range(2):
         ylo = min(ax.get_ylim()[0] for ax in axes[row])
@@ -706,92 +788,107 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
     exact.  The RNG is seeded per cell rather than shared: a shared generator
     would both race between threads and make the run depend on the order they
     happen to finish in.
+
+    One null draw per PAIR SET, shared by every measure computed on that set.
+    Under --pair-set joint that is a single draw feeding all three measures,
+    exactly as before, and the generator is consumed in the same order -- so
+    joint mode reproduces earlier runs bit for bit.
+
+    Three arms per measure: LINKED (every true pair), MATCHED (the true pairs
+    the null managed to place a partner for) and NULL.  The null can only use
+    an anchor that has a donor in reach, so it is scored on a subset of loci;
+    MATCHED is the like-for-like comparison, and the one Δ uses by default.
     """
     rng = np.random.default_rng(args.seed + seed_i)
     nb = len(edges) - 1
     accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
     n_pairs = n_null = 0
 
-    per_ctx = _load_cell(paths, cell, args.min_sites, merged, excl_chrom)
-    j = joined_pairs(per_ctx)
-    if j is None or j.empty:
+    set_of = _SET_OF[getattr(args, "pair_set", "joint")]
+    per_ctx = _load_cell(paths, cell, _min_sites(args), merged, excl_chrom)
+    frames = set_frames(per_ctx, sorted(set(set_of.values())))
+    if not frames:
         return accs, 0, 0
 
-    d = j["distance"].to_numpy()
-    keep = (d >= edges[0]) & (d <= edges[-1])
-    if keep.any():
-        b = np.clip(np.digitize(d[keep], edges) - 1, 0, nb - 1)
-        # LINKED: the true partner, all three measures off the same pairs.
-        accumulate(accs[("gg", "linked")], b,
-                   j["p1_g"].to_numpy()[keep], j["p2_g"].to_numpy()[keep])
-        accumulate(accs[("hh", "linked")], b,
-                   j["p1_h"].to_numpy()[keep], j["p2_h"].to_numpy()[keep])
-        # Both orderings of the cross measure, as the site-level script does.
-        accumulate(accs[("gh", "linked")], b,
-                   j["p1_h"].to_numpy()[keep], j["p2_g"].to_numpy()[keep])
-        accumulate(accs[("gh", "linked")], b,
-                   j["p2_h"].to_numpy()[keep], j["p1_g"].to_numpy()[keep])
-        n_pairs = int(keep.sum())
-
-    cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
     base = _pair_base(seed_i)
-    a_pos, a_vals, a_pi = end_table(j, cols, base)
     bkey = batch_of.get(cell, "") if batch_of else ""
-    if args.null_scope == "pooled":
-        pool = pools.get(bkey)
-        if pool is None:
-            if want_percell:
-                accs["_percell"] = _percell_blocks(j, d, None, None, edges,
-                                                   args)
-            return accs, n_pairs, 0
-        d_pos, d_vals, d_pi = pool
-    else:
-        d_pos, d_vals, d_pi = a_pos, a_vals, a_pi
+    blocks = {} if want_percell else None
+    for sk in sorted(frames):
+        j = frames[sk]
+        cols = _SET_COLS[sk]
+        measures = [m for m, _ in _MEASURES if set_of[m] == sk]
+        d = j["distance"].to_numpy()
+        keep = (d >= edges[0]) & (d <= edges[-1])
+        bins = np.clip(np.digitize(d, edges) - 1, 0, nb - 1)
+        for m in measures:
+            for x, y in _linked_xy(m, j, cols):
+                accumulate(accs[(m, "linked")], bins[keep], x[keep], y[keep])
+        n_pairs += int(keep.sum())
 
-    drawn = _draw_null(j, d, d_pos, d_vals, d_pi, base, edges, args, rng)
-    if drawn is None:
+        a_pos, a_vals, a_pi = end_table(j, cols, base)
+        if args.null_scope == "pooled":
+            pool = (pools.get(sk) or {}).get(bkey)
+            if pool is None:
+                if want_percell:
+                    blocks.update(_percell_blocks(j, d, cols, measures, None,
+                                                  None, edges, args))
+                continue
+            d_pos, d_vals, d_pi = pool
+        else:
+            d_pos, d_vals, d_pi = a_pos, a_vals, a_pi
+
+        drawn = _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges,
+                           args, rng)
+        if drawn is not None:
+            xa, xb, dn, _anchor, aidx = drawn
+            nkeep = (dn >= edges[0]) & (dn <= edges[-1])
+            bn = np.clip(np.digitize(dn, edges) - 1, 0, nb - 1)
+            for m in measures:
+                for x, y in _null_xy(m, xa, xb):
+                    accumulate(accs[(m, "null")], bn[nkeep], x[nkeep],
+                               y[nkeep])
+            # MATCHED: the true pairs behind the null pairs that were kept,
+            # binned by their own distance.
+            mi = aidx[nkeep]
+            mi = mi[keep[mi]]
+            for m in measures:
+                for x, y in _linked_xy(m, j, cols, mi):
+                    accumulate(accs[(m, "matched")], bins[mi], x, y)
+            n_null += int(nkeep.sum())
+
         if want_percell:
-            accs["_percell"] = _percell_blocks(j, d, None, None, edges, args)
-        return accs, n_pairs, 0
-    xa, xb, dn, null_anchor = drawn
-
-    keep = (dn >= edges[0]) & (dn <= edges[-1])
-    if keep.any():
-        bn = np.clip(np.digitize(dn[keep], edges) - 1, 0, nb - 1)
-        # ONE re-pairing feeds every measure, so the three panels are compared
-        # against the same synthetic pairs.
-        accumulate(accs[("gg", "null")], bn, xa["g"][keep], xb["g"][keep])
-        accumulate(accs[("hh", "null")], bn, xa["h"][keep], xb["h"][keep])
-        accumulate(accs[("gh", "null")], bn, xa["h"][keep], xb["g"][keep])
-        accumulate(accs[("gh", "null")], bn, xa["g"][keep], xb["h"][keep])
-        n_null = int(keep.sum())
-
+            # A SECOND, independent null draw on its own generator, so the
+            # arm above -- and with it every panel a number -- is identical
+            # with or without --per-cell.
+            rng2 = np.random.default_rng([args.seed, seed_i, 2,
+                                          sorted(frames).index(sk)])
+            drawn2 = _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges,
+                                args, rng2)
+            blocks.update(_percell_blocks(j, d, cols, measures, drawn,
+                                          drawn2, edges, args))
     if want_percell:
-        # A SECOND, independent null draw on its own generator, so the arm
-        # above -- and with it every panel a number -- is bit-identical with
-        # or without --per-cell.
-        rng2 = np.random.default_rng([args.seed, seed_i, 2])
-        drawn2 = _draw_null(j, d, d_pos, d_vals, d_pi, base, edges, args, rng2)
-        accs["_percell"] = _percell_blocks(j, d, drawn, drawn2, edges, args)
+        accs["_percell"] = blocks
     return accs, n_pairs, n_null
 
 
-def _draw_null(j, d, d_pos, d_vals, d_pi, base, edges, args, rng):
-    """One null re-pairing: ``(xa, xb, distance, anchor_genome_pos)`` or None.
+def _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges, args, rng):
+    """One null re-pairing of one pair set.
 
-    One helper for both draws, so the per-cell control is built exactly the
-    way panel a's null is.
+    Returns ``(xa, xb, distance, anchor_genome_pos, anchor_index)`` or None.
+    ``anchor_index`` names the REAL pairs that got a partner, which is what
+    the matched arm is built from.  One helper for both draws, so the
+    per-cell control is built exactly the way panel a's null is.
     """
     if args.null_type == "distance-matched":
         got = _null_indices_distance_matched(
             j["gpos1"].to_numpy(), d, d_pos, d_pi, edges, rng,
-            args.null_window, args.null_anchor_window)
+            args.null_window, args.null_anchor_window, return_anchors=True)
         if got is None:
             return None
-        ka, kb, dn = got
+        ka, kb, dn, aidx = got
         xa = {k: v[ka] for k, v in d_vals.items()}
         xb = {k: v[kb] for k, v in d_vals.items()}
-        return xa, xb, dn, d_pos[ka]
+        return xa, xb, dn, d_pos[ka], aidx
     got = _null_indices_locus_matched(
         j["gpos2"].to_numpy(), j["gpos1"].to_numpy(),
         base + np.arange(len(j), dtype=np.int64),
@@ -800,82 +897,92 @@ def _draw_null(j, d, d_pos, d_vals, d_pi, base, edges, args, rng):
         return None
     ai, kb, dn = got
     # end 1 stays with the anchor; end 2 comes from the donor pool
-    xa = {"g": j["p1_g"].to_numpy()[ai], "h": j["p1_h"].to_numpy()[ai]}
+    xa = {name: j[c1].to_numpy()[ai] for name, (c1, _c2) in cols.items()}
     xb = {k: v[kb] for k, v in d_vals.items()}
-    return xa, xb, dn, j["gpos1"].to_numpy()[ai]
+    return xa, xb, dn, j["gpos1"].to_numpy()[ai], ai
 
 
-def _percell_blocks(j, d, drawn, drawn2, edges, args):
-    """Per-genomic-block raw sums for each arm, beyond the per-cell floor.
+def _percell_blocks(j, d, cols, measures, drawn, drawn2, edges, args):
+    """Per-genomic-block raw sums for each arm of each measure on one set.
 
+    Arms: L (linked), M (matched), N (null), N2 (second null, the control).
     Blocks are --per-cell-block wide on the genome-wide coordinate, so a block
-    never spans two chromosomes.  The bootstrap resamples these, which is what
+    never spans two chromosomes; the bootstrap resamples them, which is what
     carries the spatial dependence between pairs into the per-cell SE.
     """
     lo = max(float(args.per_cell_min_distance), float(edges[0]))
     hi = float(edges[-1])
     B = int(args.per_cell_block)
-    out = {}
-
-    lk = (d >= lo) & (d <= hi)
-    blk = j["gpos1"].to_numpy()[lk] // B
-    g1, g2 = j["p1_g"].to_numpy()[lk], j["p2_g"].to_numpy()[lk]
-    h1, h2 = j["p1_h"].to_numpy()[lk], j["p2_h"].to_numpy()[lk]
-    linked = {
-        "gg": pce.block_sums(blk, g1, g2),
-        "hh": pce.block_sums(blk, h1, h2),
-        "gh": pce.block_sums(np.concatenate([blk, blk]),
-                             np.concatenate([h1, h2]),
-                             np.concatenate([g2, g1])),
-    }
-
-    def arm(dr):
-        if dr is None:
-            return None
-        xa, xb, dn, anchor = dr
-        k = (dn >= lo) & (dn <= hi)
-        bb = anchor[k] // B
-        return {
-            "gg": pce.block_sums(bb, xa["g"][k], xb["g"][k]),
-            "hh": pce.block_sums(bb, xa["h"][k], xb["h"][k]),
-            "gh": pce.block_sums(np.concatenate([bb, bb]),
-                                 np.concatenate([xa["h"][k], xa["g"][k]]),
-                                 np.concatenate([xb["g"][k], xb["h"][k]])),
-        }
-
-    null, null2 = arm(drawn), arm(drawn2)
+    g1 = j["gpos1"].to_numpy()
     empty = (np.empty(0, np.int64), np.empty((0, 6)))
-    for m in ("gg", "hh", "gh"):
-        out[m] = {"L": linked[m],
-                  "N": null[m] if null else empty,
-                  "N2": null2[m] if null2 else None}
+
+    def from_xy(blk, pairs):
+        if not pairs:
+            return empty
+        return pce.block_sums(np.concatenate([blk] * len(pairs)),
+                              np.concatenate([p[0] for p in pairs]),
+                              np.concatenate([p[1] for p in pairs]))
+
+    lk = np.flatnonzero((d >= lo) & (d <= hi))
+    out = {}
+    for m in measures:
+        arms = {"L": from_xy(g1[lk] // B, _linked_xy(m, j, cols, lk))}
+        for tag, dr in (("N", drawn), ("N2", drawn2)):
+            if dr is None:
+                arms[tag] = empty if tag == "N" else None
+                if tag == "N":
+                    arms["M"] = empty
+                continue
+            xa, xb, dn, anchor, aidx = dr
+            k = (dn >= lo) & (dn <= hi)
+            arms[tag] = from_xy(anchor[k] // B,
+                                [(x[k], y[k]) for x, y in _null_xy(m, xa, xb)])
+            if tag == "N":
+                mi = aidx[k]
+                mi = mi[(d[mi] >= lo) & (d[mi] <= hi)]
+                arms["M"] = from_xy(g1[mi] // B, _linked_xy(m, j, cols, mi))
+        out[m] = arms
     return out
 
 
 def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
-    """Donor end pools for --null-scope pooled, one per batch stratum.
+    """Donor end pools for --null-scope pooled: ``{pair_set: {batch: pool}}``.
 
-    Parallel over cells, because this is a SECOND full pass of the same
-    load-and-join that dominates the run: left serial it silently doubled the
-    wall clock of every --null-scope pooled run while nine of ten cores idled.
-    Threads rather than processes -- the per-cell end tables are large and
-    would cost more to pickle back than the join costs to compute, and with
-    ``chrom`` categorical the join no longer pins the GIL.
+    One pool per pair set, because each set's null draws from ends carrying
+    that set's values (GCH-only, HCG-only, or both).  Parallel over cells,
+    because this is a SECOND full pass of the same load-and-join that
+    dominates the run: left serial it silently doubled the wall clock of every
+    --null-scope pooled run while nine of ten cores idled.  Threads rather
+    than processes -- the per-cell end tables are large and would cost more to
+    pickle back than the join costs to compute, and with ``chrom`` categorical
+    the join no longer pins the GIL.
     """
+    set_of = _SET_OF[getattr(args, "pair_set", "joint")]
+    sets = sorted(set(set_of.values()))
+    ms = _min_sites(args)
+
     def _one(job):
         ci, cell = job
-        j = joined_pairs(_load_cell(paths, cell, args.min_sites, merged,
-                                    excl_chrom))
-        if j is None or j.empty:
+        frames = set_frames(_load_cell(paths, cell, ms, merged, excl_chrom),
+                            sets)
+        if not frames:
             return None
         key = batch_of.get(cell, "") if batch_of else ""
         # Same enumeration as run_group's job list, so a cell's ids here and
         # in its own pass agree without either side recording an offset.
-        return key, end_table(j, {"g": ("p1_g", "p2_g"),
-                                  "h": ("p1_h", "p2_h")}, _pair_base(ci))
+        return key, {sk: end_table(f, _SET_COLS[sk], _pair_base(ci))
+                     for sk, f in frames.items()}
 
     jobs = list(enumerate(cells))
-    parts: dict[str, list] = {}
+    parts: dict = {}
+
+    def _take(got):
+        if got is None:
+            return
+        key, tabs = got
+        for sk, tab in tabs.items():
+            parts.setdefault(sk, {}).setdefault(key, []).append(tab)
+
     bar = Progress(len(jobs), "pooled donors: cells")
     try:
         # getattr: callers that build a minimal args for this one helper
@@ -884,31 +991,31 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
             from concurrent.futures import ThreadPoolExecutor
             _pin_inner_threads()
             with ThreadPoolExecutor(max_workers=args.n_threads) as ex:
-                it = ex.map(_one, jobs)
-                for got in it:
-                    if got is not None:
-                        parts.setdefault(got[0], []).append(got[1])
+                for got in ex.map(_one, jobs):
+                    _take(got)
                     bar.update()
         else:
             for job in jobs:
-                got = _one(job)
-                if got is not None:
-                    parts.setdefault(got[0], []).append(got[1])
+                _take(_one(job))
                 bar.update()
     finally:
         bar.close()
-    pools = {}
-    for k, ps in parts.items():
-        pos = np.concatenate([p[0] for p in ps])
-        vals = {name: np.concatenate([p[1][name] for p in ps])
-                for name in ("g", "h")}
-        # Run-wide ids, so a donor pair drawn out of ANY cell in the stratum is
-        # recognisable as a real ligation and refused.
-        pi = np.concatenate([p[2] for p in ps])
-        o = np.argsort(pos, kind="stable")
-        pools[k] = (pos[o], {n_: v[o] for n_, v in vals.items()}, pi[o])
-    logger.info(f"  pooled donor ends: "
-                f"{ {k: int(v[0].size) for k, v in pools.items()} }")
+    pools: dict = {}
+    for sk, by_key in parts.items():
+        pools[sk] = {}
+        for k, ps in by_key.items():
+            pos = np.concatenate([p[0] for p in ps])
+            names = ps[0][1].keys()
+            vals = {n_: np.concatenate([p[1][n_] for p in ps]) for n_ in names}
+            # Run-wide ids, so a donor pair drawn out of ANY cell in the
+            # stratum is recognisable as a real ligation and refused.
+            pi = np.concatenate([p[2] for p in ps])
+            o = np.argsort(pos, kind="stable")
+            pools[sk][k] = (pos[o], {n_: v[o] for n_, v in vals.items()},
+                            pi[o])
+    logger.info("  pooled donor ends: " + ", ".join(
+        f"{sk}: {sum(int(v[0].size) for v in by.values()):,}"
+        for sk, by in pools.items()))
     return pools
 
 
@@ -971,11 +1078,15 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
     # figure.  Resampling CELLS rather than end pairs is the honest unit: a
     # cell contributes hundreds of thousands of massively non-independent
     # pairs, so a test treating those as independent would star everything.
+    # Δ is taken against MATCHED by default: the true pairs the null could
+    # place, so both arms are scored on the same loci.  "linked" keeps the old
+    # all-pairs contrast for comparison.
+    arm = getattr(args, "delta_arm", "linked")
     boot = {}
     if args.n_bootstrap > 0 and len(per_cell) >= 3:
         raw = {}
         for m, _ in _MEASURES:
-            got = bootstrap_delta([a[(m, "linked")] for a in per_cell],
+            got = bootstrap_delta([a[(m, arm)] for a in per_cell],
                                   [a[(m, "null")] for a in per_cell],
                                   args.min_pairs, args.n_bootstrap, args.seed)
             if got is not None:
@@ -1001,11 +1112,11 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
         raw = {}
         for m, _ in _MEASURES:
             if args.fisher_z == "cell":
-                raw[m] = fisher_z_cell([a[(m, "linked")] for a in per_cell],
+                raw[m] = fisher_z_cell([a[(m, arm)] for a in per_cell],
                                        [a[(m, "null")] for a in per_cell],
                                        args.fisher_min_cell_pairs)
             else:
-                raw[m] = fisher_z_pooled(accs[(m, "linked")],
+                raw[m] = fisher_z_pooled(accs[(m, arm)],
                                          accs[(m, "null")], args.min_pairs)
         flat = np.concatenate([raw[m][3] for m in raw])
         q_all = fdr(flat, args.fdr)
@@ -1067,27 +1178,38 @@ def write_percell(cells, per_cell, args, out_dir, meta):
         if not blocks:
             continue
         for m, arms in blocks.items():
-            st = pce.percell_stats(arms["L"], arms["N"], arms.get("N2"),
+            test_arm = arms["M"] if getattr(args, "delta_arm",
+                                            "matched") == "matched" else arms["L"]
+            st = pce.percell_stats(test_arm, arms["N"], arms.get("N2"),
                                    n_boot=args.per_cell_bootstrap,
                                    seed=args.seed + i,
                                    min_pairs=args.per_cell_min_pairs)
+            n_linked = int(arms["L"][1][:, 0].sum()) if len(arms["L"][1]) else 0
             rows.append({"cell_id": cell,
                          "group": meta["group_of"].get(cell, "all"),
-                         "mark": pce.MEASURE_TO_MARK[m], **st})
+                         "mark": pce.MEASURE_TO_MARK[m], "n_linked": n_linked,
+                         **st})
     if not rows:
         logger.warning("  per-cell: no cell produced a usable row")
         return None
     df = pce.add_q(pd.DataFrame(rows))
     df["min_distance"] = int(args.per_cell_min_distance)
+    df["delta_arm"] = getattr(args, "delta_arm", "matched")
+    df["pair_set"] = getattr(args, "pair_set", "joint")
     tsv = Path(out_dir) / "end_posterior_percell.tsv"
     df.to_csv(tsv, sep="\t", index=False)
     for mark, d in df.groupby("mark"):
-        ok = d["z"].notna()
+        ok = d["delta"].notna()
+        pos = float((d.loc[ok, "delta"] > 0).mean()) if ok.any() else float("nan")
+        okc = d["delta_null"].notna()
+        pos0 = (float((d.loc[okc, "delta_null"] > 0).mean())
+                if okc.any() else float("nan"))
         logger.info(
-            f"  per-cell {mark}: {int((d['q'] < 0.05).sum()):,}/{int(ok.sum()):,}"
-            f" cells q<0.05; negative control {int((d['q_null'] < 0.05).sum()):,}")
-    plotted = df[df["mark"].isin(pce.MARKS) & df["z"].notna()
-                 & df["z_null"].notna()]
+            f"  per-cell {mark}: {int(ok.sum()):,} cells; delta>0 in "
+            f"{100 * pos:.0f}% (control {100 * pos0:.0f}%); "
+            f"{int((d['q'] < 0.05).sum()):,} individually q<0.05")
+    plotted = df[df["mark"].isin(pce.MARKS) & df["delta"].notna()
+                 & df["delta_null"].notna()]
     if len(plotted):
         pce.plot(plotted, group_order=meta.get("order"),
                  group_colors=meta.get("colors"),
@@ -1123,8 +1245,31 @@ def main(argv=None) -> int:
                     help="Distance-matched only: draw the synthetic anchor "
                          "within ±this many bp of the real one (10 Mb); "
                          "0 disables.")
-    ap.add_argument("--min-sites", type=int, default=2,
-                    help="Minimum informative sites per END (2).")
+    ap.add_argument("--min-sites", type=int, default=None,
+                    help="Minimum informative sites per END for BOTH contexts. "
+                         "Unset: --min-sites-gch / --min-sites-hcg apply.")
+    ap.add_argument("--min-sites-gch", type=int, default=2,
+                    help="Minimum GCH sites per END (2).")
+    ap.add_argument("--min-sites-hcg", type=int, default=1,
+                    help="Minimum HCG sites per END (1).  CpGs are sparse: "
+                         "requiring 2 on both ends keeps a small, CpG-rich "
+                         "minority of pairs.")
+    ap.add_argument("--pair-set", choices=["per-mark", "joint"],
+                    default="per-mark",
+                    help="'per-mark' (default): GCH-GCH from every "
+                         "GCH-informative pair, HCG-HCG from every "
+                         "HCG-informative pair, the cross-context measure from "
+                         "pairs informative for both.  'joint' puts all three "
+                         "on the last set -- comparable across panels, but a "
+                         "cell with no HCG output then drops out of GCH-GCH "
+                         "and GCH-GCH is restricted to CpG-rich ends.")
+    ap.add_argument("--delta-arm", choices=["matched", "linked"],
+                    default="matched",
+                    help="Arm Δ is taken against the null with.  'matched' "
+                         "(default): the true pairs the null could place a "
+                         "partner for, so both arms cover the same loci.  "
+                         "'linked': every true pair -- a different loci set "
+                         "from the null's whenever eligibility is selective.")
     ap.add_argument("--min-distance", type=int, default=100)
     ap.add_argument("--max-distance", type=int, default=10_000_000)
     ap.add_argument("--bins-per-decade", type=int, default=8)

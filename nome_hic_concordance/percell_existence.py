@@ -42,7 +42,8 @@ MARK_COLOR = {"GCH": "#3D7AB8", "HCG": "#D4504A"}     # panel a's blue / red
 MARK_LABEL = {"GCH": "GCH accessibility", "HCG": "HCG methylation"}
 SIM_STAMP = "SIMULATED DATA \u2014 layout mock-up, not results"
 NULL_GREY = "#9AA0A8"
-REQUIRED = ("cell_id", "group", "mark", "n_pairs", "delta", "se", "z", "z_null")
+REQUIRED = ("cell_id", "group", "mark", "n_pairs", "delta", "se", "z",
+            "z_null", "delta_null")
 
 
 # ------------------------------------------------------- per-cell estimator ---
@@ -164,6 +165,44 @@ def add_q(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def sign_test(delta) -> dict:
+    """Fraction of cells with delta > 0 and a one-sided binomial p vs 50%.
+
+    The population-level reading of the per-cell statistic: whether
+    concordance is carried by MOST cells, which a cell-by-cell test cannot
+    show at single-cell depth.  Under the null a cell's delta is symmetric
+    about zero, so 50% is the reference -- and the negative-control arm,
+    reported beside it, is the empirical check that 50% is right.
+    """
+    from scipy.stats import binomtest
+    d = np.asarray(delta, float)
+    d = d[np.isfinite(d) & (d != 0)]
+    n = int(d.size)
+    k = int((d > 0).sum())
+    if n == 0:
+        return {"n": 0, "k": 0, "frac": float("nan"), "p": float("nan")}
+    return {"n": n, "k": k, "frac": k / n,
+            "p": float(binomtest(k, n, 0.5, alternative="greater").pvalue)}
+
+
+def fmt_p(p: float) -> str:
+    """'p = 3x10^-40' as mathtext.
+
+    Not Unicode superscripts: Arial has no superscript digits, so they print
+    as empty boxes in the PDF.  Mathtext in the regular font draws the
+    exponent from the same face as the rest of the label.
+    """
+    if not np.isfinite(p):
+        return "p = n/a"
+    if p >= 1e-3:
+        return f"p = {p:.3f}"
+    if p <= 0:
+        return r"p < 10$^{-300}$"
+    e = int(np.floor(np.log10(p)))
+    m = p / 10 ** e
+    return f"p = {m:.0f}\u00d710$^{{{e}}}$"
+
+
 def z_threshold(df_mark: pd.DataFrame, alpha: float = 0.05) -> float:
     """The smallest observed z that still passes BH at ``alpha``."""
     passing = df_mark.loc[df_mark["q"] < alpha, "z"]
@@ -227,6 +266,17 @@ def plot(df: pd.DataFrame, group_order=None, group_colors=None,
          out_prefix: str | None = None, formats=("pdf", "png")):
     """Draw panel c and return the Figure.
 
+    Read at the level of CELLS, not of each cell's p-value.  At single-cell
+    depth a cell holds a few hundred to a few thousand usable pairs, which is
+    rarely enough to call one cell on its own; what the data can show is
+    whether the effect is carried by most cells.  So:
+
+      (i)   per-cell delta, observed vs the negative control, headed by the
+            share of cells with delta > 0 and a sign test against 50%;
+      (ii)  the same per cell type, with each type's share above zero;
+      (iii) per-cell z against depth -- where individual significance does
+            start, if it does.
+
     The stamp is driven by the DATA, not by a flag the caller could forget: if
     any row is marked simulated, the figure says so.
     """
@@ -248,133 +298,153 @@ def plot(df: pd.DataFrame, group_order=None, group_colors=None,
     simulated = bool(df.get("simulated", pd.Series(False)).astype(bool).any())
     marks = [m for m in MARKS if m in set(df["mark"])]
 
-    with plt.rc_context(figure_style.RC):
-        fig = plt.figure(figsize=(figure_style.FIG_W_IN, 1.65 * len(marks) + 0.55))
-        gs = fig.add_gridspec(len(marks), 3, width_ratios=[1.0, 1.65, 1.05],
-                              hspace=0.62, wspace=0.34,
-                              left=0.085, right=0.985, top=0.86, bottom=0.12)
+    rc = dict(figure_style.RC, **{"mathtext.default": "regular"})
+    with plt.rc_context(rc):
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN,
+                                  1.65 * max(len(marks), 1) + 0.55))
+        gs = fig.add_gridspec(max(len(marks), 1), 3,
+                              width_ratios=[1.0, 1.65, 1.05],
+                              hspace=0.78, wspace=0.34,
+                              left=0.085, right=0.985, top=0.83, bottom=0.12)
         for r, mark in enumerate(marks):
-            d = df[df["mark"] == mark]
+            d = df[(df["mark"] == mark) & np.isfinite(df["delta"])]
             col = MARK_COLOR.get(mark, "#333333")
-            z_star = z_threshold(d)
-            n_cells = len(d)
-            n_sig = int((d["q"] < 0.05).sum())
-            n_null = int((d["q_null"] < 0.05).sum())
+            obs, ctl = sign_test(d["delta"]), sign_test(d["delta_null"])
 
-            # (i) observed vs within-cell null ---------------------------
+            # (i) observed vs control, read by sign ------------------------
             ax = fig.add_subplot(gs[r, 0])
-            hi = float(np.nanpercentile(d["z"], 99.5)) + 1.0
-            bins = np.linspace(-4.0, max(hi, 6.0), 46)
-            hn, _, _ = ax.hist(d["z_null"], bins=bins, density=True,
-                               histtype="stepfilled", color=NULL_GREY,
-                               alpha=0.45, lw=0)
-            ho, _, _ = ax.hist(d["z"], bins=bins, density=True,
-                               histtype="stepfilled", color=col, alpha=0.35, lw=0)
-            ax.hist(d["z"], bins=bins, density=True, histtype="step",
+            both = np.concatenate([d["delta"].to_numpy(),
+                                   d["delta_null"].dropna().to_numpy()])
+            both = both[np.isfinite(both)]
+            lo_x, hi_x = (np.percentile(both, [0.5, 99.5]) if both.size
+                          else (-1.0, 1.0))
+            pad = 0.05 * (hi_x - lo_x or 1.0)
+            bins = np.linspace(lo_x - pad, hi_x + pad, 41)
+            ax.hist(d["delta_null"].dropna(), bins=bins, density=True,
+                    histtype="stepfilled", color=NULL_GREY, alpha=0.45, lw=0)
+            ax.hist(d["delta"], bins=bins, density=True, histtype="stepfilled",
+                    color=col, alpha=0.35, lw=0)
+            ax.hist(d["delta"], bins=bins, density=True, histtype="step",
                     color=col, lw=0.9)
-            ax.set_ylim(0, max(hn.max(), ho.max()) * 1.18)
-            # Label the two histograms where they are, not in a legend box.
-            # The null label sits LEFT of the null peak at three-quarters
-            # height, where the null's own left tail is already low.
-            centres = 0.5 * (bins[:-1] + bins[1:])
-            ax.text(centres[np.argmax(hn)] - 1.3, hn.max() * 0.78,
-                    f"within-cell\nnull\n{n_null:,} cells\nq < 0.05",
-                    ha="right", va="center", fontsize=5.4, color="0.4",
-                    linespacing=1.05)
-            ax.text(centres[np.argmax(ho)], ho.max() * 1.05, "observed",
-                    ha="center", va="bottom", fontsize=5.8, color=col)
-            if np.isfinite(z_star):
-                ax.axvline(z_star, color="0.25", lw=0.6, ls="--")
-                ax.text(z_star + 0.2, 0.99, "q = 0.05",
-                        transform=ax.get_xaxis_transform(), ha="left",
-                        va="top", fontsize=5.2, color="0.3")
-            ax.text(0.99, 0.80,
-                    f"{n_sig:,} / {n_cells:,} cells\nq < 0.05 ({100 * n_sig / n_cells:.0f}%)",
-                    transform=ax.transAxes, ha="right", va="top", color=col,
-                    fontsize=6.2, fontweight="bold")
-            ax.set_xlabel("per-cell z (linked vs matched unlinked)")
-            # No y label: the axis carries no ticks, and the space left of it
-            # is where the null histogram's label has to go.
+            ax.axvline(0.0, color="0.25", lw=0.6, ls="--")
+            # The headline sits ABOVE the axes: with real data the two
+            # histograms overlap around zero and any in-axes text covers them.
+            # Colour names the curves -- mark colour observed, grey control --
+            # so no legend box is needed.
+            ax.text(0.5, 1.13,
+                    f"{100 * obs['frac']:.0f}% of {obs['n']:,} cells "
+                    f"\u0394 > 0, {fmt_p(obs['p'])}",
+                    transform=ax.transAxes, ha="center", va="bottom",
+                    color=col, fontsize=6.2, fontweight="bold")
+            ax.text(0.5, 1.02,
+                    f"negative control (grey): {100 * ctl['frac']:.0f}% > 0",
+                    transform=ax.transAxes, ha="center", va="bottom",
+                    color="0.4", fontsize=5.8)
+            ax.set_xlabel("per-cell \u0394r (contacts \u2212 null)")
             ax.set_yticks([])
             ax.spines["left"].set_visible(False)
             if r == 0:
-                ax.set_title("Observed vs within-cell null", pad=6)
-            ax.text(-0.30, 0.5, MARK_LABEL.get(mark, mark), rotation=90,
+                ax.set_title("Observed vs negative control", pad=24)
+            ax.text(-0.18, 0.5, MARK_LABEL.get(mark, mark), rotation=90,
                     transform=ax.transAxes, ha="center", va="center",
                     color=col, fontsize=7, fontweight="bold")
 
-            # (ii) by cell type ------------------------------------------
+            # (ii) by cell type -------------------------------------------
             ax = fig.add_subplot(gs[r, 1])
-            null_delta = d["z_null"] * d["se"]
-            lo, hi95 = np.percentile(null_delta, [2.5, 97.5])
-            ax.axhspan(lo, hi95, color=NULL_GREY, alpha=0.22, lw=0, zorder=0)
-            ax.text(1.01, 0.5 * (lo + hi95), "null\n95%",
-                    transform=ax.get_yaxis_transform(), ha="left",
-                    va="center", fontsize=5.2, color="0.45", linespacing=1.0)
+            ctl_d = d["delta_null"].dropna().to_numpy()
+            if ctl_d.size:
+                lo, hi95 = np.percentile(ctl_d, [2.5, 97.5])
+                ax.axhspan(lo, hi95, color=NULL_GREY, alpha=0.22, lw=0, zorder=0)
+                ax.text(1.01, 0.5 * (lo + hi95), "control\n95%",
+                        transform=ax.get_yaxis_transform(), ha="left",
+                        va="center", fontsize=5.2, color="0.45",
+                        linespacing=1.0)
             ax.axhline(0.0, color="0.55", lw=0.5, ls="--", zorder=0)
             rng = np.random.default_rng(1 + r)
             data = [d.loc[d["group"] == g, "delta"].to_numpy() for g in present]
-            bp = ax.boxplot(data, positions=np.arange(len(present)), widths=0.55,
-                            showfliers=False, patch_artist=True,
-                            medianprops=dict(color="0.1", lw=0.9),
-                            whiskerprops=dict(lw=0.6), capprops=dict(lw=0.6),
-                            boxprops=dict(lw=0.6))
-            for i, (g, patch) in enumerate(zip(present, bp["boxes"])):
-                gc = group_colors.get(g, "#888888")
-                patch.set_facecolor(gc)
-                patch.set_alpha(0.30)
-                patch.set_edgecolor(gc)
+            keep = [i for i, v in enumerate(data) if v.size]
+            if keep:
+                bp = ax.boxplot([data[i] for i in keep], positions=keep,
+                                widths=0.55, showfliers=False,
+                                patch_artist=True,
+                                medianprops=dict(color="0.1", lw=0.9),
+                                whiskerprops=dict(lw=0.6),
+                                capprops=dict(lw=0.6), boxprops=dict(lw=0.6))
+                for i, patch in zip(keep, bp["boxes"]):
+                    gc = group_colors.get(present[i], "#888888")
+                    patch.set_facecolor(gc)
+                    patch.set_alpha(0.30)
+                    patch.set_edgecolor(gc)
+            for i, g in enumerate(present):
                 vals = data[i]
+                if not vals.size:
+                    continue
+                gc = group_colors.get(g, "#888888")
                 ax.scatter(i + rng.uniform(-0.2, 0.2, len(vals)), vals, s=1.2,
-                           color=gc, alpha=0.35, lw=0, zorder=1, rasterized=True)
-                frac = float((d.loc[d["group"] == g, "q"] < 0.05).mean())
-                ax.text(i, 1.0, f"{100 * frac:.0f}%", transform=ax.get_xaxis_transform(),
-                        ha="center", va="bottom", fontsize=5.4, color="0.3")
+                           color=gc, alpha=0.35, lw=0, zorder=1,
+                           rasterized=True)
+                frac = float((vals > 0).mean())
+                ax.text(i, 1.0, f"{100 * frac:.0f}%",
+                        transform=ax.get_xaxis_transform(), ha="center",
+                        va="bottom", fontsize=5.4, color="0.3")
             ax.set_xticks(np.arange(len(present)))
             ax.set_xticklabels(present, rotation=40, ha="right")
             for lab, g in zip(ax.get_xticklabels(), present):
                 lab.set_color(group_colors.get(g, "#333333"))
-            ax.set_ylabel("per-cell Δr")
+            ax.set_ylabel("per-cell \u0394r")
             ax.set_xlim(-0.6, len(present) - 0.4)
             if r == 0:
-                ax.set_title("By cell type (% cells with q < 0.05)", pad=11)
+                ax.set_title("By cell type (% cells with \u0394 > 0)", pad=24)
 
-            # (iii) detection vs depth -----------------------------------
+            # (iii) individual significance vs depth ------------------------
             ax = fig.add_subplot(gs[r, 2])
-            sig = (d["q"] < 0.05).to_numpy()
-            ax.scatter(d.loc[~sig, "n_pairs"], d.loc[~sig, "z"], s=1.5,
-                       color=NULL_GREY, alpha=0.55, lw=0, rasterized=True,
-                       label="q ≥ 0.05")
-            ax.scatter(d.loc[sig, "n_pairs"], d.loc[sig, "z"], s=1.5,
-                       color=col, alpha=0.45, lw=0, rasterized=True,
-                       label="q < 0.05")
-            mid, med = running_median(d["n_pairs"], d["z"])
-            ax.plot(mid, med, color="0.1", lw=1.0, label="running median")
-            ax.set_xscale("log")
-            if np.isfinite(z_star):
-                ax.axhline(z_star, color="0.25", lw=0.6, ls="--")
-            depth, kind = pass_depth(d["n_pairs"], sig)
-            if kind == "crossing":
-                ax.axvline(depth, color="0.25", lw=0.6, ls=":")
-                note = f"\u226580% of cells pass\nabove ~{depth:,.0f} pairs"
-                ax.text(depth * 1.1, 0.97, note, transform=ax.get_xaxis_transform(),
-                        ha="left", va="top", fontsize=5.6, color="0.25")
+            dz = d[np.isfinite(d["z"])]
+            if len(dz):
+                sig = (dz["q"] < 0.05).to_numpy()
+                ax.scatter(dz.loc[~sig, "n_pairs"], dz.loc[~sig, "z"], s=1.5,
+                           color=NULL_GREY, alpha=0.55, lw=0, rasterized=True,
+                           label="q \u2265 0.05")
+                ax.scatter(dz.loc[sig, "n_pairs"], dz.loc[sig, "z"], s=1.5,
+                           color=col, alpha=0.45, lw=0, rasterized=True,
+                           label="q < 0.05")
+                if len(dz) >= 30:
+                    mid, med = running_median(dz["n_pairs"], dz["z"])
+                    ax.plot(mid, med, color="0.1", lw=1.0,
+                            label="running median")
+                ax.set_xscale("log")
+                z_star = z_threshold(dz)
+                if np.isfinite(z_star):
+                    ax.axhline(z_star, color="0.25", lw=0.6, ls="--")
+                depth, kind = pass_depth(dz["n_pairs"], sig)
+                if kind == "crossing":
+                    ax.axvline(depth, color="0.25", lw=0.6, ls=":")
+                    note = f"\u226580% pass above\n~{depth:,.0f} pairs"
+                elif kind == "always":
+                    note = "\u226580% pass\nat every depth"
+                else:
+                    note = (f"{100 * sig.mean():.0f}% pass\n"
+                            f"individually")
+                ax.text(0.98, 0.97, note, transform=ax.transAxes, ha="right",
+                        va="top", fontsize=5.6, color="0.25",
+                        bbox=dict(facecolor="white", alpha=0.75, lw=0,
+                                  pad=1.0))
+                if r == 0:
+                    ax.legend(loc="upper left", fontsize=5.2, markerscale=3,
+                              handlelength=0.9, handletextpad=0.3,
+                              borderaxespad=0.1, labelspacing=0.25)
             else:
-                note = ("\u226580% of cells pass\nat every depth" if kind == "always"
-                        else "<80% of cells pass\nat any depth")
-                ax.text(0.03, 0.97, note, transform=ax.transAxes, ha="left",
-                        va="top", fontsize=5.6, color="0.25")
-            ax.set_xlabel("informative linked pairs per cell")
+                ax.text(0.5, 0.5, "no cell has enough\nblocks for a z",
+                        transform=ax.transAxes, ha="center", va="center",
+                        fontsize=6, color="0.4")
+            ax.set_xlabel("pairs used per cell")
             ax.set_ylabel("per-cell z")
             if r == 0:
-                ax.set_title("Detection vs sequencing depth", pad=6)
-                ax.legend(loc="upper left", fontsize=5.2, markerscale=3,
-                          handlelength=0.9, handletextpad=0.3,
-                          borderaxespad=0.1, labelspacing=0.25)
+                ax.set_title("Individual significance vs depth", pad=24)
 
         fig.text(0.006, 0.985, "c", fontsize=9, fontweight="bold",
                  ha="left", va="top")
-        fig.text(0.04, 0.985, "Long-range concordance is detectable in individual cells",
+        fig.text(0.04, 0.985,
+                 "Long-range concordance is carried by most individual cells",
                  fontsize=8, fontweight="bold", ha="left", va="top")
         if simulated:
             fig.text(0.985, 0.985, SIM_STAMP, fontsize=6.5, fontweight="bold",
@@ -382,6 +452,7 @@ def plot(df: pd.DataFrame, group_order=None, group_colors=None,
 
         if out_prefix:
             for fmt in formats:
-                fig.savefig(f"{out_prefix}.{fmt}", dpi=600 if fmt == "png" else None,
+                fig.savefig(f"{out_prefix}.{fmt}",
+                            dpi=600 if fmt == "png" else None,
                             bbox_inches="tight")
     return fig

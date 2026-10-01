@@ -193,7 +193,8 @@ def test_pooled_donor_pool_keeps_identifiable_pair_ids(tmp_path):
     pools = m._build_pools(
         cells, {"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"}, args,
         None, None, ())
-    (pos, vals, pi), = pools.values()
+    # Minimal args mean --pair-set joint: one pool, keyed by its pair set.
+    (pos, vals, pi), = pools["joint"].values()
     assert (pi >= 0).all(), "no sentinel ids left"
     # Every end appears twice, once per member of its pair, and no two cells
     # share an id.
@@ -719,13 +720,15 @@ def test_build_pools_parallel_matches_serial(tmp_path):
     ser = m._build_pools(cells, paths, a1, None, None, ())
     par = m._build_pools(cells, paths, a8, None, None, ())
     assert set(ser) == set(par)
-    for k in ser:
-        pos_s, vals_s, pi_s = ser[k]
-        pos_p, vals_p, pi_p = par[k]
-        assert np.array_equal(pos_s, pos_p)
-        assert np.array_equal(pi_s, pi_p)
-        for name in ("g", "h"):
-            assert np.allclose(vals_s[name], vals_p[name])
+    for sk in ser:
+        assert set(ser[sk]) == set(par[sk])
+        for k in ser[sk]:
+            pos_s, vals_s, pi_s = ser[sk][k]
+            pos_p, vals_p, pi_p = par[sk][k]
+            assert np.array_equal(pos_s, pos_p)
+            assert np.array_equal(pi_s, pi_p)
+            for name in vals_s:
+                assert np.allclose(vals_s[name], vals_p[name])
 
 
 def test_pin_inner_threads_stops_pyarrow_fanning_out():
@@ -1000,3 +1003,134 @@ def test_a_thin_cell_reports_nan_not_zero():
     st = pce.percell_stats(few, few, min_pairs=100)
     assert np.isnan(st["delta"]) and np.isnan(st["z"])
     assert st["n_pairs"] == 10
+
+
+# -------------------------------------- per-mark pair sets + matched arm ---
+
+def _drop_hcg(tmp_path, cells):
+    for c in cells:
+        (tmp_path / "HCG" / f"{c}.posteriors.parquet").unlink()
+
+
+def test_a_cell_without_hcg_still_counts_for_gch(tmp_path):
+    """Under the old joint pair set a cell with no HCG output vanished from
+    GCH-GCH too -- 858 of 1,577 cells in the real run."""
+    m = _mod()
+    sp = _fixture(tmp_path)
+    _drop_hcg(tmp_path, ["c0", "c1", "c2"])
+    out = {}
+    for mode in ("per-mark", "joint"):
+        o = tmp_path / mode
+        assert m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
+                       "--posteriors", f"HCG={tmp_path / 'HCG'}",
+                       "--samples", sp, "--min-pairs", "50",
+                       "--plot-format", "png", "--output-dir", str(o),
+                       "--pair-set", mode] + _PERCELL) == 0
+        out[mode] = pd.read_csv(o / "end_posterior_percell.tsv", sep="\t")
+    g_pm = set(out["per-mark"].query("mark == 'GCH'")["cell_id"])
+    g_jt = set(out["joint"].query("mark == 'GCH'")["cell_id"])
+    assert {"c0", "c1", "c2"} <= g_pm
+    assert not ({"c0", "c1", "c2"} & g_jt)
+
+
+def test_per_mark_uses_more_gch_pairs_than_joint(tmp_path):
+    m = _mod()
+    sp = _fixture(tmp_path)
+    _drop_hcg(tmp_path, ["c0"])
+    n = {}
+    for mode in ("per-mark", "joint"):
+        o = tmp_path / mode
+        m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
+                "--posteriors", f"HCG={tmp_path / 'HCG'}", "--samples", sp,
+                "--min-pairs", "50", "--plot-format", "png",
+                "--output-dir", str(o), "--pair-set", mode, "--per-cell", "off"])
+        n[mode] = pd.read_csv(o / "end_posterior_dist_all.tsv",
+                              sep="\t")["gg_linked_n"].sum()
+    assert n["per-mark"] > n["joint"]
+
+
+def test_joint_mode_puts_every_measure_on_one_pair_set(tmp_path):
+    res, _ = _run(tmp_path, ["--pair-set", "joint", "--per-cell", "off"])
+    assert (res["gg_linked_n"] == res["hh_linked_n"]).all()
+
+
+def test_matched_arm_is_reported_and_drives_delta_by_default(tmp_path):
+    res, _ = _run(tmp_path, ["--per-cell", "off"])
+    for mm in ("gg", "hh", "gh"):
+        assert f"{mm}_matched_r" in res.columns
+    # matched is a subset of linked, never larger
+    assert (res["gg_matched_n"] <= res["gg_linked_n"]).all()
+
+
+def _selective_eligibility_fixture(tmp_path, n_cells=12, seed=7):
+    """Recreates the negative HCG Δ under the pooled locus-matched null.
+
+    DENSE loci sit at the same positions in every cell and carry a shared
+    per-locus state, so another cell's end there predicts the anchor as well
+    as the real partner does.  SPARSE loci are unique to each cell, carry no
+    shared state, and have no donor within the window, so the null can never
+    place them.  Linked then mixes both; the null sees only the dense ones.
+    """
+    rng = np.random.default_rng(seed)
+    for ctx in ("GCH", "HCG"):
+        (tmp_path / ctx).mkdir(parents=True, exist_ok=True)
+    dense_pos = np.arange(60) * 400_000 + 50_000
+    locus_state = rng.normal(0, 1.5, dense_pos.size)
+    cells = [f"c{i}" for i in range(n_cells)]
+    for ci, c in enumerate(cells):
+        recs = []
+        for k, p1 in enumerate(dense_pos):
+            s = locus_state[k]
+            recs.append((p1, p1 + 5000, s + rng.normal(0, 0.5),
+                         s + rng.normal(0, 0.5)))
+        for _ in range(60):
+            p1 = int(rng.integers(0, 2_000_000)) * 13 + ci * 7 + 30_000_000
+            recs.append((p1, p1 + 5000, rng.normal(0, 1.5),
+                         rng.normal(0, 1.5)))
+        for ctx in ("GCH", "HCG"):
+            sig = lambda v: 1 / (1 + np.exp(-v))                     # noqa
+            pd.DataFrame([{"chrom": "chr1", "pos1": a, "pos2": b, "n1": 6,
+                           "n2": 6, "distance": 5000,
+                           "posterior1": sig(x), "posterior2": sig(y)}
+                          for a, b, x, y in recs]).to_parquet(
+                tmp_path / ctx / f"{c}.posteriors.parquet")
+    sp = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells}).to_csv(sp, sep="\t", index=False)
+    return str(sp)
+
+
+def test_matched_arm_removes_the_selective_eligibility_artefact(tmp_path):
+    """linked − null comes out NEGATIVE here although no contact effect was
+    planted at all; matched − null, scored on the same loci, does not."""
+    m = _mod()
+    sp = _selective_eligibility_fixture(tmp_path)
+    out = tmp_path / "out"
+    assert m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
+                   "--posteriors", f"HCG={tmp_path / 'HCG'}",
+                   "--samples", sp, "--null-type", "locus-matched",
+                   "--null-scope", "pooled", "--null-window", "100",
+                   "--min-pairs", "50", "--min-distance", "1000",
+                   "--max-distance", "100000", "--plot-format", "png",
+                   "--per-cell", "off", "--n-bootstrap", "0",
+                   "--fisher-z", "none", "--output-dir", str(out)]) == 0
+    r = pd.read_csv(out / "end_posterior_dist_all.tsv", sep="\t")
+    row = r.loc[r["gg_null_n"].idxmax()]
+    linked_minus_null = row["gg_linked_r"] - row["gg_null_r"]
+    matched_minus_null = row["gg_matched_r"] - row["gg_null_r"]
+    assert linked_minus_null < -0.15, linked_minus_null
+    assert abs(matched_minus_null) < 0.08, matched_minus_null
+
+
+def test_hcg_floor_of_one_keeps_more_hcg_pairs_than_two(tmp_path):
+    res1, _ = _run(tmp_path / "a", ["--per-cell", "off", "--min-sites-hcg", "1"])
+    res2, _ = _run(tmp_path / "b", ["--per-cell", "off", "--min-sites-hcg", "2"])
+    assert res1["hh_linked_n"].sum() >= res2["hh_linked_n"].sum()
+
+
+def test_explicit_min_sites_still_applies_to_both_marks():
+    m = _mod()
+    import argparse
+    a = argparse.Namespace(min_sites=3, min_sites_gch=2, min_sites_hcg=1)
+    assert m._min_sites(a) == {"GCH": 3, "HCG": 3}
+    b = argparse.Namespace(min_sites=None, min_sites_gch=2, min_sites_hcg=1)
+    assert m._min_sites(b) == {"GCH": 2, "HCG": 1}
