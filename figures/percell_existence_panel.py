@@ -15,7 +15,8 @@ cannot fake a signal -- which is why this panel uses panel a's statistic and
 not the marginal-corrected C (that matrix is centred to zero per bin, so the
 level this panel tests is gone from it by construction).
 
-Layout, one row per mark:
+Layout, one row per mark (written as the full panel, plus <out>_main with
+column (i) for the main figure and <out>_ED with (ii)-(iii) for Extended Data):
   (i)   per-cell z, observed vs within-cell null, with how many cells pass
   (ii)  per-cell delta by cell type, in --group-order, with % significant
   (iii) z against linked pairs per cell: how deep a cell must be sequenced
@@ -45,8 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # (scripts/end_posterior_distance_correlation.py) and this mock-up draw the
 # same panel from the same code.  Re-exported here for the CLI and the tests.
 from nome_hic_concordance.percell_existence import (           # noqa: E402,F401
-    MARKS, MARK_COLOR, MARK_LABEL, NULL_GREY, REQUIRED, SIM_STAMP, add_q,
-    one_sided_p, pass_depth, plot, running_median, z_threshold)
+    LAYOUTS, MARKS, MARK_COLOR, MARK_LABEL, NULL_GREY, REQUIRED, SIM_STAMP,
+    add_q, one_sided_p, pass_depth, plot, plot_layouts, running_median,
+    z_threshold)
 
 GROUP_ORDER = ["IT-L2/3", "IT-L4", "IT-L5/6", "CT-L6", "Inhib",
                "ODC", "OPC", "ASC", "MGC", "PC/EC"]
@@ -119,9 +121,10 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     df = simulate(args.seed) if args.simulate else pd.read_csv(args.table, sep="\t")
     df = add_q(df)
-    plot(df, group_order=GROUP_ORDER,
-         group_colors=dict(zip(GROUP_ORDER, PLACEHOLDER_COLORS)),
-         out_prefix=args.out)
+    # <out>.*  full panel; <out>_main.*  column (i), the main figure;
+    # <out>_ED.*  columns (ii)-(iii), Extended Data
+    plot_layouts(df, out_prefix=args.out, group_order=GROUP_ORDER,
+                 group_colors=dict(zip(GROUP_ORDER, PLACEHOLDER_COLORS)))
     for mark, d in df.groupby("mark"):
         n_sig = int((d["q"] < 0.05).sum())
         print(f"{mark}: {n_sig}/{len(d)} cells q<0.05 "

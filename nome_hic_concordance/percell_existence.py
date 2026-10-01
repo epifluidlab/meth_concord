@@ -262,8 +262,22 @@ def pass_depth(n_pairs, significant, target: float = 0.8,
 
 # ------------------------------------------------------------------- figure ---
 
+#: Relative widths of the three columns, and the full panel's title.
+_COL_WIDTH = (1.0, 1.65, 1.05)
+FULL_TITLE = "Long-range concordance is carried by most individual cells"
+#: Panel c in the main figure is column (i) alone; (ii) and (iii) go to
+#: Extended Data.  (columns, letter, title, file suffix) for each.
+LAYOUTS = {
+    "full": ((0, 1, 2), "c", FULL_TITLE, ""),
+    "main": ((0,), "c", "Concordance in individual cells", "_main"),
+    "ED": ((1, 2), None, "Per-cell concordance by cell type and depth", "_ED"),
+}
+
+
 def plot(df: pd.DataFrame, group_order=None, group_colors=None,
-         out_prefix: str | None = None, formats=("pdf", "png")):
+         out_prefix: str | None = None, formats=("pdf", "png"),
+         columns=(0, 1, 2), letter: str | None = "c",
+         title: str | None = FULL_TITLE):
     """Draw panel c and return the Figure.
 
     Read at the level of CELLS, not of each cell's p-value.  At single-cell
@@ -276,6 +290,11 @@ def plot(df: pd.DataFrame, group_order=None, group_colors=None,
       (ii)  the same per cell type, with each type's share above zero;
       (iii) per-cell z against depth -- where individual significance does
             start, if it does.
+
+    ``columns`` draws any subset, in order: ``(0,)`` is the main-figure panel,
+    ``(1, 2)`` its Extended Data companion.  The figure width follows the
+    columns kept, with fixed margins in inches, so a one-column panel is not
+    a three-column canvas with two holes in it.
 
     The stamp is driven by the DATA, not by a flag the caller could forget: if
     any row is marked simulated, the figure says so.
@@ -300,155 +319,194 @@ def plot(df: pd.DataFrame, group_order=None, group_colors=None,
 
     rc = dict(figure_style.RC, **{"mathtext.default": "regular"})
     with plt.rc_context(rc):
-        fig = plt.figure(figsize=(figure_style.FIG_W_IN,
-                                  1.65 * max(len(marks), 1) + 0.55))
-        gs = fig.add_gridspec(max(len(marks), 1), 3,
-                              width_ratios=[1.0, 1.65, 1.05],
+        columns = tuple(columns)
+        if not columns or any(c not in (0, 1, 2) for c in columns):
+            raise ValueError("columns must be a non-empty subset of (0, 1, 2)")
+        ratios = [_COL_WIDTH[c] for c in columns]
+        # Width scales with the columns kept; margins are fixed in inches.
+        unit = (figure_style.FIG_W_IN - 0.95) / (sum(_COL_WIDTH) + 0.7)
+        width = 0.95 + unit * (sum(ratios) + 0.35 * (len(ratios) - 1))
+        # Top margin in inches: the column titles sit 24 pt above the axes
+        # (headline lines go between), and the figure title needs its own line
+        # above them -- at 0.55 in the two overprinted.
+        top_in = 0.74 if title else 0.52
+        height = 1.65 * max(len(marks), 1) + top_in - 0.1
+        fig = plt.figure(figsize=(width, height))
+        gs = fig.add_gridspec(max(len(marks), 1), len(columns),
+                              width_ratios=ratios,
                               hspace=0.78, wspace=0.34,
-                              left=0.085, right=0.985, top=0.83, bottom=0.12)
+                              left=0.62 / width, right=1 - 0.12 / width,
+                              top=1 - top_in / height,
+                              bottom=0.12)
+        slot = {c: i for i, c in enumerate(columns)}
         for r, mark in enumerate(marks):
             d = df[(df["mark"] == mark) & np.isfinite(df["delta"])]
             col = MARK_COLOR.get(mark, "#333333")
             obs, ctl = sign_test(d["delta"]), sign_test(d["delta_null"])
+            row_axes = []
 
-            # (i) observed vs control, read by sign ------------------------
-            ax = fig.add_subplot(gs[r, 0])
-            both = np.concatenate([d["delta"].to_numpy(),
-                                   d["delta_null"].dropna().to_numpy()])
-            both = both[np.isfinite(both)]
-            lo_x, hi_x = (np.percentile(both, [0.5, 99.5]) if both.size
-                          else (-1.0, 1.0))
-            pad = 0.05 * (hi_x - lo_x or 1.0)
-            bins = np.linspace(lo_x - pad, hi_x + pad, 41)
-            ax.hist(d["delta_null"].dropna(), bins=bins, density=True,
-                    histtype="stepfilled", color=NULL_GREY, alpha=0.45, lw=0)
-            ax.hist(d["delta"], bins=bins, density=True, histtype="stepfilled",
-                    color=col, alpha=0.35, lw=0)
-            ax.hist(d["delta"], bins=bins, density=True, histtype="step",
-                    color=col, lw=0.9)
-            ax.axvline(0.0, color="0.25", lw=0.6, ls="--")
-            # The headline sits ABOVE the axes: with real data the two
-            # histograms overlap around zero and any in-axes text covers them.
-            # Colour names the curves -- mark colour observed, grey control --
-            # so no legend box is needed.
-            ax.text(0.5, 1.13,
-                    f"{100 * obs['frac']:.0f}% of {obs['n']:,} cells "
-                    f"\u0394 > 0, {fmt_p(obs['p'])}",
-                    transform=ax.transAxes, ha="center", va="bottom",
-                    color=col, fontsize=6.2, fontweight="bold")
-            ax.text(0.5, 1.02,
-                    f"negative control (grey): {100 * ctl['frac']:.0f}% > 0",
-                    transform=ax.transAxes, ha="center", va="bottom",
-                    color="0.4", fontsize=5.8)
-            ax.set_xlabel("per-cell \u0394r (contacts \u2212 null)")
-            ax.set_yticks([])
-            ax.spines["left"].set_visible(False)
-            if r == 0:
-                ax.set_title("Observed vs negative control", pad=24)
-            ax.text(-0.18, 0.5, MARK_LABEL.get(mark, mark), rotation=90,
-                    transform=ax.transAxes, ha="center", va="center",
-                    color=col, fontsize=7, fontweight="bold")
-
-            # (ii) by cell type -------------------------------------------
-            ax = fig.add_subplot(gs[r, 1])
-            ctl_d = d["delta_null"].dropna().to_numpy()
-            if ctl_d.size:
-                lo, hi95 = np.percentile(ctl_d, [2.5, 97.5])
-                ax.axhspan(lo, hi95, color=NULL_GREY, alpha=0.22, lw=0, zorder=0)
-                ax.text(1.01, 0.5 * (lo + hi95), "control\n95%",
-                        transform=ax.get_yaxis_transform(), ha="left",
-                        va="center", fontsize=5.2, color="0.45",
-                        linespacing=1.0)
-            ax.axhline(0.0, color="0.55", lw=0.5, ls="--", zorder=0)
-            rng = np.random.default_rng(1 + r)
-            data = [d.loc[d["group"] == g, "delta"].to_numpy() for g in present]
-            keep = [i for i, v in enumerate(data) if v.size]
-            if keep:
-                bp = ax.boxplot([data[i] for i in keep], positions=keep,
-                                widths=0.55, showfliers=False,
-                                patch_artist=True,
-                                medianprops=dict(color="0.1", lw=0.9),
-                                whiskerprops=dict(lw=0.6),
-                                capprops=dict(lw=0.6), boxprops=dict(lw=0.6))
-                for i, patch in zip(keep, bp["boxes"]):
-                    gc = group_colors.get(present[i], "#888888")
-                    patch.set_facecolor(gc)
-                    patch.set_alpha(0.30)
-                    patch.set_edgecolor(gc)
-            for i, g in enumerate(present):
-                vals = data[i]
-                if not vals.size:
-                    continue
-                gc = group_colors.get(g, "#888888")
-                ax.scatter(i + rng.uniform(-0.2, 0.2, len(vals)), vals, s=1.2,
-                           color=gc, alpha=0.35, lw=0, zorder=1,
-                           rasterized=True)
-                frac = float((vals > 0).mean())
-                ax.text(i, 1.0, f"{100 * frac:.0f}%",
-                        transform=ax.get_xaxis_transform(), ha="center",
-                        va="bottom", fontsize=5.4, color="0.3")
-            ax.set_xticks(np.arange(len(present)))
-            ax.set_xticklabels(present, rotation=40, ha="right")
-            for lab, g in zip(ax.get_xticklabels(), present):
-                lab.set_color(group_colors.get(g, "#333333"))
-            ax.set_ylabel("per-cell \u0394r")
-            ax.set_xlim(-0.6, len(present) - 0.4)
-            if r == 0:
-                ax.set_title("By cell type (% cells with \u0394 > 0)", pad=24)
-
-            # (iii) individual significance vs depth ------------------------
-            ax = fig.add_subplot(gs[r, 2])
-            dz = d[np.isfinite(d["z"])]
-            if len(dz):
-                sig = (dz["q"] < 0.05).to_numpy()
-                ax.scatter(dz.loc[~sig, "n_pairs"], dz.loc[~sig, "z"], s=1.5,
-                           color=NULL_GREY, alpha=0.55, lw=0, rasterized=True,
-                           label="q \u2265 0.05")
-                ax.scatter(dz.loc[sig, "n_pairs"], dz.loc[sig, "z"], s=1.5,
-                           color=col, alpha=0.45, lw=0, rasterized=True,
-                           label="q < 0.05")
-                if len(dz) >= 30:
-                    mid, med = running_median(dz["n_pairs"], dz["z"])
-                    ax.plot(mid, med, color="0.1", lw=1.0,
-                            label="running median")
-                ax.set_xscale("log")
-                z_star = z_threshold(dz)
-                if np.isfinite(z_star):
-                    ax.axhline(z_star, color="0.25", lw=0.6, ls="--")
-                depth, kind = pass_depth(dz["n_pairs"], sig)
-                if kind == "crossing":
-                    ax.axvline(depth, color="0.25", lw=0.6, ls=":")
-                    note = f"\u226580% pass above\n~{depth:,.0f} pairs"
-                elif kind == "always":
-                    note = "\u226580% pass\nat every depth"
-                else:
-                    note = (f"{100 * sig.mean():.0f}% pass\n"
-                            f"individually")
-                ax.text(0.98, 0.97, note, transform=ax.transAxes, ha="right",
-                        va="top", fontsize=5.6, color="0.25",
-                        bbox=dict(facecolor="white", alpha=0.75, lw=0,
-                                  pad=1.0))
+            if 0 in slot:
+                # (i) observed vs control, read by sign ------------------------
+                ax = fig.add_subplot(gs[r, slot[0]])
+                row_axes.append(ax)
+                both = np.concatenate([d["delta"].to_numpy(),
+                                       d["delta_null"].dropna().to_numpy()])
+                both = both[np.isfinite(both)]
+                lo_x, hi_x = (np.percentile(both, [0.5, 99.5]) if both.size
+                              else (-1.0, 1.0))
+                pad = 0.05 * (hi_x - lo_x or 1.0)
+                bins = np.linspace(lo_x - pad, hi_x + pad, 41)
+                ax.hist(d["delta_null"].dropna(), bins=bins, density=True,
+                        histtype="stepfilled", color=NULL_GREY, alpha=0.45, lw=0)
+                ax.hist(d["delta"], bins=bins, density=True, histtype="stepfilled",
+                        color=col, alpha=0.35, lw=0)
+                ax.hist(d["delta"], bins=bins, density=True, histtype="step",
+                        color=col, lw=0.9)
+                ax.axvline(0.0, color="0.25", lw=0.6, ls="--")
+                # The headline sits ABOVE the axes: with real data the two
+                # histograms overlap around zero and any in-axes text covers them.
+                # Colour names the curves -- mark colour observed, grey control --
+                # so no legend box is needed.
+                ax.text(0.5, 1.13,
+                        f"{100 * obs['frac']:.0f}% of {obs['n']:,} cells "
+                        f"\u0394 > 0, {fmt_p(obs['p'])}",
+                        transform=ax.transAxes, ha="center", va="bottom",
+                        color=col, fontsize=6.2, fontweight="bold")
+                ax.text(0.5, 1.02,
+                        f"negative control (grey): {100 * ctl['frac']:.0f}% > 0",
+                        transform=ax.transAxes, ha="center", va="bottom",
+                        color="0.4", fontsize=5.8)
+                ax.set_xlabel("per-cell \u0394r (contacts \u2212 null)")
+                ax.set_yticks([])
+                ax.spines["left"].set_visible(False)
                 if r == 0:
-                    ax.legend(loc="upper left", fontsize=5.2, markerscale=3,
-                              handlelength=0.9, handletextpad=0.3,
-                              borderaxespad=0.1, labelspacing=0.25)
-            else:
-                ax.text(0.5, 0.5, "no cell has enough\nblocks for a z",
-                        transform=ax.transAxes, ha="center", va="center",
-                        fontsize=6, color="0.4")
-            ax.set_xlabel("pairs used per cell")
-            ax.set_ylabel("per-cell z")
-            if r == 0:
-                ax.set_title("Individual significance vs depth", pad=24)
+                    ax.set_title("Observed vs negative control", pad=24)
 
-        fig.text(0.006, 0.985, "c", fontsize=9, fontweight="bold",
-                 ha="left", va="top")
-        fig.text(0.04, 0.985,
-                 "Long-range concordance is carried by most individual cells",
-                 fontsize=8, fontweight="bold", ha="left", va="top")
+            if 1 in slot:
+                # (ii) by cell type -------------------------------------------
+                ax = fig.add_subplot(gs[r, slot[1]])
+                row_axes.append(ax)
+                ctl_d = d["delta_null"].dropna().to_numpy()
+                if ctl_d.size:
+                    lo, hi95 = np.percentile(ctl_d, [2.5, 97.5])
+                    ax.axhspan(lo, hi95, color=NULL_GREY, alpha=0.22, lw=0, zorder=0)
+                    ax.text(1.01, 0.5 * (lo + hi95), "control\n95%",
+                            transform=ax.get_yaxis_transform(), ha="left",
+                            va="center", fontsize=5.2, color="0.45",
+                            linespacing=1.0)
+                ax.axhline(0.0, color="0.55", lw=0.5, ls="--", zorder=0)
+                rng = np.random.default_rng(1 + r)
+                data = [d.loc[d["group"] == g, "delta"].to_numpy() for g in present]
+                keep = [i for i, v in enumerate(data) if v.size]
+                if keep:
+                    bp = ax.boxplot([data[i] for i in keep], positions=keep,
+                                    widths=0.55, showfliers=False,
+                                    patch_artist=True,
+                                    medianprops=dict(color="0.1", lw=0.9),
+                                    whiskerprops=dict(lw=0.6),
+                                    capprops=dict(lw=0.6), boxprops=dict(lw=0.6))
+                    for i, patch in zip(keep, bp["boxes"]):
+                        gc = group_colors.get(present[i], "#888888")
+                        patch.set_facecolor(gc)
+                        patch.set_alpha(0.30)
+                        patch.set_edgecolor(gc)
+                for i, g in enumerate(present):
+                    vals = data[i]
+                    if not vals.size:
+                        continue
+                    gc = group_colors.get(g, "#888888")
+                    ax.scatter(i + rng.uniform(-0.2, 0.2, len(vals)), vals, s=1.2,
+                               color=gc, alpha=0.35, lw=0, zorder=1,
+                               rasterized=True)
+                    frac = float((vals > 0).mean())
+                    ax.text(i, 1.0, f"{100 * frac:.0f}%",
+                            transform=ax.get_xaxis_transform(), ha="center",
+                            va="bottom", fontsize=5.4, color="0.3")
+                ax.set_xticks(np.arange(len(present)))
+                ax.set_xticklabels(present, rotation=40, ha="right")
+                for lab, g in zip(ax.get_xticklabels(), present):
+                    lab.set_color(group_colors.get(g, "#333333"))
+                ax.set_ylabel("per-cell \u0394r")
+                ax.set_xlim(-0.6, len(present) - 0.4)
+                if r == 0:
+                    ax.set_title("By cell type (% cells with \u0394 > 0)", pad=24)
+
+            if 2 in slot:
+                # (iii) individual significance vs depth ------------------------
+                ax = fig.add_subplot(gs[r, slot[2]])
+                row_axes.append(ax)
+                dz = d[np.isfinite(d["z"])]
+                if len(dz):
+                    sig = (dz["q"] < 0.05).to_numpy()
+                    ax.scatter(dz.loc[~sig, "n_pairs"], dz.loc[~sig, "z"], s=1.5,
+                               color=NULL_GREY, alpha=0.55, lw=0, rasterized=True,
+                               label="q \u2265 0.05")
+                    ax.scatter(dz.loc[sig, "n_pairs"], dz.loc[sig, "z"], s=1.5,
+                               color=col, alpha=0.45, lw=0, rasterized=True,
+                               label="q < 0.05")
+                    if len(dz) >= 30:
+                        mid, med = running_median(dz["n_pairs"], dz["z"])
+                        ax.plot(mid, med, color="0.1", lw=1.0,
+                                label="running median")
+                    ax.set_xscale("log")
+                    z_star = z_threshold(dz)
+                    if np.isfinite(z_star):
+                        ax.axhline(z_star, color="0.25", lw=0.6, ls="--")
+                    depth, kind = pass_depth(dz["n_pairs"], sig)
+                    if kind == "crossing":
+                        ax.axvline(depth, color="0.25", lw=0.6, ls=":")
+                        note = f"\u226580% pass above\n~{depth:,.0f} pairs"
+                    elif kind == "always":
+                        note = "\u226580% pass\nat every depth"
+                    else:
+                        note = (f"{100 * sig.mean():.0f}% pass\n"
+                                f"individually")
+                    ax.text(0.98, 0.97, note, transform=ax.transAxes, ha="right",
+                            va="top", fontsize=5.6, color="0.25",
+                            bbox=dict(facecolor="white", alpha=0.75, lw=0,
+                                      pad=1.0))
+                    if r == 0:
+                        ax.legend(loc="upper left", fontsize=5.2, markerscale=3,
+                                  handlelength=0.9, handletextpad=0.3,
+                                  borderaxespad=0.1, labelspacing=0.25)
+                else:
+                    ax.text(0.5, 0.5, "no cell has enough\nblocks for a z",
+                            transform=ax.transAxes, ha="center", va="center",
+                            fontsize=6, color="0.4")
+                ax.set_xlabel("pairs used per cell")
+                ax.set_ylabel("per-cell z")
+                if r == 0:
+                    ax.set_title("Individual significance vs depth", pad=24)
+
+
+            # The mark names the row on whichever column is drawn first.
+            # Offset in inches: column (i) has no y ticks, the others do.
+            off = 0.16 if columns[0] == 0 else 0.5
+            row_axes[0].text(-off / (unit * _COL_WIDTH[columns[0]]), 0.5,
+                             MARK_LABEL.get(mark, mark), rotation=90,
+                             transform=row_axes[0].transAxes, ha="center",
+                             va="center", color=col, fontsize=7,
+                             fontweight="bold")
+
+        # Letter and title are placed in inches, not figure fractions, so they
+        # sit the same distance in on a one-column panel as on three.
+        if letter:
+            fig.text(0.05 / width, 0.985, letter, fontsize=9, fontweight="bold",
+                     ha="left", va="top")
+        if title:
+            fig.text((0.22 if letter else 0.05) / width, 0.985, title,
+                     fontsize=8, fontweight="bold", ha="left", va="top")
         if simulated:
-            fig.text(0.985, 0.985, SIM_STAMP, fontsize=6.5, fontweight="bold",
-                     color="#C0392B", ha="right", va="top")
+            # Top right on the wide figure; on a narrow one the title fills
+            # that line, so the stamp goes along the bottom edge instead.
+            if width >= 4.0:
+                fig.text(0.985, 0.985, SIM_STAMP, fontsize=6.5,
+                         fontweight="bold", color="#C0392B", ha="right",
+                         va="top")
+            else:
+                fig.text(0.05 / width, 0.004, SIM_STAMP, fontsize=6.5,
+                         fontweight="bold", color="#C0392B", ha="left",
+                         va="bottom")
 
         if out_prefix:
             for fmt in formats:
@@ -456,3 +514,23 @@ def plot(df: pd.DataFrame, group_order=None, group_colors=None,
                             dpi=600 if fmt == "png" else None,
                             bbox_inches="tight")
     return fig
+
+
+def plot_layouts(df: pd.DataFrame, out_prefix: str, group_order=None,
+                 group_colors=None, formats=("pdf", "png"),
+                 layouts=("full", "main", "ED")) -> dict:
+    """Write each layout to ``<out_prefix><suffix>.<fmt>``; returns the figures.
+
+    The main and Extended Data panels are drawn from the same table by the same
+    code as the full panel, so the three can never disagree.
+    """
+    import matplotlib.pyplot as plt
+    figs = {}
+    for name in layouts:
+        columns, letter, title, suffix = LAYOUTS[name]
+        figs[name] = plot(df, group_order=group_order,
+                          group_colors=group_colors,
+                          out_prefix=f"{out_prefix}{suffix}", formats=formats,
+                          columns=columns, letter=letter, title=title)
+        plt.close(figs[name])
+    return figs

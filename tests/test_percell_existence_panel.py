@@ -148,3 +148,54 @@ def test_exponents_are_mathtext_not_unicode_superscripts():
     s = fmt_p(3e-40)
     assert "$^{-40}$" in s
     assert not any(ch in s for ch in "⁰¹²³⁻")
+
+
+# ------------------------------------------------- main / Extended Data split ---
+
+def _titles(fig):
+    return [ax.get_title() for ax in fig.axes]
+
+
+def test_main_panel_is_column_one_alone():
+    """The main figure shows observed vs control only, one axis per mark."""
+    m = _mod()
+    df = m.add_q(m.simulate(9))
+    fig = m.plot(df, columns=(0,))
+    assert len(fig.axes) == len(m.MARKS)
+    assert _titles(fig)[0] == "Observed vs negative control"
+    assert not any("cell type" in t or "depth" in t for t in _titles(fig))
+
+
+def test_extended_data_panel_is_columns_two_and_three():
+    m = _mod()
+    fig = m.plot(m.add_q(m.simulate(10)), columns=(1, 2), letter=None)
+    assert len(fig.axes) == 2 * len(m.MARKS)
+    titles = [t for t in _titles(fig) if t]
+    assert titles[0].startswith("By cell type")
+    assert titles[1].startswith("Individual significance")
+    assert "Observed vs negative control" not in titles
+
+
+def test_one_column_panel_is_narrower_than_three():
+    m = _mod()
+    df = m.add_q(m.simulate(11))
+    full = m.plot(df).get_size_inches()[0]
+    main = m.plot(df, columns=(0,)).get_size_inches()[0]
+    assert main < 0.45 * full
+
+
+def test_layouts_write_three_files_and_each_is_stamped(tmp_path):
+    """Splitting the panel must not lose the SIMULATED stamp on any piece."""
+    m = _mod()
+    figs = m.plot_layouts(m.add_q(m.simulate(12)), str(tmp_path / "c"),
+                          formats=("pdf",))
+    for suffix in ("", "_main", "_ED"):
+        assert (tmp_path / f"c{suffix}.pdf").exists(), suffix
+    for name, fig in figs.items():
+        assert any(m.SIM_STAMP in t for t in _texts(fig)), name
+
+
+def test_bad_columns_are_refused():
+    m = _mod()
+    with pytest.raises(ValueError, match="columns"):
+        m.plot(m.add_q(m.simulate(13)), columns=(3,))

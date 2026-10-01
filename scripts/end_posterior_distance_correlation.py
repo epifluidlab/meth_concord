@@ -1280,10 +1280,13 @@ def write_percell(cells, per_cell, args, out_dir, meta):
     plotted = df[df["mark"].isin(pce.MARKS) & df["delta"].notna()
                  & df["delta_null"].notna()]
     if len(plotted):
-        pce.plot(plotted, group_order=meta.get("order"),
-                 group_colors=meta.get("colors"),
-                 out_prefix=str(Path(out_dir) / "end_posterior_percell"),
-                 formats=(args.plot_format,))
+        # full panel, plus main-figure (column i) and Extended Data (ii-iii)
+        prefix = Path(out_dir) / "end_posterior_percell"
+        pce.plot_layouts(plotted, out_prefix=str(prefix),
+                         group_order=meta.get("order"),
+                         group_colors=meta.get("colors"),
+                         formats=(args.plot_format,))
+        logger.info(f"  wrote {prefix}{{,_main,_ED}}.{args.plot_format}")
     logger.info(f"  wrote {tsv}")
     return df
 

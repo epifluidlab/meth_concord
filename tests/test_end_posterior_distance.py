@@ -930,7 +930,8 @@ def test_per_cell_table_and_panel_are_written(tmp_path):
     assert set(t["mark"]) == {"GCH", "HCG", "HCG-GCH"}
     assert len(t) == 8 * 3, "one row per cell per mark"
     assert set(t["group"]) == {"A", "B"}
-    assert (out / "end_posterior_percell.png").exists()
+    for suffix in ("", "_main", "_ED"):
+        assert (out / f"end_posterior_percell{suffix}.png").exists(), suffix
 
 
 def test_per_cell_finds_the_planted_concordance(tmp_path):
