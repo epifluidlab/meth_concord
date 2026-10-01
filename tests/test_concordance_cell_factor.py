@@ -144,3 +144,72 @@ def test_the_mle_edge_is_counted():
     # an exact 0 is "nothing reached this cell", counted separately
     assert cov.loc["a", "zero_frac"] == 0
     assert cov.loc["b", "zero_frac"] == pytest.approx(1 / 4)
+
+
+# ------------------------------------------- level tracking, bin by bin ---
+
+@pytest.fixture
+def level_run(tmp_path):
+    """Eight cell types whose methylation differs bin by bin, as it does.
+
+    'levelL' is L computed from each cell's own level in each bin at ONE
+    coordination everywhere, so its cell-type blocks are methylation and
+    nothing else.  'bioC' has cell-type profiles unrelated to the level.
+    """
+    rng = np.random.default_rng(1)
+    types = np.repeat([f"T{i}" for i in range(8)], 25)
+    n, nb = len(types), 300
+    cells = [f"c{i}" for i in range(n)]
+    bins = [f"chr1:{j * 250_000}" for j in range(nb)]
+    t_idx = np.searchsorted(np.unique(types), types)
+    eff = rng.normal(0, 0.06, (8, nb))                 # DMR-like
+    p = np.clip(0.62 + eff[t_idx] + rng.normal(0, 0.03, (n, nb)), 0.3, 0.95)
+    d = tmp_path / "05_concordance"
+    d.mkdir()
+    frame = dict(index=cells, columns=bins)
+    pd.DataFrame(p, **frame).to_parquet(d / "accessibility_mean.parquet")
+    r = 0.1
+    L = r * (1 - 2 * p) / (p * (1 - p)) + rng.normal(0, 0.02, (n, nb))
+    pd.DataFrame(L, **frame).to_parquet(d / "concordance_levelL.parquet")
+    prof = rng.normal(0, 0.03, (8, nb))
+    bio = prof[t_idx] + rng.normal(0, 0.02, (n, nb))
+    pd.DataFrame(bio, **frame).to_parquet(d / "concordance_bioC.parquet")
+    sp = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "cell_type": types}).to_csv(
+        sp, sep="\t", index=False)
+    return d, sp, tmp_path
+
+
+def _level_summary(level_run):
+    d, sp, tmp = level_run
+    m = _mod()
+    argv = ["--matrix", f"levelL={d / 'concordance_levelL.parquet'}",
+            "--matrix", f"bioC={d / 'concordance_bioC.parquet'}",
+            "--samples", str(sp), "--cell-type-column", "cell_type",
+            "--top-bins", "100", "-o", str(tmp / "out" / "cf"),
+            "--plot-format", "png"]
+    assert m.main(argv) == 0
+    return pd.read_csv(tmp / "out" / "cf.summary.tsv", sep="\t")
+
+
+def test_blocks_that_are_methylation_are_called_so(level_run):
+    s = _level_summary(level_run)
+    same = _get(s, "levelL", "level_tracking_top", "same_abs_r")
+    other = _get(s, "levelL", "level_tracking_top", "other_bins_abs_r")
+    assert same > 0.8
+    assert same > other + 0.3
+    # L falls as methylation rises (for p > 0.5 and positive coordination)
+    assert _get(s, "levelL", "level_tracking_top", "same_r") < -0.8
+
+
+def test_blocks_unrelated_to_level_sit_at_chance(level_run):
+    s = _level_summary(level_run)
+    same = _get(s, "bioC", "level_tracking_top", "same_abs_r")
+    chance = _get(s, "bioC", "level_tracking_top", "permuted_types_abs_r")
+    assert abs(same - chance) < 0.15
+
+
+def test_level_test_needs_four_cell_types(run):
+    """Three cell-type means cannot carry a correlation worth reporting."""
+    s = _summary(run, "bio")
+    assert not s["kind"].str.startswith("level_tracking").any()

@@ -36,6 +36,31 @@ that tracks depth within a cell type is technical however well it also
 separates cell types; one that separates cell types and tracks nothing
 within them is not, or not detectably so.
 
+A heatmap without stripes is not cleared by that.  The level can also enter
+bin by bin, and then it draws cell-type BLOCKS, which look like biology.  For
+pure coordination r between two ends at level p,
+
+    C = 2 r p(1-p)                     0.84x from p = 0.52 to 0.70
+    L ~ r (1 - 2p) / (p(1-p))          11.5x over the same range
+
+so at equal coordination L is set largely by the bin's level, and wherever
+cell types differ in level -- most bins, for methylation -- L differs with
+them.  (C's level term is a different one: a marginal mismatch d between the
+linked and the expected ends adds 2d(2p-1) to C, 10x over that range, but
+only 2d/(p(1-p)) to L, 1.2x.  Its weight follows the cell's genome-wide
+level, which is a stripe.)  So, per bin, the statistic's cell-type means are
+correlated with the level's cell-type means -- means, because a cell has
+level data in too few bins to regress on cell by cell -- and set against two
+references:
+
+  other bins       the level of a DIFFERENT bin: what a genome-wide level
+                   difference between cell types gives on its own
+  permuted types   the level with cell-type labels shuffled per bin: chance
+
+over all bins and over the --top-bins most cell-type-variable ones (the kind
+a marker heatmap draws).  Same bin well above other bins means the
+statistic's blocks follow each bin's own methylation.
+
 Usage:
   concordance_cell_factor.py \\
       --matrix gch=.../context_GCH/05_concordance/concordance_coordination.margreg_k5.method1_local.resid.parquet \\
@@ -143,6 +168,73 @@ def leading_factors(normed: pd.DataFrame, n_pcs: int = 5, seed: int = 0):
     share = (svd.singular_values_ ** 2) / total if total > 0 else \
         np.zeros(k)
     return svd.transform(Z), svd.components_, share
+
+
+def _colcorr(A: np.ndarray, B: np.ndarray, min_n: int = 4) -> np.ndarray:
+    """Pearson r per column over the rows finite in both; NaN under min_n."""
+    ok = np.isfinite(A) & np.isfinite(B)
+    n = ok.sum(0)
+    A0, B0 = np.where(ok, A, 0.0), np.where(ok, B, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ma, mb = A0.sum(0) / n, B0.sum(0) / n
+        da, db = np.where(ok, A - ma, 0.0), np.where(ok, B - mb, 0.0)
+        r = (da * db).sum(0) / np.sqrt((da ** 2).sum(0) * (db ** 2).sum(0))
+    return np.where(n >= min_n, r, np.nan)
+
+
+def type_variable_bins(normed: pd.DataFrame, cell_type, top: int) -> list:
+    """The ``top`` bins with the largest between-cell-type share (eta^2) of
+    the normalised values -- the kind of bin a marker heatmap selects."""
+    X = normed.to_numpy(float)
+    g = pd.Series(np.asarray(cell_type))
+    means = pd.DataFrame(X).groupby(g.values).transform("mean").to_numpy()
+    mu = X.mean(0, keepdims=True)
+    tot = ((X - mu) ** 2).sum(0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        e2 = np.where(tot > 0, ((means - mu) ** 2).sum(0) / tot, 0.0)
+    order = np.argsort(-e2)[:max(1, int(top))]
+    return [normed.columns[i] for i in order]
+
+
+def level_tracking(raw: pd.DataFrame, level: pd.DataFrame | None,
+                   cell_type, top_bins: list, seed: int = 0) -> dict:
+    """Does the statistic's cell-type pattern in a bin follow that bin's level?
+
+    Returns ``{scope: {same_abs_r, same_r, other_bins_abs_r,
+    permuted_types_abs_r, n_bins}}`` for scope ``all`` and ``top``, medians
+    over bins.  Empty when there is no level or fewer than 4 cell types.
+    """
+    if level is None:
+        return {}
+    g = np.asarray(cell_type).astype(str)
+    S = raw.groupby(g).mean()
+    Lv = level.reindex(index=raw.index, columns=raw.columns).groupby(g).mean()
+    if len(S) < 4:
+        return {}
+    Y, X = S.to_numpy(float), Lv.reindex(S.index).to_numpy(float)
+    rng = np.random.default_rng(seed)
+    nb = X.shape[1]
+    # Another bin's level: one random non-zero offset, so no bin meets itself.
+    other = (np.arange(nb) + int(rng.integers(1, max(nb, 2)))) % nb
+    # Cell-type labels shuffled independently in every bin.
+    perm = np.argsort(rng.random(X.shape), axis=0)
+    r_same = _colcorr(X, Y)
+    r_other = _colcorr(X[:, other], Y)
+    r_perm = _colcorr(np.take_along_axis(X, perm, axis=0), Y)
+    pos = {b: i for i, b in enumerate(S.columns)}
+    top_idx = np.array([pos[b] for b in top_bins if b in pos], int)
+    out = {}
+    for scope, idx in (("all", np.arange(nb)), ("top", top_idx)):
+        if not len(idx):
+            continue
+        out[scope] = {
+            "same_abs_r": float(np.nanmedian(np.abs(r_same[idx]))),
+            "same_r": float(np.nanmedian(r_same[idx])),
+            "other_bins_abs_r": float(np.nanmedian(np.abs(r_other[idx]))),
+            "permuted_types_abs_r": float(np.nanmedian(np.abs(r_perm[idx]))),
+            "n_bins": int(np.isfinite(r_same[idx]).sum()),
+        }
+    return out
 
 
 def _rank(x: np.ndarray) -> np.ndarray:
@@ -254,6 +346,14 @@ def analyse(name: str, path: str, cell_type: pd.Series,
         rows.append({"matrix": name, "kind": "rho_bins", "covariate": c,
                      "value": spearman(bins_df["PC1_loading"], bins_df[c]),
                      "note": "PC1 loading vs bin"})
+    top = type_variable_bins(normed, ct, args.top_bins)
+    for scope, vals in level_tracking(raw.loc[:, retained], level, ct,
+                                      top).items():
+        label = ("all bins" if scope == "all"
+                 else f"top {args.top_bins} cell-type-variable bins")
+        for k, v in vals.items():
+            rows.append({"matrix": name, "kind": f"level_tracking_{scope}",
+                         "covariate": k, "value": v, "note": label})
     return cells_df, bins_df, rows
 
 
@@ -279,6 +379,17 @@ def verdict(summary: pd.DataFrame, name: str) -> str:
     bins = s[s["kind"] == "rho_bins"].dropna(subset=["value"])
     lines.append("  PC1 loading per bin tracks: " + ", ".join(
         f"{r.covariate} {r.value:+.2f}" for r in bins.itertuples()))
+    for scope in ("top", "all"):
+        k = f"level_tracking_{scope}"
+        if not (s["kind"] == k).any():
+            continue
+        note = s[s["kind"] == k]["note"].iloc[0]
+        lines.append(
+            f"  cell-type pattern vs the bin's own level ({note}, "
+            f"n={int(get(k, 'n_bins'))}): |r| same bin "
+            f"{get(k, 'same_abs_r'):.2f} (signed {get(k, 'same_r'):+.2f}), "
+            f"other bins {get(k, 'other_bins_abs_r'):.2f}, permuted types "
+            f"{get(k, 'permuted_types_abs_r'):.2f}")
     return "\n".join(lines)
 
 
@@ -356,6 +467,9 @@ def main(argv=None) -> int:
                     choices=["on", "off"])
     ap.add_argument("--min-cell-coverage", type=float, default=0.0)
     ap.add_argument("--n-pcs", type=int, default=5)
+    ap.add_argument("--top-bins", type=int, default=500,
+                    help="Cell-type-variable bins for the level test (500, "
+                         "the size of the marker heatmap).")
     ap.add_argument("-o", "--output-prefix", required=True)
     ap.add_argument("--plot-format", default="pdf,png")
     args = ap.parse_args(argv)
