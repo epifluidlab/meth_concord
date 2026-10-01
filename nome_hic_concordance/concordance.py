@@ -1712,6 +1712,7 @@ def compute_signed_concordance_matrix(
     marginal_correct_k: int = 5,
     marginal_correct_stats: tuple[str, ...] = ("coordination",
                                                "direction_logor"),
+    residual: bool = True,
     baseline: str = "short-range",
     concordance_combine: str = "signed-diff",
     dm_window_mb: float = 0.0,
@@ -2843,16 +2844,47 @@ def compute_signed_concordance_matrix(
                                          baseline=accessibility_df,
                                          k=marginal_correct_k)
                         _two.to_parquet(out_path / f"{_stem}{_sfx}.parquet")
-                        stage3_residual(_two, [accessibility_df]).to_parquet(
-                            out_path / f"{_stem}.resid{_sfx}.parquet")
+                        if residual:
+                            stage3_residual(_two, [accessibility_df]).to_parquet(
+                                out_path / f"{_stem}.resid{_sfx}.parquet")
                     _wrote = "".join(f", {_stem}{x}.parquet"
                                      for x, _, _ in _jobs)
                     logger.info(
-                        f"Marginal correction ({_stat}): wrote{_wrote} and "
-                        f"the matching .resid sibling(s)"
+                        f"Marginal correction ({_stat}): wrote{_wrote}"
+                        + (" and the matching .resid sibling(s)" if residual
+                           else "")
                         + ("" if len(_jobs) > 1 else
                            "  (no drawn null to correct; --emit-null writes "
                            "one, and the Q-Q needs it)"))
+        # The HCG path, written routinely.  HCG concordance transferred
+        # across replicates at 0.79 untouched, so it gets no marginal
+        # correction -- but the residual, coordination beyond what the bin's
+        # own level predicts, is still the quantity reported, and both
+        # contexts are reported on the same footing.  It used to take a
+        # second pass (scripts/marginal_correct.py --residual-only), so a run
+        # that skipped that pass silently had no HCG residual.  Same names
+        # and same baseline as that script -- the RAW mean, i.e. what
+        # accessibility_mean.parquet holds, not the batch-corrected copy the
+        # k-NN graph was built from -- so the file is the one it wrote.
+        elif residual:
+            from .marginal_correction import stage3_residual
+            for _stat in marginal_correct_stats:
+                if _stat not in components:
+                    logger.warning(f"residual: no {_stat!r} component; "
+                                   f"skipping.")
+                    continue
+                # The drawn null is residualised against the SAME observed
+                # baseline, so the Q-Q compares like with like.
+                _jobs = [("", components[_stat])]
+                if null_components is not None and _stat in null_components:
+                    _jobs.append(("_null", null_components[_stat]))
+                for _sfx, _m in _jobs:
+                    stage3_residual(_m, [accessibility_raw]).to_parquet(
+                        out_path / f"concordance_{_stat}.resid{_sfx}.parquet")
+                logger.info(
+                    f"Residual against accessibility ({_stat}): wrote "
+                    + ", ".join(f"concordance_{_stat}.resid{x}.parquet"
+                                for x, _ in _jobs))
         if null_components is not None:
             for _name, _df in null_components.items():
                 _df.to_parquet(

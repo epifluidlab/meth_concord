@@ -502,6 +502,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "transferred at 0.79 uncorrected, and correcting a matrix that "
              "does not need it can only cost signal.")
     parser.add_argument(
+        "--no-residual", action="store_true",
+        help="Do not write the residual against accessibility.  By default "
+             "Step 5 writes it for coordination and direction_logor: "
+             "without --marginal-correct (the HCG path) as "
+             "concordance_<stat>.resid.parquet, with it as the .resid sibling "
+             "of the corrected matrix, plus a _null copy of either when a "
+             "drawn null exists.  The plain residual is the file "
+             "scripts/marginal_correct.py --residual-only writes, which "
+             "earlier runs needed as a separate pass.")
+    parser.add_argument(
         "--marginal-correct-k", type=int, default=5, metavar="K",
         help="Marginal factors removed by --marginal-correct (5).  Swept on "
              "the real data: cross/within peaked at 0.575 (k=5) and 0.581 "
@@ -1739,6 +1749,7 @@ def run_context(
                 concordance_formula=concordance_formula,
                 marginal_correct=args.marginal_correct,
                 marginal_correct_k=args.marginal_correct_k,
+                residual=not args.no_residual,
                 baseline=args.baseline,
                 concordance_combine=concordance_combine,
                 dm_window_mb=args.dm_window_mb,

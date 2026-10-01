@@ -418,6 +418,151 @@ def test_step5_marginal_correct_also_corrects_the_drawn_null(tmp_path):
     assert (out / "concordance_marginal_null.parquet").exists()
 
 
+# ------------------------------------ the Step-5 residual, the HCG path --
+
+_STATS = ("coordination", "direction_logor")
+
+
+def _script_main():
+    import importlib.util
+    from pathlib import Path
+    path = (Path(__file__).resolve().parent.parent / "scripts"
+            / "marginal_correct.py")
+    spec = importlib.util.spec_from_file_location("marginal_correct_cli", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m.main
+
+
+def _batches(out):
+    cells = pd.read_parquet(out / "concordance_coordination.parquet").index
+    half = len(cells) // 2
+    return pd.Series(["A"] * half + ["B"] * (len(cells) - half),
+                     index=cells, name="exp_batch")
+
+
+def test_step5_writes_the_hcg_residual_routinely(tmp_path):
+    """A run without --marginal-correct (the HCG run) used to write no
+    residual at all; it took a second pass with the script, and a run that
+    skipped the pass had no concordance_coordination.resid.parquet."""
+    out = _step5(tmp_path, emit_null=True)
+    for stat in _STATS:
+        assert (out / f"concordance_{stat}.resid.parquet").exists(), stat
+        assert (out / f"concordance_{stat}.resid_null.parquet").exists(), stat
+    assert list(out.glob("*margreg*")) == []
+    # the uncorrected matrices are still there, untouched
+    assert (out / "concordance_coordination.parquet").exists()
+
+
+def test_step5_residual_is_the_file_the_script_writes(tmp_path):
+    """Same names, same values as marginal_correct.py --residual-only, so a
+    directory from an older run patched with the script and a new run agree.
+
+    Run WITH batch correction on: Step 5 corrects the accessibility it builds
+    the k-NN graph from, and the residual must not pick up that copy.  The
+    script -- and every measurement behind the residual -- regresses on the
+    raw mean in accessibility_mean.parquet.
+    """
+    src = tmp_path / "first"
+    probe = _step5(src)
+    bl = _batches(probe)
+    out = _step5(tmp_path, batch_labels=bl, batch_correction="center",
+                 emit_null=True)
+    sp = tmp_path / "samples.tsv"
+    pd.DataFrame({"cell_name": bl.index, "exp_batch": bl.values}).to_csv(
+        sp, sep="\t", index=False)
+    ref = tmp_path / "script"
+    assert _script_main()([str(out), str(sp), "--batch-col", "exp_batch",
+                           "--residual-only", "--output-dir", str(ref)]) == 0
+    for stat in _STATS:
+        for sfx in ("", "_null"):
+            name = f"concordance_{stat}.resid{sfx}.parquet"
+            a, b = pd.read_parquet(out / name), pd.read_parquet(ref / name)
+            assert list(a.index) == list(b.index), name
+            assert list(a.columns) == list(b.columns), name
+            assert np.array_equal(a.to_numpy(float), b.to_numpy(float),
+                                  equal_nan=True), name
+
+
+
+def test_step5_residual_regresses_on_the_raw_accessibility(tmp_path,
+                                                            monkeypatch):
+    """Not the batch-corrected copy the k-NN graph is built from.
+
+    Checked on the baseline actually handed to the regression: the shared
+    fixture's accessibility is one value in every cell, so the fitted slope
+    is zero against any baseline and the residual files alone could not
+    tell the two apart.
+    """
+    seen = []
+    real = mc.stage3_residual
+
+    def spy(matrix, baselines):
+        seen.append([b.copy() for b in baselines])
+        return real(matrix, baselines)
+
+    monkeypatch.setattr(mc, "stage3_residual", spy)
+    probe = _step5(tmp_path / "first")
+    bl = _batches(probe)
+    seen.clear()
+    from tests.test_signed_concordance import _focal_active_paths
+    from nome_hic_concordance import concordance as cc
+    src, out = tmp_path / "src", tmp_path / "05"
+    src.mkdir()
+    res = cc.compute_signed_concordance_matrix(
+        _focal_active_paths(src, n_cells=8), bin_size=1000, min_distance=100,
+        min_gch_sites=2, baseline="distance-pooled", dm_prior="shared",
+        output_dir=str(out), save_outputs=True, use_rwr=False,
+        batch_labels=bl, batch_correction="center")
+    raw = pd.read_parquet(out / "accessibility_mean.parquet")
+    assert seen, "stage3_residual was never called"
+    for (base,) in seen:
+        b = base.reindex(index=raw.index, columns=raw.columns)
+        assert np.allclose(b.to_numpy(float), raw.to_numpy(float),
+                           equal_nan=True)
+    # the correction really did change the copy the graph used, so the
+    # check above is not vacuous
+    corrected = res["accessibility"].reindex(index=raw.index,
+                                             columns=raw.columns)
+    assert not np.allclose(corrected.to_numpy(float), raw.to_numpy(float),
+                           equal_nan=True)
+
+
+def test_step5_no_residual_writes_none(tmp_path):
+    out = _step5(tmp_path, emit_null=True, residual=False)
+    assert list(out.glob("*.resid*")) == []
+
+
+def test_step5_with_marginal_correct_writes_no_plain_residual(tmp_path):
+    """GCH keeps its own residual -- the .resid sibling of the corrected
+    matrix -- and does not also get a plain one beside it."""
+    cells = [f"cell{i}" for i in range(8)]
+    bl = pd.Series(["A"] * 4 + ["B"] * 4, index=cells, name="exp_batch")
+    out = _step5(tmp_path, batch_labels=bl, marginal_correct=True,
+                 marginal_correct_k=2)
+    assert (out / "concordance_coordination.margreg_k2.method1_local"
+                  ".resid.parquet").exists()
+    assert not (out / "concordance_coordination.resid.parquet").exists()
+
+
+def test_step5_no_residual_also_skips_the_corrected_residual(tmp_path):
+    """--no-residual means what the script's flag of the same name means."""
+    cells = [f"cell{i}" for i in range(8)]
+    bl = pd.Series(["A"] * 4 + ["B"] * 4, index=cells, name="exp_batch")
+    out = _step5(tmp_path, batch_labels=bl, marginal_correct=True,
+                 marginal_correct_k=2, residual=False)
+    assert (out / "concordance_coordination.margreg_k2.method1_local"
+                  ".parquet").exists()
+    assert list(out.glob("*.resid*")) == []
+
+
+def test_cli_no_residual_flag():
+    from nome_hic_concordance.cli import parse_args
+    base = ["--samples", "s.tsv", "--output-dir", "o"]
+    assert parse_args(base).no_residual is False
+    assert parse_args(base + ["--no-residual"]).no_residual is True
+
+
 def test_step5_says_so_when_there_is_no_null_to_correct(tmp_path, caplog):
     import logging
     cells = [f"cell{i}" for i in range(8)]

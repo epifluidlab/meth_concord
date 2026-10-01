@@ -11,6 +11,13 @@ them unchanged -- ``nome_hic_compare --concordance-matrix name=PATH``,
 ``celltype_marker_bins.py --matrix name=PATH`` and
 ``scaled_region_profile.py --matrix name=PATH`` all take a path.
 
+Step 5 now writes both itself: the corrected pair under --marginal-correct,
+and the --residual-only output (concordance_<stat>.resid.parquet, the HCG
+path) by default unless --no-residual.  This script stays for directories
+from earlier runs, and for settings Step 5 does not expose (--anchor-k,
+--extra-baseline, ...).  Its --residual-only output is identical to the file
+Step 5 writes.
+
 WHEN TO USE THIS.  GCH only.  HCG concordance transferred across replicates
 at 0.79 without correction and should be left alone; correcting a matrix
 that does not need it can only cost signal.  See
