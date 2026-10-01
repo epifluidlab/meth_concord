@@ -223,9 +223,13 @@ def test_level_test_needs_four_cell_types(run):
     assert not s["kind"].str.startswith("level_tracking").any()
 
 
-def test_only_structure_beyond_the_null_survives_the_difference(level_run):
-    """The drawn null shares whatever the pipeline makes on its own; what
-    separates cell types in real - null is beyond it."""
+def test_the_difference_cancels_what_real_and_null_share(level_run):
+    """Without a cell graph, what real and null share cancels in real - null.
+
+    The arithmetic only: with imputation over a cell graph the difference is
+    smoothed over that graph too and separates cell types regardless, which
+    is why the script reports it as no evidence on its own.
+    """
     d, sp, tmp = level_run
     m = _mod()
     null = str(d / "concordance_nullL.parquet")
@@ -255,3 +259,40 @@ def test_a_null_for_an_unnamed_matrix_is_refused(level_run):
                 "--null", f"b={d / 'concordance_nullL.parquet'}",
                 "--samples", str(sp), "--cell-type-column", "cell_type",
                 "-o", str(tmp / "out" / "cf")])
+
+
+def test_rwr_gives_pure_noise_the_graphs_cell_types():
+    """Why real - null purity is no evidence under imputation.
+
+    Pure noise has no cell types in it; smoothed over a cell graph built from
+    cell-type-structured features (as the pipeline's is, from accessibility
+    or methylation), it separates cell types almost perfectly.  So does any
+    matrix imputed that way -- a difference of two of them included.
+    """
+    from nome_hic_concordance.comparison import _prep_matrix
+    from nome_hic_concordance.imputation import (build_knn_graph,
+                                                 rwr_impute_matrices)
+    from nome_hic_concordance.metrics import knn_chance, knn_purity
+    from sklearn.decomposition import TruncatedSVD
+    import tempfile
+    rng = np.random.default_rng(0)
+    types = np.repeat(np.arange(6), 40)
+    n, nb = len(types), 400
+    feat = rng.normal(0, 1, (6, 100))[types] + rng.normal(0, 1, (n, 100))
+    _, P = build_knn_graph(feat, k=15)
+
+    def purity(M):
+        df = pd.DataFrame(M, index=[f"c{i}" for i in range(n)],
+                          columns=[f"chr1:{j}" for j in range(nb)])
+        with tempfile.TemporaryDirectory() as d:
+            Z = _prep_matrix(df, "x", d, "quantile", 0.0, "rank",
+                             True).to_numpy()
+        Z = (Z - Z.mean(0)) / (Z.std(0) + 1e-12)
+        return knn_purity(TruncatedSVD(5, random_state=0).fit_transform(Z),
+                          types)
+
+    noise = rng.normal(0, 1, (n, nb))
+    imputed, _ = rwr_impute_matrices({"x": noise}, P, restart_prob=0.5)
+    chance = knn_chance(types)
+    assert purity(noise) < chance + 0.1
+    assert purity(imputed["x"]) > 0.8

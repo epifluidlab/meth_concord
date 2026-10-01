@@ -62,26 +62,26 @@ a marker heatmap draws).  Same bin well above other bins means the
 statistic's blocks follow each bin's own methylation.
 
 None of this says whether the structure is COORDINATION.  The drawn null
-does: step 5 carries it through the same counts, prior, imputation and
-expected side with no coordination, so whatever it shares with the real
-matrix the pipeline makes on its own.  --null NAME=PATH pairs a matrix with
-its null and adds two analyses, NAME_null and NAME_minus_null (real minus
-null, cell-bin by cell-bin), and every analysis reports kNN cell-type purity
-on its leading components against chance.  The factor real and null share
-cancels in the difference, so purity there is cell-type structure beyond
-what the pipeline produces without coordination.  A heatmap is worth
-drawing from a matrix only if that number is clearly above chance.
+does: step 5 builds it from as many random NON-contact end pairs as the cell
+had contacts in that bin, and carries it through the same prior, imputation,
+expected side and normalisation.  It keeps every cell's marginal, depth,
+missingness and the co-state of ends that merely share a region -- all but
+contact-specific coordination.  --null NAME=PATH pairs a matrix with its
+null and every analysis reports kNN cell-type purity on its leading
+components against chance.  The comparison that answers the question is
+REAL against NULL: a matrix that separates cell types no better than its
+null shows no cell-type structure of its own.
 
-Usage:
-  concordance_cell_factor.py \\
-      --matrix gch=.../context_GCH/05_concordance/concordance_coordination.margreg_k5.method1_local.resid.parquet \\
-      --matrix hcg=.../context_HCG/05_concordance/concordance_coordination.resid.parquet \\
-      --samples samples.tsv --cell-type-column cell_type \\
-      --batch-column exp_batch,lib_batch --exclude-chrom chrM,chrX,chrY \\
-      -o output/cell_factor/cell_factor
-
-The step-5 sidecars are looked up beside each matrix, then one directory up
-(for a matrix written into a subfolder by marginal_correct.py --output-dir).
+NAME_minus_null (real - null, cell-bin by cell-bin) is reported too, but its
+purity is NOT evidence on its own whenever the matrices were imputed over a
+cell graph.  Both were smoothed over the same graph, so their difference is
+smoothed over it as well and takes on the graph's cell-type structure
+whatever it contains -- RWR of pure noise does the same.  For sparse data
+the difference also keeps the shared pattern of empty cell-bins (both sides
+empty gives an exact 0 in both).  On the 250 kb mouse cortex run real -
+null still scored 0.79 (HCG C) and 0.53 (GCH) while real and null tied
+(0.82 / 0.82, 0.53 / 0.52).  A cell-type contrast that can tell coordination
+from the graph has to be made without the graph: counts pooled by cell type.
 """
 
 from __future__ import annotations
@@ -582,9 +582,10 @@ def main(argv=None) -> int:
         chance = summary[(summary["matrix"] == name)
                          & (summary["covariate"] == "knn_chance")]["value"]
         print(f"{name} against its null: cell-type purity real "
-              f"{pur(name):.2f}, null {pur(name + '_null'):.2f}, real - null "
-              f"{pur(name + '_minus_null'):.2f} (chance "
-              f"{float(chance.iloc[0]):.2f})")
+              f"{pur(name):.2f}, null {pur(name + '_null'):.2f} (chance "
+              f"{float(chance.iloc[0]):.2f}); real - null "
+              f"{pur(name + '_minus_null'):.2f}, which is not evidence on its "
+              f"own if both were imputed over a cell graph")
     return 0
 
 
