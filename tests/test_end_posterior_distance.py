@@ -1299,7 +1299,8 @@ def test_link_shuffle_takes_end_2_from_another_cell_in_bin_y():
     cols = {"g": ("p1", "p2")}
     frames = _link_frames(m, codes=[0.0, 0.1, 0.2])
     pool = _contact_pool(m, frames, cols, edges)
-    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    a = _args(m, null_type="link-shuffle", null_scope="pooled",
+              link_shuffle_bin=250_000)
     j = frames[0]
     d = j["distance"].to_numpy()
     xa, xb, dn, anchor, ai = m._draw_link_shuffle(
@@ -1320,7 +1321,8 @@ def test_link_shuffle_has_no_donor_outside_bin_y():
     cols = {"g": ("p1", "p2")}
     frames = _link_frames(m, codes=[0.0, 0.9], shift=5_000_000)
     pool = _contact_pool(m, frames, cols, edges)
-    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    a = _args(m, null_type="link-shuffle", null_scope="pooled",
+              link_shuffle_bin=250_000)
     j = frames[0]
     got = m._draw_link_shuffle(j, j["distance"].to_numpy(), cols, pool,
                                m._pair_base(0), edges, a,
@@ -1346,7 +1348,8 @@ def test_a_long_range_pair_keeps_a_donor_whose_partner_is_elsewhere():
     anchor = frame(1_000_000, 1_600_000, 0.0)      # 600 kb, end 2 in bin y
     donor = frame(1_620_000, 9_000_000, 0.7)       # partner 7 Mb away
     pool = _contact_pool(m, {0: anchor, 1: donor}, cols, edges)
-    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    a = _args(m, null_type="link-shuffle", null_scope="pooled",
+              link_shuffle_bin=250_000)
     got = m._draw_link_shuffle(anchor, anchor["distance"].to_numpy(), cols,
                                pool, m._pair_base(0), edges, a,
                                np.random.default_rng(0))
@@ -1369,7 +1372,8 @@ def test_link_shuffle_bins_follow_the_per_chromosome_grid():
         return f.assign(gpos1=m.genome_coords(f["chrom"], f["pos1"]),
                         gpos2=m.genome_coords(f["chrom"], f["pos2"]))
 
-    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    a = _args(m, null_type="link-shuffle", null_scope="pooled",
+              link_shuffle_bin=250_000)
     anchor = frame(400_000, 1_240_000, 0.0)        # end 2 in [1.00, 1.25) Mb
     for donor_end, expect in ((1_260_000, None), (1_215_000, 0.5)):
         donor = frame(9_000_000, donor_end, 0.5)   # partner far away
@@ -1394,7 +1398,8 @@ def test_link_shuffle_null_pairs_never_cross_chromosomes():
     cells = {0: j.iloc[:half].reset_index(drop=True),
              1: j.iloc[half:].reset_index(drop=True)}
     pool = _contact_pool(m, cells, cols, edges)
-    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    a = _args(m, null_type="link-shuffle", null_scope="pooled",
+              link_shuffle_bin=250_000)
     xa, xb, dn, anchor, ai = m._draw_link_shuffle(
         cells[0], cells[0]["distance"].to_numpy(), cols, pool,
         m._pair_base(0), edges, a, np.random.default_rng(5))
@@ -1417,13 +1422,65 @@ def test_link_shuffle_strata_are_cell_type_by_batch():
     assert st == {"a": "T1|e1", "b": "T1|e2", "c": "T2|e1", "d": "T2|e1"}
 
 
-def test_link_shuffle_needs_pooled_scope(tmp_path):
+def test_link_shuffle_same_cell_runs_and_says_so(tmp_path):
+    """Under --null-scope cell link-shuffle is the same-cell, same-bin null."""
+    t, out = _run_link(tmp_path, ["--null-scope", "cell"], rho=1.0)
+    assert (t["gg_null_n"] > 0).any()
+
+
+def test_centring_is_on_by_default_only_across_cells():
     m = _mod()
-    sp = _fixture(tmp_path)
-    with pytest.raises(SystemExit, match="pooled"):
-        m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
-                "--samples", sp, "--output-dir", str(tmp_path / "o"),
-                "--null-type", "link-shuffle", "--plot-format", "png"])
+    pooled = _args(m, null_type="link-shuffle", null_scope="pooled")
+    cell = _args(m, null_type="link-shuffle", null_scope="cell")
+    assert m._center_on(pooled) and not m._center_on(cell)
+    assert m._center_on(_args(m, null_type="link-shuffle", null_scope="cell",
+                              cell_center="on"))
+
+
+def test_same_cell_link_shuffle_never_takes_the_real_partner():
+    m = _mod()
+    edges = m.build_edges(1000, 10_000_000, 8)
+    cols = {"g": ("p1", "p2")}
+    # the anchor (row 0): end 1 at 1.0 Mb, real partner at 1.6 Mb (0.9);
+    # rows 1-5: other contacts of the SAME cell with an end in that bin at
+    # ~600 kb from end 1 (0.3) -- their own partners far away
+    p1 = [1_000_000] + [9_000_000 + k for k in range(5)]
+    p2 = [1_600_000] + [1_560_000 + 20_000 * k for k in range(5)]
+    f = pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p2})
+    f["distance"] = (f["pos2"] - f["pos1"]).abs()
+    f["p1"] = [0.1] + [0.3] * 5
+    f["p2"] = [0.9] + [0.3] * 5
+    f = f.assign(gpos1=m.genome_coords(f["chrom"], f["pos1"]),
+                 gpos2=m.genome_coords(f["chrom"], f["pos2"]))
+    base = m._pair_base(0)
+    pool = m._own_contact_pool(f, cols, base, edges)
+    a = _args(m, null_type="link-shuffle", null_scope="cell",
+              link_shuffle_bin=250_000)
+    seen = set()
+    for seed in range(40):
+        got = m._draw_link_shuffle(f.iloc[:1], f["distance"].to_numpy()[:1],
+                                   cols, pool, base, edges, a,
+                                   np.random.default_rng(seed))
+        assert got is not None
+        xa, xb, dn, anchor, ai = got
+        seen.add(float(xb["g"][0]))
+        assert np.digitize(dn[0], edges) == np.digitize(600_000, edges)
+        local = (anchor[0] + dn[0]) % m._GENOME_STRIDE
+        assert 1_500_000 <= local < 1_750_000
+    assert seen == {0.3}, "the real partner (0.9) must never stand in"
+
+
+def test_same_cell_null_needs_no_centring_for_a_cell_offset(tmp_path):
+    """Same nucleus in both arms: a per-cell level cannot open a gap."""
+    t, _ = _run_link(tmp_path, ["--null-scope", "cell"], offset_sd=1.0)
+    assert abs(_gap(t)) < 0.05
+
+
+def test_same_cell_null_finds_planted_coordination_past_the_bin(tmp_path):
+    t, _ = _run_link(tmp_path, ["--null-scope", "cell"], rho=1.5)
+    assert _gap(t) > 0.3
+    far = t[t["bin_lo"] >= 250_000]
+    assert (far["gg_null_n"] > 0).any()
 
 
 def _link_fixture(tmp_path, n_cells=16, offset_sd=0.0, rho=0.0, seed=3,

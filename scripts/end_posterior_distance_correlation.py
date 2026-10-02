@@ -38,10 +38,17 @@ Nulls mirror the site-level script:
         e.g. exp_batch,lib_batch).  Where that end's own partner sits does
         not matter, so the curve continues past the bin size.  Answers "same
         place, same distance, same kind of cell -- but the two ends were not
-        ligated in one nucleus".  Needs --null-scope pooled.  Each end is
-        centred on its own cell's mean in every arm (--cell-center auto), or
+        ligated in one nucleus".  That is --null-scope pooled.  Under
+        --null-scope cell the stand-in end 2 is instead another contact end of
+        the SAME cell in that bin at that distance, never the real partner:
+        same nucleus AND same place, so only the ligation itself differs --
+        the strictest null here.  It thins at short range, where a 250 kb bin
+        rarely holds a same-cell end at the right distance; there the
+        distance-matched null applies anyway.  The pooled version centres
+        each end on its own cell's mean in every arm (--cell-center auto), or
         the shared nucleus of a linked pair's two ends -- absent from a
-        cross-cell null -- would count as concordance.
+        cross-cell null -- would count as concordance; the same-cell one
+        needs no centring.
 
     --null-scope cell     donors come from the anchor's own cell.
     --null-scope pooled   donors come from every cell in the group, optionally
@@ -471,11 +478,13 @@ def end_table(df: pd.DataFrame, cols: dict[str, tuple[str, str]],
 
 
 def _center_on(args) -> bool:
-    """--cell-center: 'auto' centres only under link-shuffle, the one null
-    whose two ends always come from two different cells."""
+    """--cell-center: 'auto' centres only under pooled link-shuffle, the one
+    null whose two ends always come from two different cells.  The same-cell
+    version keeps both ends in one nucleus, as the linked pair does."""
     mode = getattr(args, "cell_center", "auto")
     if mode == "auto":
-        return getattr(args, "null_type", "") == "link-shuffle"
+        return (getattr(args, "null_type", "") == "link-shuffle"
+                and getattr(args, "null_scope", "cell") == "pooled")
     return mode == "on"
 
 
@@ -512,12 +521,32 @@ def _contact_ends(f: pd.DataFrame, edges) -> pd.DataFrame:
     return f[(d >= edges[0]) & (d <= edges[-1])]
 
 
+def _own_contact_pool(j: pd.DataFrame, cols: dict, base: int, edges):
+    """Same-cell link-shuffle donors: this cell's contact ends.
+
+    Built from the FULL frame so a pair's id is ``base + its row``, which is
+    how the draw recognises -- and refuses -- the real partner.
+    """
+    d = j["distance"].to_numpy()
+    keep = np.flatnonzero((d >= edges[0]) & (d <= edges[-1]))
+    ids = base + keep.astype(np.int64)
+    g1 = j["gpos1"].to_numpy(np.int64)[keep]
+    g2 = j["gpos2"].to_numpy(np.int64)[keep]
+    parts = [(g1, {n_: j[c1].to_numpy(float)[keep]
+                   for n_, (c1, _c2) in cols.items()}, ids),
+             (g2, {n_: j[c2].to_numpy(float)[keep]
+                   for n_, (_c1, c2) in cols.items()}, ids)]
+    return _merge_end_tables(parts)
+
+
 def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
                        max_rounds=16):
     """Link-shuffle null: keep end 1, take another cell's contact end as end 2.
 
     The donor is an end of a linked pair (in range) from ANOTHER cell of the
-    anchor's stratum -- the pool is per stratum -- lying in the same
+    anchor's stratum -- the pool is per stratum -- or, under --null-scope
+    cell, from the anchor's OWN cell but not its own read pair, lying in the
+    same
     --link-shuffle-bin bin as the real end 2 (bin y), on the same side of
     end 1, at a distance from end 1 inside the anchor pair's own distance
     bin.  Where the donor's own partner sits does not matter, so pairs far
@@ -553,6 +582,7 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
     lo = np.maximum(lo, np.searchsorted(d_pos, y0, side="left"))
     hi = np.minimum(hi, np.searchsorted(d_pos, y0 + B, side="left"))
     me = int(base // _PAIR_STRIDE)
+    same_cell = getattr(args, "null_scope", "pooled") == "cell"
     alive = in_range & (hi > lo)
     kb_out = np.full(n, -1, dtype=np.int64)
     for _ in range(max_rounds):
@@ -561,8 +591,12 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
             break
         span = (hi[idx] - lo[idx]).astype(np.int64)
         kk = lo[idx] + (rng.random(idx.size) * span).astype(np.int64)
-        # another cell (pair ids carry the cell), so never a real ligation
-        good = (d_pi[kk] // _PAIR_STRIDE) != me
+        if same_cell:
+            # the cell's own ends: anything but the real partner's read pair
+            good = d_pi[kk] != (base + idx)
+        else:
+            # another cell (pair ids carry the cell): never a real ligation
+            good = (d_pi[kk] // _PAIR_STRIDE) != me
         sel = idx[good]
         kb_out[sel] = kk[good]
         alive[sel] = False
@@ -988,6 +1022,8 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
     def donors(sk, j, cols):
         if args.null_scope == "pooled":
             return (pools.get(sk) or {}).get(bkey)
+        if args.null_type == "link-shuffle":
+            return _own_contact_pool(j, cols, base, edges)
         return end_table(j, cols, base, _coords(args))
 
     # ---- panel a: one pass per panel-a pair set, generator order unchanged.
@@ -1342,7 +1378,8 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
               merged=None, excl_chrom=(), executor=None, percell=None):
     nb = len(edges) - 1
     accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
-    links = args.null_type == "link-shuffle"
+    links = (args.null_type == "link-shuffle"
+             and args.null_scope == "pooled")
     pools = ({} if args.null_scope != "pooled" or links
              else _build_pools(cells, paths, args, batch_of, merged,
                                excl_chrom))
@@ -1481,7 +1518,9 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
             + (", null partners on any chromosome"
                if getattr(args, "null_chrom", "same") == "any"
                and args.null_type != "link-shuffle" else "")
-            + (f", same {args.link_shuffle_bin / 1000:g} kb bins, other cells"
+            + (f", same {args.link_shuffle_bin / 1000:g} kb bin, "
+               + ("other cells" if args.null_scope == "pooled"
+                  else "same cell")
                if args.null_type == "link-shuffle" else "")
             + (", ends centred per cell" if _center_on(args) else ""))
     _figure(curves, centers, label,
@@ -1580,7 +1619,7 @@ def main(argv=None) -> int:
     ap.add_argument("--cell-center", choices=["auto", "on", "off"],
                     default="auto",
                     help="Centre each end's posterior on its own cell's mean, "
-                         "in every arm.  'auto' (default): on for "
+                         "in every arm.  'auto' (default): on for pooled "
                          "link-shuffle only, whose null ends always come from "
                          "two cells while a linked pair's share one -- so "
                          "cell-to-cell differences in level would otherwise "
@@ -1758,10 +1797,7 @@ def main(argv=None) -> int:
         args.exclude_bed,
         [c.strip() for c in args.exclude_chrom.split(",") if c.strip()])
 
-    if args.null_type == "link-shuffle":
-        if args.null_scope != "pooled":
-            raise SystemExit("--null-type link-shuffle draws end 2 from OTHER "
-                             "cells; pass --null-scope pooled.")
+    if args.null_type == "link-shuffle" and args.null_scope == "pooled":
         batch_of = _link_strata(samples, args, batch_of)
     if args.null_chrom == "any" and args.null_type != "link-shuffle":
         logger.warning(
