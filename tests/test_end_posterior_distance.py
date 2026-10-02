@@ -1263,3 +1263,162 @@ def test_null_chrom_any_crosses_chromosomes_and_same_does_not():
                             != (xb["_gpos"] // m._GENOME_STRIDE)).mean())
     assert frac["same"] == 0.0
     assert frac["any"] > 0.8
+
+
+# ------------------------------------------------------------- link-shuffle --
+
+def _link_frames(m, codes, n=60, decoy=False, seed=0):
+    """Identical links in every cell; end-2 values encode the cell."""
+    rng = np.random.default_rng(seed)
+    pos1 = 1_000_000 + np.arange(n) * 500
+    dist = np.exp(rng.uniform(np.log(2_000), np.log(150_000), n)).astype(int)
+    frames = {}
+    for ci, code in enumerate(codes):
+        p1, p2, d = pos1.copy(), pos1 + dist, dist.copy()
+        v2 = np.full(n, code, float)
+        if decoy and ci > 0:
+            # same distances, but end 1 in ANOTHER 250 kb bin: never a donor
+            p1 = p1 + 5_000_000
+            p2 = p1 + dist
+        f = pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p2,
+                          "distance": d, "p1": rng.uniform(0, 1, n),
+                          "p2": v2})
+        frames[ci] = f.assign(gpos1=m.genome_coords(f["chrom"], f["pos1"]),
+                              gpos2=m.genome_coords(f["chrom"], f["pos2"]))
+    return frames
+
+
+def test_link_shuffle_takes_end_2_from_another_cell_in_the_same_bins():
+    m = _mod()
+    edges = m.build_edges(1000, 1_000_000, 8)
+    cols = {"g": ("p1", "p2")}
+    frames = _link_frames(m, codes=[0.0, 0.1, 0.2])
+    pool = m._merge_link_tables([m._link_table(f, cols, ci, edges, 250_000)
+                                 for ci, f in frames.items()])
+    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    j = frames[0]
+    d = j["distance"].to_numpy()
+    xa, xb, dn, anchor, ai = m._draw_link_shuffle(
+        j, d, cols, pool, m._pair_base(0), edges, a, np.random.default_rng(1))
+    assert len(ai) > 0.9 * len(j), "identical links in other cells: most place"
+    assert set(np.unique(xb["g"])) <= {0.1, 0.2}, "never the anchor's own cell"
+    same_bin = (np.digitize(dn, edges) == np.digitize(d[ai], edges))
+    assert same_bin.all(), "the swapped pair stays in its distance bin"
+    assert np.array_equal(anchor, j["gpos1"].to_numpy()[ai])
+
+
+def test_link_shuffle_ignores_links_between_other_bins():
+    m = _mod()
+    edges = m.build_edges(1000, 1_000_000, 8)
+    cols = {"g": ("p1", "p2")}
+    frames = _link_frames(m, codes=[0.0, 0.9], decoy=True)
+    pool = m._merge_link_tables([m._link_table(f, cols, ci, edges, 250_000)
+                                 for ci, f in frames.items()])
+    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    j = frames[0]
+    got = m._draw_link_shuffle(j, j["distance"].to_numpy(), cols, pool,
+                               m._pair_base(0), edges, a,
+                               np.random.default_rng(1))
+    assert got is None, "same distances elsewhere are not the same link"
+
+
+def test_link_shuffle_strata_are_cell_type_by_batch():
+    import argparse
+    m = _mod()
+    s = pd.DataFrame({"cell_name": ["a", "b", "c", "d"],
+                      "group": ["T1", "T1", "T2", "T2"],
+                      "exp_batch": ["e1", "e2", "e1", "e1"]})
+    a = argparse.Namespace(cell_column="cell_name", group_column="group")
+    batch_of = {"a": "e1", "b": "e2", "c": "e1", "d": "e1"}
+    st = m._link_strata(s, a, batch_of)
+    assert st == {"a": "T1|e1", "b": "T1|e2", "c": "T2|e1", "d": "T2|e1"}
+
+
+def test_link_shuffle_needs_pooled_scope(tmp_path):
+    m = _mod()
+    sp = _fixture(tmp_path)
+    with pytest.raises(SystemExit, match="pooled"):
+        m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
+                "--samples", sp, "--output-dir", str(tmp_path / "o"),
+                "--null-type", "link-shuffle", "--plot-format", "png"])
+
+
+def _link_fixture(tmp_path, n_cells=16, offset_sd=0.0, rho=0.0, seed=3):
+    """The same links in every cell, so every stratum has donors.
+
+    ``offset_sd`` gives each cell its own level (logit scale) -- shared by
+    both ends of its pairs, which is all a cross-cell null lacks; ``rho`` a
+    real per-pair coordination.
+    """
+    rng = np.random.default_rng(seed)
+    n = 600
+    pos1 = 100_000 + np.sort(rng.integers(0, 2_400_000, n))
+    dist = np.exp(rng.uniform(np.log(2_000), np.log(200_000), n)).astype(int)
+    cells = [f"c{i}" for i in range(n_cells)]
+    for ctx in ("GCH", "HCG"):
+        (tmp_path / ctx).mkdir(parents=True, exist_ok=True)
+    for c in cells:
+        off = rng.normal(0, offset_sd)
+        shared = rng.normal(0, 1, n)
+        for ctx in ("GCH", "HCG"):
+            sig = lambda: 1 / (1 + np.exp(-(off + rho * shared         # noqa
+                                            + rng.normal(0, 0.6, n))))
+            pd.DataFrame({"chrom": "chr1", "pos1": pos1,
+                          "pos2": pos1 + dist, "n1": 6, "n2": 6,
+                          "distance": dist, "posterior1": sig(),
+                          "posterior2": sig()}).to_parquet(
+                tmp_path / ctx / f"{c}.posteriors.parquet")
+    sp = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells,
+                  "group": np.repeat(["A", "B"], n_cells // 2),
+                  "exp_batch": np.tile(["e1", "e1", "e2", "e2"], n_cells // 4),
+                  "lib_batch": np.tile(["l1", "l2"], n_cells // 2)}).to_csv(
+        sp, sep="\t", index=False)
+    return str(sp)
+
+
+def _run_link(tmp_path, extra=(), **fx):
+    m = _mod()
+    sp = _link_fixture(tmp_path, **fx)
+    out = tmp_path / "out"
+    argv = ["--posteriors", f"GCH={tmp_path / 'GCH'}",
+            "--posteriors", f"HCG={tmp_path / 'HCG'}",
+            "--samples", sp, "--output-dir", str(out), "--plot-format", "png",
+            "--null-type", "link-shuffle", "--null-scope", "pooled",
+            "--group-column", "group",
+            "--null-match-column", "exp_batch,lib_batch",
+            "--min-distance", "1000", "--max-distance", "1000000",
+            "--bins-per-decade", "4", "--min-pairs", "50",
+            "--n-bootstrap", "0", "--fisher-z", "none"] + list(extra)
+    assert m.main(argv) == 0
+    return pd.read_csv(out / "end_posterior_dist_all.tsv", sep="\t"), out
+
+
+def _gap(t, m="gg"):
+    ok = t[f"{m}_matched_r"].notna() & t[f"{m}_null_r"].notna()
+    assert ok.any()
+    return float((t.loc[ok, f"{m}_matched_r"] - t.loc[ok, f"{m}_null_r"]).mean())
+
+
+def test_cell_centring_stops_a_cell_level_offset_reading_as_concordance(
+        tmp_path):
+    """Two ends of one nucleus share its level; a cross-cell null does not."""
+    off, _ = _run_link(tmp_path / "off", ["--cell-center", "off"],
+                       offset_sd=1.0)
+    on, _ = _run_link(tmp_path / "on", offset_sd=1.0)      # auto = on here
+    assert _gap(off) > 0.2, "uncentred: the cell's level reads as concordance"
+    assert abs(_gap(on)) < 0.05, "centred: no coordination, no gap"
+
+
+def test_link_shuffle_finds_planted_coordination(tmp_path):
+    t, _ = _run_link(tmp_path, rho=1.5)
+    assert _gap(t) > 0.3
+    assert (t["gg_null_n"] > 0).sum() >= 3
+
+
+def test_link_shuffle_feeds_the_per_cell_test(tmp_path):
+    t, out = _run_link(tmp_path, ["--per-cell", "on",
+                                  "--per-cell-min-pairs", "50"], rho=1.5)
+    pc = pd.read_csv(out / "end_posterior_percell.tsv", sep="\t")
+    g = pc[pc["mark"] == "GCH"]
+    assert (g["delta"] > 0).mean() > 0.8
