@@ -1731,14 +1731,68 @@ def region_summary(reg: pd.DataFrame, args) -> pd.DataFrame:
             return max(0.0, 1.0 - np.var(c, ddof=1) / np.var(v, ddof=1))
 
         rg, rh = rel(x, cx), rel(y, cy)
+        ts = stats.theilslopes(y, x)
+        rx, ry = stats.rankdata(x), stats.rankdata(y)
         out.append({"band_lo": blo, "band_hi": bhi, "n_regions": len(w),
                     "pearson_r": r, "spearman_rho": rho,
                     "rotation_p": _rotation_p(x, y, min_shift),
+                    # the same rotation on ranks: whether the BULK trend, not
+                    # just a tail of regions high in both, beats the null
+                    "rotation_p_spearman": _rotation_p(rx, ry, min_shift),
+                    "ols_slope": float(np.polyfit(x, y, 1)[0]),
+                    "theilsen_slope": float(ts[0]),
+                    "theilsen_lo": float(ts[2]), "theilsen_hi": float(ts[3]),
                     "control_r": rc, "reliability_GCH": rg,
                     "reliability_HCG": rh,
                     "disattenuated_r": (r / np.sqrt(rg * rh)
                                         if rg > 0 and rh > 0 else np.nan)})
     return pd.DataFrame(out)
+
+
+def _density_panel(ax, x, y, sparse_frac=0.1):
+    """smoothScatter-style panel: kernel density, sparsest points, two fits.
+
+    The density is shown on a fourth-root scale, as R's smoothScatter does,
+    so the thin edges stay visible next to the dense core; only the points
+    in the sparsest ``sparse_frac`` of the cloud are drawn individually.
+    Least squares (with its 95% band) and Theil-Sen are both drawn: when a
+    tail of points carries the least-squares slope the two part, and that
+    is worth seeing rather than averaging away.
+    """
+    from scipy import stats
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    px = 0.06 * (np.ptp(x) or 1.0)
+    py = 0.06 * (np.ptp(y) or 1.0)
+    x0, x1, y0, y1 = x.min() - px, x.max() + px, y.min() - py, y.max() + py
+    kde = stats.gaussian_kde(np.vstack([x, y]))
+    gx, gy = np.mgrid[x0:x1:220j, y0:y1:220j]
+    z = kde(np.vstack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
+    ax.imshow((z / z.max()).T ** 0.25, origin="lower", aspect="auto",
+              extent=[x0, x1, y0, y1], cmap="Blues", interpolation="bilinear")
+    dens = kde(np.vstack([x, y]))
+    sparse = dens <= np.quantile(dens, sparse_frac)
+    ax.scatter(x[sparse], y[sparse], s=7, color="black", lw=0, zorder=3)
+    xs = np.linspace(x0, x1, 200)
+    slope, icpt = np.polyfit(x, y, 1)
+    n = len(x)
+    resid = y - (icpt + slope * x)
+    s_res = np.sqrt(np.sum(resid ** 2) / max(n - 2, 1))
+    sxx = np.sum((x - x.mean()) ** 2) or 1.0
+    half = (stats.t.ppf(0.975, max(n - 2, 1)) * s_res
+            * np.sqrt(1.0 / n + (xs - x.mean()) ** 2 / sxx))
+    fit = icpt + slope * xs
+    ax.fill_between(xs, fit - half, fit + half, color="#d62728", alpha=0.18,
+                    lw=0, zorder=4)
+    ax.plot(xs, fit, color="#d62728", lw=1.6, zorder=5,
+            label=f"least squares, slope {slope:+.2f}")
+    ts = stats.theilslopes(y, x)
+    ax.plot(xs, ts[1] + ts[0] * xs, color="#d62728", lw=1.4, ls="--",
+            zorder=5, label=f"Theil–Sen (robust), slope {ts[0]:+.2f}")
+    ax.axhline(0, color="#9AA0A6", lw=0.8, zorder=2)
+    ax.axvline(0, color="#9AA0A6", lw=0.8, zorder=2)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.legend(fontsize=8, frameon=False, loc="upper left")
 
 
 def _region_figure(reg: pd.DataFrame, summ: pd.DataFrame, out_path, args):
@@ -1751,8 +1805,8 @@ def _region_figure(reg: pd.DataFrame, summ: pd.DataFrame, out_path, args):
     if not rows:
         return False
     fig, axes = plt.subplots(len(rows), 3, squeeze=False,
-                             figsize=(16, 4.4 * len(rows)),
-                             gridspec_kw={"width_ratios": [1, 1, 2.2]})
+                             figsize=(17, 5.0 * len(rows)),
+                             gridspec_kw={"width_ratios": [1, 1, 2.0]})
     for i, s in enumerate(rows):
         d = reg[(reg["band_lo"] == s.band_lo) & (reg["band_hi"] == s.band_hi)
                 & (reg["n_obs"] >= min_n) & (reg["n_null"] >= min_n)]
@@ -1764,18 +1818,16 @@ def _region_figure(reg: pd.DataFrame, summ: pd.DataFrame, out_path, args):
                                         ("delta_ctl",
                                          "control: null − null"))):
             ax = axes[i, k]
-            size = 6 + 30 * np.sqrt(w[("n_obs", "HCG")]
-                                    / w[("n_obs", "HCG")].max())
-            ax.scatter(w[(val, "GCH")], w[(val, "HCG")], s=size,
-                       color="#555555", alpha=0.6, lw=0)
-            ax.axhline(0, color="#9AA0A6", lw=0.8)
-            ax.axvline(0, color="#9AA0A6", lw=0.8)
+            _density_panel(ax, w[(val, "GCH")].to_numpy(),
+                           w[(val, "HCG")].to_numpy())
             ax.set_xlabel(f"GCH–GCH {lab}")
             ax.set_ylabel(f"HCG–HCG {lab}")
             if k == 0:
-                ax.set_title(f"{band}: {s.n_regions} regions  r = "
-                             f"{s.pearson_r:+.2f}, ρ = {s.spearman_rho:+.2f}, "
-                             f"rotation p = {s.rotation_p:.3f}", fontsize=10)
+                ax.set_title(
+                    f"{band}: {s.n_regions} regions\n"
+                    f"r = {s.pearson_r:+.2f} (rotation p {s.rotation_p:.3f}),"
+                    f"  ρ = {s.spearman_rho:+.2f} (rotation p "
+                    f"{s.rotation_p_spearman:.3f})", fontsize=10)
             else:
                 ax.set_title(f"control r = {s.control_r:+.2f}", fontsize=10)
         ax = axes[i, 2]

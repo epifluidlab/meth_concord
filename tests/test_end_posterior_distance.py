@@ -1802,3 +1802,15 @@ def test_region_bands_split_the_distance_range(tmp_path):
 def test_per_region_off_writes_nothing(tmp_path):
     out = _run_regions(tmp_path, "shared", ["--per-region", "off"])
     assert not (out / "end_posterior_regions.tsv").exists()
+
+
+def test_region_summary_reports_slopes_and_a_rank_rotation_p(tmp_path):
+    out = _run_regions(tmp_path, "shared")
+    s = pd.read_csv(out / "end_posterior_regions_summary.tsv", sep="\t").iloc[0]
+    for c in ("ols_slope", "theilsen_slope", "theilsen_lo", "theilsen_hi",
+              "rotation_p_spearman"):
+        assert np.isfinite(s[c]), c
+    # both marks carry the same planted per-region strength: slope ~ 1
+    assert 0.6 < s["theilsen_slope"] < 1.4
+    assert s["theilsen_lo"] <= s["theilsen_slope"] <= s["theilsen_hi"]
+    assert s["rotation_p_spearman"] < 0.05
