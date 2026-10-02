@@ -1666,3 +1666,9 @@ def test_panel_a_draws_the_delta_arm_and_the_null_only(tmp_path, arm, expect):
         obs = lines[m._OBS_LABEL[arm]]
         assert np.allclose(obs, expect)
         assert np.allclose(lines["non-linked"], 0.1)
+    # every bin is marked on BOTH lines, so the gap can be read point by point
+    for ax in fig.axes[:3]:
+        for ln in ax.get_lines():
+            if not ln.get_label().startswith("_"):
+                assert ln.get_marker() not in ("", "None", None), \
+                    ln.get_label()

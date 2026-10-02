@@ -784,16 +784,20 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None,
     for j, (key, title) in enumerate(_MEASURES):
         ax = axes[0, j]
         obs = getattr(args, "delta_arm", "linked")
+        # Both lines are straight segments between bin centres, no
+        # smoothing; the null gets hollow markers so each bin's value can be
+        # read off it too -- without them the gap to the observed curve could
+        # not be checked against row 2 point by point.
         for cond, clab, style in (
                 (obs, _OBS_LABEL.get(obs, obs),
-                 dict(marker="o", ls="-", alpha=1.0, lw=1.6)),
+                 dict(marker="o", ms=3.0, ls="-", alpha=1.0, lw=1.6)),
                 ("null", "non-linked",
-                 dict(marker="", ls="--", alpha=0.6, lw=1.6))):
+                 dict(marker="o", ms=3.0, mfc="white", ls="--", alpha=0.8,
+                      lw=1.4))):
             if (key, cond) not in curves:
                 continue
             r, n = curves[(key, cond)]
-            ax.plot(centers, r, label=clab, color=_COLOR[key], ms=3.0,
-                    **style)
+            ax.plot(centers, r, label=clab, color=_COLOR[key], **style)
         ax.axhline(0, color="#9AA0A6", lw=0.8)
         ax.set_title(title, fontsize=11)
         ax.set_ylabel("Pearson r of end posteriors" if j == 0 else "")
