@@ -1814,3 +1814,45 @@ def test_region_summary_reports_slopes_and_a_rank_rotation_p(tmp_path):
     assert 0.6 < s["theilsen_slope"] < 1.4
     assert s["theilsen_lo"] <= s["theilsen_slope"] <= s["theilsen_hi"]
     assert s["rotation_p_spearman"] < 0.05
+
+
+def test_main_layout_is_gch_hcg_and_the_regions(tmp_path):
+    """The cross-context column gives way to the per-region scatters."""
+    import argparse
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n = 30
+    shared = rng.normal(0.05, 0.02, n)
+    rows = []
+    for mark, noise in (("GCH", 0.004), ("HCG", 0.006)):
+        rows.append(pd.DataFrame({
+            "chrom": "chr1", "chrom_code": 1,
+            "start": np.arange(n) * 1_000_000, "end": 0,
+            "band_lo": 1000.0, "band_hi": 300000.0, "mark": mark,
+            "n_obs": 1000, "n_null": 1000, "r_obs": 0, "r_null": 0,
+            "r_null2": 0,
+            "delta": shared + rng.normal(0, noise, n),
+            "delta_ctl": rng.normal(0, noise, n)}))
+    reg = pd.concat(rows, ignore_index=True)
+    a = argparse.Namespace(region_size=1_000_000, region_min_pairs=500,
+                           delta_arm="matched", fisher_z="none")
+    summ = m.region_summary(reg, a)
+    centers = np.array([1e3, 1e4, 1e5])
+    nn = np.full(3, 500)
+    curves = {(k, c): (np.full(3, v), nn) for k, _ in m._MEASURES
+              for c, v in (("linked", .5), ("matched", .3), ("null", .1))}
+    fig = m._main_figure(curves, centers, "all", tmp_path / "main.png", a,
+                         reg, summ)
+    assert (tmp_path / "main.png").exists()
+    titles = [ax.get_title() for ax in fig.axes]
+    assert any("GCH–GCH" in t for t in titles)
+    assert any("HCG–HCG" in t for t in titles)
+    assert not any("cross-context" in t for t in titles)
+    assert any("Same places?" in t for t in titles)
+    assert any("control" in t for t in titles)
+
+
+def test_the_run_writes_the_main_layout(tmp_path):
+    out = _run_regions(tmp_path, "shared")
+    assert (out / "end_posterior_dist_all_main.png").exists()
+    assert (out / "end_posterior_dist_all.png").exists(), "ED figure kept"

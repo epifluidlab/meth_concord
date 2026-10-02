@@ -767,6 +767,75 @@ _OBS_LABEL = {"matched": "linked (pairs with a null partner)",
               "linked": "linked (every true pair)"}
 
 
+def _draw_measure(ax, axd, key, title, curves, centers, args, boot,
+                  fisher=None, first=True):
+    """One measure's column: observed and null on ``ax``, the contrast below.
+
+    Shared by the full figure and the main-figure layout, so the two draw
+    every curve, band and FDR ring identically.
+    """
+    obs = getattr(args, "delta_arm", "linked")
+    # Both lines are straight segments between bin centres, no
+    # smoothing; the null gets hollow markers so each bin's value can be
+    # read off it too -- without them the gap to the observed curve could
+    # not be checked against row 2 point by point.
+    for cond, clab, style in (
+            (obs, _OBS_LABEL.get(obs, obs),
+             dict(marker="o", ms=3.0, ls="-", alpha=1.0, lw=1.6)),
+            ("null", "non-linked",
+             dict(marker="o", ms=3.0, mfc="white", ls="--", alpha=0.8,
+                  lw=1.4))):
+        if (key, cond) not in curves:
+            continue
+        r, n = curves[(key, cond)]
+        ax.plot(centers, r, label=clab, color=_COLOR[key], **style)
+    ax.axhline(0, color="#9AA0A6", lw=0.8)
+    ax.set_title(title, fontsize=11)
+    ax.set_ylabel("Pearson r of end posteriors" if first else "")
+    ax.set_xscale("log")
+    ax.legend(fontsize=8, frameon=False)
+
+    if fisher is not None:
+        delta, lo, hi, pv, q, _ = fisher.get(
+            key, (np.full(len(centers), np.nan),) * 5 + (None,))
+        by_cell = args.fisher_z == "cell"
+        band = ("95% CI (t across cells)" if by_cell
+                else "95% CI (Fisher z)")
+        line = ("Δz = mean$_{cells}$(z$_{linked}$ − z$_{null}$)" if by_cell
+                else "Δz = z(r$_{linked}$) − z(r$_{null}$)")
+        ylab = "Δz (Fisher)"
+    else:
+        arm = getattr(args, "delta_arm", "linked")
+        delta = curves[(key, arm)][0] - curves[(key, "null")][0]
+        lo, hi, pv, q = boot.get(key, (None, None, None, None))
+        band, line = "95% CI (cell bootstrap)", f"Δ = {arm} − null"
+        ylab = f"Δ = {arm} − null"
+    if lo is not None:
+        axd.fill_between(centers, lo, hi, color=_COLOR[key], alpha=0.18,
+                         lw=0, label=band)
+    axd.plot(centers, delta, color=_COLOR[key], lw=1.6, marker="o", ms=3,
+             label=line)
+    if q is not None:
+        # Ring the bins that survive FDR, and only those: one test per bin
+        # per measure means several would clear raw p<0.05 by chance.
+        sig = np.isfinite(q) & (q < 0.05) & np.isfinite(delta)
+        if sig.any():
+            axd.plot(centers[sig], delta[sig], "o", ms=8,
+                     mfc="none", mec=_COLOR[key], mew=1.5,
+                     label=f"q < 0.05  ({int(sig.sum())} bins)")
+        for xi, di, qi in zip(centers, delta, q):
+            mark = stars(qi)
+            if mark and np.isfinite(di):
+                axd.annotate(mark, (xi, di), textcoords="offset points",
+                             xytext=(0, 7), ha="center", fontsize=8,
+                             color=_COLOR[key])
+    axd.axhline(0, color="#9AA0A6", lw=0.8)
+    axd.set_xscale("log")
+    axd.set_xlabel("genomic distance between the two ends (bp)")
+    axd.set_ylabel(ylab if first else "")
+    axd.legend(fontsize=8, frameon=False)
+
+
 def _figure(curves, centers, label, out_path, args, note="", boot=None,
             fisher=None):
     """Row 1 the observed and null curves, row 2 the contrast between them.
@@ -790,68 +859,8 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None,
     fig, axes = plt.subplots(2, len(_MEASURES),
                              figsize=(5.2 * len(_MEASURES), 8), sharex=True)
     for j, (key, title) in enumerate(_MEASURES):
-        ax = axes[0, j]
-        obs = getattr(args, "delta_arm", "linked")
-        # Both lines are straight segments between bin centres, no
-        # smoothing; the null gets hollow markers so each bin's value can be
-        # read off it too -- without them the gap to the observed curve could
-        # not be checked against row 2 point by point.
-        for cond, clab, style in (
-                (obs, _OBS_LABEL.get(obs, obs),
-                 dict(marker="o", ms=3.0, ls="-", alpha=1.0, lw=1.6)),
-                ("null", "non-linked",
-                 dict(marker="o", ms=3.0, mfc="white", ls="--", alpha=0.8,
-                      lw=1.4))):
-            if (key, cond) not in curves:
-                continue
-            r, n = curves[(key, cond)]
-            ax.plot(centers, r, label=clab, color=_COLOR[key], **style)
-        ax.axhline(0, color="#9AA0A6", lw=0.8)
-        ax.set_title(title, fontsize=11)
-        ax.set_ylabel("Pearson r of end posteriors" if j == 0 else "")
-        ax.set_xscale("log")
-        ax.legend(fontsize=8, frameon=False)
-
-        axd = axes[1, j]
-        if fisher is not None:
-            delta, lo, hi, pv, q, _ = fisher.get(
-                key, (np.full(len(centers), np.nan),) * 5 + (None,))
-            by_cell = args.fisher_z == "cell"
-            band = ("95% CI (t across cells)" if by_cell
-                    else "95% CI (Fisher z)")
-            line = ("Δz = mean$_{cells}$(z$_{linked}$ − z$_{null}$)" if by_cell
-                    else "Δz = z(r$_{linked}$) − z(r$_{null}$)")
-            ylab = "Δz (Fisher)"
-        else:
-            arm = getattr(args, "delta_arm", "linked")
-            delta = curves[(key, arm)][0] - curves[(key, "null")][0]
-            lo, hi, pv, q = boot.get(key, (None, None, None, None))
-            band, line = "95% CI (cell bootstrap)", f"Δ = {arm} − null"
-            ylab = f"Δ = {arm} − null"
-        if lo is not None:
-            axd.fill_between(centers, lo, hi, color=_COLOR[key], alpha=0.18,
-                             lw=0, label=band)
-        axd.plot(centers, delta, color=_COLOR[key], lw=1.6, marker="o", ms=3,
-                 label=line)
-        if q is not None:
-            # Ring the bins that survive FDR, and only those: one test per bin
-            # per measure means several would clear raw p<0.05 by chance.
-            sig = np.isfinite(q) & (q < 0.05) & np.isfinite(delta)
-            if sig.any():
-                axd.plot(centers[sig], delta[sig], "o", ms=8,
-                         mfc="none", mec=_COLOR[key], mew=1.5,
-                         label=f"q < 0.05  ({int(sig.sum())} bins)")
-            for xi, di, qi in zip(centers, delta, q):
-                mark = stars(qi)
-                if mark and np.isfinite(di):
-                    axd.annotate(mark, (xi, di), textcoords="offset points",
-                                 xytext=(0, 7), ha="center", fontsize=8,
-                                 color=_COLOR[key])
-        axd.axhline(0, color="#9AA0A6", lw=0.8)
-        axd.set_xscale("log")
-        axd.set_xlabel("genomic distance between the two ends (bp)")
-        axd.set_ylabel(ylab if j == 0 else "")
-        axd.legend(fontsize=8, frameon=False)
+        _draw_measure(axes[0, j], axes[1, j], key, title, curves, centers,
+                      args, boot, fisher, first=(j == 0))
     test = ("" if fisher is None else
             ("   [Fisher z, paired within cell, t across cells]"
              if args.fisher_z == "cell" else
@@ -1610,7 +1619,15 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
     if want:
         write_percell(cells, per_cell, args, out_dir, percell)
         if getattr(args, "per_region", "off") == "on":
-            write_regions(per_cell, args, out_dir)
+            got = write_regions(per_cell, args, out_dir)
+            if got is not None:
+                main = (Path(out_dir)
+                        / f"end_posterior_dist_{label}_main.{args.plot_format}")
+                if _main_figure(curves, centers, label, main, args, *got,
+                                note=note, boot=boot) is not None:
+                    logger.info(f"  wrote {main}  (GCH, HCG and the regions; "
+                                f"the cross-context column stays in "
+                                f"end_posterior_dist_{label}.{args.plot_format})")
     return curves, centers
 
 
@@ -1853,6 +1870,71 @@ def _region_figure(reg: pd.DataFrame, summ: pd.DataFrame, out_path, args):
     return True
 
 
+def _main_band(summ: pd.DataFrame):
+    """The band the main figure shows: the only one, else the longest-range."""
+    if summ is None or not len(summ):
+        return None
+    return summ.sort_values("band_lo").iloc[-1]
+
+
+def _main_figure(curves, centers, label, out_path, args, reg, summ, note="",
+                 boot=None):
+    """Main-figure layout: GCH and HCG against distance, then the regions.
+
+    The cross-context column is replaced by the per-region answer to the
+    question it was meant to ask -- is the two marks' coordination in the
+    same places?  Observed region scatter on top, its null-draw control
+    below, aligned with the distance panels' two rows.  The three-measure
+    figure is still written for Extended Data.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
+    s = _main_band(summ)
+    if s is None:
+        return None
+    min_n = int(getattr(args, "region_min_pairs", 500))
+    d = reg[(reg["band_lo"] == s["band_lo"]) & (reg["band_hi"] == s["band_hi"])
+            & (reg["n_obs"] >= min_n) & (reg["n_null"] >= min_n)]
+    w = d.pivot_table(index=["chrom_code", "start"], columns="mark",
+                      values=["delta", "delta_ctl"]).dropna().sort_index()
+    if len(w) < 8:
+        return None
+    titles = dict(_MEASURES)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8.4),
+                             gridspec_kw={"width_ratios": [1, 1, 1.05]})
+    for j, key in enumerate(("gg", "hh")):
+        axes[0, j].sharex(axes[1, j])
+        _draw_measure(axes[0, j], axes[1, j], key, titles[key], curves,
+                      centers, args, boot or {}, None, first=(j == 0))
+        axes[0, j].tick_params(labelbottom=False)
+    size = f"{int(args.region_size) / 1e6:g} Mb"
+    band = f"{s['band_lo'] / 1e3:g}-{s['band_hi'] / 1e3:g} kb"
+    _density_panel(axes[0, 2], w[("delta", "GCH")].to_numpy(),
+                   w[("delta", "HCG")].to_numpy())
+    axes[0, 2].set_title(
+        f"Same places? one point per {size} region ({int(s['n_regions'])})\n"
+        f"r = {s['pearson_r']:+.2f}, ρ = {s['spearman_rho']:+.2f}  "
+        f"(genome-rotation p {s['rotation_p']:.3f} / "
+        f"{s['rotation_p_spearman']:.3f})", fontsize=10)
+    axes[0, 2].set_xlabel(f"GCH–GCH Δ, pairs {band}")
+    axes[0, 2].set_ylabel("HCG–HCG Δ")
+    _density_panel(axes[1, 2], w[("delta_ctl", "GCH")].to_numpy(),
+                   w[("delta_ctl", "HCG")].to_numpy())
+    axes[1, 2].set_title(f"control: second null − null   r = "
+                         f"{s['control_r']:+.2f}", fontsize=10)
+    axes[1, 2].set_xlabel("GCH–GCH control Δ")
+    axes[1, 2].set_ylabel("HCG–HCG control Δ")
+    fig.suptitle(f"{label}: end-posterior correlation vs distance"
+                 + (f"   ({note})" if note else "")
+                 + "   |   right: the two marks per region", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return fig
+
+
 def write_regions(per_cell, args, out_dir):
     """end_posterior_regions.tsv, its summary, and the figure.
 
@@ -1917,7 +1999,7 @@ def write_regions(per_cell, args, out_dir):
     if _region_figure(reg, summ, fig, args):
         logger.info(f"  wrote {fig}")
     logger.info(f"  wrote {tsv}")
-    return reg
+    return reg, summ
 
 
 def main(argv=None) -> int:
