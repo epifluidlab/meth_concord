@@ -410,12 +410,20 @@ def _linked_xy(m, frame, cols, idx=None):
 
 
 def _null_xy(m, xa, xb):
-    """(x, y) arrays of a null arm of measure ``m`` from donor values."""
+    """(x, y) arrays of a null arm of measure ``m`` from donor values.
+
+    gh keeps HCG on x and GCH on y in BOTH orders, exactly as the linked arm
+    does.  The two orders are pooled into one correlation, so swapping the
+    roles in the second -- (GCH of a, HCG of b), as every version before this
+    did -- put methylation (mean ~0.65) and accessibility (mean ~0.3) into
+    the same variable, and the mean difference alone made the null r about
+    -0.2 at every distance: the whole of the cross-context "excess".
+    """
     if m == "gg":
         return [(xa["g"], xb["g"])]
     if m == "hh":
         return [(xa["h"], xb["h"])]
-    return [(xa["h"], xb["g"]), (xa["g"], xb["h"])]
+    return [(xa["h"], xb["g"]), (xb["h"], xa["g"])]
 
 
 def joined_pairs(per_ctx: dict[str, pd.DataFrame]):

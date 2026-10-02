@@ -1210,8 +1210,18 @@ def test_reproduction_flags_match_the_original_script_exactly(tmp_path):
     b = pd.read_csv(tmp_path / "new" / "end_posterior_dist_all.tsv", sep="\t")
     shared = [c for c in a.columns if c in b.columns]
     assert len(shared) > 30
+    # The cross-context NULL is the one deliberate departure: the original
+    # swapped HCG and GCH in its second order (see _null_xy).  The FDR runs
+    # over the whole figure, so every q moves with gh's p-values; the raw
+    # p-values of gg and hh do not.  Everything else -- gg, hh, the linked
+    # and matched gh arms, every count -- must still reproduce exactly.
+    fixed = {c for c in shared
+             if c == "gh_null_r" or c.startswith(("gh_delta_", "gh_fz_"))
+             or c.endswith("_q")}
     for c in shared:
-        assert a[c].equals(b[c]), c
+        if c not in fixed:
+            assert a[c].equals(b[c]), c
+    assert not a["gh_null_r"].equals(b["gh_null_r"])
 
 
 def test_panel_a_is_untouched_by_a_separate_per_cell_pass(tmp_path):
@@ -1672,3 +1682,28 @@ def test_panel_a_draws_the_delta_arm_and_the_null_only(tmp_path, arm, expect):
             if not ln.get_label().startswith("_"):
                 assert ln.get_marker() not in ("", "None", None), \
                     ln.get_label()
+
+
+
+def test_cross_context_null_keeps_hcg_on_x_and_gch_on_y():
+    """The bug: the null's second order was (GCH, HCG) while the linked
+    arm's is (HCG, GCH).  Pooled into one correlation, the marks' different
+    means -- methylation ~0.65, accessibility ~0.3 -- made an independent
+    null read about -0.2 at every distance."""
+    m = _mod()
+    rng = np.random.default_rng(0)
+    n = 20_000
+    xa = {"h": rng.normal(0.65, 0.1, n), "g": rng.normal(0.3, 0.1, n)}
+    xb = {"h": rng.normal(0.65, 0.1, n), "g": rng.normal(0.3, 0.1, n)}
+    pairs = m._null_xy("gh", xa, xb)
+    x = np.concatenate([p[0] for p in pairs])
+    y = np.concatenate([p[1] for p in pairs])
+    assert abs(np.corrcoef(x, y)[0, 1]) < 0.03, "independent ends: r ~ 0"
+    assert abs(x.mean() - 0.65) < 0.01 and abs(y.mean() - 0.3) < 0.01, \
+        "x is HCG and y is GCH in both orders"
+    # and the linked arm is built the same way
+    f = pd.DataFrame({"p1_h": xa["h"], "p2_h": xb["h"],
+                      "p1_g": xa["g"], "p2_g": xb["g"]})
+    cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
+    lx = np.concatenate([p[0] for p in m._linked_xy("gh", f, cols)])
+    assert abs(lx.mean() - 0.65) < 0.01
