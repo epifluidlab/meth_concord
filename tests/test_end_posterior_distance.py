@@ -1426,7 +1426,8 @@ def test_link_shuffle_needs_pooled_scope(tmp_path):
                 "--null-type", "link-shuffle", "--plot-format", "png"])
 
 
-def _link_fixture(tmp_path, n_cells=16, offset_sd=0.0, rho=0.0, seed=3):
+def _link_fixture(tmp_path, n_cells=16, offset_sd=0.0, rho=0.0, seed=3,
+                  rho_of=None):
     """The same links in every cell, so every stratum has donors.
 
     ``offset_sd`` gives each cell its own level (logit scale) -- shared by
@@ -1440,11 +1441,12 @@ def _link_fixture(tmp_path, n_cells=16, offset_sd=0.0, rho=0.0, seed=3):
     cells = [f"c{i}" for i in range(n_cells)]
     for ctx in ("GCH", "HCG"):
         (tmp_path / ctx).mkdir(parents=True, exist_ok=True)
-    for c in cells:
+    for ci, c in enumerate(cells):
         off = rng.normal(0, offset_sd)
         shared = rng.normal(0, 1, n)
+        r_c = rho if rho_of is None else rho_of(ci)
         for ctx in ("GCH", "HCG"):
-            sig = lambda: 1 / (1 + np.exp(-(off + rho * shared         # noqa
+            sig = lambda: 1 / (1 + np.exp(-(off + r_c * shared         # noqa
                                             + rng.normal(0, 0.6, n))))
             pd.DataFrame({"chrom": "chr1", "pos1": pos1,
                           "pos2": pos1 + dist, "n1": 6, "n2": 6,
@@ -1512,3 +1514,67 @@ def test_link_shuffle_feeds_the_per_cell_test(tmp_path):
     pc = pd.read_csv(out / "end_posterior_percell.tsv", sep="\t")
     g = pc[pc["mark"] == "GCH"]
     assert (g["delta"] > 0).mean() > 0.8
+
+
+def test_link_shuffle_never_builds_a_run_wide_pool(tmp_path, monkeypatch):
+    """The run-wide pool is what ran out of memory on 1,577 cells."""
+    m = _mod()
+    sp = _link_fixture(tmp_path, rho=1.0)
+
+    def boom(*a, **k):
+        raise AssertionError("run-wide donor pool built under link-shuffle")
+
+    monkeypatch.setattr(m, "_build_pools", boom)
+    assert m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
+                   "--samples", sp, "--output-dir", str(tmp_path / "o"),
+                   "--plot-format", "png", "--null-type", "link-shuffle",
+                   "--null-scope", "pooled", "--group-column", "group",
+                   "--null-match-column", "exp_batch,lib_batch",
+                   "--min-distance", "1000", "--max-distance", "1000000",
+                   "--bins-per-decade", "4", "--min-pairs", "50",
+                   "--n-bootstrap", "0", "--fisher-z", "none",
+                   "--per-cell", "off"]) == 0
+
+
+def test_link_shuffle_per_cell_rows_stay_with_their_cells(tmp_path):
+    """Strata finish out of order; per_cell[i] must still be cells[i]."""
+    planted = {1, 4, 6, 11, 13}
+    t, out = _run_link(tmp_path, ["--per-cell", "on",
+                                  "--per-cell-min-pairs", "50",
+                                  "--n-threads", "3", "--backend", "thread"],
+                       rho_of=lambda ci: 1.5 if ci in planted else 0.0)
+    pc = pd.read_csv(out / "end_posterior_percell.tsv", sep="\t")
+    g = pc[pc["mark"] == "GCH"].set_index("cell_id")["delta"]
+    hi = {f"c{i}" for i in planted}
+    assert g[list(hi)].min() > g.drop(list(hi)).max()
+
+
+def test_link_shuffle_backends_agree(tmp_path):
+    """Serial, thread and process runs of the stratum path: same numbers."""
+    import subprocess
+    sp = _link_fixture(tmp_path, rho=1.0)
+    common = ["--posteriors", f"GCH={tmp_path / 'GCH'}",
+              "--posteriors", f"HCG={tmp_path / 'HCG'}",
+              "--samples", sp, "--plot-format", "png",
+              "--null-type", "link-shuffle", "--null-scope", "pooled",
+              "--group-column", "group",
+              "--null-match-column", "exp_batch,lib_batch",
+              "--min-distance", "1000", "--max-distance", "1000000",
+              "--bins-per-decade", "4", "--min-pairs", "50",
+              "--n-bootstrap", "0", "--fisher-z", "none"]
+    got = {}
+    for name, extra in (("serial", ["--n-threads", "1"]),
+                        ("thread", ["--n-threads", "3", "--backend",
+                                    "thread"]),
+                        ("process", ["--n-threads", "3", "--backend",
+                                     "process"])):
+        out = tmp_path / name
+        r = subprocess.run([sys.executable, str(_SCRIPT)] + common
+                           + ["--output-dir", str(out)] + extra,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-3000:]
+        got[name] = pd.read_csv(out / "end_posterior_dist_all.tsv", sep="\t")
+    for name in ("thread", "process"):
+        for c in got["serial"].columns:
+            assert np.allclose(got["serial"][c], got[name][c],
+                               equal_nan=True), (name, c)

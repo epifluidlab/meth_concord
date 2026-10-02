@@ -1137,13 +1137,19 @@ def _percell_blocks(j, d, cols, measures, drawn, drawn2, edges, args):
     return out
 
 
-def _build_pools(cells, paths, args, batch_of, merged, excl_chrom,
-                 edges=None):
+def _pool_sets(args):
+    """Pair sets a donor pool must cover: panel a's, plus the per-cell test's."""
+    sets = set(_SET_OF[getattr(args, "pair_set", "joint")].values())
+    if getattr(args, "per_cell", "off") == "on":
+        sets |= set(_percell_set_of(args).values())
+    return sorted(sets)
+
+
+def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
     """Donor end pools for --null-scope pooled: ``{pair_set: {batch: pool}}``.
 
-    Under --null-type link-shuffle the pool holds only CONTACT ends -- both
-    ends of every linked pair in the distance range, which needs ``edges``
-    -- centred on their own cell's mean, one pool per stratum.
+    Not used by link-shuffle, which builds one small pool per stratum inside
+    the stratum's own task (:func:`_stratum_job`).
 
     One pool per pair set, because each set's null draws from ends carrying
     that set's values (GCH-only, HCG-only, or both).  Parallel over cells,
@@ -1154,15 +1160,8 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom,
     pickle back than the join costs to compute, and with ``chrom`` categorical
     the join no longer pins the GIL.
     """
-    set_of = _SET_OF[getattr(args, "pair_set", "joint")]
-    sets = set(set_of.values())
-    if getattr(args, "per_cell", "off") == "on":
-        sets |= set(_percell_set_of(args).values())
-    sets = sorted(sets)
+    sets = _pool_sets(args)
     ms = _min_sites(args)
-    links = getattr(args, "null_type", "") == "link-shuffle"
-    if links and edges is None:
-        raise ValueError("link-shuffle pools need the distance edges")
 
     def _one(job):
         ci, cell = job
@@ -1171,12 +1170,6 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom,
         if not frames:
             return None
         key = batch_of.get(cell, "") if batch_of else ""
-        if links:
-            if _center_on(args):
-                frames = {sk: _center_frame(f, _SET_COLS[sk])
-                          for sk, f in frames.items()}
-            frames = {sk: _contact_ends(f, edges) for sk, f in frames.items()}
-            frames = {sk: f for sk, f in frames.items() if len(f)}
         # Same enumeration as run_group's job list, so a cell's ids here and
         # in its own pass agree without either side recording an offset.
         return key, {sk: end_table(f, _SET_COLS[sk], _pair_base(ci),
@@ -1213,13 +1206,10 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom,
     pools: dict = {}
     for sk, by_key in parts.items():
         # Run-wide ids, so a donor pair drawn out of ANY cell in the stratum
-        # is recognisable as a real ligation (or, for link-shuffle, as the
-        # anchor's own cell) and refused.
+        # is recognisable as a real ligation and refused.
         pools[sk] = {k: _merge_end_tables(ps) for k, ps in by_key.items()}
-    logger.info(("  link-shuffle contact ends: " if links
-                 else "  pooled donor ends: ") + ", ".join(
+    logger.info("  pooled donor ends: " + ", ".join(
         f"{sk}: {sum(int(v[0].size) for v in by.values()):,}"
-        + (f" in {len(by)} strata" if links else "")
         for sk, by in pools.items()))
     return pools
 
@@ -1248,19 +1238,124 @@ def _link_strata(samples: pd.DataFrame, args, batch_of):
     return strata.to_dict()
 
 
+def _stratum_pool(members, paths, edges, args, merged, excl_chrom):
+    """link-shuffle donors for ONE stratum: its cells' contact ends.
+
+    Both ends of every linked pair in the distance range, centred on their
+    own cell's mean, values as float32 and without the genome-coordinate
+    copy (the position already is one) -- roughly a third of a full end
+    table, and only ever one stratum's worth at a time per worker.
+    """
+    ms = _min_sites(args)
+    sets = _pool_sets(args)
+    parts: dict = {}
+    for cell, i in members:
+        frames = set_frames(_load_cell(paths, cell, ms, merged, excl_chrom),
+                            sets)
+        for sk, f in frames.items():
+            if _center_on(args):
+                f = _center_frame(f, _SET_COLS[sk])
+            f = _contact_ends(f, edges)
+            if not len(f):
+                continue
+            pos, vals, pi = end_table(f, _SET_COLS[sk], _pair_base(i),
+                                      "genome")
+            vals = {n_: v.astype(np.float32) for n_, v in vals.items()
+                    if n_ != "_gpos"}
+            parts.setdefault(sk, []).append((pos, vals, pi))
+    return {sk: _merge_end_tables(ps) for sk, ps in parts.items()}
+
+
+def _stratum_job(task, paths, edges, args, batch_of, merged, excl_chrom):
+    """One stratum: build its pool, run its cells, let the pool go.
+
+    Returns ``[(cell_index, accumulate_result), ...]``.  The cell index is
+    the cell's position in the group, as everywhere else, so seeds and pair
+    ids are what a cell-by-cell run would have used.
+    """
+    key, members, want = task
+    pool = _stratum_pool(members, paths, edges, args, merged, excl_chrom)
+    pools = {sk: {key: p} for sk, p in pool.items()}
+    return [(i, _accumulate_cell(cell, i, paths, edges, args, pools,
+                                 batch_of, merged, excl_chrom, want))
+            for cell, i in members]
+
+
+def _stratum_worker(task):
+    """Process-backend entry: only (key, members, want) crosses over."""
+    return _stratum_job(task, _W["paths"], _W["edges"], _W["args"],
+                        _W["batch_of"], _W["merged"], _W["excl_chrom"])
+
+
+def _run_strata(cells, paths, edges, args, batch_of, merged, excl_chrom,
+                executor, want, accs, per_cell, label):
+    """link-shuffle, one stratum per task.
+
+    A run-wide donor pool -- every contact end of every cell, for every pair
+    set -- was the whole run's pairs held at once, briefly twice while it
+    was merged, and handed to each worker process: on 1,577 cells the job
+    was killed for memory the moment the pool was built.  A stratum (cell
+    type x batch, median 7 cells) is its own closed world for this null, so
+    it can be built, used and dropped on its own.  Results go back into
+    cell order, because per_cell[i] has to belong to cells[i].
+    """
+    by: dict = {}
+    for i, c in enumerate(cells):
+        by.setdefault(batch_of.get(c, "") if batch_of else "", []).append(
+            (c, i))
+    # Largest strata first, so a big one cannot be left running alone at
+    # the end while the other workers idle.
+    tasks = sorted(((k, m, want) for k, m in by.items()),
+                   key=lambda t: -len(t[1]))
+    sizes = [len(t[1]) for t in tasks]
+    logger.info(f"  link-shuffle: {len(tasks)} strata, "
+                f"{min(sizes)}-{max(sizes)} cells each")
+    if executor is not None and len(tasks) > 1:
+        if args.backend == "process":
+            it = executor.map(_stratum_worker, tasks)
+        else:
+            it = executor.map(lambda t: _stratum_job(
+                t, paths, edges, args, batch_of, merged, excl_chrom), tasks)
+    else:
+        it = (_stratum_job(t, paths, edges, args, batch_of, merged,
+                           excl_chrom) for t in tasks)
+    slots: list = [None] * len(cells)
+    bar = Progress(len(cells), f"{label}: cells")
+    try:
+        for res in it:
+            for i, r in res:
+                slots[i] = r
+            bar.update(len(res))
+    finally:
+        bar.close()
+    n_pairs = n_null = 0
+    for a, np_, nn_ in slots:
+        for k in accs:
+            accs[k] += a[k]
+        per_cell.append(a)
+        n_pairs += np_
+        n_null += nn_
+    return n_pairs, n_null
+
+
 def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
               merged=None, excl_chrom=(), executor=None, percell=None):
     nb = len(edges) - 1
     accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
-    pools = ({} if args.null_scope != "pooled"
+    links = args.null_type == "link-shuffle"
+    pools = ({} if args.null_scope != "pooled" or links
              else _build_pools(cells, paths, args, batch_of, merged,
-                               excl_chrom, edges))
+                               excl_chrom))
 
     n_pairs = n_null = 0
     per_cell: list = []   # kept for the cell-level bootstrap
     want = percell is not None
     jobs = [(c, i, want) for i, c in enumerate(cells)]
-    if executor is not None and len(cells) > 1:
+    if links:
+        n_pairs, n_null = _run_strata(cells, paths, edges, args, batch_of,
+                                      merged, excl_chrom, executor, want,
+                                      accs, per_cell, label)
+    elif executor is not None and len(cells) > 1:
         # The pool is created once for the whole run and reused across groups.
         # Only ProcessPoolExecutor.map honours chunksize; threads ignore it.
         # Keep chunks small so one straggling worker cannot be left holding a
