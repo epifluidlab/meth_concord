@@ -1707,3 +1707,98 @@ def test_cross_context_null_keeps_hcg_on_x_and_gch_on_y():
     cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
     lx = np.concatenate([p[0] for p in m._linked_xy("gh", f, cols)])
     assert abs(lx.mean() - 0.65) < 0.01
+
+
+# --------------------------------------------------------------- per-region --
+
+def _region_fixture(tmp_path, pattern, n_cells=10, n_regions=40,
+                    region=1_000_000, seed=5):
+    """Coordination strength set per REGION, for each mark.
+
+    'shared': both marks coordinated strongly in the same regions;
+    'independent': each mark's strong regions drawn on its own.
+    """
+    rng = np.random.default_rng(seed)
+    rho_g = rng.uniform(0.0, 1.5, n_regions)
+    rho_h = (rho_g.copy() if pattern == "shared"
+             else rng.uniform(0.0, 1.5, n_regions))
+    for ctx in ("GCH", "HCG"):
+        (tmp_path / ctx).mkdir(parents=True, exist_ok=True)
+    cells = [f"c{i}" for i in range(n_cells)]
+    per = 60
+    for c in cells:
+        recs = {"GCH": [], "HCG": []}
+        for k in range(n_regions):
+            p1 = k * region + rng.integers(0, region - 320_000, per)
+            dist = np.exp(rng.uniform(np.log(2_000), np.log(250_000),
+                                      per)).astype(int)
+            for ctx, rho in (("GCH", rho_g[k]), ("HCG", rho_h[k])):
+                s = rng.normal(0, 1, per)          # one latent per pair
+                f = lambda: 1 / (1 + np.exp(-(rho * s                 # noqa
+                                              + rng.normal(0, 0.6, per))))
+                recs[ctx].append(pd.DataFrame({
+                    "chrom": "chr1", "pos1": p1, "pos2": p1 + dist,
+                    "n1": 6, "n2": 6, "distance": dist,
+                    "posterior1": f(), "posterior2": f()}))
+        for ctx in ("GCH", "HCG"):
+            pd.concat(recs[ctx]).to_parquet(
+                tmp_path / ctx / f"{c}.posteriors.parquet")
+    sp = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "group": "A"}).to_csv(
+        sp, sep="\t", index=False)
+    return str(sp)
+
+
+def _run_regions(tmp_path, pattern, extra=()):
+    m = _mod()
+    sp = _region_fixture(tmp_path, pattern)
+    out = tmp_path / "out"
+    argv = ["--posteriors", f"GCH={tmp_path / 'GCH'}",
+            "--posteriors", f"HCG={tmp_path / 'HCG'}",
+            "--samples", sp, "--output-dir", str(out), "--plot-format", "png",
+            "--min-distance", "1000", "--max-distance", "300000",
+            "--bins-per-decade", "4", "--min-pairs", "20",
+            "--n-bootstrap", "0", "--fisher-z", "none",
+            "--null-anchor-window", "200000", "--per-cell-min-pairs", "20",
+            "--region-size", "1000000", "--region-min-pairs", "30"] + list(extra)
+    assert m.main(argv) == 0
+    return out
+
+
+def test_regions_coordinated_in_the_same_places_correlate(tmp_path):
+    out = _run_regions(tmp_path, "shared")
+    s = pd.read_csv(out / "end_posterior_regions_summary.tsv", sep="\t")
+    assert len(s) == 1
+    row = s.iloc[0]
+    assert row["pearson_r"] > 0.6 and row["spearman_rho"] > 0.5
+    assert row["rotation_p"] < 0.05
+    assert abs(row["control_r"]) < 0.4, "noise alone does not correlate"
+    assert (out / "end_posterior_regions.png").exists()
+
+
+def test_independently_placed_coordination_does_not(tmp_path):
+    out = _run_regions(tmp_path, "independent")
+    s = pd.read_csv(out / "end_posterior_regions_summary.tsv", sep="\t")
+    assert abs(s.iloc[0]["pearson_r"]) < 0.45
+
+
+def test_regions_sit_on_the_per_chromosome_grid(tmp_path):
+    out = _run_regions(tmp_path, "shared")
+    r = pd.read_csv(out / "end_posterior_regions.tsv", sep="\t")
+    assert set(r["chrom"]) == {"chr1"}
+    assert (r["start"] % 1_000_000 == 0).all()
+    assert (r["end"] - r["start"] == 1_000_000).all()
+    assert {"GCH", "HCG"} <= set(r["mark"])
+
+
+def test_region_bands_split_the_distance_range(tmp_path):
+    out = _run_regions(tmp_path, "shared",
+                       ["--region-bands", "1000,50000,300000"])
+    r = pd.read_csv(out / "end_posterior_regions.tsv", sep="\t")
+    assert sorted(set(zip(r["band_lo"], r["band_hi"]))) == [
+        (1000.0, 50000.0), (50000.0, 300000.0)]
+
+
+def test_per_region_off_writes_nothing(tmp_path):
+    out = _run_regions(tmp_path, "shared", ["--per-region", "off"])
+    assert not (out / "end_posterior_regions.tsv").exists()

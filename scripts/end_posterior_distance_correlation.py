@@ -1179,9 +1179,20 @@ def _percell_blocks(j, d, cols, measures, drawn, drawn2, edges, args):
                               np.concatenate([p[1] for p in pairs]))
 
     lk = np.flatnonzero((d >= lo) & (d <= hi))
+    # Per-REGION sums ride along (--per-region): the same arms keyed by
+    # region x distance band on the per-chromosome grid, summed over cells
+    # later by write_regions.
+    regions = getattr(args, "per_region", "off") == "on"
+    if regions:
+        bands = _region_bands(args, lo, hi)
+
+        def rk(gpos, dist):
+            return _region_key(gpos, dist, int(args.region_size), bands)
     out = {}
     for m in measures:
         arms = {"L": from_xy(g1[lk] // B, _linked_xy(m, j, cols, lk))}
+        reg = ({"L": from_xy(rk(g1[lk], d[lk]), _linked_xy(m, j, cols, lk))}
+               if regions else None)
         for tag, dr in (("N", drawn), ("N2", drawn2)):
             if dr is None:
                 arms[tag] = empty if tag == "N" else None
@@ -1190,14 +1201,50 @@ def _percell_blocks(j, d, cols, measures, drawn, drawn2, edges, args):
                 continue
             xa, xb, dn, anchor, aidx = dr
             k = (dn >= lo) & (dn <= hi)
-            arms[tag] = from_xy(anchor[k] // B,
-                                [(x[k], y[k]) for x, y in _null_xy(m, xa, xb)])
+            nxy = [(x[k], y[k]) for x, y in _null_xy(m, xa, xb)]
+            arms[tag] = from_xy(anchor[k] // B, nxy)
+            if regions:
+                reg[tag] = from_xy(rk(anchor[k], dn[k]), nxy)
             if tag == "N":
                 mi = aidx[k]
                 mi = mi[(d[mi] >= lo) & (d[mi] <= hi)]
                 arms["M"] = from_xy(g1[mi] // B, _linked_xy(m, j, cols, mi))
+                if regions:
+                    reg["M"] = from_xy(rk(g1[mi], d[mi]),
+                                       _linked_xy(m, j, cols, mi))
+        if regions:
+            arms["R"] = reg
         out[m] = arms
     return out
+
+
+def _region_bands(args, lo: float, hi: float) -> np.ndarray:
+    """Distance-band edges for --per-region: --region-bands, or one band."""
+    raw = getattr(args, "region_bands", None)
+    if not raw:
+        return np.array([lo, hi], dtype=float)
+    e = sorted({float(x) for x in str(raw).split(",") if x.strip()}
+               | {lo, hi})
+    return np.array([x for x in e if lo <= x <= hi], dtype=float)
+
+
+def _region_key(gpos, dist, size: int, bands: np.ndarray) -> np.ndarray:
+    """One int64 per pair: region start (per-chromosome grid) x band."""
+    g = np.asarray(gpos, np.int64)
+    start = g - ((g & (_GENOME_STRIDE - 1)) % int(size))
+    nb = len(bands) - 1
+    band = np.clip(np.searchsorted(bands, np.asarray(dist, float),
+                                   side="right") - 1, 0, nb - 1)
+    return start * nb + band
+
+
+def _chrom_name(code: int) -> str:
+    """Inverse of :func:`_chrom_code` for the names it maps directly."""
+    code = int(code)
+    if code < 1000:
+        return f"chr{code}"
+    return {1001: "chrX", 1002: "chrY", 1003: "chrM"}.get(code,
+                                                         f"contig{code}")
 
 
 def _pool_sets(args):
@@ -1562,6 +1609,8 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                 f"end-pairs; wrote {tsv}")
     if want:
         write_percell(cells, per_cell, args, out_dir, percell)
+        if getattr(args, "per_region", "off") == "on":
+            write_regions(per_cell, args, out_dir)
     return curves, centers
 
 
@@ -1619,6 +1668,204 @@ def write_percell(cells, per_cell, args, out_dir, meta):
         logger.info(f"  wrote {prefix}{{,_main,_ED}}.{args.plot_format}")
     logger.info(f"  wrote {tsv}")
     return df
+
+
+def _sum_keyed(parts):
+    """Sum several (keys, sums) block tables onto one key axis."""
+    parts = [p for p in parts if p is not None and p[0].size]
+    if not parts:
+        return np.empty(0, np.int64), np.empty((0, 6))
+    keys = np.concatenate([p[0] for p in parts])
+    sums = np.concatenate([p[1] for p in parts])
+    uniq, inv = np.unique(keys, return_inverse=True)
+    out = np.zeros((uniq.size, 6))
+    np.add.at(out, inv, sums)
+    return uniq, out
+
+
+def _rotation_p(x, y, min_shift: int):
+    """Two-sided p for corr(x, y) against y rotated along the genome.
+
+    Neighbouring regions are not independent, so a Pearson p would be far
+    too small; rotating one track keeps each track's own autocorrelation and
+    breaks only their alignment.  Shifts below ``min_shift`` regions are
+    skipped -- they barely move the track.
+    """
+    n = len(x)
+    shifts = range(min_shift, n - min_shift + 1)
+    if n < 8 or len(shifts) < 5:
+        return float("nan")
+    r0 = np.corrcoef(x, y)[0, 1]
+    rs = np.array([np.corrcoef(x, np.roll(y, k))[0, 1] for k in shifts])
+    return float((1 + np.sum(np.abs(rs) >= abs(r0))) / (1 + len(rs)))
+
+
+def region_summary(reg: pd.DataFrame, args) -> pd.DataFrame:
+    """Δ_GCH against Δ_HCG across regions, one row per distance band."""
+    from scipy import stats
+    out = []
+    min_n = int(getattr(args, "region_min_pairs", 500))
+    for (blo, bhi), d in reg.groupby(["band_lo", "band_hi"]):
+        ok = d[(d["n_obs"] >= min_n) & (d["n_null"] >= min_n)]
+        w = ok.pivot_table(index=["chrom_code", "start"], columns="mark",
+                           values=["delta", "delta_ctl"]).dropna()
+        if not {("delta", "GCH"), ("delta", "HCG")} <= set(w.columns) \
+                or len(w) < 8:
+            continue
+        w = w.sort_index()
+        x, y = w[("delta", "GCH")].to_numpy(), w[("delta", "HCG")].to_numpy()
+        cx = w[("delta_ctl", "GCH")].to_numpy()
+        cy = w[("delta_ctl", "HCG")].to_numpy()
+        r, _ = stats.pearsonr(x, y)
+        rho, _ = stats.spearmanr(x, y)
+        rc, _ = stats.pearsonr(cx, cy)
+        # Rotations shorter than ~50 Mb leave neighbouring regions aligned;
+        # capped at an eighth of the track so a short one still has shifts.
+        min_shift = max(2, min(int(np.ceil(50_000_000
+                                           / int(args.region_size))),
+                               len(x) // 8))
+
+        def rel(v, c):
+            # control Δ (second null minus first) carries only noise, so its
+            # spread across regions estimates the noise in a region's Δ
+            return max(0.0, 1.0 - np.var(c, ddof=1) / np.var(v, ddof=1))
+
+        rg, rh = rel(x, cx), rel(y, cy)
+        out.append({"band_lo": blo, "band_hi": bhi, "n_regions": len(w),
+                    "pearson_r": r, "spearman_rho": rho,
+                    "rotation_p": _rotation_p(x, y, min_shift),
+                    "control_r": rc, "reliability_GCH": rg,
+                    "reliability_HCG": rh,
+                    "disattenuated_r": (r / np.sqrt(rg * rh)
+                                        if rg > 0 and rh > 0 else np.nan)})
+    return pd.DataFrame(out)
+
+
+def _region_figure(reg: pd.DataFrame, summ: pd.DataFrame, out_path, args):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
+    min_n = int(getattr(args, "region_min_pairs", 500))
+    rows = list(summ.itertuples())
+    if not rows:
+        return False
+    fig, axes = plt.subplots(len(rows), 3, squeeze=False,
+                             figsize=(16, 4.4 * len(rows)),
+                             gridspec_kw={"width_ratios": [1, 1, 2.2]})
+    for i, s in enumerate(rows):
+        d = reg[(reg["band_lo"] == s.band_lo) & (reg["band_hi"] == s.band_hi)
+                & (reg["n_obs"] >= min_n) & (reg["n_null"] >= min_n)]
+        w = d.pivot_table(index=["chrom_code", "start"], columns="mark",
+                          values=["delta", "delta_ctl", "n_obs"]).dropna()
+        w = w.sort_index()
+        band = f"{s.band_lo / 1e3:g}-{s.band_hi / 1e3:g} kb"
+        for k, (val, lab) in enumerate((("delta", "Δ = observed − null"),
+                                        ("delta_ctl",
+                                         "control: null − null"))):
+            ax = axes[i, k]
+            size = 6 + 30 * np.sqrt(w[("n_obs", "HCG")]
+                                    / w[("n_obs", "HCG")].max())
+            ax.scatter(w[(val, "GCH")], w[(val, "HCG")], s=size,
+                       color="#555555", alpha=0.6, lw=0)
+            ax.axhline(0, color="#9AA0A6", lw=0.8)
+            ax.axvline(0, color="#9AA0A6", lw=0.8)
+            ax.set_xlabel(f"GCH–GCH {lab}")
+            ax.set_ylabel(f"HCG–HCG {lab}")
+            if k == 0:
+                ax.set_title(f"{band}: {s.n_regions} regions  r = "
+                             f"{s.pearson_r:+.2f}, ρ = {s.spearman_rho:+.2f}, "
+                             f"rotation p = {s.rotation_p:.3f}", fontsize=10)
+            else:
+                ax.set_title(f"control r = {s.control_r:+.2f}", fontsize=10)
+        ax = axes[i, 2]
+        idx = np.arange(len(w))
+        for mark, col in (("GCH", "#1f77b4"), ("HCG", "#d62728")):
+            v = w[("delta", mark)].to_numpy()
+            z = (v - v.mean()) / (v.std() or 1.0)
+            ax.plot(idx, z, color=col, lw=1.1, marker="o", ms=2.5,
+                    label=f"{mark} Δ (z)")
+        codes = np.asarray([c for c, _ in w.index])
+        for b in np.flatnonzero(np.diff(codes)) + 0.5:
+            ax.axvline(b, color="#DDDDDD", lw=0.8)
+        ax.set_xlabel(f"regions in genome order ({args.region_size / 1e6:g} "
+                      f"Mb; grey lines: chromosome boundaries)")
+        ax.set_ylabel("Δ, z-scored per mark")
+        ax.legend(fontsize=8, frameon=False)
+    fig.suptitle("Is long-range concordance coordinated in the same places "
+                 "for both marks?  (one point per region, all cells pooled)",
+                 fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return True
+
+
+def write_regions(per_cell, args, out_dir):
+    """end_posterior_regions.tsv, its summary, and the figure.
+
+    Each region's Δ uses every cell's pairs in that region -- the per-cell
+    pass's arms, summed -- so it is precise where a single cell's is not.
+    The control Δ (second null draw minus the first) has no signal by
+    construction: it is what the correlation looks like from noise alone.
+    """
+    arm = "M" if getattr(args, "delta_arm", "matched") == "matched" else "L"
+    rows = []
+    measures = sorted({m for acc in per_cell
+                       for m in (acc.get("_percell") or {})})
+    for m in measures:
+        tabs = {t: _sum_keyed([(acc["_percell"][m].get("R") or {}).get(t)
+                               for acc in per_cell
+                               if m in (acc.get("_percell") or {})])
+                for t in (arm, "N", "N2")}
+        keys, mats = pce._align([tabs[arm], tabs["N"], tabs["N2"]])
+        if not keys.size:
+            continue
+        r = [pce.corr_from_sums(mt) for mt in mats]
+        rows.append(pd.DataFrame({
+            "key": keys, "mark": pce.MEASURE_TO_MARK[m],
+            "n_obs": mats[0][:, 0].astype(np.int64),
+            "n_null": mats[1][:, 0].astype(np.int64),
+            "r_obs": r[0], "r_null": r[1], "r_null2": r[2]}))
+    if not rows:
+        logger.warning("  per-region: nothing to write")
+        return None
+    reg = pd.concat(rows, ignore_index=True)
+    edges_lo = max(float(args.per_cell_min_distance), float(args.min_distance))
+    bands = _region_bands(args, edges_lo, float(args.max_distance))
+    nb = len(bands) - 1
+    band = (reg["key"] % nb).astype(int)
+    start = reg["key"] // nb
+    reg["chrom_code"] = (start // _GENOME_STRIDE).astype(np.int64)
+    reg["chrom"] = [_chrom_name(c) for c in reg["chrom_code"]]
+    reg["start"] = (start - reg["chrom_code"] * _GENOME_STRIDE).astype(np.int64)
+    reg["end"] = reg["start"] + int(args.region_size)
+    reg["band_lo"] = bands[band]
+    reg["band_hi"] = bands[band + 1]
+    reg["delta"] = reg["r_obs"] - reg["r_null"]
+    reg["delta_ctl"] = reg["r_null2"] - reg["r_null"]
+    reg = reg.drop(columns="key").sort_values(
+        ["band_lo", "chrom_code", "start", "mark"]).reset_index(drop=True)
+    cols = ["chrom", "start", "end", "band_lo", "band_hi", "mark", "n_obs",
+            "n_null", "r_obs", "r_null", "r_null2", "delta", "delta_ctl",
+            "chrom_code"]
+    reg = reg[cols]
+    tsv = Path(out_dir) / "end_posterior_regions.tsv"
+    reg.to_csv(tsv, sep="\t", index=False)
+    summ = region_summary(reg, args)
+    summ.to_csv(Path(out_dir) / "end_posterior_regions_summary.tsv",
+                sep="\t", index=False)
+    for s in summ.itertuples():
+        logger.info(
+            f"  per-region {s.band_lo:g}-{s.band_hi:g} bp: Δ_GCH vs Δ_HCG "
+            f"across {s.n_regions} regions r = {s.pearson_r:+.3f} "
+            f"(rho {s.spearman_rho:+.3f}, rotation p {s.rotation_p:.3g}); "
+            f"control r = {s.control_r:+.3f}")
+    fig = Path(out_dir) / f"end_posterior_regions.{args.plot_format}"
+    if _region_figure(reg, summ, fig, args):
+        logger.info(f"  wrote {fig}")
+    logger.info(f"  wrote {tsv}")
+    return reg
 
 
 def main(argv=None) -> int:
@@ -1775,6 +2022,22 @@ def main(argv=None) -> int:
                     help="Per-cell test uses pairs at least this far apart "
                          "(1 kb): below it most pairs are the two ends of one "
                          "unligated fragment, not contacts.")
+    ap.add_argument("--per-region", choices=["on", "off"], default="on",
+                    help="With --per-cell on: also compute each region's Δ "
+                         "from every cell's pairs there, and correlate GCH's "
+                         "with HCG's across regions -- is the two marks' "
+                         "long-range coordination in the same places?")
+    ap.add_argument("--region-size", type=int, default=10_000_000,
+                    help="Region size for --per-region (10 Mb), on the "
+                         "per-chromosome grid.")
+    ap.add_argument("--region-bands", default=None,
+                    help="Comma-separated distance-band edges (bp) for "
+                         "--per-region, e.g. 1000,100000,10000000; default "
+                         "one band from --per-cell-min-distance to "
+                         "--max-distance.")
+    ap.add_argument("--region-min-pairs", type=int, default=500,
+                    help="A region enters the correlation only with at least "
+                         "this many observed and null pairs for a mark.")
     ap.add_argument("--per-cell-block", type=int, default=10_000_000,
                     help="Genomic block (bp) the per-cell bootstrap resamples "
                          "(10 Mb), so pairs that share a domain move together.")
