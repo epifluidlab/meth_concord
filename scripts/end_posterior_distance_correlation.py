@@ -754,9 +754,20 @@ def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
 
 # ----------------------------------------------------------------- plotting --
 
+#: How the observed curve is labelled, by --delta-arm.
+_OBS_LABEL = {"matched": "linked (pairs with a null partner)",
+              "linked": "linked (every true pair)"}
+
+
 def _figure(curves, centers, label, out_path, args, note="", boot=None,
             fisher=None):
-    """Row 1 the linked and null curves, row 2 the contrast between them.
+    """Row 1 the observed and null curves, row 2 the contrast between them.
+
+    The observed curve is the --delta-arm arm, so row 1 shows the very pairs
+    row 2's Δ is taken on: under 'matched' (the default) only the linked
+    pairs the null placed a partner for.  Two lines, not three -- linked and
+    matched sit on top of each other wherever most pairs are placed, and the
+    third line only made the figure harder to read.  Both are in the TSV.
 
     With ``fisher`` the second row switches to Δz and its parametric interval;
     the first row is untouched, so the two files can be read side by side and
@@ -772,17 +783,17 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None,
                              figsize=(5.2 * len(_MEASURES), 8), sharex=True)
     for j, (key, title) in enumerate(_MEASURES):
         ax = axes[0, j]
-        # MATCHED is not drawn: it sits on top of LINKED wherever the null
-        # places most anchors and only adds an unreadable third line.  It is
-        # in the TSV, and Δ uses it when --delta-arm matched.
-        style = {"linked": dict(marker="o", ls="-", alpha=1.0, lw=1.6),
-                 "null": dict(marker="", ls="--", alpha=0.6, lw=1.6)}
-        for cond, clab in _CONDS:
-            if cond not in style or (key, cond) not in curves:
+        obs = getattr(args, "delta_arm", "linked")
+        for cond, clab, style in (
+                (obs, _OBS_LABEL.get(obs, obs),
+                 dict(marker="o", ls="-", alpha=1.0, lw=1.6)),
+                ("null", "non-linked",
+                 dict(marker="", ls="--", alpha=0.6, lw=1.6))):
+            if (key, cond) not in curves:
                 continue
             r, n = curves[(key, cond)]
             ax.plot(centers, r, label=clab, color=_COLOR[key], ms=3.0,
-                    **style[cond])
+                    **style)
         ax.axhline(0, color="#9AA0A6", lw=0.8)
         ax.set_title(title, fontsize=11)
         ax.set_ylabel("Pearson r of end posteriors" if j == 0 else "")
@@ -838,6 +849,7 @@ def _figure(curves, centers, label, out_path, args, note="", boot=None,
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
+    return fig
 
 
 def _figure_by_group(per_group, out_path, args, colors=None):
@@ -861,14 +873,15 @@ def _figure_by_group(per_group, out_path, args, colors=None):
 
     fig, axes = plt.subplots(2, len(_MEASURES),
                              figsize=(5.2 * len(_MEASURES), 8), sharex=True)
+    arm = getattr(args, "delta_arm", "linked")
     for j, (key, title) in enumerate(_MEASURES):
-        for row, what in enumerate(("linked", "delta")):
+        for row, what in enumerate(("observed", "delta")):
             ax = axes[row, j]
             for g in labels:
                 curves, centers = per_group[g]
-                arm = getattr(args, "delta_arm", "linked")
-                if what == "linked":
-                    y = curves[(key, "linked")][0]
+                if what == "observed":
+                    # the --delta-arm arm, as in the per-group figures
+                    y = curves[(key, arm)][0]
                 else:
                     y = (curves[(key, arm)][0]
                          - curves[(key, "null")][0])
@@ -878,7 +891,9 @@ def _figure_by_group(per_group, out_path, args, colors=None):
             ax.set_xscale("log")
             if row == 0:
                 ax.set_title(title, fontsize=11)
-                ax.set_ylabel("linked r" if j == 0 else "")
+                ax.set_ylabel(("linked r (pairs with a null partner)"
+                               if arm == "matched" else "linked r")
+                              if j == 0 else "")
             else:
                 ax.set_xlabel("genomic distance between the two ends (bp)")
                 ax.set_ylabel(f"Δ = {getattr(args, 'delta_arm', 'linked')}"

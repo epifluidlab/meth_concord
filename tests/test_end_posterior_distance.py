@@ -1635,3 +1635,34 @@ def test_link_shuffle_backends_agree(tmp_path):
         for c in got["serial"].columns:
             assert np.allclose(got["serial"][c], got[name][c],
                                equal_nan=True), (name, c)
+
+
+# ----------------------------------------------------- panel a: two lines --
+
+def _drawn(fig, row_axes=3):
+    """Labelled lines of the top row: {label: ydata}."""
+    out = []
+    for ax in fig.axes[:row_axes]:
+        out.append({ln.get_label(): np.asarray(ln.get_ydata(), float)
+                    for ln in ax.get_lines()
+                    if not ln.get_label().startswith("_")})
+    return out
+
+
+@pytest.mark.parametrize("arm,expect", [("matched", 0.3), ("linked", 0.5)])
+def test_panel_a_draws_the_delta_arm_and_the_null_only(tmp_path, arm, expect):
+    """Row 1 shows the pairs row 2's Δ is taken on, and nothing else."""
+    import argparse
+    m = _mod()
+    centers = np.array([1e3, 1e4, 1e5])
+    n = np.full(3, 500)
+    level = {"linked": 0.5, "matched": 0.3, "null": 0.1}
+    curves = {(k, c): (np.full(3, v), n)
+              for k, _ in m._MEASURES for c, v in level.items()}
+    a = argparse.Namespace(delta_arm=arm, fisher_z="none")
+    fig = m._figure(curves, centers, "all", tmp_path / "a.png", a)
+    for lines in _drawn(fig):
+        assert len(lines) == 2, lines.keys()
+        obs = lines[m._OBS_LABEL[arm]]
+        assert np.allclose(obs, expect)
+        assert np.allclose(lines["non-linked"], 0.1)
