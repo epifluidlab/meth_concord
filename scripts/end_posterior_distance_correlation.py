@@ -30,14 +30,15 @@ Nulls mirror the site-level script:
         within +/---null-window of the true partner.  Answers "same two places,
         different molecule".
 
-    --null-type link-shuffle       shuffle the LINKS themselves across cells:
-        keep end 1 of a contact and give it the end 2 of another contact
-        joining the same two --link-shuffle-bin bins (250 kb) at the same log
-        distance bin, from ANOTHER cell of the same stratum (cell type from
-        --group-column x --null-match-column, e.g. exp_batch,lib_batch).  The
-        swapped pair must still fall in the same distance bin.  Answers "same
-        two places, same distance, same kind of cell -- but the two ends were
-        not ligated in one nucleus".  Needs --null-scope pooled.  Each end is
+    --null-type link-shuffle       re-pair contacts across cells: keep end 1
+        of a contact and give it, as end 2, an end of ANOTHER cell's contact
+        that lies in the same --link-shuffle-bin bin (250 kb) as the real end
+        2, at a distance from end 1 in the same log distance bin, from the
+        same stratum (cell type from --group-column x --null-match-column,
+        e.g. exp_batch,lib_batch).  Where that end's own partner sits does
+        not matter, so the curve continues past the bin size.  Answers "same
+        place, same distance, same kind of cell -- but the two ends were not
+        ligated in one nucleus".  Needs --null-scope pooled.  Each end is
         centred on its own cell's mean in every arm (--cell-center auto), or
         the shared nucleus of a linked pair's two ends -- absent from a
         cross-cell null -- would count as concordance.
@@ -495,68 +496,62 @@ def _center_frame(f: pd.DataFrame, cols: dict) -> pd.DataFrame:
     return f
 
 
-def _link_key(g1, g2, dbin, bin_size, nb, maxoff):
-    """One int64 per link: (bin of end 1, offset to bin of end 2, distance
-    bin).  Both orientations are handled by shifting the offset."""
-    b1 = np.asarray(g1, np.int64) // int(bin_size)
-    off = np.asarray(g2, np.int64) // int(bin_size) - b1
-    off = np.clip(off + maxoff, 0, 2 * maxoff)
-    return (b1 * (2 * maxoff + 1) + off) * nb + np.asarray(dbin, np.int64)
+def _merge_end_tables(parts: list):
+    """Concatenate end tables ``(pos, vals, pair_ids)`` and sort by position."""
+    pos = np.concatenate([p[0] for p in parts])
+    names = parts[0][1].keys()
+    vals = {n_: np.concatenate([p[1][n_] for p in parts]) for n_ in names}
+    pi = np.concatenate([p[2] for p in parts])
+    o = np.argsort(pos, kind="stable")
+    return pos[o], {n_: v[o] for n_, v in vals.items()}, pi[o]
 
 
-def _link_table(f: pd.DataFrame, cols: dict, cell_index: int, edges,
-                bin_size: int) -> dict:
-    """One cell's links, keyed for link-shuffle, carrying end 2's values."""
-    nb = len(edges) - 1
-    maxoff = int(edges[-1] // int(bin_size)) + 2
+def _contact_ends(f: pd.DataFrame, edges) -> pd.DataFrame:
+    """The pairs whose ends can stand in for an end 2: linked pairs in range."""
     d = f["distance"].to_numpy()
-    ok = (d >= edges[0]) & (d <= edges[-1])
-    g1 = f["gpos1"].to_numpy(np.int64)[ok]
-    g2 = f["gpos2"].to_numpy(np.int64)[ok]
-    dbin = np.clip(np.digitize(d[ok], edges) - 1, 0, nb - 1)
-    return {"key": _link_key(g1, g2, dbin, bin_size, nb, maxoff),
-            "cell": np.full(int(ok.sum()), int(cell_index), np.int32),
-            "g2": g2,
-            "vals": {name: f[c2].to_numpy(float)[ok]
-                     for name, (_c1, c2) in cols.items()}}
-
-
-def _merge_link_tables(parts: list) -> dict:
-    """Concatenate cells' link tables and sort by key, for searchsorted."""
-    key = np.concatenate([p["key"] for p in parts])
-    o = np.argsort(key, kind="stable")
-    names = parts[0]["vals"].keys()
-    return {"key": key[o],
-            "cell": np.concatenate([p["cell"] for p in parts])[o],
-            "g2": np.concatenate([p["g2"] for p in parts])[o],
-            "vals": {n_: np.concatenate([p["vals"][n_] for p in parts])[o]
-                     for n_ in names}}
+    return f[(d >= edges[0]) & (d <= edges[-1])]
 
 
 def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
                        max_rounds=16):
-    """Link-shuffle null: keep end 1, take end 2 of another cell's link.
+    """Link-shuffle null: keep end 1, take another cell's contact end as end 2.
 
-    The donor link joins the same two --link-shuffle-bin bins at the same
-    log distance bin, comes from another cell of the anchor's stratum (the
-    pool is per stratum), and must leave the swapped pair inside that same
-    distance bin -- below the bin size a donor anywhere in the 250 kb bin
-    would otherwise give a null pair far apart from the linked one.  Same
-    return shape as :func:`_draw_null`.
+    The donor is an end of a linked pair (in range) from ANOTHER cell of the
+    anchor's stratum -- the pool is per stratum -- lying in the same
+    --link-shuffle-bin bin as the real end 2 (bin y), on the same side of
+    end 1, at a distance from end 1 inside the anchor pair's own distance
+    bin.  Where the donor's own partner sits does not matter, so pairs far
+    beyond the bin size keep their donors.  Same return shape as
+    :func:`_draw_null`.
     """
+    if pool is None:
+        return None
+    d_pos, d_vals, d_pi = pool
+    n = len(j)
+    if d_pos.size == 0 or n == 0:
+        return None
     nb = len(edges) - 1
     B = int(getattr(args, "link_shuffle_bin", 250_000))
-    maxoff = int(edges[-1] // B) + 2
-    n = len(j)
-    if pool is None or n == 0 or pool["key"].size == 0:
-        return None
     g1 = j["gpos1"].to_numpy(np.int64)
     g2 = j["gpos2"].to_numpy(np.int64)
     in_range = (d >= edges[0]) & (d <= edges[-1])
-    dbin = np.clip(np.digitize(d, edges) - 1, 0, nb - 1)
-    key = _link_key(g1, g2, dbin, B, nb, maxoff)
-    lo = np.searchsorted(pool["key"], key, side="left")
-    hi = np.searchsorted(pool["key"], key, side="right")
+    k = np.clip(np.digitize(d, edges) - 1, 0, nb - 1)
+    e_lo, e_hi = edges[k], edges[k + 1]
+    right = g2 >= g1
+    # Distance band on the real end 2's side of end 1, half-open like the
+    # bins themselves: [lo, hi) to the right, (lo, hi] to the left.
+    lo = np.where(right, np.searchsorted(d_pos, g1 + e_lo, side="left"),
+                  np.searchsorted(d_pos, g1 - e_hi, side="right"))
+    hi = np.where(right, np.searchsorted(d_pos, g1 + e_hi, side="left"),
+                  np.searchsorted(d_pos, g1 - e_lo, side="right"))
+    # ... intersected with bin y, the bin of the real end 2, on the
+    # pipeline's per-chromosome grid (chr:0, chr:250000, ...).  Binning the
+    # genome-wide coordinate instead would shift every boundary by
+    # (chromosome code x 2^33) mod B -- 184,592 bp on chr1.  A bin never
+    # holds two chromosomes, so the null pair is always cis.
+    y0 = g2 - ((g2 & (_GENOME_STRIDE - 1)) % B)
+    lo = np.maximum(lo, np.searchsorted(d_pos, y0, side="left"))
+    hi = np.minimum(hi, np.searchsorted(d_pos, y0 + B, side="left"))
     me = int(base // _PAIR_STRIDE)
     alive = in_range & (hi > lo)
     kb_out = np.full(n, -1, dtype=np.int64)
@@ -565,14 +560,11 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
         if idx.size == 0:
             break
         span = (hi[idx] - lo[idx]).astype(np.int64)
-        k = lo[idx] + (rng.random(idx.size) * span).astype(np.int64)
-        dn = np.abs(pool["g2"][k] - g1[idx])
-        same = ((dn >= edges[0]) & (dn <= edges[-1])
-                & (np.clip(np.digitize(dn, edges) - 1, 0, nb - 1)
-                   == dbin[idx]))
-        good = same & (pool["cell"][k] != me)
+        kk = lo[idx] + (rng.random(idx.size) * span).astype(np.int64)
+        # another cell (pair ids carry the cell), so never a real ligation
+        good = (d_pi[kk] // _PAIR_STRIDE) != me
         sel = idx[good]
-        kb_out[sel] = k[good]
+        kb_out[sel] = kk[good]
         alive[sel] = False
     placed = kb_out >= 0
     if not placed.any():
@@ -580,13 +572,13 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
     ai = np.flatnonzero(placed)
     kb = kb_out[placed]
     xa = {name: j[c1].to_numpy(float)[ai] for name, (c1, _c2) in cols.items()}
-    xb = {name: pool["vals"][name][kb] for name in cols}
-    dn = np.abs(pool["g2"][kb] - g1[ai]).astype(float)
+    xb = {name: d_vals[name][kb] for name in cols}
+    dn = np.abs(d_pos[kb] - g1[ai]).astype(float)
     return xa, xb, dn, g1[ai], ai
 
 
 def _draw(j, d, cols, pool, base, edges, args, rng):
-    """Dispatch one null draw on whatever kind of pool the null type uses."""
+    """Dispatch one null draw to the null type's own function."""
     if getattr(args, "null_type", "") == "link-shuffle":
         return _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng)
     d_pos, d_vals, d_pi = pool
@@ -595,7 +587,13 @@ def _draw(j, d, cols, pool, base, edges, args, rng):
 
 
 def _coords(args) -> str:
-    """'genome' (partners on the same chromosome) or 'raw' (any chromosome)."""
+    """'genome' (partners on the same chromosome) or 'raw' (any chromosome).
+
+    link-shuffle is always 'genome': it looks donors up by the bin of the
+    real end 2, which only means something on a chromosome-aware coordinate.
+    """
+    if getattr(args, "null_type", "") == "link-shuffle":
+        return "genome"
     return "raw" if getattr(args, "null_chrom", "same") == "any" else "genome"
 
 
@@ -1143,8 +1141,9 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom,
                  edges=None):
     """Donor end pools for --null-scope pooled: ``{pair_set: {batch: pool}}``.
 
-    Under --null-type link-shuffle each pool is instead a table of LINKS
-    (see :func:`_link_table`), keyed by stratum, which needs ``edges``.
+    Under --null-type link-shuffle the pool holds only CONTACT ends -- both
+    ends of every linked pair in the distance range, which needs ``edges``
+    -- centred on their own cell's mean, one pool per stratum.
 
     One pool per pair set, because each set's null draws from ends carrying
     that set's values (GCH-only, HCG-only, or both).  Parallel over cells,
@@ -1176,10 +1175,8 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom,
             if _center_on(args):
                 frames = {sk: _center_frame(f, _SET_COLS[sk])
                           for sk, f in frames.items()}
-            return key, {sk: _link_table(f, _SET_COLS[sk], ci, edges,
-                                         getattr(args, "link_shuffle_bin",
-                                                 250_000))
-                         for sk, f in frames.items()}
+            frames = {sk: _contact_ends(f, edges) for sk, f in frames.items()}
+            frames = {sk: f for sk, f in frames.items() if len(f)}
         # Same enumeration as run_group's job list, so a cell's ids here and
         # in its own pass agree without either side recording an offset.
         return key, {sk: end_table(f, _SET_COLS[sk], _pair_base(ci),
@@ -1214,27 +1211,15 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom,
     finally:
         bar.close()
     pools: dict = {}
-    if links:
-        for sk, by_key in parts.items():
-            pools[sk] = {k: _merge_link_tables(ps) for k, ps in by_key.items()}
-        logger.info("  link-shuffle donor links: " + ", ".join(
-            f"{sk}: {sum(int(v['key'].size) for v in by.values()):,} in "
-            f"{len(by)} strata" for sk, by in pools.items()))
-        return pools
     for sk, by_key in parts.items():
-        pools[sk] = {}
-        for k, ps in by_key.items():
-            pos = np.concatenate([p[0] for p in ps])
-            names = ps[0][1].keys()
-            vals = {n_: np.concatenate([p[1][n_] for p in ps]) for n_ in names}
-            # Run-wide ids, so a donor pair drawn out of ANY cell in the
-            # stratum is recognisable as a real ligation and refused.
-            pi = np.concatenate([p[2] for p in ps])
-            o = np.argsort(pos, kind="stable")
-            pools[sk][k] = (pos[o], {n_: v[o] for n_, v in vals.items()},
-                            pi[o])
-    logger.info("  pooled donor ends: " + ", ".join(
+        # Run-wide ids, so a donor pair drawn out of ANY cell in the stratum
+        # is recognisable as a real ligation (or, for link-shuffle, as the
+        # anchor's own cell) and refused.
+        pools[sk] = {k: _merge_end_tables(ps) for k, ps in by_key.items()}
+    logger.info(("  link-shuffle contact ends: " if links
+                 else "  pooled donor ends: ") + ", ".join(
         f"{sk}: {sum(int(v[0].size) for v in by.values()):,}"
+        + (f" in {len(by)} strata" if links else "")
         for sk, by in pools.items()))
     return pools
 
@@ -1495,8 +1480,8 @@ def main(argv=None) -> int:
                              "link-shuffle"],
                     default="distance-matched")
     ap.add_argument("--link-shuffle-bin", type=int, default=250_000,
-                    help="link-shuffle: genomic bin both ends of a donor link "
-                         "must share with the anchor link (250000).")
+                    help="link-shuffle: the donor end must lie in the same "
+                         "bin of this size as the real end 2 (250000).")
     ap.add_argument("--cell-center", choices=["auto", "on", "off"],
                     default="auto",
                     help="Centre each end's posterior on its own cell's mean, "

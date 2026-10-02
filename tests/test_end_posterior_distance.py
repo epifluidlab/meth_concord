@@ -1267,34 +1267,38 @@ def test_null_chrom_any_crosses_chromosomes_and_same_does_not():
 
 # ------------------------------------------------------------- link-shuffle --
 
-def _link_frames(m, codes, n=60, decoy=False, seed=0):
-    """Identical links in every cell; end-2 values encode the cell."""
+def _link_frames(m, codes, n=60, shift=None, seed=0):
+    """Identical links in every cell; both ends' values encode the cell.
+
+    ``shift`` moves every cell after the first by that many bp, so none of
+    their ends can fall in the anchor's bins.
+    """
     rng = np.random.default_rng(seed)
     pos1 = 1_000_000 + np.arange(n) * 500
     dist = np.exp(rng.uniform(np.log(2_000), np.log(150_000), n)).astype(int)
     frames = {}
     for ci, code in enumerate(codes):
-        p1, p2, d = pos1.copy(), pos1 + dist, dist.copy()
-        v2 = np.full(n, code, float)
-        if decoy and ci > 0:
-            # same distances, but end 1 in ANOTHER 250 kb bin: never a donor
-            p1 = p1 + 5_000_000
-            p2 = p1 + dist
-        f = pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p2,
-                          "distance": d, "p1": rng.uniform(0, 1, n),
-                          "p2": v2})
+        p1 = pos1 + (shift if (shift and ci > 0) else 0)
+        f = pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p1 + dist,
+                          "distance": dist, "p1": float(code),
+                          "p2": float(code)})
         frames[ci] = f.assign(gpos1=m.genome_coords(f["chrom"], f["pos1"]),
                               gpos2=m.genome_coords(f["chrom"], f["pos2"]))
     return frames
 
 
-def test_link_shuffle_takes_end_2_from_another_cell_in_the_same_bins():
+def _contact_pool(m, frames, cols, edges):
+    return m._merge_end_tables([
+        m.end_table(m._contact_ends(f, edges), cols, m._pair_base(ci),
+                    "genome") for ci, f in frames.items()])
+
+
+def test_link_shuffle_takes_end_2_from_another_cell_in_bin_y():
     m = _mod()
-    edges = m.build_edges(1000, 1_000_000, 8)
+    edges = m.build_edges(1000, 10_000_000, 8)
     cols = {"g": ("p1", "p2")}
     frames = _link_frames(m, codes=[0.0, 0.1, 0.2])
-    pool = m._merge_link_tables([m._link_table(f, cols, ci, edges, 250_000)
-                                 for ci, f in frames.items()])
+    pool = _contact_pool(m, frames, cols, edges)
     a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
     j = frames[0]
     d = j["distance"].to_numpy()
@@ -1302,24 +1306,103 @@ def test_link_shuffle_takes_end_2_from_another_cell_in_the_same_bins():
         j, d, cols, pool, m._pair_base(0), edges, a, np.random.default_rng(1))
     assert len(ai) > 0.9 * len(j), "identical links in other cells: most place"
     assert set(np.unique(xb["g"])) <= {0.1, 0.2}, "never the anchor's own cell"
-    same_bin = (np.digitize(dn, edges) == np.digitize(d[ai], edges))
-    assert same_bin.all(), "the swapped pair stays in its distance bin"
-    assert np.array_equal(anchor, j["gpos1"].to_numpy()[ai])
+    assert (np.digitize(dn, edges) == np.digitize(d[ai], edges)).all(), \
+        "the new pair stays in its distance bin"
+    local = lambda g: np.asarray(g) % m._GENOME_STRIDE      # noqa: E731
+    g2 = j["gpos2"].to_numpy()[ai]
+    assert (local(anchor + dn) // 250_000 == local(g2) // 250_000).all(), \
+        "the stand-in end 2 sits in the real end 2's bin"
 
 
-def test_link_shuffle_ignores_links_between_other_bins():
+def test_link_shuffle_has_no_donor_outside_bin_y():
     m = _mod()
-    edges = m.build_edges(1000, 1_000_000, 8)
+    edges = m.build_edges(1000, 10_000_000, 8)
     cols = {"g": ("p1", "p2")}
-    frames = _link_frames(m, codes=[0.0, 0.9], decoy=True)
-    pool = m._merge_link_tables([m._link_table(f, cols, ci, edges, 250_000)
-                                 for ci, f in frames.items()])
+    frames = _link_frames(m, codes=[0.0, 0.9], shift=5_000_000)
+    pool = _contact_pool(m, frames, cols, edges)
     a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
     j = frames[0]
     got = m._draw_link_shuffle(j, j["distance"].to_numpy(), cols, pool,
                                m._pair_base(0), edges, a,
                                np.random.default_rng(1))
-    assert got is None, "same distances elsewhere are not the same link"
+    assert got is None, "same distances elsewhere are not the same place"
+
+
+def test_a_long_range_pair_keeps_a_donor_whose_partner_is_elsewhere():
+    """The point of not requiring the donor's whole link to match: past the
+    bin size, another cell rarely has a contact joining the same two bins,
+    but it often has SOME contact end in bin y."""
+    m = _mod()
+    edges = m.build_edges(1000, 10_000_000, 8)
+    cols = {"g": ("p1", "p2")}
+
+    def frame(p1, p2, code):
+        f = pd.DataFrame({"chrom": "chr1", "pos1": [p1], "pos2": [p2],
+                          "distance": [abs(p2 - p1)], "p1": [code],
+                          "p2": [code]})
+        return f.assign(gpos1=m.genome_coords(f["chrom"], f["pos1"]),
+                        gpos2=m.genome_coords(f["chrom"], f["pos2"]))
+
+    anchor = frame(1_000_000, 1_600_000, 0.0)      # 600 kb, end 2 in bin y
+    donor = frame(1_620_000, 9_000_000, 0.7)       # partner 7 Mb away
+    pool = _contact_pool(m, {0: anchor, 1: donor}, cols, edges)
+    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    got = m._draw_link_shuffle(anchor, anchor["distance"].to_numpy(), cols,
+                               pool, m._pair_base(0), edges, a,
+                               np.random.default_rng(0))
+    assert got is not None
+    xa, xb, dn, _anc, ai = got
+    assert xb["g"][0] == 0.7 and dn[0] == 620_000
+
+
+def test_link_shuffle_bins_follow_the_per_chromosome_grid():
+    """Bin y is the pipeline's chr:k*250000 bin, not a bin of the genome-wide
+    coordinate, whose boundaries sit 184,592 bp off on chr1."""
+    m = _mod()
+    edges = m.build_edges(1000, 10_000_000, 8)
+    cols = {"g": ("p1", "p2")}
+
+    def frame(p1, p2, code):
+        f = pd.DataFrame({"chrom": "chr1", "pos1": [p1], "pos2": [p2],
+                          "distance": [abs(p2 - p1)], "p1": [code],
+                          "p2": [code]})
+        return f.assign(gpos1=m.genome_coords(f["chrom"], f["pos1"]),
+                        gpos2=m.genome_coords(f["chrom"], f["pos2"]))
+
+    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    anchor = frame(400_000, 1_240_000, 0.0)        # end 2 in [1.00, 1.25) Mb
+    for donor_end, expect in ((1_260_000, None), (1_215_000, 0.5)):
+        donor = frame(9_000_000, donor_end, 0.5)   # partner far away
+        pool = _contact_pool(m, {0: anchor, 1: donor}, cols, edges)
+        got = m._draw_link_shuffle(anchor, anchor["distance"].to_numpy(),
+                                   cols, pool, m._pair_base(0), edges, a,
+                                   np.random.default_rng(0))
+        if expect is None:
+            assert got is None, "1.26 Mb is the next bin on chr1's grid"
+        else:
+            assert got is not None and got[1]["g"][0] == expect
+
+
+def test_link_shuffle_null_pairs_never_cross_chromosomes():
+    m = _mod()
+    edges = m.build_edges(1000, 10_000_000, 8)
+    cols = {"g": ("p1_g", "p2_g"), "h": ("p1_h", "p2_h")}
+    j = _multi_chrom_pairs(seed=4)
+    j = j.assign(gpos1=m.genome_coords(j["chrom"], j["pos1"]),
+                 gpos2=m.genome_coords(j["chrom"], j["pos2"]))
+    half = len(j) // 2
+    cells = {0: j.iloc[:half].reset_index(drop=True),
+             1: j.iloc[half:].reset_index(drop=True)}
+    pool = _contact_pool(m, cells, cols, edges)
+    a = _args(m, null_type="link-shuffle", link_shuffle_bin=250_000)
+    xa, xb, dn, anchor, ai = m._draw_link_shuffle(
+        cells[0], cells[0]["distance"].to_numpy(), cols, pool,
+        m._pair_base(0), edges, a, np.random.default_rng(5))
+    g1 = cells[0]["gpos1"].to_numpy()[ai]
+    g2 = cells[0]["gpos2"].to_numpy()[ai]
+    donor = np.where(g2 >= g1, g1 + dn, g1 - dn)
+    assert len(ai) > 0
+    assert (_chrom_of(m, donor) == _chrom_of(m, g1)).all()
 
 
 def test_link_shuffle_strata_are_cell_type_by_batch():
@@ -1353,7 +1436,7 @@ def _link_fixture(tmp_path, n_cells=16, offset_sd=0.0, rho=0.0, seed=3):
     rng = np.random.default_rng(seed)
     n = 600
     pos1 = 100_000 + np.sort(rng.integers(0, 2_400_000, n))
-    dist = np.exp(rng.uniform(np.log(2_000), np.log(200_000), n)).astype(int)
+    dist = np.exp(rng.uniform(np.log(2_000), np.log(800_000), n)).astype(int)
     cells = [f"c{i}" for i in range(n_cells)]
     for ctx in ("GCH", "HCG"):
         (tmp_path / ctx).mkdir(parents=True, exist_ok=True)
@@ -1414,6 +1497,13 @@ def test_link_shuffle_finds_planted_coordination(tmp_path):
     t, _ = _run_link(tmp_path, rho=1.5)
     assert _gap(t) > 0.3
     assert (t["gg_null_n"] > 0).sum() >= 3
+
+
+def test_link_shuffle_curve_continues_past_the_bin_size(tmp_path):
+    t, _ = _run_link(tmp_path, rho=1.5)
+    far = t[t["bin_lo"] >= 250_000]
+    assert (far["gg_null_n"] > 0).any(), "null pairs beyond 250 kb"
+    assert far["gg_null_r"].notna().any()
 
 
 def test_link_shuffle_feeds_the_per_cell_test(tmp_path):
