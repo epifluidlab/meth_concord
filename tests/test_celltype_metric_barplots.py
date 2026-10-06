@@ -438,6 +438,7 @@ def test_matrix_norm_none_is_accepted_as_in_nome_hic_compare(tmp_path):
     assert np.isfinite(t.loc["C", "knn_purity"])
     assert t.loc["C", "knn_purity"] > t.loc["random", "knn_purity"]
     # and it is a different normalization, not quantile under another name
+    (tmp_path / "q").mkdir()
     q, _ = _run_min(tmp_path / "q", [])
     assert not np.isclose(t.loc["C", "score_sd"],
                           q.set_index("arm").loc["C", "score_sd"])
