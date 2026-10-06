@@ -746,7 +746,26 @@ def test_a_run_reports_how_often_the_null_hit_a_contact(tmp_path, caplog):
         _run(tmp_path, n_draws=2, emit_null=True)
     msgs = [r.getMessage() for r in caplog.records
             if r.getMessage().startswith("Drawn null:")]
-    assert len(msgs) == 1 and "own read pairs" in msgs[0]
+    assert sum("own read pairs" in m for m in msgs) == 1
+    # ...and how much of the null it could not draw at all
+    short = [m for m in msgs if "pairs wanted" in m]
+    assert len(short) == 1 and "cell-bins with contacts" in short[0]
+
+
+def test_a_bin_too_thin_to_split_asks_for_a_null_and_gets_none(tmp_path):
+    """One contact and nothing else: two read ends, no half to draw from."""
+    path = tmp_path / "c.parquet"
+    pd.DataFrame({
+        "chrom": ["chr1"], "pos1": [100], "pos2": [5_100],
+        "n1": [5], "n2": [5], "distance": [5_000],
+        "posterior1": [0.9], "posterior2": [0.1],
+    }).to_parquet(path)
+    _, counts = cc._compute_cell_dm_expected(
+        str(path), "c", bin_size=10_000, min_distance=500, min_gch_sites=2,
+        mode="pooled", null_split=True, null_draws=3)
+    rec = counts["chr1:0"]
+    assert rec["n_null_wanted"] == 3.0
+    assert cc._null_keys(0)[3] not in rec
 
 
 # ---------------------------------------------------------------------------

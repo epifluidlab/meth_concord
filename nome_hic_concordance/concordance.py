@@ -1101,6 +1101,13 @@ def _compute_cell_dm_expected(
                 seed=seed_base + int(b), contact_keys=_ckeys,
             )
         _entry_null = {}
+        if null_split:
+            # How many null pairs this cell-bin asked for, whether or not it
+            # got them: a bin under 4 read ends has no half to draw from,
+            # and a half whose pairings are all too close (or contacts)
+            # comes up short.  Logged against what was kept.
+            _entry_null["n_null_wanted"] = float(
+                len(og) * max(1, int(null_draws)))
         if null_split and null_pos is not None:
             # K INDEPENDENT DRAWS from the SAME end pool.  The pool is the
             # bin's own marginal and stays fixed; only the pairing is
@@ -2072,6 +2079,34 @@ def compute_signed_concordance_matrix(
                         f"were redrawn as non-contacts; without that check "
                         f"about this share of the null would be real "
                         f"contacts.")
+                # Where no unlinked pairing could stand in.  Those cell-bins
+                # are unobserved in the null: RWR fills them from the null's
+                # own neighbours, and --null-rank leaves them out.
+                _n_k = [_null_keys(_d)[3]
+                        for _d in range(max(1, int(null_draws)))]
+                _want = _none = _short = _cb = 0
+                for d in dm_by_cell.values():
+                    for e in d.values():
+                        w = e.get("n_null_wanted", 0.0)
+                        if w <= 0:
+                            continue
+                        _cb += 1
+                        _want += w
+                        got = sum(e.get(k, 0.0) for k in _n_k)
+                        if got <= 0:
+                            _none += 1
+                        elif got < w:
+                            _short += 1
+                if _want > 0:
+                    logger.info(
+                        f"Drawn null: kept {_kept:,.0f} of the "
+                        f"{_want:,.0f} pairs wanted ({_kept / _want:.2%}).  "
+                        f"{_none:,} of {_cb:,} cell-bins with contacts got "
+                        f"no null pair (under 4 read ends to split, or no "
+                        f"unlinked pairing far enough apart) and {_short:,} "
+                        f"more came up short; the null leaves those "
+                        f"unobserved, RWR fills them from the null's own "
+                        f"neighbours and --null-rank skips them.")
 
         # ---- Step 2: assemble cells × bins soft-count matrices --------------
         all_bins: set[str] = set()
