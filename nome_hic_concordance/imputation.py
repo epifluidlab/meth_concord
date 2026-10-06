@@ -363,6 +363,7 @@ def run_rwr_pipeline(
     auto_select_passes: bool = False,
     max_auto_passes: int = 5,
     random_state: int = 0,
+    graph_fn: Callable[[dict[str, np.ndarray]], pd.DataFrame] | None = None,
 ) -> tuple[dict[str, np.ndarray], pd.DataFrame, dict]:
     """Orchestrate the full RWR + (optional) refinement loop.
 
@@ -409,6 +410,13 @@ def run_rwr_pipeline(
         selected (its dominant axis is the accessibility/batch confound).
     max_auto_passes : int
         Upper bound on refinement passes when ``auto_select_passes`` is True.
+    graph_fn : callable, optional
+        ``f(imputed_dict) -> DataFrame``: what the refinement passes build
+        their graph from, and what the auto-select eigengap is read off,
+        in place of ``layer2_fn``'s Δ.  ``layer2_fn`` still makes the Δ
+        that is returned.  Lets a run keep its headline statistic out of
+        the graph -- e.g. build every graph from coordination when the
+        headline is a log odds ratio whose sign follows the marginal.
 
     Returns
     -------
@@ -452,6 +460,8 @@ def run_rwr_pipeline(
         max_iter=max_iter, tol=tol,
     )
     delta_df = layer2_fn(imputed)
+    basis_df = graph_fn(imputed) if graph_fn is not None else delta_df
+    basis_name = "Δ_signed" if graph_fn is None else "graph_fn"
     all_diagnostics["passes"].append({
         "pass": 0,
         "knn_basis": "QN(initial_feature_matrix)",
@@ -478,6 +488,7 @@ def run_rwr_pipeline(
     patience = 1  # stop after this many consecutive non-improving passes
 
     prev_delta = delta_df.copy()
+    prev_basis = basis_df.copy()
     for pass_idx in range(1, total_passes + 1):
         # Rebuild k-NN from the previous pass's Δ_signed.  Two bases:
         #   "raw"      — per-column-rank(Δ) only (legacy).  Keeps any
@@ -487,13 +498,13 @@ def run_rwr_pipeline(
         #   "postnorm" — apply the Step-7 normalization (per-cell rank →
         #                per-bin QN → row recenter) first, stripping the
         #                per-cell shift before the graph is built.
-        prev_arr = prev_delta.to_numpy(dtype=np.float64)
+        prev_arr = prev_basis.to_numpy(dtype=np.float64)
         if refinement_basis == "postnorm":
             qn_delta = quantile_normalize_for_knn(post_norm_for_knn(prev_arr))
-            basis_label = f"postnorm(Δ_signed_pass_{pass_idx - 1})"
+            basis_label = f"postnorm({basis_name}_pass_{pass_idx - 1})"
         else:
             qn_delta = quantile_normalize_for_knn(prev_arr)
-            basis_label = f"QN(Δ_signed_pass_{pass_idx - 1})"
+            basis_label = f"QN({basis_name}_pass_{pass_idx - 1})"
         logger.info(
             f"RWR pass {pass_idx}: rebuilding k-NN graph from {basis_label}"
         )
@@ -507,6 +518,7 @@ def run_rwr_pipeline(
             max_iter=max_iter, tol=tol,
         )
         delta_df = layer2_fn(imputed)
+        basis_df = graph_fn(imputed) if graph_fn is not None else delta_df
         # Per-pass convergence diagnostic: ‖Δ_p − Δ_{p-1}‖.
         delta_change = float(
             np.nanmean(np.abs(delta_df.to_numpy() - prev_delta.to_numpy()))
@@ -520,7 +532,7 @@ def run_rwr_pipeline(
 
         if auto_select_passes:
             eg = _top_eigengap(
-                post_norm_for_knn(delta_df.to_numpy(dtype=np.float64)),
+                post_norm_for_knn(basis_df.to_numpy(dtype=np.float64)),
                 random_state=random_state,
             )
             pass_diag["eigengap"] = float(eg)
@@ -544,6 +556,7 @@ def run_rwr_pipeline(
                 ensure_dir(output_dir) / f"cell_knn_graph_pass{pass_idx}.npz", W,
             )
         prev_delta = delta_df.copy()
+        prev_basis = basis_df.copy()
 
         if auto_select_passes and no_improve >= patience:
             logger.info(

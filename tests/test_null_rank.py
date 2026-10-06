@@ -773,7 +773,7 @@ def test_a_bin_too_thin_to_split_asks_for_a_null_and_gets_none(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _rwr_run(tmp_path, null_graph, passes, n_draws=2):
+def _rwr_run(tmp_path, null_graph, passes, n_draws=2, **kw):
     src = tmp_path / f"src_{null_graph}_{passes}"
     src.mkdir(parents=True, exist_ok=True)
     paths = null_rank_paths(src, planted=set(range(0, 60, 4)))
@@ -784,7 +784,7 @@ def _rwr_run(tmp_path, null_graph, passes, n_draws=2):
         save_outputs=False, use_rwr=True, rwr_k=4,
         rwr_n_refine_passes=passes, rwr_refinement_basis="postnorm",
         n_threads=1, eb_min_obs=50, emit_null=True, null_draws=n_draws,
-        null_graph=null_graph)
+        null_graph=null_graph, **kw)
 
 
 @pytest.fixture
@@ -859,3 +859,146 @@ def test_with_refinement_the_null_builds_its_own_graph(tmp_path):
 def test_the_null_graph_is_checked():
     with pytest.raises(ValueError, match="null_graph"):
         cc.compute_signed_concordance_matrix({}, null_graph="observed")
+
+
+# ---------------------------------------------------------------------------
+# A cell graph built from coordination alone
+# ---------------------------------------------------------------------------
+
+
+def test_refinement_builds_its_graph_from_graph_fn(monkeypatch):
+    """layer2_fn makes the returned statistic; graph_fn, when given, is what
+    every refinement graph is built from."""
+    from nome_hic_concordance import imputation as imp
+    rng = np.random.default_rng(0)
+    n, nb = 30, 20
+    cols = [f"chr1:{j}" for j in range(nb)]
+    feats, basis = [], []
+    real_build = imp.build_knn_graph
+
+    def spy_build(features, k=15, metric="cosine"):
+        feats.append(np.array(features))
+        return real_build(features, k=k, metric=metric)
+
+    def graph(imputed):
+        basis.append(imputed["x"] * 2.0)
+        return pd.DataFrame(basis[-1], columns=cols)
+
+    monkeypatch.setattr(imp, "build_knn_graph", spy_build)
+    imp.run_rwr_pipeline(
+        {"x": rng.random((n, nb))}, pd.DataFrame(rng.random((n, nb))),
+        lambda imputed: pd.DataFrame(np.zeros((n, nb)), columns=cols),
+        n_refine_passes=2, k=5, refinement_basis="raw", graph_fn=graph)
+    assert len(feats) == 3 and len(basis) == 3
+    for p in (1, 2):
+        assert np.allclose(feats[p], imp.quantile_normalize_for_knn(basis[p - 1]))
+
+
+@pytest.fixture
+def rwr_kwargs(monkeypatch):
+    """Every RWR run step 5 starts, with everything it was handed."""
+    from nome_hic_concordance import imputation
+    calls, real = [], imputation.run_rwr_pipeline
+
+    def spy(soft_count_matrices, *a, **kw):
+        calls.append({"counts": dict(soft_count_matrices), **kw})
+        return real(soft_count_matrices, *a, **kw)
+
+    monkeypatch.setattr(imputation, "run_rwr_pipeline", spy)
+    return calls
+
+
+def test_a_coordination_graph_starts_from_the_observed_C(tmp_path, rwr_kwargs):
+    _rwr_run(tmp_path, "own", passes=1, rwr_init="coordination")
+    assert len(rwr_kwargs) == 3
+    seen = []
+    for call in rwr_kwargs:
+        assert call["graph_fn"] is not None
+        init = call["initial_feature_matrix"].to_numpy()
+        n = call["counts"]
+        # a cell-bin with no contact is MISSING, not a 0 that says nothing
+        has = (n["n_linked"] > 0) & (n["n_dm"] > 0)
+        assert np.array_equal(np.isfinite(init), has)
+        seen.append(init)
+    # the null starts from its own pairs, on the observed's cell-bins
+    obs, null = seen[0], seen[1]
+    assert not (np.isfinite(null) & ~np.isfinite(obs)).any()
+    both = np.isfinite(obs) & np.isfinite(null)
+    assert both.mean() > 0.5 and not np.allclose(obs[both], null[both])
+
+
+def test_by_default_the_graph_starts_from_accessibility(tmp_path, rwr_kwargs):
+    res = _rwr_run(tmp_path, "own", passes=0)
+    assert rwr_kwargs[0]["graph_fn"] is None
+    assert np.allclose(
+        rwr_kwargs[0]["initial_feature_matrix"].to_numpy(),
+        res["accessibility"].to_numpy(), equal_nan=True)
+
+
+def test_rwr_init_is_checked():
+    with pytest.raises(ValueError, match="rwr_init"):
+        cc.compute_signed_concordance_matrix({}, rwr_init="methylation")
+
+
+def _level_only_types(tmp_path, n_types=3, per_type=12, n_bins=60,
+                      bin_size=10_000, depth=8, seed=0):
+    """Cell types that differ ONLY in methylation level.  Every pair's two
+    ends are drawn independently, so there is no coordination anywhere."""
+    rng = np.random.default_rng(seed)
+    marg = rng.uniform(0.1, 0.9, (n_types, n_bins))
+    paths, types = {}, []
+    for t in range(n_types):
+        for c in range(per_type):
+            rec = []
+            for b in range(n_bins):
+                pm, base = marg[t, b], b * bin_size
+                for _ in range(rng.poisson(depth)):
+                    a, bb = rng.random() < pm, rng.random() < pm
+                    o1 = int(rng.integers(100, 3000))
+                    o2 = o1 + int(rng.integers(1000, 6000))
+                    rec.append((base + o1, base + o2, 0.9 if a else 0.1,
+                                0.9 if bb else 0.1, o2 - o1))
+                    p3 = 0.9 if rng.random() < pm else 0.1
+                    rec.append((base + o1, base + o1 + 40, 0.9 if a else 0.1,
+                                p3, 40))
+            df = pd.DataFrame(rec, columns=["pos1", "pos2", "posterior1",
+                                            "posterior2", "distance"])
+            df.insert(0, "chrom", "chr1")
+            df["n1"] = np.int32(4)
+            df["n2"] = np.int32(4)
+            name = f"t{t}_c{c}"
+            df.to_parquet(tmp_path / f"{name}.parquet")
+            paths[name] = str(tmp_path / f"{name}.parquet")
+            types.append(t)
+    return paths, np.array(types)
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_a_coordination_graph_gives_level_only_types_nothing(tmp_path, seed):
+    """The leak, and the cure.  Over a graph built from methylation, C with
+    no coordination in it separates cell types that differ only in level;
+    over a graph built from C itself it does not."""
+    import tempfile
+    from sklearn.decomposition import TruncatedSVD
+    from nome_hic_concordance.comparison import _prep_matrix
+    from nome_hic_concordance.metrics import knn_chance, knn_purity
+
+    paths, types = _level_only_types(tmp_path, seed=seed)
+
+    def purity(init):
+        res = cc.compute_signed_concordance_matrix(
+            paths, bin_size=10_000, min_distance=500, min_gch_sites=2,
+            baseline="distance-pooled", dm_prior="shared",
+            output_dir=str(tmp_path / "out"), save_outputs=False,
+            use_rwr=True, rwr_k=8, rwr_n_refine_passes=0, rwr_init=init,
+            n_threads=1)
+        with tempfile.TemporaryDirectory() as d:
+            Z = _prep_matrix(res["coordination"], "x", d, "quantile", 0.0,
+                             "rank", True).to_numpy()
+        Z = (Z - Z.mean(0)) / (Z.std(0) + 1e-12)
+        return knn_purity(TruncatedSVD(5, random_state=0).fit_transform(Z),
+                          types)
+
+    chance = knn_chance(types)
+    assert purity("accessibility") > chance + 0.15
+    assert purity("coordination") < chance + 0.1

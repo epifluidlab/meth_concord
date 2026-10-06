@@ -1797,6 +1797,7 @@ def compute_signed_concordance_matrix(
     rwr_refinement_basis: str = "raw",
     rwr_auto_select_passes: bool = False,
     rwr_max_auto_passes: int = 5,
+    rwr_init: str = "accessibility",
     rwr_solver: str = "auto",
     rwr_max_iter: int = 30,
     rwr_tol: float = 1e-4,
@@ -1878,6 +1879,19 @@ def compute_signed_concordance_matrix(
     rwr_k, rwr_restart_prob, rwr_n_refine_passes, rwr_solver,
     rwr_max_iter, rwr_tol :
         RWR parameters; see :mod:`nome_hic_concordance.imputation`.
+    rwr_init : {"accessibility", "coordination"}
+        What the cell graph is built from.  "accessibility" (default):
+        pass 0 from mean accessibility (methylation for HCG), refinement
+        passes from the headline Δ.  "coordination": EVERY graph -- pass 0
+        and each refinement, and the eigengap that picks among them --
+        from coordination C = O - E, the part of the statistic that does
+        not follow the marginal.  Pass 0 uses the run's own raw counts,
+        with cell-bins that have no contact (or no expected) left missing
+        rather than read as 0.  Neither the marginal nor a headline whose
+        sign follows it (the log odds ratio) reaches the graph, so the
+        imputation can only carry cell-type structure the coordination
+        itself has.  A drawn null on its own graph builds it the same way
+        from its own pairs, on the same cell-bins.
     eb_min_obs : int
         Min (cell, bin) observations for DM MoM fit; below this, a
         uniform Dirichlet fallback is used.
@@ -1931,6 +1945,10 @@ def compute_signed_concordance_matrix(
     if null_graph not in ("own", "shared"):
         raise ValueError(
             f"null_graph must be 'own' or 'shared'; got {null_graph!r}.")
+    if rwr_init not in ("accessibility", "coordination"):
+        raise ValueError(
+            f"rwr_init must be 'accessibility' or 'coordination'; got "
+            f"{rwr_init!r}.")
     if baseline not in ("short-range", "distance-matched", "distance-pooled"):
         raise ValueError(
             f"baseline must be 'short-range' (alias 'unlinked'), "
@@ -2569,11 +2587,28 @@ def compute_signed_concordance_matrix(
                         if k not in _all_null_ks} if own_null else raw_counts)
     run_rwr = use_rwr and n_cells >= 2
 
+    def _coordination(counts, observed_only=False):
+        """C = O - E from ``counts``: the graph basis under
+        rwr_init="coordination".  ``observed_only`` leaves a cell-bin with
+        no contact, or no expected, missing -- its MLE C would be a 0 that
+        says nothing, and a graph would then group cells by which bins
+        they happen to have data in."""
+        o_o, o_c, e_o, e_c, _ = _fit_and_rates(counts)
+        c = decompose_components(o_o, o_c, e_o, e_c)["coordination"]
+        if observed_only:
+            n_e = counts["n_dm"] if uses_expected else counts["n_unlinked"]
+            c = np.where((counts["n_linked"] > 0) & (n_e > 0), c, np.nan)
+        return pd.DataFrame(c, index=cell_names, columns=sorted_bins)
+
     def _rwr(counts, out_dir):
+        by_c = rwr_init == "coordination"
         return _imputation_mod.run_rwr_pipeline(
             soft_count_matrices=counts,
-            initial_feature_matrix=accessibility_df.fillna(np.nan),
+            initial_feature_matrix=(
+                _coordination(counts, observed_only=True) if by_c
+                else accessibility_df.fillna(np.nan)),
             layer2_fn=_layer2,
+            graph_fn=_coordination if by_c else None,
             n_refine_passes=rwr_n_refine_passes,
             refinement_basis=rwr_refinement_basis,
             auto_select_passes=rwr_auto_select_passes,
@@ -2588,7 +2623,10 @@ def compute_signed_concordance_matrix(
         logger.info(
             f"Running pre-Layer-2 RWR imputation "
             f"(k={rwr_k}, restart={rwr_restart_prob}, "
-            f"refine_passes={rwr_n_refine_passes})"
+            f"refine_passes={rwr_n_refine_passes}, graph from "
+            + ("coordination C = O - E, never accessibility"
+               if rwr_init == "coordination" else "accessibility")
+            + ")"
         )
         imputed_counts, delta_signed_df, rwr_diagnostics = _rwr(
             observed_counts, output_dir if save_outputs else None)

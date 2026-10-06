@@ -727,6 +727,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "validated to peak with the cell-type AUC among "
                              "refined passes).  Default (unset): 'auto' for "
                              "--concordance-method signed, 0 otherwise.")
+    parser.add_argument(
+        "--rwr-init", choices=["accessibility", "coordination"],
+        default="accessibility",
+        help="What the RWR cell graph is built from.  'accessibility' "
+             "(default): pass 0 from mean accessibility (methylation for "
+             "HCG), refinement passes from the headline statistic.  "
+             "'coordination': EVERY graph -- pass 0, each refinement and the "
+             "eigengap that picks among them -- from the observed "
+             "coordination C = O - E, with cell-bins that have no contact "
+             "left missing.  The methylation level never reaches the graph, "
+             "and neither does a headline whose sign follows it (the "
+             "direction log odds ratio), so the imputed matrices can only "
+             "carry cell-type structure that the coordination itself has.  "
+             "With --null-graph own the drawn null builds its graph the same "
+             "way from its own pairs.  --rwr-refine-passes 0 gives the "
+             "plainest version: one graph, straight from the observed.")
     parser.add_argument("--rwr-max-auto-passes", type=int, default=5,
                         help="Upper bound on refinement passes when "
                              "--rwr-refine-passes auto.")
@@ -1787,6 +1803,7 @@ def run_context(
                 rwr_refinement_basis=refinement_basis,
                 rwr_auto_select_passes=auto_select_passes,
                 rwr_max_auto_passes=args.rwr_max_auto_passes,
+                rwr_init=args.rwr_init,
                 rwr_solver=args.rwr_solver,
                 rwr_max_iter=args.rwr_max_iter,
                 rwr_tol=args.rwr_tol,
@@ -1838,6 +1855,7 @@ def run_context(
                     rwr_refinement_basis=refinement_basis,
                     rwr_auto_select_passes=auto_select_passes,
                     rwr_max_auto_passes=args.rwr_max_auto_passes,
+                    rwr_init=args.rwr_init,
                     rwr_solver=args.rwr_solver, rwr_max_iter=args.rwr_max_iter,
                     rwr_tol=args.rwr_tol, eb_min_obs=args.eb_min_obs,
                     n_threads=args.n_threads, output_dir=str(concordance_dir),
