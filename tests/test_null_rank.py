@@ -443,9 +443,9 @@ def test_every_null_flag_reaches_step_five():
     params = set(inspect.signature(
         cc.compute_signed_concordance_matrix).parameters)
     flags = set(re.findall(r'"--(null-[a-z-]+)"', src))
-    assert flags == {"null-draws", "null-rank", "null-z", "null-rank-scope",
-                     "null-rank-statistics", "null-rank-min-pairs",
-                     "null-rank-min-pool"}
+    assert flags == {"null-draws", "null-graph", "null-rank", "null-z",
+                     "null-rank-scope", "null-rank-statistics",
+                     "null-rank-min-pairs", "null-rank-min-pool"}
     for flag in flags:
         kw = flag.replace("-", "_")
         assert kw in params, f"--{flag} has no {kw} parameter on step 5"
@@ -747,3 +747,96 @@ def test_a_run_reports_how_often_the_null_hit_a_contact(tmp_path, caplog):
     msgs = [r.getMessage() for r in caplog.records
             if r.getMessage().startswith("Drawn null:")]
     assert len(msgs) == 1 and "own read pairs" in msgs[0]
+
+
+# ---------------------------------------------------------------------------
+# The null runs the whole calculation on its own pairs
+# ---------------------------------------------------------------------------
+
+
+def _rwr_run(tmp_path, null_graph, passes, n_draws=2):
+    src = tmp_path / f"src_{null_graph}_{passes}"
+    src.mkdir(parents=True, exist_ok=True)
+    paths = null_rank_paths(src, planted=set(range(0, 60, 4)))
+    return cc.compute_signed_concordance_matrix(
+        paths, bin_size=10_000, min_distance=500, min_gch_sites=2,
+        baseline="distance-pooled", dm_prior="shared",
+        output_dir=str(tmp_path / f"out_{null_graph}_{passes}"),
+        save_outputs=False, use_rwr=True, rwr_k=4,
+        rwr_n_refine_passes=passes, rwr_refinement_basis="postnorm",
+        n_threads=1, eb_min_obs=50, emit_null=True, null_draws=n_draws,
+        null_graph=null_graph)
+
+
+@pytest.fixture
+def rwr_calls(monkeypatch):
+    """Every RWR run step 5 starts, with the counts it was handed."""
+    from nome_hic_concordance import imputation
+    calls, real = [], imputation.run_rwr_pipeline
+
+    def spy(soft_count_matrices, *a, **kw):
+        calls.append(dict(soft_count_matrices))
+        return real(soft_count_matrices, *a, **kw)
+
+    monkeypatch.setattr(imputation, "run_rwr_pipeline", spy)
+    return calls
+
+
+def test_each_null_draw_runs_its_own_rwr(tmp_path, rwr_calls):
+    res = _rwr_run(tmp_path, "own", passes=1)
+    null_ks = {k for d in range(2) for k in cc._null_keys(d)}
+    assert len(rwr_calls) == 3, "the observed, then one run per draw"
+    assert not null_ks & set(rwr_calls[0])
+    for d, counts in enumerate(rwr_calls[1:]):
+        # the draw's pairs stand in for the contacts...
+        assert np.array_equal(counts["k_open"],
+                              res["raw_counts"][cc._null_keys(d)[0]])
+        assert np.array_equal(counts["n_linked"],
+                              res["raw_counts"][cc._null_keys(d)[3]])
+        # ...and E is imputed again, over the null's own graph
+        assert np.array_equal(counts["k_dm_open"],
+                              res["raw_counts"]["k_dm_open"])
+        assert not null_ks & set(counts)
+    assert len(res["null_rwr_diagnostics"]) == 2
+
+
+def test_a_shared_null_rides_on_the_observed_run(tmp_path, rwr_calls):
+    _rwr_run(tmp_path, "shared", passes=1)
+    assert len(rwr_calls) == 1
+    assert set(cc._null_keys(0)) <= set(rwr_calls[0])
+
+
+def test_the_observed_does_not_depend_on_where_the_null_is_imputed(tmp_path):
+    own = _rwr_run(tmp_path, "own", passes=1)
+    shared = _rwr_run(tmp_path, "shared", passes=1)
+    for name in ("coordination", "direction_logor", "marginal"):
+        assert np.array_equal(own[name].to_numpy(), shared[name].to_numpy(),
+                              equal_nan=True), name
+    # the run reports the observed's priors, not the last null's
+    assert own["priors"]["linked"]["alpha"] == (
+        shared["priors"]["linked"]["alpha"])
+
+
+def test_without_refinement_both_nulls_use_the_same_graph(tmp_path):
+    """Pass 0 is built from accessibility, which no pairing changes."""
+    own = _rwr_run(tmp_path, "own", passes=0)
+    shared = _rwr_run(tmp_path, "shared", passes=0)
+    a = own["null_components"]["coordination"].to_numpy()
+    b = shared["null_components"]["coordination"].to_numpy()
+    assert np.allclose(a, b, equal_nan=True)
+
+
+def test_with_refinement_the_null_builds_its_own_graph(tmp_path):
+    """A refinement pass rebuilds the graph from the concordance it is
+    imputing.  On the observed's graph the null is smoothed over
+    neighbourhoods the OBSERVED chose; on its own, over its own."""
+    own = _rwr_run(tmp_path, "own", passes=1)
+    shared = _rwr_run(tmp_path, "shared", passes=1)
+    a = own["null_components"]["coordination"].to_numpy()
+    b = shared["null_components"]["coordination"].to_numpy()
+    assert not np.allclose(a, b, equal_nan=True)
+
+
+def test_the_null_graph_is_checked():
+    with pytest.raises(ValueError, match="null_graph"):
+        cc.compute_signed_concordance_matrix({}, null_graph="observed")

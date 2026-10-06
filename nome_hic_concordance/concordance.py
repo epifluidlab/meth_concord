@@ -1797,6 +1797,7 @@ def compute_signed_concordance_matrix(
     dm_prior: str = "separate",
     emit_null: bool = False,
     null_draws: int = 1,
+    null_graph: str = "own",
     null_rank: bool = False,
     null_z: bool = False,
     null_rank_scope: str = "cell",
@@ -1873,6 +1874,19 @@ def compute_signed_concordance_matrix(
     eb_min_obs : int
         Min (cell, bin) observations for DM MoM fit; below this, a
         uniform Dirichlet fallback is used.
+    null_graph : {"own", "shared"}
+        How a drawn null (``emit_null``) is imputed.  "own" (default): each
+        draw is run through the whole calculation as if its pairs were the
+        contacts -- its own RWR, whose refinement passes rebuild the graph
+        from the NULL's concordance and pick the null's own pass, its own
+        imputed E and its own prior -- so it is what the pipeline reports
+        when there is no coordination, and it never sees the observed.
+        "shared": the draws are imputed alongside the observed, over the
+        observed's graph, and scored against the observed's E and prior.
+        Cheaper (one RWR run, not ``null_draws + 1``), but a refinement
+        pass builds that graph from the observed concordance, so the null
+        inherits the observed's cell structure and the two cannot differ
+        in it.
 
     Returns
     -------
@@ -1907,6 +1921,9 @@ def compute_signed_concordance_matrix(
     if dm_prior not in ("separate", "shared"):
         raise ValueError(
             f"dm_prior must be 'separate' or 'shared'; got {dm_prior!r}.")
+    if null_graph not in ("own", "shared"):
+        raise ValueError(
+            f"null_graph must be 'own' or 'shared'; got {null_graph!r}.")
     if baseline not in ("short-range", "distance-matched", "distance-pooled"):
         raise ValueError(
             f"baseline must be 'short-range' (alias 'unlinked'), "
@@ -2421,9 +2438,11 @@ def compute_signed_concordance_matrix(
                 imputed["k_u_mixed"], imputed["n_unlinked"], alpha_u)
 
         # One (open, closed) rate pair per drawn-null replicate, in draw
-        # order.  The observed prior (alpha_l) is used for all of them: the
-        # null is what O looks like with no coordination, so it has to meet
-        # the same shrinkage O does.
+        # order -- present only under null_graph="shared", where the draws
+        # ride along with the observed.  The observed prior (alpha_l) is used
+        # for all of them: the null is what O looks like with no
+        # coordination, so it has to meet the same shrinkage O does.  (Under
+        # "own" each draw is passed in AS the observed and meets its own.)
         null_rates: list[tuple[np.ndarray, np.ndarray]] = []
         for _d in range(max(1, int(null_draws))):
             _ko, _kc, _km, _kn = _null_keys(_d)
@@ -2505,35 +2524,46 @@ def compute_signed_concordance_matrix(
             delta_signed, index=cell_names, columns=sorted_bins,
         )
 
+    # A drawn null on its OWN graph is run separately below, so the
+    # observed's run carries none of the null's matrices.
+    _all_null_ks = {k for _d in range(max(1, int(null_draws)))
+                    for k in _null_keys(_d)}
+    own_null = (null_graph == "own"
+                and any(k in raw_counts for k in _all_null_ks))
+    observed_counts = ({k: v for k, v in raw_counts.items()
+                        if k not in _all_null_ks} if own_null else raw_counts)
+    run_rwr = use_rwr and n_cells >= 2
+
+    def _rwr(counts, out_dir):
+        return _imputation_mod.run_rwr_pipeline(
+            soft_count_matrices=counts,
+            initial_feature_matrix=accessibility_df.fillna(np.nan),
+            layer2_fn=_layer2,
+            n_refine_passes=rwr_n_refine_passes,
+            refinement_basis=rwr_refinement_basis,
+            auto_select_passes=rwr_auto_select_passes,
+            max_auto_passes=rwr_max_auto_passes,
+            k=rwr_k, restart_prob=rwr_restart_prob,
+            solver=rwr_solver, max_iter=rwr_max_iter, tol=rwr_tol,
+            output_dir=out_dir, random_state=random_state,
+        )
+
     rwr_diagnostics = None
-    if use_rwr and n_cells >= 2:
+    if run_rwr:
         logger.info(
             f"Running pre-Layer-2 RWR imputation "
             f"(k={rwr_k}, restart={rwr_restart_prob}, "
             f"refine_passes={rwr_n_refine_passes})"
         )
-        imputed_counts, delta_signed_df, rwr_diagnostics = (
-            _imputation_mod.run_rwr_pipeline(
-                soft_count_matrices=raw_counts,
-                initial_feature_matrix=accessibility_df.fillna(np.nan),
-                layer2_fn=_layer2,
-                n_refine_passes=rwr_n_refine_passes,
-                refinement_basis=rwr_refinement_basis,
-                auto_select_passes=rwr_auto_select_passes,
-                max_auto_passes=rwr_max_auto_passes,
-                k=rwr_k, restart_prob=rwr_restart_prob,
-                solver=rwr_solver, max_iter=rwr_max_iter, tol=rwr_tol,
-                output_dir=output_dir if save_outputs else None,
-                random_state=random_state,
-            )
-        )
+        imputed_counts, delta_signed_df, rwr_diagnostics = _rwr(
+            observed_counts, output_dir if save_outputs else None)
     else:
         if use_rwr and n_cells < 2:
             logger.warning(
                 f"Skipping RWR: only {n_cells} cell(s); RWR requires >= 2."
             )
         # Run Layer 2 directly on the raw soft counts.
-        imputed_counts = raw_counts
+        imputed_counts = observed_counts
         delta_signed_df = _layer2(imputed_counts)
 
     # ---- Component matrices (the interpretable 2 d.o.f. + the signed mix) --
@@ -2548,16 +2578,61 @@ def compute_signed_concordance_matrix(
         name: pd.DataFrame(arr, index=cell_names, columns=sorted_bins)
         for name, arr in decompose_components(_o_o, _o_c, _e_o, _e_c).items()
     }
-    # The same decomposition with the DRAWN null in place of the observed.
-    # Same E, same prior, same counts, no coordination -- so it is what each
-    # component looks like when the answer is nothing, and the only honest
-    # reference a Q-Q plot of these statistics has.
+    # One (O open, O closed, E open, E closed) rate set per drawn null.
+    if _null_rates is not None:            # shared: the observed's E
+        _null_rates = [(o, c, _e_o, _e_c) for o, c in _null_rates]
+    null_rwr_diagnostics = None
+    if own_null:
+        # THE NULL RUNS THE WHOLE CALCULATION ITSELF.  Its pairs stand in
+        # for the contacts and everything downstream is redone on them: the
+        # RWR, whose refinement passes rebuild the cell graph from the
+        # concordance being imputed and keep the pass with the largest
+        # eigengap; E, imputed over that graph; the prior.  Imputed over the
+        # OBSERVED's graph instead, the null is smoothed over neighbourhoods
+        # chosen by the observed concordance, so it carries the observed's
+        # cell structure and the two tie on any cell-type score whether or
+        # not coordination differs between cell types.  Pass 0 is the same
+        # for both -- it comes from accessibility, which no pairing changes.
+        _observed_priors = {k: v for k, v in fitted_priors.items()}
+        _null_rates, null_rwr_diagnostics = [], []
+        _n_draws = max(1, int(null_draws))
+        for _d in range(_n_draws):
+            _ko, _kc, _km, _kn = _null_keys(_d)
+            if _ko not in raw_counts:
+                break
+            as_observed = {**observed_counts,
+                           "k_open": raw_counts[_ko],
+                           "k_closed": raw_counts[_kc],
+                           "k_mixed": raw_counts[_km],
+                           "n_linked": raw_counts[_kn]}
+            if run_rwr:
+                logger.info(
+                    f"Drawn null {_d + 1}/{_n_draws}: the same RWR with the "
+                    f"null pairs as the contacts -- its own graph, "
+                    f"refinement passes and imputed E.")
+                as_observed, _, _diag = _rwr(as_observed, None)
+                null_rwr_diagnostics.append(_diag)
+            _no, _nc, _ne_o, _ne_c, _ = _fit_and_rates(as_observed)
+            _null_rates.append((_no, _nc, _ne_o, _ne_c))
+        # _fit_and_rates records the priors it fitted; the run reports the
+        # observed's.
+        fitted_priors.clear()
+        fitted_priors.update(_observed_priors)
+        _kept = [d.get("auto_selected_pass") for d in null_rwr_diagnostics]
+        if rwr_diagnostics is not None and any(k is not None for k in _kept):
+            logger.info(
+                f"RWR refinement pass kept: observed "
+                f"{rwr_diagnostics.get('auto_selected_pass')}, drawn null "
+                f"{', '.join(str(k) for k in _kept)}.")
+        _null_rates = _null_rates or None
+    # The same decomposition with the DRAWN null in place of the observed:
+    # what each component looks like when the answer is nothing, and the
+    # only honest reference a Q-Q plot of these statistics has.
     null_components = None
     if _null_rates is not None:
         null_components = {
             name: pd.DataFrame(arr, index=cell_names, columns=sorted_bins)
-            for name, arr in decompose_components(
-                _null_rates[0][0], _null_rates[0][1], _e_o, _e_c).items()
+            for name, arr in decompose_components(*_null_rates[0]).items()
         }
     # ---- Rank of each observed bin against its own drawn null ------------
     rank_components = None
@@ -2602,7 +2677,7 @@ def compute_signed_concordance_matrix(
         rank_components = {} if null_rank else None
         z_components = {} if null_z else None
         for _name in _want:
-            _draws = [decompose_components(_nr[0], _nr[1], _e_o, _e_c)[_name]
+            _draws = [decompose_components(*_nr)[_name]
                       for _nr in _null_rates]
             if null_rank:
                 _arr, _info = empirical_rank(
@@ -2698,8 +2773,8 @@ def compute_signed_concordance_matrix(
         if rank_components is not None and len(_null_rates) >= 2:
             null_rank_calibration = {}
             for _name in _want:
-                _draws = [decompose_components(
-                    _nr[0], _nr[1], _e_o, _e_c)[_name] for _nr in _null_rates]
+                _draws = [decompose_components(*_nr)[_name]
+                          for _nr in _null_rates]
                 _cal = rank_self_calibration(
                     _draws, _strata, _testable, scope=str(null_rank_scope),
                     min_pool=int(null_rank_min_pool))
@@ -3032,6 +3107,11 @@ def compute_signed_concordance_matrix(
         "imputed_counts": imputed_counts,
         "priors":         fitted_priors,
         "rwr_diagnostics": rwr_diagnostics,
+        # How the drawn null was imputed, and its own RWR runs under "own".
+        "null_graph": null_graph,
+        "null_rwr_diagnostics": null_rwr_diagnostics,
+        # The first draw's components -- the _null files -- or None.
+        "null_components": null_components,
         # Everything a batch-setting sweep needs to skip steps 1-3 next time.
         "raw_counts": raw_counts,
         "accessibility_raw": accessibility_raw,

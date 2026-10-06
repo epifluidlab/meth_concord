@@ -364,9 +364,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "1/(K+1).  --null-rank pools a stratum's draws across its bins, "
              "so the pool is n_bins_in_stratum x K and K does not have to be "
              "large -- K=5 over a 1,000-bin stratum resolves 4e-4, which "
-             "survives FDR over 10,000 bins.  Each draw is another four "
-             "soft-count matrices carried through RWR, so cost is linear in "
-             "K.  Default 1 (unchanged behaviour).",
+             "survives FDR over 10,000 bins.  Under --null-graph own (the "
+             "default) each draw is its own RWR run, so step 5's RWR costs "
+             "about K+1 times one run.  Default 3.",
+    )
+    parser.add_argument(
+        "--null-graph", choices=["own", "shared"], default="own",
+        help="How the drawn null is imputed.  'own' (default): each draw "
+             "goes through the whole calculation as if its pairs were the "
+             "contacts -- its own RWR, whose refinement passes rebuild the "
+             "cell graph from the NULL's concordance, its own imputed E and "
+             "its own prior -- so it shows what the pipeline reports when "
+             "there is no coordination.  'shared' (the old behaviour) "
+             "imputes the draws over the observed's graph and scores them "
+             "against the observed's E.  It is cheaper, but under "
+             "--rwr-refine-passes (auto for the signed method) that graph is "
+             "rebuilt from the observed concordance, so the null inherits "
+             "the observed's cell structure and the two tie on any "
+             "cell-type score by construction.",
     )
     parser.add_argument(
         "--null-rank", action="store_true",
@@ -1757,6 +1772,7 @@ def run_context(
                 dm_prior=args.dm_prior,
                 emit_null=(args.emit_null or args.null_rank or args.null_z),
                 null_draws=args.null_draws,
+                null_graph=args.null_graph,
                 null_rank=args.null_rank,
                 null_z=args.null_z,
                 null_rank_scope=args.null_rank_scope,
@@ -1806,6 +1822,9 @@ def run_context(
                 dm_prior=args.dm_prior,
                 emit_null=(args.emit_null or args.null_rank or args.null_z),
                 null_draws=args.null_draws,
+                # The sweep reads only Δ; the null rides along on the observed's
+                # graph rather than costing a full RWR run per draw per setting.
+                null_graph="shared",
                 null_rank=args.null_rank,
                 null_z=args.null_z,
                 null_rank_scope=args.null_rank_scope,
