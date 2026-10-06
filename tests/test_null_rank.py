@@ -687,3 +687,63 @@ def test_the_memory_arithmetic_matches_the_cohort_that_was_killed():
         assert n_mat * one_mb / 1000 == pytest.approx(want_gb, abs=0.1), k
     # Dropping 10 -> 3 more than halves it, which is the advice given.
     assert (8 + 4 + 4 * 3) / (8 + 4 + 4 * 10) < 0.5
+
+
+# ---------------------------------------------------------------------------
+# The drawn null is never a real contact
+# ---------------------------------------------------------------------------
+
+
+def test_the_drawn_null_never_is_a_real_contact():
+    """In a sparse bin a random pairing can land on a contact itself.
+
+    Four ends, one contact (0, 5000), and that contact is the ONLY pair whose
+    two ends are both open -- so any co-open mass in the null is the contact
+    leaking into it.
+    """
+    epos = np.array([0, 5_000, 10_000, 20_000], np.int64)
+    ep = np.array([1.0, 1.0, 0.0, 0.0])
+    keys = cc._contact_keys([0], [5_000])
+    for seed in range(60):
+        o, c, m, n, hits = cc._null_observed_for_bin(
+            epos, ep, 3, 1_000, seed, contact_keys=keys)
+        assert o == 0.0, seed
+        assert n == 3, "redrawn to full size, not dropped"
+    # ...and without the exclusion the contact does get drawn
+    leaked = [cc._null_observed_for_bin(epos, ep, 3, 1_000, s)[0] > 0
+              for s in range(60)]
+    assert any(leaked)
+    # a draw refuses a contact exactly when the old one would have used it
+    hit = [cc._null_observed_for_bin(epos, ep, 3, 1_000, s,
+                                     contact_keys=keys)[4] for s in range(60)]
+    assert [h > 0 for h in hit] == leaked
+
+
+def test_the_hits_measure_how_often_a_random_pairing_is_a_contact():
+    """2 of the 12 ordered pairings are the contact: a rate of 1/6."""
+    epos = np.array([0, 5_000, 10_000, 20_000], np.int64)
+    ep = np.full(4, 0.5)
+    keys = cc._contact_keys([0], [5_000])
+    runs = [cc._null_observed_for_bin(epos, ep, 3, 1_000, s,
+                                      contact_keys=keys) for s in range(400)]
+    hits = sum(r[4] for r in runs)
+    kept = sum(r[3] for r in runs)
+    assert kept == 1200
+    assert abs(hits / (hits + kept) - 1 / 6) < 0.04
+
+
+def test_contact_keys_are_orientation_free():
+    assert np.array_equal(cc._contact_keys([5, 900], [100, 2]),
+                          cc._contact_keys([100, 2], [5, 900]))
+    keys = cc._contact_keys([5, 900], [100, 2])
+    assert cc._is_contact([100, 2, 5], [5, 900, 2], keys).tolist() == [
+        True, True, False]
+    assert not cc._is_contact([1], [2], None).any()
+
+
+def test_a_run_reports_how_often_the_null_hit_a_contact(tmp_path, caplog):
+    with caplog.at_level("INFO"):
+        _run(tmp_path, n_draws=2, emit_null=True)
+    msgs = [r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Drawn null:")]
+    assert len(msgs) == 1 and "own read pairs" in msgs[0]

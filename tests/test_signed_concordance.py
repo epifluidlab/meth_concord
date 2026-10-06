@@ -374,7 +374,7 @@ def test_pooled_expected_for_bin_known_values():
     # observed contact (0,2000).  Remaining: (0,3000) [po=.18,pc=.08,pm=.74]
     # and (1000,3000) [po=.16,pc=.16,pm=.68].  Means: .17/.12/.71, ×2 contacts.
     k_o, k_c, k_m, n = concordance._pooled_expected_for_bin(
-        epos, ep, contact_pairs=[(0, 2000)], n_contacts=2,
+        epos, ep, concordance._contact_keys([0], [2000]), n_contacts=2,
         min_distance=1500, max_ends=400, seed=0)
     assert n == 2
     assert abs(k_o - 0.34) < 1e-9
@@ -389,9 +389,52 @@ def test_pooled_expected_for_bin_excludes_short_and_contacts():
     epos = np.array([0, 100, 200], dtype=np.int64)
     ep = np.array([0.9, 0.8, 0.1], dtype=np.float64)
     k_o, k_c, k_m, n = concordance._pooled_expected_for_bin(
-        epos, ep, contact_pairs=[], n_contacts=3,
+        epos, ep, None, n_contacts=3,
         min_distance=1000, max_ends=400, seed=0)
     assert (k_o, k_c, k_m, n) == (0.0, 0.0, 0.0, 0)
+
+
+def test_the_distance_matched_expected_leaves_contacts_out():
+    """A re-pairing that is a read pair is a contact.  Here the contact is
+    half of its own bucket, so E was partly the contact scored against
+    itself."""
+    epos = np.array([0, 1000, 2000], dtype=np.int64)
+    ep = np.array([0.9, 0.9, 0.1], dtype=np.float64)
+    # bucket d=1000: (0,1000) po=.81 -- the contact -- and (1000,2000) po=.09
+    k_o, _k_c, _k_m, n, n_fb = concordance._dm_expected_for_bin(
+        epos, ep, np.array([1000]), dist_bin=1000, max_ends=400, seed=0,
+        contact_keys=concordance._contact_keys([1000], [0]))
+    assert (n, n_fb) == (1, 0)
+    assert abs(k_o - 0.09) < 1e-9
+
+
+def test_a_pool_of_nothing_but_contacts_has_no_expected():
+    epos = np.array([0, 1000], dtype=np.int64)
+    ep = np.array([0.9, 0.9], dtype=np.float64)
+    assert concordance._dm_expected_for_bin(
+        epos, ep, np.array([1000]), dist_bin=1000, max_ends=400, seed=0,
+        contact_keys=concordance._contact_keys([0], [1000])) == (
+            0.0, 0.0, 0.0, 0, 0)
+
+
+@pytest.mark.parametrize("mode", ["pooled", "matched"])
+def test_a_windowed_pool_refuses_the_next_bins_contacts(tmp_path, mode):
+    """With dm_window_bins > 0 the pool reaches into the next bin, and that
+    bin's read pairs are contacts too -- not this bin's, but contacts."""
+    path = tmp_path / "c.parquet"
+    pd.DataFrame({
+        "chrom": ["chr1", "chr1"],
+        "pos1": [100, 1100], "pos2": [900, 1900],
+        "n1": [5, 5], "n2": [5, 5], "distance": [800, 800],
+        "posterior1": [0.0, 1.0], "posterior2": [0.0, 1.0],
+    }).to_parquet(path)
+    _, counts = concordance._compute_cell_dm_expected(
+        str(path), "c", bin_size=1000, min_distance=500, min_gch_sites=2,
+        dm_window_bins=1, mode=mode)
+    # bin 0's pool is 100, 900, 1100, 1900; the one co-open pairing in it,
+    # (1100, 1900), is bin 1's read pair.
+    assert counts["chr1:0"]["n_dm"] == 1
+    assert counts["chr1:0"]["k_dm_open"] == 0.0
 
 
 def test_compute_cell_dm_expected_pooled_mode(tmp_path):

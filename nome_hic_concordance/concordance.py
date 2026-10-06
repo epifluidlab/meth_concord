@@ -748,7 +748,7 @@ def _compute_cell_soft_counts(
 
 def _dm_expected_for_bin(
     epos: np.ndarray, ep: np.ndarray, contact_dists: np.ndarray,
-    dist_bin: int, max_ends: int, seed: int,
+    dist_bin: int, max_ends: int, seed: int, contact_keys=None,
 ) -> tuple[float, float, float, int]:
     """Distance-matched expected co-state for one bin's contacts.
 
@@ -772,6 +772,11 @@ def _dm_expected_for_bin(
     not, that reintroduces a positive offset in exactly the bins the
     long-range question is about.  The count is returned so the run can say
     how much of itself was actually matched.
+
+    End-pairs in ``contact_keys`` (:func:`_contact_keys`) are left out: a
+    re-pairing that is a read pair is a contact, and in a sparse bin it can
+    be the only pair in its own bucket, which scores the contact against
+    itself.
     """
     m = epos.shape[0]
     if m < 2 or contact_dists.size == 0:
@@ -782,6 +787,10 @@ def _dm_expected_for_bin(
         epos, ep = epos[idx], ep[idx]
         m = max_ends
     iu, ju = np.triu_indices(m, k=1)      # all unordered end-pairs (i<j)
+    keep = ~_is_contact(epos[iu], epos[ju], contact_keys)
+    if not keep.any():                    # every end-pair is a contact
+        return 0.0, 0.0, 0.0, 0, 0
+    iu, ju = iu[keep], ju[keep]
     d = np.abs(epos[iu] - epos[ju])
     pa, pb = ep[iu], ep[ju]
     po = pa * pb
@@ -810,8 +819,34 @@ def _dm_expected_for_bin(
             int(n_fb))
 
 
+#: Pair key for excluding real contacts: low position << 32 | high position.
+_PAIR_KEY = np.int64(1) << np.int64(32)
+
+
+def _contact_keys(pos1, pos2) -> np.ndarray:
+    """One int64 per read pair, orientation-free and sorted.
+
+    What the expected and the drawn null check a re-pairing against: a
+    "non-contact" end-pair that is one of these is a contact.
+    """
+    a = np.asarray(pos1, np.int64)
+    b = np.asarray(pos2, np.int64)
+    return np.unique(np.minimum(a, b) * _PAIR_KEY + np.maximum(a, b))
+
+
+def _is_contact(pos_a, pos_b, keys) -> np.ndarray:
+    """Whether each end-pair ``(pos_a[k], pos_b[k])`` is one of ``keys``."""
+    a = np.asarray(pos_a, np.int64)
+    b = np.asarray(pos_b, np.int64)
+    if keys is None or len(keys) == 0:
+        return np.zeros(a.shape, dtype=bool)
+    q = np.minimum(a, b) * _PAIR_KEY + np.maximum(a, b)
+    at = np.minimum(np.searchsorted(keys, q), len(keys) - 1)
+    return keys[at] == q
+
+
 def _null_observed_for_bin(epos, ep, n_contacts, min_distance, seed,
-                           max_distance=0):
+                           max_distance=0, contact_keys=None):
     """A synthetic O drawn from non-contact pairs: the pipeline's own null.
 
     A Q-Q plot needs a sample from the null, and no parametric reference is
@@ -830,14 +865,27 @@ def _null_observed_for_bin(epos, ep, n_contacts, min_distance, seed,
     It must be drawn from ends DISJOINT from the ones the expected is built
     on.  Sharing them makes the two agree more than chance and the null
     comes back too narrow, which reads as a calibrated model.
+
+    And it must never BE a real contact.  The pool holds the contacts' own
+    ends, so in a sparse bin -- a handful of ends, which single cells mostly
+    have -- a random pairing can land on a contact itself, and the "null"
+    then carries the very coordination it is meant to lack.  Pairings in
+    ``contact_keys`` (:func:`_contact_keys` of the cell's read pairs) are
+    refused and redrawn, as the expected refuses them.
+
+    Returns ``(open, closed, mixed, n, hits)``.  ``hits`` is how many
+    pairings the sampler drew and refused for being a contact on its way to
+    the ``n`` it kept, so ``hits / (hits + n)`` is the rate at which a
+    random pairing in this bin lands on one -- the share of the null that
+    was real contacts before they were refused.
     """
     m = epos.shape[0]
     if m < 2 or n_contacts <= 0:
-        return 0.0, 0.0, 0.0, 0
+        return 0.0, 0.0, 0.0, 0, 0
     rng = np.random.default_rng(seed)
     want = int(n_contacts)
     got_o = got_c = got_m = 0.0
-    n_got = 0
+    n_got = hits = 0
     # Rejection-sample pairs at or beyond min_distance.  Capped so a bin
     # whose ends are all close together cannot spin here.
     for _ in range(40):
@@ -851,6 +899,13 @@ def _null_observed_for_bin(epos, ep, n_contacts, min_distance, seed,
         ok &= d >= int(min_distance)
         if max_distance and int(max_distance) > 0:
             ok &= d <= int(max_distance)
+        real = ok & _is_contact(epos[i], epos[j], contact_keys)
+        if real.any():
+            # The contacts passed over before the last pairing kept.
+            walk = real[ok]
+            stop = np.searchsorted(np.cumsum(~walk), want - n_got)
+            hits += int(walk[:stop + 1].sum())
+            ok &= ~real
         if not ok.any():
             continue
         take = min(int(ok.sum()), want - n_got)
@@ -859,12 +914,12 @@ def _null_observed_for_bin(epos, ep, n_contacts, min_distance, seed,
         got_c += float(np.sum((1.0 - pa) * (1.0 - pb)))
         got_m += float(np.sum(pa * (1.0 - pb) + (1.0 - pa) * pb))
         n_got += take
-    return got_o, got_c, got_m, n_got
+    return got_o, got_c, got_m, n_got, hits
 
 
 def _pooled_expected_for_bin(
     epos: np.ndarray, ep: np.ndarray,
-    contact_pairs: list[tuple[int, int]], n_contacts: int,
+    contact_keys, n_contacts: int,
     min_distance: int, max_ends: int, seed: int, max_distance: int = 0,
 ) -> tuple[float, float, float, int]:
     """Distance-POOLED expected co-state for one bin's contacts.
@@ -873,10 +928,10 @@ def _pooled_expected_for_bin(
     non-contact null, but instead of matching each observed contact's
     distance it pools **all** synthetic end-pairs with separation
     >= ``min_distance`` into a single mean expected rate (excluding any
-    pair that coincides with an observed contact).  This trades the
-    distance control of the distance-matched null for many more pairs, so
-    the per-bin expected is far less noisy ("more reads for the
-    estimation").
+    pair that coincides with a read pair, ``contact_keys`` from
+    :func:`_contact_keys`).  This trades the distance control of the
+    distance-matched null for many more pairs, so the per-bin expected is
+    far less noisy ("more reads for the estimation").
 
     To stay a drop-in sibling of the distance-matched expected, the result
     is scaled so that ``n_dm == n_contacts`` and the per-state rate
@@ -898,11 +953,7 @@ def _pooled_expected_for_bin(
     keep = d >= int(min_distance)          # long-range pairs only
     if max_distance and int(max_distance) > 0:   # cap to the distance band
         keep &= d <= int(max_distance)
-    if contact_pairs:                      # exclude the observed (linked) pairs
-        lo = np.minimum(epos[iu], epos[ju])
-        hi = np.maximum(epos[iu], epos[ju])
-        for c_lo, c_hi in contact_pairs:
-            keep &= ~((lo == int(c_lo)) & (hi == int(c_hi)))
+    keep &= ~_is_contact(epos[iu], epos[ju], contact_keys)   # not a contact
     if not keep.any():
         return 0.0, 0.0, 0.0, 0
     pa, pb = ep[iu][keep], ep[ju][keep]
@@ -934,7 +985,10 @@ def _compute_cell_dm_expected(
     The null pool for a bin is its own informative read ends (those of any
     pair, regardless of partner location); with ``dm_window_bins > 0`` it is
     pooled over ±that many neighbouring bins (more end-pairs at long
-    distances where a single bin's pairs thin out).
+    distances where a single bin's pairs thin out).  "Null end-pair" means
+    a re-pairing that is not one of the cell's read pairs: those are
+    contacts wherever they sit, and both modes and the drawn null refuse
+    them.
 
     ``mode`` selects how the expected rate is formed from that pool:
 
@@ -942,9 +996,9 @@ def _compute_cell_dm_expected(
       soft co-state of null end-pairs at the contact's distance bucket
       (``_dm_expected_for_bin``).  Controls distance + bin-marginal.
     - ``"pooled"`` (distance-pooled): the mean soft co-state of *all* null
-      end-pairs with separation >= ``min_distance`` (excluding the observed
-      contacts; ``_pooled_expected_for_bin``).  Drops distance control for
-      many more pairs → a less-noisy expected.
+      end-pairs with separation >= ``min_distance``
+      (``_pooled_expected_for_bin``).  Drops distance control for many
+      more pairs → a less-noisy expected.
     """
     df = pd.read_parquet(
         posteriors_path,
@@ -972,6 +1026,16 @@ def _compute_cell_dm_expected(
     e_bin = (e_pos // bsz)
     ends = pd.DataFrame({"chrom": e_chrom, "bin": e_bin, "pos": e_pos, "p": e_p})
     ends_by_bin = {key: g for key, g in ends.groupby(["chrom", "bin"], sort=False)}
+
+    # Every read pair whose two ends could both be in a pool, by chromosome.
+    # A re-pairing that lands on one IS a contact, so the expected and the
+    # drawn null refuse them all -- not only the bin's long-range contacts:
+    # with dm_window_bins > 0 the pool reaches into neighbouring bins, and a
+    # distance-matched bucket can start below min_distance.
+    both = inf1 & inf2
+    k_chrom, k_pos1, k_pos2 = chrom[both], pos1[both], pos2[both]
+    pair_keys = {c: _contact_keys(k_pos1[k_chrom == c], k_pos2[k_chrom == c])
+                 for c in np.unique(k_chrom)}
 
     # Observed long-range contacts (same-bin, informative, linked); optionally
     # capped at max_distance to focus a distance band (e.g. 20–200 kb E–P).
@@ -1018,16 +1082,13 @@ def _compute_cell_dm_expected(
                 null_pos = ep_df["pos"].to_numpy(dtype=np.int64)[_b]
                 null_p = ep_df["p"].to_numpy(dtype=np.float64)[_b]
                 ep_df = ep_df.iloc[_a]
+        _ckeys = pair_keys.get(c)
         if mode == "pooled":
-            p1c = og["pos1"].to_numpy(dtype=np.int64)
-            p2c = og["pos2"].to_numpy(dtype=np.int64)
-            contact_pairs = list(zip(np.minimum(p1c, p2c).tolist(),
-                                     np.maximum(p1c, p2c).tolist()))
             n_fb = 0
             k_o, k_c, k_m, n_dm = _pooled_expected_for_bin(
                 ep_df["pos"].to_numpy(dtype=np.int64),
                 ep_df["p"].to_numpy(dtype=np.float64),
-                contact_pairs, n_contacts=len(og),
+                _ckeys, n_contacts=len(og),
                 min_distance=int(min_distance), max_ends=int(dm_max_ends),
                 seed=seed_base + int(b), max_distance=int(max_distance),
             )
@@ -1037,7 +1098,7 @@ def _compute_cell_dm_expected(
                 ep_df["p"].to_numpy(dtype=np.float64),
                 og["distance"].to_numpy(dtype=np.int64),
                 dist_bin=int(dm_dist_bin), max_ends=int(dm_max_ends),
-                seed=seed_base + int(b),
+                seed=seed_base + int(b), contact_keys=_ckeys,
             )
         _entry_null = {}
         if null_split and null_pos is not None:
@@ -1048,17 +1109,22 @@ def _compute_cell_dm_expected(
             # bin rather than for some average bin.  Offsetting the seed by
             # a large prime per draw keeps them independent without
             # colliding with the neighbouring bin's seeds.
+            _hits = 0
             for _d in range(max(1, int(null_draws))):
-                _no, _nc, _nm, _nn = _null_observed_for_bin(
+                _no, _nc, _nm, _nn, _h = _null_observed_for_bin(
                     null_pos, null_p, n_contacts=len(og),
                     min_distance=int(min_distance),
                     seed=seed_base + 5701 + int(b) + _d * 1_000_003,
-                    max_distance=int(max_distance))
+                    max_distance=int(max_distance), contact_keys=_ckeys)
                 _ko, _kc, _km, _kn = _null_keys(_d)
                 _entry_null[_ko] = _no
                 _entry_null[_kc] = _nc
                 _entry_null[_km] = _nm
                 _entry_null[_kn] = float(_nn)
+                _hits += _h
+            # A diagnostic, like n_dm_fallback: summed and logged, then
+            # dropped by the matrix assembly with every other extra key.
+            _entry_null["n_null_contact_hits"] = float(_hits)
         counts[f"{c}:{int(b) * bsz}"] = {
             **_entry_null,
             "k_dm_open": k_o, "k_dm_closed": k_c, "k_dm_mixed": k_m,
@@ -1971,6 +2037,24 @@ def compute_signed_concordance_matrix(
                         f"fill) or --dm-window-mb (pools ends from "
                         f"neighbouring bins, which is what thin bins need)."
                     )
+
+            # How often a random pairing landed on a real contact.  Those
+            # are refused and redrawn; the rate is about the share of the
+            # null that was real coordination before they were.
+            if emit_null:
+                _hit = sum(e.get("n_null_contact_hits", 0.0)
+                           for d in dm_by_cell.values() for e in d.values())
+                _kept = sum(e.get(_null_keys(_d)[3], 0.0)
+                            for d in dm_by_cell.values() for e in d.values()
+                            for _d in range(max(1, int(null_draws))))
+                if _kept > 0:
+                    logger.info(
+                        f"Drawn null: {_hit:,.0f} of {_hit + _kept:,.0f} "
+                        f"random pairings ({_hit / (_hit + _kept):.2%}) "
+                        f"landed on one of the cell's own read pairs and "
+                        f"were redrawn as non-contacts; without that check "
+                        f"about this share of the null would be real "
+                        f"contacts.")
 
         # ---- Step 2: assemble cells × bins soft-count matrices --------------
         all_bins: set[str] = set()
