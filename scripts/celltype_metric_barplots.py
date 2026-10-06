@@ -39,9 +39,12 @@ THREE THINGS TO KNOW
    the 1D/3D baselines those arms are measured against.
 2. The random control is a per-bin permutation of the concordance matrix
    across cells: it preserves every bin's value distribution and the exact NaN
-   pattern, and destroys only the cell association.  It is the floor for this
-   whole pipeline, so it also absorbs any apparent structure the imputation and
-   normalization introduce on their own.
+   pattern, and destroys only the cell association.  It is the floor for THIS
+   script's steps -- normalization, batch correction, SVD -- since those run
+   after the shuffle.  It is not a floor for step 5's imputation, which ran
+   before it: shuffling an imputed matrix destroys the structure the cell
+   graph put there too.  The drawn null (``--concordance-c-null``, below)
+   keeps that structure, so it is the floor for an imputed matrix.
 
 Example (GCH, matching the nome_hic_compare invocation with skip_top_svd = 1)
 
