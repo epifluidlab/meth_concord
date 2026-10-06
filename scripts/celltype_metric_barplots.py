@@ -58,6 +58,20 @@ Example (GCH, matching the nome_hic_compare invocation with skip_top_svd = 1)
         --output-dir out/09_metric_barplots_GCH
 
 For HCG, point at the HCG matrices and drop ``--skip-top-svd``.
+
+CHOOSING THE BARS.  ``--arms`` picks exactly which bars are drawn, e.g. a
+main-figure set of the two baselines and one concordance matrix:
+
+    --arms baseline_1d,baseline_3d,C,C_null --c-label "C residual"
+
+``--concordance-d`` is optional (no D arms without it), and
+``--concordance-c-null`` adds C's DRAWN null -- step 5's
+``concordance_<stat>..._null.parquet``, which went through the same
+imputation and correction as C -- as its own bar.  That is the floor that
+matters for an imputed matrix: the per-bin shuffle below destroys the
+structure the cell graph puts into any matrix it imputes, the drawn null
+keeps it.  A C bar that does not clear its drawn null shows what the
+pipeline produces without coordination, not cell-type information.
 """
 
 from __future__ import annotations
@@ -76,14 +90,52 @@ logger = logging.getLogger("metric_barplots")
 # arm key -> (display label, bar colour).  Order here is the plotting order.
 ARM_STYLE = [
     ("baseline_1d",   "1D baseline",                 "#8A94A6"),
+    ("baseline_3d",   "3D baseline",                 "#B4BCC8"),
     ("D",             "D",                           "#5F4BB6"),
     ("D_linear",      "D − 1D,3D  (linear)",         "#8A79D6"),
     ("D_quadratic",   "D − 1D,3D  (quadratic)",      "#B3A8E3"),
     ("C",             "C",                           "#1F8A7B"),
     ("C_linear",      "C − 1D,3D  (linear)",         "#4FB3A4"),
     ("C_quadratic",   "C − 1D,3D  (quadratic)",      "#9BD9CE"),
+    ("C_null",        "C, drawn null",               "#D9DDE3"),
     ("random",        "random control",              "#C9CED6"),
 ]
+
+#: Arms that need --concordance-d, and the one that needs its null.
+D_ARMS = ("D", "D_linear", "D_quadratic")
+
+
+def arm_labels(args) -> dict:
+    """Display label per arm; --c-label renames C in every C arm."""
+    c = getattr(args, "c_label", None) or "C"
+    out = {}
+    for key, lab, _ in ARM_STYLE:
+        out[key] = (c + lab[1:]) if key.startswith("C") else lab
+    return out
+
+
+def resolve_arms(args, have_d: bool, have_c_null: bool) -> list:
+    """The arms to compute and draw, in ARM_STYLE order."""
+    available = {k for k, *_ in ARM_STYLE}
+    if not have_d:
+        available -= set(D_ARMS)
+    if not have_c_null:
+        available.discard("C_null")
+    spec = getattr(args, "arms", "auto") or "auto"
+    if spec == "auto":
+        return [k for k, *_ in ARM_STYLE if k in available]
+    want = [a.strip() for a in spec.split(",") if a.strip()]
+    known = {k for k, *_ in ARM_STYLE}
+    unknown = [a for a in want if a not in known]
+    if unknown:
+        raise SystemExit(f"--arms: unknown {unknown}; choose from "
+                         f"{[k for k, *_ in ARM_STYLE]}")
+    missing = [a for a in want if a not in available]
+    if missing:
+        need = ("--concordance-d" if any(a in D_ARMS for a in missing)
+                else "--concordance-c-null")
+        raise SystemExit(f"--arms {missing} need {need}")
+    return [k for k, *_ in ARM_STYLE if k in want]
 
 METRIC_LABEL = {
     "knn_purity": "kNN purity",
@@ -176,8 +228,15 @@ def score_matrix(raw, name, labels, args, out_dir, batch_labels=None):
 
 
 def build_arms(mats, labels, args, out_dir, batch_labels,
-               concordance_batch_labels=None):
-    """Every arm's metric dict, keyed as in ARM_STYLE."""
+               concordance_batch_labels=None, arms=None):
+    """The requested arms' metric dicts, keyed as in ARM_STYLE.
+
+    ``arms`` defaults to every arm the inputs allow; ``mats`` may lack "D"
+    and "C_null".
+    """
+    if arms is None:
+        arms = resolve_arms(args, "D" in mats, "C_null" in mats)
+    want = set(arms)
     results: dict[str, dict] = {}
 
     def correct(df, nm):
@@ -197,44 +256,74 @@ def build_arms(mats, labels, args, out_dir, batch_labels,
             args.random_seed, nm)
 
     mats = dict(mats)
-    src_raw = mats[args.random_source.upper()]      # before the correction
-    mats["C"] = correct(mats["C"], "C")
-    mats["D"] = correct(mats["D"], "D")
+    src = _random_source(args, mats)
+    src_raw = mats[src]                              # before the correction
+    # The drawn null meets the same concordance-stage correction as C: it is
+    # C's twin through every step, or it is not C's null.
+    for key in ("C", "D", "C_null"):
+        if key in mats:
+            mats[key] = correct(mats[key], key)
 
-    results["baseline_1d"] = score_matrix(
-        mats["1D"], "baseline_1d", labels, args, out_dir, batch_labels)
-    for key, raw in (("C", mats["C"]), ("D", mats["D"])):
-        results[key] = score_matrix(raw, key, labels, args, out_dir,
-                                    batch_labels)
+    if "baseline_1d" in want:
+        results["baseline_1d"] = score_matrix(
+            mats["1D"], "baseline_1d", labels, args, out_dir, batch_labels)
+    if "baseline_3d" in want:
+        results["baseline_3d"] = score_matrix(
+            mats["3D"], "baseline_3d", labels, args, out_dir, batch_labels)
+    for key in ("C", "D", "C_null"):
+        if key in want and key in mats:
+            results[key] = score_matrix(mats[key], key, labels, args, out_dir,
+                                        batch_labels)
 
     # Residual arms.  variance_partition consumes the NORMALIZED target and
     # baselines (the order run_comparison uses), and residual_umap re-preps the
     # residual before scoring — score_matrix does that second prep.
-    prep = lambda df, nm: comparison._prep_matrix(   # noqa: E731
-        df, nm, str(out_dir), args.matrix_norm, args.min_cell_coverage,
-        args.per_cell_norm, args.post_norm_recenter)
-    base_norm = {"accessibility": prep(mats["1D"], "vp_1d"),
-                 "compartment": prep(mats["3D"], "vp_3d")}
-    for key, raw in (("C", mats["C"]), ("D", mats["D"])):
-        tnorm = prep(raw, f"vp_target_{key}")
-        for level in ("linear", "quadratic"):
-            name = f"{key}_{level}"
-            resid = comparison.variance_partition(
-                tnorm, base_norm, name, str(out_dir / "variance_partition"),
-                level_control=level, plot_format=args.plot_format,
-                batch_labels=batch_labels)
-            results[name] = score_matrix(resid, f"residual_{name}", labels,
-                                         args, out_dir, batch_labels)
+    resid_arms = [f"{k}_{lv}" for k in ("C", "D") if k in mats
+                  for lv in ("linear", "quadratic")
+                  if f"{k}_{lv}" in want]
+    if resid_arms:
+        prep = lambda df, nm: comparison._prep_matrix(   # noqa: E731
+            df, nm, str(out_dir), args.matrix_norm, args.min_cell_coverage,
+            args.per_cell_norm, args.post_norm_recenter)
+        base_norm = {"accessibility": prep(mats["1D"], "vp_1d"),
+                     "compartment": prep(mats["3D"], "vp_3d")}
+        for key in ("C", "D"):
+            names = [a for a in resid_arms if a.startswith(key + "_")]
+            if not names:
+                continue
+            tnorm = prep(mats[key], f"vp_target_{key}")
+            for name in names:
+                level = name.split("_", 1)[1]
+                resid = comparison.variance_partition(
+                    tnorm, base_norm, name,
+                    str(out_dir / "variance_partition"),
+                    level_control=level, plot_format=args.plot_format,
+                    batch_labels=batch_labels)
+                results[name] = score_matrix(resid, f"residual_{name}",
+                                             labels, args, out_dir,
+                                             batch_labels)
 
     # The floor has to travel the SAME road as the real arms, correction
     # included, or it stops being a floor: harmony in particular can invent
     # clustering, and only an arm that also passes through it can absorb that.
     # Shuffled FIRST, so the correction meets a matrix with no cell
     # association left, exactly as it would if the data carried no signal.
-    results["random"] = score_matrix(
-        correct(_shuffle_within_bins(src_raw, args.random_seed), "random"),
-        "random", labels, args, out_dir, batch_labels)
+    if "random" in want:
+        results["random"] = score_matrix(
+            correct(_shuffle_within_bins(src_raw, args.random_seed),
+                    "random"),
+            "random", labels, args, out_dir, batch_labels)
     return results
+
+
+def _random_source(args, mats) -> str:
+    """Which matrix the random control shuffles: D if given, else C."""
+    want = (getattr(args, "random_source", "auto") or "auto").lower()
+    if want == "auto":
+        return "D" if "D" in mats else "C"
+    if want.upper() not in mats:
+        raise SystemExit(f"--random-source {want} needs --concordance-{want}")
+    return want.upper()
 
 
 # ----------------------------------------------------------------- plotting --
@@ -245,13 +334,14 @@ def barplot(results, metric, context, out_path, args):
     import matplotlib.pyplot as plt
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10})
 
-    rows = [(lab, col, (results.get(k) or {}).get(metric, np.nan))
-            for k, lab, col in ARM_STYLE]
+    names = arm_labels(args)
+    rows = [(names[k], col, (results.get(k) or {}).get(metric, np.nan))
+            for k, _lab, col in ARM_STYLE if k in results]
     labels = [r[0] for r in rows][::-1]         # first arm at the top
     colors = [r[1] for r in rows][::-1]
     vals = [r[2] for r in rows][::-1]
 
-    fig, ax = plt.subplots(figsize=(7.6, 4.6))
+    fig, ax = plt.subplots(figsize=(7.6, max(2.4, 0.55 * len(rows) + 0.8)))
     y = np.arange(len(vals))
     ax.barh(y, vals, color=colors, edgecolor="white", height=0.72)
     ax.set_yticks(y)
@@ -301,7 +391,20 @@ def main(argv=None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--concordance-c", required=True)
-    ap.add_argument("--concordance-d", required=True)
+    ap.add_argument("--concordance-d", default=None,
+                    help="Optional: without it there are no D arms.")
+    ap.add_argument("--concordance-c-null", default=None,
+                    help="C's drawn null from step 5 (the matching "
+                         "..._null.parquet).  Scored as its own bar, through "
+                         "the same correction as C -- the floor an imputed C "
+                         "has to clear.")
+    ap.add_argument("--arms", default="auto",
+                    help="Comma-separated bars to compute and draw, from: "
+                         + ", ".join(k for k, *_ in ARM_STYLE)
+                         + ".  'auto' (default): every arm the inputs allow.")
+    ap.add_argument("--c-label", default="C",
+                    help="Name for C in the bar labels, e.g. 'C residual' when "
+                         "--concordance-c is the marginal-corrected residual.")
     ap.add_argument("--baseline-1d", required=True)
     ap.add_argument("--baseline-3d", required=True)
     ap.add_argument("--samples", required=True)
@@ -353,8 +456,10 @@ def main(argv=None) -> int:
                          "floor that skipped the correction could not absorb "
                          "structure the correction itself creates.")
     ap.add_argument("--harmony-theta", type=float, default=None)
-    ap.add_argument("--random-source", choices=["c", "d"], default="d",
-                    help="Which concordance matrix the random control shuffles.")
+    ap.add_argument("--random-source", choices=["auto", "c", "d"],
+                    default="auto",
+                    help="Which concordance matrix the random control "
+                         "shuffles; 'auto' (default): D if given, else C.")
     ap.add_argument("--metrics", default="knn_purity,ari,nmi",
                     help="Comma-separated; one PDF each.  Also available: "
                          "purity_index, silhouette.")
@@ -371,9 +476,15 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     excl = {c.strip() for c in args.exclude_chrom.split(",") if c.strip()}
-    mats = {"C": _load(args.concordance_c), "D": _load(args.concordance_d),
+    mats = {"C": _load(args.concordance_c),
             "1D": _load(args.baseline_1d), "3D": _load(args.baseline_3d)}
+    if args.concordance_d:
+        mats["D"] = _load(args.concordance_d)
+    if args.concordance_c_null:
+        mats["C_null"] = _load(args.concordance_c_null)
     mats = {k: _drop_chroms(v, excl) for k, v in mats.items()}
+    arms = resolve_arms(args, "D" in mats, "C_null" in mats)
+    _random_source(args, mats)              # fail early on a bad source
 
     samples = pd.read_csv(args.samples, sep="\t")
     labels = samples.set_index(args.cell_column)[args.group_column].dropna()
@@ -403,11 +514,12 @@ def main(argv=None) -> int:
                 f"{labels.nunique()} groups; context {args.context}.")
 
     results = build_arms(mats, labels, args, out_dir, batch_labels,
-                         concordance_batch_labels)
+                         concordance_batch_labels, arms=arms)
 
+    names = arm_labels(args)
     tab = pd.DataFrame(
-        [{"arm": key, "label": lab, **(results.get(key) or {})}
-         for key, lab, _ in ARM_STYLE])
+        [{"arm": key, "label": names[key], **(results.get(key) or {})}
+         for key in arms])
     tsv = out_dir / f"{args.context}_metrics.tsv"
     tab.to_csv(tsv, sep="\t", index=False)
     logger.info(f"wrote {tsv}")
