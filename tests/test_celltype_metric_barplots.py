@@ -428,3 +428,16 @@ def test_unknown_arm_is_refused(tmp_path):
         m.main(["--concordance-c", p["c"], "--baseline-1d", p["b1"],
                 "--baseline-3d", p["b3"], "--samples", p["samples"],
                 "--arms", "C,E", "--output-dir", str(tmp_path / "o")])
+
+
+
+def test_matrix_norm_none_is_accepted_as_in_nome_hic_compare(tmp_path):
+    """HCG runs use --matrix-norm none there; the bar plots must follow."""
+    tab, out = _run_min(tmp_path, ["--matrix-norm", "none"])
+    t = tab.set_index("arm")
+    assert np.isfinite(t.loc["C", "knn_purity"])
+    assert t.loc["C", "knn_purity"] > t.loc["random", "knn_purity"]
+    # and it is a different normalization, not quantile under another name
+    q, _ = _run_min(tmp_path / "q", [])
+    assert not np.isclose(t.loc["C", "score_sd"],
+                          q.set_index("arm").loc["C", "score_sd"])

@@ -373,7 +373,9 @@ def barplot(results, metric, context, out_path, args):
                  f"matrix", fontsize=11.5, pad=16)
     sub = (f"SVD-{args.n_svd}"
            + (f", skip top {args.skip_top_svd}" if args.skip_top_svd else "")
-           + f", {args.matrix_norm} norm, k = {args.knn_k}")
+           + (", no per-bin norm" if args.matrix_norm == "none"
+              else f", {args.matrix_norm} norm")
+           + f", k = {args.knn_k}")
     ax.annotate(sub, xy=(0.5, 1.0), xytext=(0, 5), xycoords="axes fraction",
                 textcoords="offset points", ha="center", va="bottom",
                 fontsize=8, color="#6B7280", style="italic")
@@ -415,8 +417,12 @@ def main(argv=None) -> int:
                          "variance-partition regression as nuisance "
                          "covariates (as nome_hic_compare does).")
     ap.add_argument("--context", default="GCH")
-    ap.add_argument("--matrix-norm", choices=["quantile", "zscore"],
-                    default="quantile")
+    ap.add_argument("--matrix-norm", choices=["quantile", "zscore", "none"],
+                    default="quantile",
+                    help="Per-bin normalization, as in nome_hic_compare: "
+                         "'none' skips the per-bin step and leaves the bins "
+                         "on their own scale (the per-cell step and the NaN "
+                         "imputation still run) -- the HCG setting there.")
     ap.add_argument("--per-cell-norm",
                     choices=["off", "center", "zscore", "rank"], default="rank")
     ap.add_argument("--post-norm-recenter", action="store_true")
