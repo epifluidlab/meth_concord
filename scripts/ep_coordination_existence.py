@@ -53,11 +53,13 @@ split-half, batch and label permutation test whether there is an association,
 not where it comes from.  So a random forest separates cell types that differ
 in methylation level alone -- Δ|m+cov 0.85 at 1 Mb on synthetic cells with no
 coordination anywhere, where L2-logistic stays at 0.56.  --null runs the
-identical ladder on --null-draws draws in which every contact is replaced by
-a non-contact pair of the cell's own ends, in the same region at a matched
-distance: same depth, coverage, methylation and distance mix, no
-coordination.  Only real clearly above the draws counts; its rank among them
-is the p-value.
+identical ladder on --null-draws draws with no coordination.  The default
+--null-type link-shuffle keeps each contact's left end and gives it as a
+partner an end of ANOTHER long-range read pair of the same cell, at a
+distance in the contact's own bin: the same kind of ends, only paired
+differently.  Contacts with no such donor are left out of the real value and
+the null alike.  Only real clearly above the draws counts; its rank among
+them is the p-value.
 
     python scripts/ep_coordination_existence.py \\
         --input-dir output/.../context_HCG/04_posteriors \\
@@ -77,7 +79,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from nome_hic_concordance.utils import manifest_text
+
+# Import the package from THIS checkout, so the script and the package it
+# calls are always the same version (an installed copy may be another).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from nome_hic_concordance.utils import manifest_text  # noqa: E402
 
 _MULT = 100_000_000      # region_id = chrom_code * _MULT + bin_index
 
@@ -206,6 +215,53 @@ def _draw_null(c_reg, c_dist, b_reg, b_dist, dbins, rng):
     return np.where(ok, order[pick], -1), ok & ~matched
 
 
+def _link_shuffle_draw(c_lo, c_hi, c_row, d_pos, d_row, dbins, keys, rng,
+                       max_rounds: int = 32):
+    """Link-shuffle: one donor per contact, from the SAME cell.
+
+    The anchor is the contact's left end and stays.  The donor stands in
+    for its partner: an end of another long-range read pair of this cell
+    (``d_pos`` sorted, ``d_row`` its read pair), on the partner's side of
+    the anchor -- to its right, as the partner and every pair of E are --
+    at a distance in the contact's own distance bin, never the contact's
+    own read pair and never re-forming any of the cell's read pairs
+    (``keys``).  Where the donor's own partner sits does not matter.  (A
+    donor from the left would sit in the region before the anchor's, whose
+    level the real pair never sees: on cells that differ only in level that
+    gave the null MORE cell-type information than the real.)
+    Returns (donor index into ``d_pos`` or -1, matched): ``matched`` -- a
+    valid donor exists -- does not depend on the draw, so the arm the real
+    value is computed on is the same for every draw.
+    """
+    n = c_lo.size
+    out = np.full(n, -1, np.int64)
+    if n == 0 or d_pos.size == 0:
+        return out, np.zeros(n, dtype=bool)
+    nb = len(dbins) - 1
+    d = c_hi - c_lo
+    k = np.clip(np.searchsorted(dbins, d, side="right") - 1, 0, nb - 1)
+    e_lo, e_hi = dbins[k], dbins[k + 1]
+    rL = np.searchsorted(d_pos, c_lo + e_lo, side="left")
+    rH = np.searchsorted(d_pos, c_lo + e_hi, side="left")
+    tot = np.maximum(rH - rL, 0)
+    # The contact's own partner is a long-range end in its own window.
+    own = (d >= e_lo) & (d < e_hi)
+    matched = (tot - own) >= 1
+    alive = matched.copy()
+    for _ in range(max_rounds):
+        idx = np.flatnonzero(alive)
+        if idx.size == 0:
+            break
+        pick = rL[idx] + (rng.random(idx.size) * tot[idx]).astype(np.int64)
+        dp = d_pos[pick]
+        good = ((d_row[pick] != c_row[idx])
+                & ~_is_pair(np.minimum(c_lo[idx], dp),
+                            np.maximum(c_lo[idx], dp), keys))
+        out[idx[good]] = pick[good]
+        alive[idx[good]] = False
+    return out, matched
+
+
 def _region_ids(codes: np.ndarray, pos: np.ndarray, gran) -> np.ndarray:
     """Integer region id = chrom_code*_MULT + bin (bin=0 for 'chrom')."""
     if gran == "chrom":
@@ -226,9 +282,30 @@ def _agg(ids: np.ndarray, weights: list) -> tuple:
     return uniq, sums, cnt
 
 
+def cell_donor_ends(path: Path, min_d: int, min_gch: int) -> dict:
+    """{chrom: (positions, posteriors)} of every informative end of a read
+    pair at least ``min_d`` long -- this cell's link-shuffle donors."""
+    df = pd.read_parquet(path, columns=["chrom", "pos1", "pos2", "n1", "n2",
+                                         "posterior1", "posterior2"])
+    chrom = df["chrom"].astype(str).to_numpy()
+    pos1 = df["pos1"].to_numpy(np.int64); pos2 = df["pos2"].to_numpy(np.int64)
+    p1 = df["posterior1"].to_numpy(np.float64, na_value=np.nan)
+    p2 = df["posterior2"].to_numpy(np.float64, na_value=np.nan)
+    lr = np.abs(pos2 - pos1) >= int(min_d)
+    m1 = lr & (df["n1"].to_numpy() >= min_gch) & np.isfinite(p1)
+    m2 = lr & (df["n2"].to_numpy() >= min_gch) & np.isfinite(p2)
+    ch = np.concatenate([chrom[m1], chrom[m2]])
+    pos = np.concatenate([pos1[m1], pos2[m2]])
+    pp = np.concatenate([p1[m1], p2[m2]])
+    return {c: (pos[ch == c], pp[ch == c]) for c in np.unique(ch)}
+
+
 def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
                  min_gch: int, cap: int, seed: int, decay_dbins: np.ndarray = None,
-                 null: bool = False, null_draws: int = 1):
+                 null: bool = False, null_draws: int = 1,
+                 null_type: str = "link-shuffle", per_decade: int = 4,
+                 pool=None, cell_id: int = -1, chrom_code=None,
+                 max_widen: int = 2):
     """Per-(region) Δ_signed (log2 O/E) + mean openness for one cell, at each
     granularity.  Fully vectorized.  Returns (cell, {gran: {"keys", "delta",
     "marg", "n"}}, decay, null_part): per granularity the cell's region names
@@ -238,10 +315,21 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
     holds distance-binned soft-agreement sums/counts for contacts (O) and the
     random null (E) — for the Hi-C-style distance plot.
 
-    ``null``: also the same Δ with each contact replaced by a NON-contact pair
-    of this cell's ends in the same region at a matched distance -- what the
-    statistic looks like with no coordination, at the same depth, coverage and
-    methylation.  The ends are split into two disjoint halves per chromosome:
+    ``null``: also the same Δ with no coordination, ``null_draws`` times.
+    ``null_type="link-shuffle"`` (default) keeps each contact's left end
+    and replaces its partner with an end of another long-range read pair at
+    a distance in the contact's own bin (``per_decade`` log bins per decade).
+    With ``pool`` (this cell's stratum, :mod:`nome_hic_concordance.
+    link_shuffle`) the donor comes from ANOTHER cell, widening the distance
+    window by up to ``max_widen`` bins where needed; without it, from this
+    cell -- see :func:`_link_shuffle_draw`, and why that is too narrow at
+    single-cell depth.  The ends are the
+    contacts' own kind, so real and null differ only in who is paired with
+    whom.  A contact with no donor is left out of the real value AND the
+    null (the matched arm), and E is the plain one, shared by both.
+    ``null_type="all-ends"`` instead replaces each contact with a
+    NON-contact pair of this cell's ends in the same region at a matched
+    distance.  The ends are split into two disjoint halves per chromosome:
     E is built from one, the null pairs from the other, and neither pool may
     hold one of the cell's read pairs.  The real Δ is then computed against
     that same E, so real and null differ only in their O pairs.  The split
@@ -285,17 +373,36 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
     rng = np.random.default_rng(seed)
     ep_pos_l, ep_open_l, ep_closed_l, ep_code_l, ep_dist_l = [], [], [], [], []
     nb_pos_l, nb_open_l, nb_closed_l, nb_code_l, nb_dist_l = [], [], [], [], []
+    split = null and null_type == "all-ends"
     if null:
-        # The cell's read pairs, which neither E nor the null may re-form.
+        # The cell's read pairs, which the null may not re-form.
         both = inf1 & inf2
         rp_keys = {c: _pair_keys(lo[both][chrom[both] == c],
                                  hi[both][chrom[both] == c])
                    for c in np.unique(chrom[both])}
         nrng = np.random.default_rng(seed + 7919)
+    n_draws = max(1, int(null_draws)) if null else 0
+    draw_rngs = [np.random.default_rng(seed + 104_729 + 1_000_003 * d)
+                 for d in range(n_draws)]
+    # LINK-SHUFFLE: E -- and the region's level -- from the ends of SHORT
+    # read pairs only.  A real contact's two ends would otherwise sit in
+    # their pools too, so O shares noise with E and with the level Δ|m+cov
+    # regresses out, and a donor from another cell shares none.  On synthetic cells with no coordination that made the pooled
+    # null MORE separable than the real (z -1.5 to -8.8); with no long-range
+    # end in E the real is one more draw (z -1.8 to +0.7) while planted
+    # coordination still clears every draw.
+    short_ = (np.abs(pos2 - pos1) < int(min_d))
+    if null and not split:
+        x_chrom = np.concatenate([chrom[inf1 & short_], chrom[inf2 & short_]])
+        x_pos = np.concatenate([pos1[inf1 & short_], pos2[inf2 & short_]])
+        x_p = np.concatenate([p1[inf1 & short_], p2[inf2 & short_]])
+    else:
+        x_chrom, x_pos, x_p = e_chrom, e_pos, e_p
     for ci, c in enumerate(uniq_chroms):
         sel = e_chrom == c
-        if not null:
-            lp, eo, ec, ed = _window_pairs(e_pos[sel], e_p[sel], min_d, max_d,
+        if not split:
+            xs = x_chrom == c
+            lp, eo, ec, ed = _window_pairs(x_pos[xs], x_p[xs], min_d, max_d,
                                            cap, rng)
             if lp.size:
                 ep_pos_l.append(lp); ep_open_l.append(eo); ep_closed_l.append(ec)
@@ -324,15 +431,66 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
     else:
         e_lpos = np.empty(0, np.int64); e_open = np.empty(0)
         e_closed = np.empty(0); e_codes = np.empty(0, np.int64); e_dist = np.empty(0)
-    m_codes = code_of(e_chrom)
-    if null:
+    # The region's level comes from the same ends as E: it is what Δ|m+cov
+    # regresses out, and with the contacts' own ends in it the real value
+    # would lose more to that regression than a donor-paired null.
+    m_codes = code_of(x_chrom)
+    if split:
         cat = (lambda lst, dt: np.concatenate(lst) if lst
                else np.empty(0, dt))
         b_lpos, b_open = cat(nb_pos_l, np.int64), cat(nb_open_l, np.float64)
         b_closed = cat(nb_closed_l, np.float64)
         b_codes, b_dist = cat(nb_code_l, np.int64), cat(nb_dist_l, np.int64)
         o_sep = sep[cm]
-        null_dbins = _null_dbins(min_d, max_d)
+        null_dbins = _null_dbins(min_d, max_d, per_decade)
+    if null and not split:
+        # Donors: every end of a read pair at least min_d long -- a contact
+        # end, the kind of end the partner it stands in for is.
+        ls_dbins = _null_dbins(min_d, max_d, per_decade)
+        lr = np.flatnonzero(sep >= min_d)
+        r1, r2 = lr[inf1[lr]], lr[inf2[lr]]
+        dn_chrom = np.concatenate([chrom[r1], chrom[r2]])
+        dn_pos = np.concatenate([pos1[r1], pos2[r2]]).astype(np.int64)
+        dn_p = np.concatenate([p1[r1], p2[r2]])
+        dn_row = np.concatenate([r1, r2]).astype(np.int64)
+        c_rows = np.flatnonzero(cm)
+        c_chrom, c_lo, c_hi = chrom[cm], lo[cm], hi[cm]
+        p_lo = np.where(pos1 <= pos2, p1, p2)[cm]       # the anchor's call
+        matched = np.zeros(c_rows.size, dtype=bool)
+        donor_p = np.full((n_draws, c_rows.size), np.nan)
+        if pool is not None:
+            from nome_hic_concordance import link_shuffle as _ls
+            codes_all = pd.Series(chrom).map(chrom_code).to_numpy(np.int64)
+            own_g, _ = _ls.donor_ends(codes_all, pos1, pos2, p1, p2, inf1,
+                                      inf2, min_d)
+            donor_p, level = _ls.draw_link_shuffle(
+                codes_all[cm] * _ls.GENOME_STRIDE + c_lo, c_hi - c_lo,
+                cell_id, pool, np.sort(own_g), ls_dbins, draw_rngs[0],
+                n_draws=n_draws, max_widen=max_widen)
+            matched = level >= 0
+        for c in (np.unique(c_chrom) if pool is None else []):
+            ci_ = np.flatnonzero(c_chrom == c)
+            di_ = np.flatnonzero(dn_chrom == c)
+            order = np.argsort(dn_pos[di_], kind="mergesort")
+            dpos, drow = dn_pos[di_][order], dn_row[di_][order]
+            dpp = dn_p[di_][order]
+            for d_ in range(n_draws):
+                pick, m_ = _link_shuffle_draw(c_lo[ci_], c_hi[ci_],
+                                              c_rows[ci_], dpos, drow,
+                                              ls_dbins, rp_keys.get(c),
+                                              draw_rngs[d_])
+                matched[ci_] = m_
+                ok = pick >= 0
+                donor_p[d_, ci_[ok]] = dpp[pick[ok]]
+        ls_open = p_lo[None, :] * donor_p
+        ls_closed = (1.0 - p_lo[None, :]) * (1.0 - donor_p)
+        ls_got = np.isfinite(donor_p)
+        if pool is not None:        # (own distance bin, widened, none)
+            ls_stats = (int((level == 0).sum()), int((level > 0).sum()),
+                        int((level < 0).sum()))
+        else:                       # (matched, unmatched, failed draws)
+            ls_stats = (int(matched.sum()), int((~matched).sum()),
+                        int((matched[None, :] & ~ls_got).sum()))
 
     # Distance-decay accumulators (Hi-C-style), over the SEPARATE decay range
     # [decay_dbins[0], decay_dbins[-1]] using ALL informative pairs in that
@@ -375,21 +533,28 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
 
     eps = 1e-6
     out: dict = {}
-    n_draws = max(1, int(null_draws)) if null else 0
     out_null: dict = {}
     stats: dict = {}
-    draw_rngs = [np.random.default_rng(seed + 104_729 + 1_000_003 * d)
-                 for d in range(n_draws)]
     for gran in granularities:
         gk = str(gran)
         ro = _region_ids(o_codes, o_pos, gran)
         re = _region_ids(e_codes, e_lpos, gran)
-        rm = _region_ids(m_codes, e_pos, gran)
-        ids_o, (oo_s, oc_s), no = _agg(ro, [o_open, o_closed])
+        rm = _region_ids(m_codes, x_pos, gran)
+        if null and not split:                # the matched arm only
+            ids_o, (oo_s, oc_s), no = _agg(ro[matched], [o_open[matched],
+                                                         o_closed[matched]])
+        else:
+            ids_o, (oo_s, oc_s), no = _agg(ro, [o_open, o_closed])
         ids_e, (eo_s, ec_s), ne = _agg(re, [e_open, e_closed])
-        ids_m, (psum,), nm = _agg(rm, [e_p])
+        ids_m, (psum,), nm = _agg(rm, [x_p])
         draws_ = []
-        if null:
+        if null and not split:
+            for d_ in range(n_draws):
+                g_ = ls_got[d_]
+                draws_.append(_agg(ro[g_], [ls_open[d_][g_],
+                                            ls_closed[d_][g_]]))
+            stats[gk] = ls_stats
+        elif split:
             b_reg = _region_ids(b_codes, b_lpos, gran)
             tally = np.zeros(3, np.int64)
             for drng in draw_rngs:
@@ -454,7 +619,8 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
             dn[d_] = np.where((n_n > 0) & (n_e > 0), dnull, np.nan)
             cn[d_] = n_n
         out_null[gk] = {"delta": dn, "n": cn}
-    null_part = {"out": out_null, "stats": stats} if null else None
+    null_part = ({"out": out_null, "stats": stats, "type": null_type}
+                 if null else None)
     return cell, out, decay, null_part
 
 
@@ -788,14 +954,10 @@ def main(argv=None) -> None:
                          "genome-wide (not a few-region artifact). Adds two "
                          "columns (evenchr/oddchr AUC + perm-p).")
     ap.add_argument("--null", action="store_true",
-                    help="Also run the identical ladder on a DRAWN NULL: in "
-                         "each cell, every contact replaced by a non-contact "
-                         "pair of the cell's own ends in the same region at a "
-                         "matched distance (same depth, coverage, methylation "
-                         "and distance mix; no coordination).  Each cell's "
-                         "ends are split in two disjoint halves, one for E and "
-                         "one for the null, and the real Δ is computed against "
-                         "that same E.  WHY: at 1-3 pairs per region Δ's SPREAD "
+                    help="Also run the identical ladder on a DRAWN NULL with "
+                         "no coordination, --null-draws times; see "
+                         "--null-type for how it is drawn.  WHY: at 1-3 pairs "
+                         "per region Δ's SPREAD "
                          "depends on the methylation level, and regressing out "
                          "level, level^2 and coverage removes only its average "
                          "-- a random forest can still separate cell types "
@@ -803,6 +965,56 @@ def main(argv=None) -> None:
                          "evidence of coordination.  With --output-prefix also "
                          "writes the per-cell x region matrices, real and "
                          "null.")
+    ap.add_argument("--null-type", choices=["link-shuffle", "all-ends"],
+                    default="link-shuffle",
+                    help="How the null is drawn.  'link-shuffle' (default): "
+                         "each contact keeps its left end, and its partner is "
+                         "replaced by an end of ANOTHER long-range read pair "
+                         "(>= --min-distance) of the same cell, on the "
+                         "partner's side at a distance in the contact's own "
+                         "distance bin -- "
+                         "never the contact's own read pair, never re-forming "
+                         "any read pair of the cell.  The ends are the "
+                         "contacts' own kind, so real and null differ only in "
+                         "who is paired with whom.  Contacts with no such "
+                         "donor are left out of the real value AND the null "
+                         "(the matched arm); the run reports how many.  "
+                         "'all-ends': each contact replaced by a non-contact "
+                         "pair of ANY of the cell's read ends in the same "
+                         "region at a matched distance, from one half of a "
+                         "split of the ends (E from the other half).  It keeps "
+                         "every contact but also differs from the real in "
+                         "which ends are paired, so a difference between "
+                         "contact ends and other ends can pass for "
+                         "coordination.")
+    ap.add_argument("--null-scope", choices=["pooled", "cell"],
+                    default="pooled",
+                    help="Where a link-shuffle donor comes from.  'pooled' "
+                         "(default): ANOTHER cell of the anchor's stratum "
+                         "(--null-strata), so it can never re-form a read "
+                         "pair and there are many candidates per contact.  "
+                         "'cell': the anchor's own cell -- at single-cell "
+                         "depth most contacts then have one candidate or "
+                         "none, every draw repeats it, and the null comes out "
+                         "far too narrow (a real value with no coordination "
+                         "landed 4 sd above it on synthetic cells).")
+    ap.add_argument("--null-strata", default="group",
+                    help="Comma-separated --samples columns that define a "
+                         "pooled link-shuffle stratum (default 'group', the "
+                         "cell type).  Adding a batch, e.g. group,exp_batch, "
+                         "keeps donors within a batch; a column with many "
+                         "levels leaves too few cells per stratum.")
+    ap.add_argument("--null-max-widen", type=int, default=2,
+                    help="Pooled link-shuffle: when a contact's own distance "
+                         "bin holds no donor, borrow from up to this many "
+                         "neighbouring bins on each side (default 2).  The "
+                         "run reports how often.")
+    ap.add_argument("--null-dist-bins-per-decade", type=int, default=None,
+                    help="Distance bins per decade the null is matched in "
+                         "(default 4 for link-shuffle, whose donors are "
+                         "scarce, 8 for all-ends).  More bins match distance "
+                         "more tightly and leave more contacts without a "
+                         "link-shuffle donor.")
     ap.add_argument("--null-full-ladder", action="store_true",
                     help="Run EVERY column of the ladder on each null draw.  "
                          "By default a draw computes only what the summary "
@@ -828,6 +1040,8 @@ def main(argv=None) -> None:
 
     grans = [g if g == "chrom" else int(g)
              for g in args.granularities.split(",")]
+    per_decade = (args.null_dist_bins_per_decade
+                  or (4 if args.null_type == "link-shuffle" else 8))
     in_dir = Path(args.input_dir)
     files = sorted(in_dir.glob("*.posteriors.parquet"))
     if not files:
@@ -849,19 +1063,63 @@ def main(argv=None) -> None:
                                      args.decay_min_distance + 1)),
                         int(args.decay_bins) + 1)
 
+    # Pooled link-shuffle: every cell's donor ends first, pooled by stratum.
+    from nome_hic_concordance import link_shuffle as _ls
+    cell_pool = [None] * len(files)
+    chrom_code = None
+    if (args.null and args.null_type == "link-shuffle"
+            and args.null_scope == "pooled"):
+        names_ = [f.stem.replace(".posteriors", "") for f in files]
+        cols_s = [c.strip() for c in args.null_strata.split(",") if c.strip()]
+        stratum = pd.Series("all", index=names_)
+        for j, col in enumerate(cols_s):
+            v = (_load_column(args.samples, col).reindex(names_)
+                 .fillna("NA").astype(str))
+            stratum = v if j == 0 else stratum + "|" + v
+        if args.n_threads > 1 and len(files) > 1:
+            from joblib import Parallel, delayed
+            ends = Parallel(n_jobs=args.n_threads)(
+                delayed(cell_donor_ends)(f, args.min_distance,
+                                         args.min_gch_sites) for f in files)
+        else:
+            ends = [cell_donor_ends(f, args.min_distance, args.min_gch_sites)
+                    for f in files]
+        chrom_code = {c: i for i, c in
+                      enumerate(sorted({c for e in ends for c in e}))}
+        by_stratum: dict = {}
+        for i, e in enumerate(ends):
+            if e:
+                by_stratum.setdefault(stratum.iloc[i], {})[i] = (
+                    np.concatenate([chrom_code[c] * _ls.GENOME_STRIDE
+                                    + e[c][0] for c in e]),
+                    np.concatenate([e[c][1] for c in e]))
+        pools = {k: _ls.build_pool(v) for k, v in by_stratum.items()}
+        empty = _ls.build_pool({})
+        cell_pool = [pools.get(stratum.iloc[i], empty)
+                     for i in range(len(files))]
+        sizes = [len(v) for v in by_stratum.values()]
+        print(f"[ep-existence] link-shuffle donors from other cells of the "
+              f"same {'x'.join(cols_s) or 'run'}: {len(pools)} strata, "
+              f"median {int(np.median(sizes)) if sizes else 0} cells, "
+              f"{sum(pl[0].size for pl in pools.values()):,} donor ends")
+
     if args.n_threads > 1 and len(files) > 1:
         from joblib import Parallel, delayed
         results = Parallel(n_jobs=args.n_threads, verbose=5)(
             delayed(process_cell)(f, grans, args.min_distance, args.max_distance,
                                    args.min_gch_sites, args.max_ends_per_chrom,
                                    args.random_seed + i, dbins, args.null,
-                                   args.null_draws)
+                                   args.null_draws, args.null_type, per_decade,
+                                   cell_pool[i], i, chrom_code,
+                                   args.null_max_widen)
             for i, f in enumerate(files))
     else:
         results = [process_cell(f, grans, args.min_distance, args.max_distance,
                                 args.min_gch_sites, args.max_ends_per_chrom,
                                 args.random_seed + i, dbins, args.null,
-                                args.null_draws)
+                                args.null_draws, args.null_type, per_decade,
+                                cell_pool[i], i, chrom_code,
+                                args.null_max_widen)
                    for i, f in enumerate(files)]
     nulls = {c: nl for c, d, _dec, nl in results if d}
     results = [(c, d, dec) for c, d, dec, _nl in results if d]
@@ -1071,11 +1329,28 @@ def main(argv=None) -> None:
         if args.null:
             st = np.sum([nulls[c]["stats"].get(gk, (0, 0, 0))
                          for c in cells if nulls[c]], axis=0)
-            tot = max(int(np.sum(st)), 1)
-            print(f"[ep-existence] null pairs at {gk}: {st[0] / tot:.1%} at a "
-                  f"matched distance, {st[1] / tot:.1%} in the region at "
-                  f"another distance, {st[2] / tot:.1%} none (left "
-                  f"unobserved)")
+            if (args.null_type == "link-shuffle"
+                    and args.null_scope == "pooled"):
+                n_c = max(int(np.sum(st)), 1)
+                print(f"[ep-existence] link-shuffle at {gk}: of {n_c:,} "
+                      f"contacts, {st[0] / n_c:.1%} got a donor from another "
+                      f"cell in their own distance bin, {st[1] / n_c:.1%} "
+                      f"from a widened bin, {st[2] / n_c:.1%} none (left out "
+                      f"of the real value and the null alike).")
+            elif args.null_type == "link-shuffle":
+                n_c = max(int(st[0] + st[1]), 1)
+                print(f"[ep-existence] link-shuffle at {gk}: "
+                      f"{st[0] / n_c:.1%} of {n_c:,} contacts have a donor "
+                      f"and form the matched arm (real and null alike); "
+                      f"{st[1] / n_c:.1%} have none and are left out of "
+                      f"both; {int(st[2]):,} draw(s) found no valid donor "
+                      f"after retries.")
+            else:
+                tot = max(int(np.sum(st)), 1)
+                print(f"[ep-existence] null pairs at {gk}: {st[0] / tot:.1%} "
+                      f"at a matched distance, {st[1] / tot:.1%} in the "
+                      f"region at another distance, {st[2] / tot:.1%} none "
+                      f"(left unobserved)")
         region_keys = list(all_regions)       # aligned with D columns
         keep_cols = np.ones(all_regions.size, dtype=bool)
         # Region-observation filter: drop sparsely-observed regions so the

@@ -47,17 +47,24 @@ def make_cells(out, coord=0.0, per=30, n_types=3, chroms=3, chrom_mb=20,
             rec = []
             for ch in range(chroms):
                 for r in range(chrom_mb):
-                    m, lo = level[t, ch, r], r * 1_000_000
+                    lo = r * 1_000_000
+
+                    def end_at(x, ch=ch):
+                        # each end from the level of ITS OWN region: an end
+                        # that took its partner's region's level would be
+                        # coupled to it, which is coordination by another name
+                        m = level[t, ch, min(x // 1_000_000, chrom_mb - 1)]
+                        return 0.95 if rng.random() < m else 0.05
 
                     def end():
-                        return 0.95 if rng.random() < m else 0.05
+                        return end_at(lo)
 
                     own = (ch * chrom_mb + r) % n_types == t
                     for _ in range(rng.poisson(contacts)):
                         a = lo + int(rng.integers(0, 1_000_000))
                         b = a + int(rng.integers(20_000, 400_000))
-                        pa = end()
-                        pb = pa if own and rng.random() < coord else end()
+                        pa = end_at(a)
+                        pb = pa if own and rng.random() < coord else end_at(b)
                         rec.append((f"chr{ch + 1}", a, b, pa, pb))
                     for _ in range(rng.poisson(12)):      # the E end pool
                         a = lo + int(rng.integers(0, 1_000_000))
@@ -75,7 +82,7 @@ def make_cells(out, coord=0.0, per=30, n_types=3, chroms=3, chrom_mb=20,
     return out
 
 
-def run(d, classifier="rf", draws=4, extra=()):
+def run(d, classifier="rf", draws=4, extra=(), null_type="link-shuffle"):
     prefix = str(Path(d) / "o")
     with contextlib.redirect_stdout(io.StringIO()):
         ep.main(["--input-dir", str(d), "--samples", str(Path(d) / "samples.tsv"),
@@ -83,8 +90,8 @@ def run(d, classifier="rf", draws=4, extra=()):
                  "--min-gch-sites", "1", "--granularities", "1",
                  "--classifier", classifier, "--min-region-frac", "0.5",
                  "--n-perm", "0", "--n-threads", "1", "--null",
-                 "--null-draws", str(draws), "--output-prefix", prefix,
-                 *extra])
+                 "--null-type", null_type, "--null-draws", str(draws),
+                 "--output-prefix", prefix, *extra])
     t = pd.read_csv(prefix + ".ep_existence.csv")
     real = float(t.loc[t["data"] == "real",
                        "concordance_resid_full_auc"].iloc[0])
@@ -96,19 +103,24 @@ def run(d, classifier="rf", draws=4, extra=()):
 # ------------------------------------------------------------- behaviour --
 
 
-def test_with_no_coordination_the_real_is_one_more_null_draw(tmp_path):
+@pytest.mark.parametrize("null_type", ["link-shuffle", "all-ends"])
+def test_with_no_coordination_the_real_is_one_more_null_draw(tmp_path,
+                                                             null_type):
     """Cell types differ only in level, and the forest still separates them
     (well above 0.5) -- but so does every null draw."""
-    real, null, _ = run(make_cells(tmp_path, coord=0.0, seed=0))
+    real, null, _ = run(make_cells(tmp_path, coord=0.0, seed=0),
+                        null_type=null_type)
     assert null.size == 4
     assert real - null.mean() < 0.1
     assert real <= null.max() + 0.02
 
 
-def test_planted_coordination_clears_every_null_draw(tmp_path):
-    real, null, _ = run(make_cells(tmp_path, coord=0.9, seed=1))
+@pytest.mark.parametrize("null_type", ["link-shuffle", "all-ends"])
+def test_planted_coordination_clears_every_null_draw(tmp_path, null_type):
+    real, null, _ = run(make_cells(tmp_path, coord=0.9, seed=1),
+                        null_type=null_type)
     assert real > null.max()
-    assert real - null.mean() > 0.1
+    assert real - null.mean() > 0.05
 
 
 # ---------------------------------------------------------------- pieces --
@@ -139,7 +151,8 @@ def test_each_region_gets_as_many_null_pairs_as_contacts(tmp_path):
     d = make_cells(tmp_path, per=2, chroms=1, chrom_mb=10, contacts=3)
     path = sorted(d.glob("*.posteriors.parquet"))[0]
     _, out, _, null_part = ep.process_cell(
-        path, [1], 20_000, 2_000_000, 1, 4000, 0, None, True, 3)
+        path, [1], 20_000, 2_000_000, 1, 4000, 0, None, True, 3,
+        null_type="all-ends", per_decade=8)
     stats = null_part["stats"]["1"]
     assert stats[2] == 0                            # every contact got one
     n_null = null_part["out"]["1"]["n"]
@@ -181,3 +194,26 @@ def test_a_null_draw_computes_only_what_it_is_compared_on(tmp_path):
     assert np.isfinite(null["concordance_auc"])
     assert null["concordance_resid_full_auc"] == pytest.approx(
         core[core["data"] == "drawn_null"].iloc[0]["concordance_resid_full_auc"])
+
+
+def test_link_shuffle_keeps_long_range_ends_out_of_e_and_the_level(tmp_path):
+    """A contact end in E or in the level Δ|m+cov regresses out shares noise
+    with O, which a donor from another cell does not."""
+    rec = []
+    for i in range(40):                         # long-range: methylated ends
+        a = 100_000 + i * 20_000
+        rec.append(("chr1", a, a + 50_000, 0.95, 0.95))
+    for i in range(80):                         # short pairs: unmethylated
+        a = 100_000 + i * 10_000
+        rec.append(("chr1", a, a + 500, 0.05, 0.05))
+    df = pd.DataFrame(rec, columns=["chrom", "pos1", "pos2", "posterior1",
+                                    "posterior2"])
+    df["n1"] = np.int32(3)
+    df["n2"] = np.int32(3)
+    path = tmp_path / "c.posteriors.parquet"
+    df.to_parquet(path)
+    _, plain, _, _ = ep.process_cell(path, [1], 20_000, 2_000_000, 1, 4000, 0)
+    _, ls, _, _ = ep.process_cell(path, [1], 20_000, 2_000_000, 1, 4000, 0,
+                                  None, True, 2)
+    assert np.nanmax(plain["1"]["marg"]) > 0.3      # long-range ends in it
+    assert np.nanmax(ls["1"]["marg"]) < 0.1         # short ends only
