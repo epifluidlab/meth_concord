@@ -57,6 +57,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from nome_hic_concordance import batch_correction as bc
+from nome_hic_concordance.utils import manifest_text
 from nome_hic_concordance import imputation
 
 logger = logging.getLogger("bc_under_mle")
@@ -66,14 +67,13 @@ SOFT_KEYS = ["k_open", "k_closed", "k_mixed", "n_linked",
 
 
 def _load_samples(path: str) -> pd.DataFrame:
-    with open(path) as fh:
-        first = fh.readline().strip()
+    first = manifest_text(path).readline().strip()   # first non-comment line
     first_field = first.split("\t")[0].strip().lower()
     has_header = first_field in (
         "cell_name", "cellname", "cell", "sample", "sample_name",
     )
     if has_header:
-        df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+        df = pd.read_csv(manifest_text(path), sep="\t", dtype=str)
         df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
         if "cellname" in df.columns:
             df = df.rename(columns={"cellname": "cell_name"})
@@ -83,7 +83,7 @@ def _load_samples(path: str) -> pd.DataFrame:
             df = df.rename(columns={"sample": "cell_name"})
     else:
         df = pd.read_csv(
-            path, sep="\t", header=None, comment="#",
+            manifest_text(path), sep="\t", header=None,
             names=["cell_name", "bam_path", "group"], dtype=str,
         )
     return df

@@ -54,12 +54,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from nome_hic_concordance.utils import manifest_text
 
 _MULT = 100_000_000      # region_id = chrom_code * _MULT + bin_index
 
 
 def _load_labels(path: str) -> pd.Series:
-    df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+    df = pd.read_csv(manifest_text(path), sep="\t", dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "cell_name" not in df.columns:
         df = df.rename(columns={"cell": "cell_name"} if "cell" in df.columns
@@ -71,7 +72,7 @@ def _load_labels(path: str) -> pd.Series:
 
 def _load_column(path: str, col: str) -> pd.Series:
     """Read an arbitrary per-cell column (e.g. batch) from the samples TSV."""
-    df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+    df = pd.read_csv(manifest_text(path), sep="\t", dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "cell_name" not in df.columns:
         df = df.rename(columns={"cell": "cell_name"} if "cell" in df.columns

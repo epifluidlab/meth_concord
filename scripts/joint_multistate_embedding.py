@@ -50,6 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from nome_hic_concordance import coordination_eval as ce
+from nome_hic_concordance.utils import manifest_text
 from nome_hic_concordance import joint_embedding as je
 from nome_hic_concordance.joint_coordination import (
     JOINT_CHANNELS, build_matrices, process_cell, scan_priors,
@@ -57,7 +58,7 @@ from nome_hic_concordance.joint_coordination import (
 
 
 def _labels(path: str) -> pd.Series:
-    df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+    df = pd.read_csv(manifest_text(path), sep="\t", dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "cell_name" not in df.columns:
         df = df.rename(columns={"cell": "cell_name"} if "cell" in df.columns
@@ -68,7 +69,7 @@ def _labels(path: str) -> pd.Series:
 
 
 def _column(path: str, col: str) -> pd.Series:
-    df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+    df = pd.read_csv(manifest_text(path), sep="\t", dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "cell_name" not in df.columns:
         df = df.rename(columns={"cell": "cell_name"} if "cell" in df.columns

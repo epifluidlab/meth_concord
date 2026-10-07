@@ -45,6 +45,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from nome_hic_concordance import batch_correction as bc
+from nome_hic_concordance.utils import manifest_text
 from nome_hic_concordance import imputation
 
 logger = logging.getLogger("dm_vs_mle")
@@ -53,7 +54,7 @@ SOFT_KEYS = ["k_open", "k_closed", "k_mixed", "n_linked",
 
 
 def _load_samples(path):
-    df = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+    df = pd.read_csv(manifest_text(path), sep="\t", dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "cell_name" not in df.columns:
         # Accept 'cell' (e.g. samples.filtered.with_batches.tsv) or fall back
