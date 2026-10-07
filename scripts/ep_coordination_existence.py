@@ -476,7 +476,8 @@ def _zcols(X: np.ndarray) -> np.ndarray:
     return np.where(sd < 1e-12, 0.0, Xc / np.where(sd < 1e-12, 1.0, sd))
 
 
-def _cv_rf(X: np.ndarray, y: np.ndarray, n_folds: int, seed: int):
+def _cv_rf(X: np.ndarray, y: np.ndarray, n_folds: int, seed: int,
+           n_jobs: int = 1):
     """5-fold CV AUC with a random forest (binary → AUC, multiclass → OvR-macro).
 
     Tree ensembles weight any feature regardless of its variance, so — unlike
@@ -499,7 +500,7 @@ def _cv_rf(X: np.ndarray, y: np.ndarray, n_folds: int, seed: int):
         if len(np.unique(yy[tr])) < 2 or len(np.unique(yy[te])) < 2:
             continue
         clf = RandomForestClassifier(n_estimators=300, max_features="sqrt",
-                                     n_jobs=1, random_state=seed)
+                                     n_jobs=n_jobs, random_state=seed)
         clf.fit(X[tr], yy[tr]); prob = clf.predict_proba(X[te])
         aucs.append(roc_auc_score(yy[te], prob[:, 1]) if nc == 2 else
                     roc_auc_score(yy[te], prob, multi_class="ovr", average="macro"))
@@ -565,17 +566,18 @@ def _residualize_against(R: np.ndarray, B: np.ndarray) -> np.ndarray:
     return R - Bz @ beta
 
 
-def _make_clf(method: str, seed: int):
+def _make_clf(method: str, seed: int, n_jobs: int = 1):
     if method == "rf":
         from sklearn.ensemble import RandomForestClassifier
         return RandomForestClassifier(n_estimators=300, max_features="sqrt",
-                                      n_jobs=1, random_state=seed)
+                                      n_jobs=n_jobs, random_state=seed)
     from sklearn.linear_model import LogisticRegression
     return LogisticRegression(max_iter=2000, solver="lbfgs", multi_class="ovr",
                               C=1.0)
 
 
-def _cv_predict(X: np.ndarray, y: np.ndarray, method: str, n_folds: int, seed: int):
+def _cv_predict(X: np.ndarray, y: np.ndarray, method: str, n_folds: int,
+                seed: int, n_jobs: int = 1):
     """Pooled out-of-fold predictions for an ROC curve.
 
     Binary → (y∈{0,1}, positive-class score).  Multiclass → micro-averaged
@@ -594,14 +596,14 @@ def _cv_predict(X: np.ndarray, y: np.ndarray, method: str, n_folds: int, seed: i
     if nc == 2:
         score = np.full(len(yy), np.nan)
         for tr, te in skf.split(X, yy):
-            clf = _make_clf(method, seed).fit(X[tr], yy[tr])
+            clf = _make_clf(method, seed, n_jobs).fit(X[tr], yy[tr])
             score[te] = clf.predict_proba(X[te])[:, 1]
         ok = np.isfinite(score)
         return yy[ok].astype(float), score[ok]
     Yb = label_binarize(yy, classes=list(range(nc)))
     P = np.full((len(yy), nc), np.nan)
     for tr, te in skf.split(X, yy):
-        clf = _make_clf(method, seed).fit(X[tr], yy[tr])
+        clf = _make_clf(method, seed, n_jobs).fit(X[tr], yy[tr])
         P[te] = clf.predict_proba(X[te])
     ok = np.isfinite(P).all(axis=1)
     return Yb[ok].ravel().astype(float), P[ok].ravel()
@@ -871,7 +873,10 @@ def main(argv=None) -> None:
 
     def _score(X, yy):
         if method == "rf":
-            return _cv_rf(X, yy, args.n_folds, args.random_seed)
+            # Permutations already run one process per thread; without
+            # them the forest gets the threads.  Same trees either way.
+            return _cv_rf(X, yy, args.n_folds, args.random_seed,
+                          n_jobs=1 if args.n_perm > 0 else args.n_threads)
         return _cv_auc(X, yy, n_folds=args.n_folds, random_state=args.random_seed)
 
     def _prep(Xstd):
@@ -956,10 +961,9 @@ def main(argv=None) -> None:
                     pd.DataFrame(R2resid[:, ~mA]))))
         if args.output_prefix and label == "real":   # out-of-fold preds for ROC
             roc_data[gk] = {
-                "Δ": _cv_predict(Xc, y, method, args.n_folds, args.random_seed),
-                "Δ|m": _cv_predict(Xr, y, method, args.n_folds, args.random_seed),
-                "Δ|m+cov": _cv_predict(Xr2, y, method, args.n_folds,
-                                       args.random_seed)}
+                name: _cv_predict(X_, y, method, args.n_folds,
+                                  args.random_seed, args.n_threads)
+                for name, X_ in (("Δ", Xc), ("Δ|m", Xr), ("Δ|m+cov", Xr2))}
         sh = (f"  | even {shA:.3f}({shAp:.3f}) odd {shB:.3f}({shBp:.3f})"
               if args.split_half else "")
         bt = (f"  | Δ|m+cov+batch {b3mean:.3f}({b3p:.3f})"
