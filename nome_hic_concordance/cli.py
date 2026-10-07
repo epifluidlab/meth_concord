@@ -369,6 +369,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "about K+1 times one run.  Default 3.",
     )
     parser.add_argument(
+        "--null-type", choices=["link-shuffle", "all-ends"],
+        default="link-shuffle",
+        help="How the drawn null's pairs are made.  'link-shuffle' "
+             "(default): each contact keeps its left end, and its partner "
+             "becomes an end of a long-range read pair from ANOTHER cell of "
+             "the same --null-strata stratum, in the same bin, on the "
+             "partner's side, at a distance in the contact's own log bin -- "
+             "the same kind of ends, only paired differently.  Contacts with "
+             "no donor are left out of the null; the run reports how many.  "
+             "E is then built from the ends of short read pairs only, so no "
+             "contact end sits in it (with them, O and E share noise that a "
+             "donor from another cell does not, and the null came out more "
+             "cell-type separable than the real on synthetic cells).  "
+             "'all-ends': random non-contact pairs of half of the bin's "
+             "ends, E from the other half.")
+    parser.add_argument(
+        "--null-strata", default="group",
+        help="Comma-separated --samples columns whose combination is a "
+             "link-shuffle donor stratum (default 'group', the cell type).  "
+             "Add a batch, e.g. group,exp_batch, to keep donors within a "
+             "batch; a column with many levels leaves too few cells per "
+             "stratum for short contacts to find a donor.")
+    parser.add_argument(
+        "--null-max-widen", type=int, default=2,
+        help="Link-shuffle: a contact whose own distance bin holds no donor "
+             "may borrow from up to this many neighbouring bins on each side "
+             "(default 2).")
+    parser.add_argument(
+        "--null-dist-bins-per-decade", type=int, default=4,
+        help="Link-shuffle: log distance bins per decade a donor is matched "
+             "in (default 4).")
+    parser.add_argument(
         "--null-graph", choices=["own", "shared"], default="own",
         help="How the drawn null is imputed.  'own' (default): each draw "
              "goes through the whole calculation as if its pairs were the "
@@ -1492,6 +1524,19 @@ def run_context(
                     f"{cbc_cols} (score-level uses "
                     f"{args.batch_column or 'nothing'}).")
 
+    # Link-shuffle donor strata for step 5's drawn null.
+    null_strata = None
+    if getattr(args, "null_strata", None):
+        ns_cols = [c.strip() for c in args.null_strata.split(",")
+                   if c.strip()]
+        missing = [c for c in ns_cols if c not in samples.columns]
+        if missing:
+            raise ValueError(
+                f"--null-strata {missing} not in {args.samples}. "
+                f"Available columns: {samples.columns.tolist()}")
+        null_strata = (samples.set_index("cell_name")[ns_cols].astype(str)
+                       .agg("|".join, axis=1))
+
     if args.batch_correction == "auto":
         batch_correction = "harmony" if batch_labels is not None else "none"
     else:
@@ -1789,6 +1834,10 @@ def run_context(
                 emit_null=(args.emit_null or args.null_rank or args.null_z),
                 null_draws=args.null_draws,
                 null_graph=args.null_graph,
+                null_type=args.null_type,
+                null_strata=null_strata,
+                null_max_widen=args.null_max_widen,
+                null_dist_bins_per_decade=args.null_dist_bins_per_decade,
                 null_rank=args.null_rank,
                 null_z=args.null_z,
                 null_rank_scope=args.null_rank_scope,
@@ -1842,6 +1891,10 @@ def run_context(
                 # The sweep reads only Δ; the null rides along on the observed's
                 # graph rather than costing a full RWR run per draw per setting.
                 null_graph="shared",
+                null_type=args.null_type,
+                null_strata=null_strata,
+                null_max_widen=args.null_max_widen,
+                null_dist_bins_per_decade=args.null_dist_bins_per_decade,
                 null_rank=args.null_rank,
                 null_z=args.null_z,
                 null_rank_scope=args.null_rank_scope,

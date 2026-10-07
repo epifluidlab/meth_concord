@@ -131,3 +131,45 @@ def draw_link_shuffle(anchor_g, d, own_cell: int, pool, own_g, dbins, rng,
             cand = cand[pool_cell[cand] != own_cell]
             donor_p[dr, i] = pool_p[rng.choice(cand)]
     return donor_p, level
+
+
+def read_donor_ends(posteriors_path, min_distance: int,
+                    min_sites: int) -> dict:
+    """{chrom: (positions, posteriors)} of one cell's donor ends: every end
+    with a call (``n >= min_sites``) of a read pair at least
+    ``min_distance`` long."""
+    import pandas as pd
+    df = pd.read_parquet(posteriors_path,
+                         columns=["chrom", "pos1", "pos2", "n1", "n2",
+                                  "posterior1", "posterior2"])
+    chrom = df["chrom"].astype(str).to_numpy()
+    pos1 = df["pos1"].to_numpy(np.int64)
+    pos2 = df["pos2"].to_numpy(np.int64)
+    p1 = df["posterior1"].to_numpy(np.float64, na_value=np.nan)
+    p2 = df["posterior2"].to_numpy(np.float64, na_value=np.nan)
+    lr = np.abs(pos2 - pos1) >= int(min_distance)
+    m1 = lr & (df["n1"].to_numpy() >= min_sites) & np.isfinite(p1)
+    m2 = lr & (df["n2"].to_numpy() >= min_sites) & np.isfinite(p2)
+    ch = np.concatenate([chrom[m1], chrom[m2]])
+    pos = np.concatenate([pos1[m1], pos2[m2]])
+    pp = np.concatenate([p1[m1], p2[m2]])
+    return {c: (pos[ch == c], pp[ch == c]) for c in np.unique(ch)}
+
+
+def pools_by_stratum(ends_by_cell: list, strata: list) -> tuple[list, dict]:
+    """Per-cell pools from ``ends_by_cell[i]`` ({chrom: (pos, p)}) grouped
+    by ``strata[i]``.  Returns (the pool for each cell, the chromosome
+    codes used for genome coordinates)."""
+    chrom_code = {c: i for i, c in enumerate(sorted({c for e in ends_by_cell
+                                                     for c in e}))}
+    grouped: dict = {}
+    for i, e in enumerate(ends_by_cell):
+        if e:
+            grouped.setdefault(strata[i], {})[i] = (
+                np.concatenate([chrom_code[c] * GENOME_STRIDE + e[c][0]
+                                for c in e]),
+                np.concatenate([e[c][1] for c in e]))
+    pools = {k: build_pool(v) for k, v in grouped.items()}
+    empty = build_pool({})
+    return [pools.get(strata[i], empty) for i in range(len(ends_by_cell))], \
+        chrom_code

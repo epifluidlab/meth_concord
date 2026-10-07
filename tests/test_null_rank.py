@@ -443,9 +443,11 @@ def test_every_null_flag_reaches_step_five():
     params = set(inspect.signature(
         cc.compute_signed_concordance_matrix).parameters)
     flags = set(re.findall(r'"--(null-[a-z-]+)"', src))
-    assert flags == {"null-draws", "null-graph", "null-rank", "null-z",
-                     "null-rank-scope", "null-rank-statistics",
-                     "null-rank-min-pairs", "null-rank-min-pool"}
+    assert flags == {"null-draws", "null-graph", "null-type", "null-strata",
+                     "null-max-widen", "null-dist-bins-per-decade",
+                     "null-rank", "null-z", "null-rank-scope",
+                     "null-rank-statistics", "null-rank-min-pairs",
+                     "null-rank-min-pool"}
     for flag in flags:
         kw = flag.replace("-", "_")
         assert kw in params, f"--{flag} has no {kw} parameter on step 5"

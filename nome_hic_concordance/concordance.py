@@ -978,9 +978,26 @@ def _compute_cell_dm_expected(
     random_state: int = 42,
     null_split: bool = False,
     null_draws: int = 1,
+    link_pool=None,
+    cell_id: int = -1,
+    chrom_code: dict | None = None,
+    per_decade: int = 4,
+    max_widen: int = 2,
 ) -> tuple[str, dict[str, dict[str, float]]]:
     """Per-(cell, bin) expected soft counts (``_DM_KEYS``) from a non-contact
     end-pair null.
+
+    ``link_pool`` (this cell's stratum, from :mod:`.link_shuffle`) draws a
+    LINK-SHUFFLE null instead of the split-ends one: each contact keeps its
+    left end, and its partner is an end of a long-range read pair from
+    ANOTHER cell of the stratum, in the same bin, on the partner's side at a
+    distance in the contact's own log bin (``per_decade`` per decade,
+    widened by up to ``max_widen`` bins when that holds none).  E is then
+    built from the ends of SHORT read pairs only (< ``min_distance``): with
+    the contacts' own ends in its pool, O and E share noise that a donor
+    from another cell does not, and the null comes out more cell-type
+    separable than the real (measured on synthetic cells).  A bin with
+    fewer than two such ends falls back to all its ends.
 
     The null pool for a bin is its own informative read ends (those of any
     pair, regardless of partner location); with ``dm_window_bins > 0`` it is
@@ -1026,6 +1043,16 @@ def _compute_cell_dm_expected(
     e_bin = (e_pos // bsz)
     ends = pd.DataFrame({"chrom": e_chrom, "bin": e_bin, "pos": e_pos, "p": e_p})
     ends_by_bin = {key: g for key, g in ends.groupby(["chrom", "bin"], sort=False)}
+    link = link_pool is not None
+    if link:
+        sh = np.abs(pos2 - pos1) < int(min_distance)
+        s1, s2 = inf1 & sh, inf2 & sh
+        sp = np.concatenate([pos1[s1], pos2[s2]])
+        short = pd.DataFrame({"chrom": np.concatenate([chrom[s1], chrom[s2]]),
+                              "bin": sp // bsz, "pos": sp,
+                              "p": np.concatenate([p1[s1], p2[s2]])})
+        short_by_bin = {key: g for key, g in
+                        short.groupby(["chrom", "bin"], sort=False)}
 
     # Every read pair whose two ends could both be in a pool, by chromosome.
     # A re-pairing that lands on one IS a contact, so the expected and the
@@ -1058,14 +1085,43 @@ def _compute_cell_dm_expected(
     # by random_state keeps the per-cell decorrelation while letting a
     # --random-seed sweep actually perturb the subsample.
     seed_base = (zlib.crc32(cell_name.encode("utf-8")) + int(random_state)) % (2 ** 31)
+    n_draws = max(1, int(null_draws))
+    if link:
+        # Every contact's donors, all bins at once; per bin below.
+        from . import link_shuffle as _ls
+        codes = pd.Series(chrom).map(chrom_code).to_numpy(np.int64)
+        own_g, _ = _ls.donor_ends(codes, pos1, pos2, p1, p2, inf1, inf2,
+                                  int(min_distance))
+        crow = np.flatnonzero(linked)            # obs row i is crow[i]
+        lo_c = np.minimum(pos1, pos2)[crow]
+        hi_c = np.maximum(pos1, pos2)[crow]
+        p_lo = np.where(pos1 <= pos2, p1, p2)[crow]   # the anchor's call
+        start = codes[crow] * _ls.GENOME_STRIDE + (lo_c // bsz) * bsz
+        ls_donor, ls_level = _ls.draw_link_shuffle(
+            codes[crow] * _ls.GENOME_STRIDE + lo_c, hi_c - lo_c, int(cell_id),
+            link_pool, np.sort(own_g),
+            _ls.log_dbins(int(min_distance),
+                          int(max_distance) if max_distance else bsz,
+                          int(per_decade)),
+            np.random.default_rng(seed_base + 31_337), n_draws=n_draws,
+            bounds=(start, start + bsz), max_widen=int(max_widen))
+
+    def _pool_of(by_bin, c, b):
+        if dm_window_bins > 0:
+            pool = [by_bin[(c, bb)] for bb in range(int(b) - dm_window_bins,
+                    int(b) + dm_window_bins + 1) if (c, bb) in by_bin]
+            return pd.concat(pool) if pool else None
+        return by_bin.get((c, int(b)))
+
     for (c, b), og in obs.groupby(["chrom", "bin"], sort=False):
         # Assemble the (optionally windowed) end pool for this bin.
-        if dm_window_bins > 0:
-            pool = [ends_by_bin[(c, bb)] for bb in range(int(b) - dm_window_bins,
-                    int(b) + dm_window_bins + 1) if (c, bb) in ends_by_bin]
-            ep_df = pd.concat(pool) if pool else None
+        e_fallback = 0.0
+        if link:
+            ep_df = _pool_of(short_by_bin, c, b)
+            if ep_df is None or len(ep_df) < 2:
+                ep_df, e_fallback = _pool_of(ends_by_bin, c, b), 1.0
         else:
-            ep_df = ends_by_bin.get((c, int(b)))
+            ep_df = _pool_of(ends_by_bin, c, b)
         if ep_df is None or len(ep_df) < 2:
             continue
         null_pos = null_p = None
@@ -1101,6 +1157,26 @@ def _compute_cell_dm_expected(
                 seed=seed_base + int(b), contact_keys=_ckeys,
             )
         _entry_null = {}
+        if link:
+            ix = og.index.to_numpy()
+            pa_ = p_lo[ix]
+            for _d in range(n_draws):
+                dp = ls_donor[_d, ix]
+                got = np.isfinite(dp)
+                a_, b_ = pa_[got], dp[got]
+                _ko, _kc, _km, _kn = _null_keys(_d)
+                _entry_null[_ko] = float(np.sum(a_ * b_))
+                _entry_null[_kc] = float(np.sum((1.0 - a_) * (1.0 - b_)))
+                _entry_null[_km] = float(np.sum(a_ * (1.0 - b_)
+                                                + (1.0 - a_) * b_))
+                _entry_null[_kn] = float(got.sum())
+            # Diagnostics, summed and logged like n_dm_fallback.
+            lv = ls_level[ix]
+            _entry_null["n_null_wanted"] = float(len(og) * n_draws)
+            _entry_null["n_ls_own_bin"] = float((lv == 0).sum())
+            _entry_null["n_ls_widened"] = float((lv > 0).sum())
+            _entry_null["n_ls_none"] = float((lv < 0).sum())
+            _entry_null["n_e_all_ends"] = e_fallback
         if null_split:
             # How many null pairs this cell-bin asked for, whether or not it
             # got them: a bin under 4 read ends has no half to draw from,
@@ -1806,6 +1882,10 @@ def compute_signed_concordance_matrix(
     emit_null: bool = False,
     null_draws: int = 1,
     null_graph: str = "own",
+    null_type: str = "all-ends",
+    null_strata: pd.Series | None = None,
+    null_max_widen: int = 2,
+    null_dist_bins_per_decade: int = 4,
     null_rank: bool = False,
     null_z: bool = False,
     null_rank_scope: str = "cell",
@@ -1879,6 +1959,22 @@ def compute_signed_concordance_matrix(
     rwr_k, rwr_restart_prob, rwr_n_refine_passes, rwr_solver,
     rwr_max_iter, rwr_tol :
         RWR parameters; see :mod:`nome_hic_concordance.imputation`.
+    null_type : {"all-ends", "link-shuffle"}
+        How a drawn null's pairs are made.  "all-ends" (this function's
+        default): random non-contact pairs of one half of the bin's read
+        ends, E from the other half.  "link-shuffle" (the CLI's default):
+        each contact keeps its left end and its partner becomes an end of a
+        long-range read pair from ANOTHER cell of its ``null_strata``
+        stratum, in the same bin, on the partner's side, at a distance in
+        the contact's own log bin (``null_dist_bins_per_decade``, widened by
+        up to ``null_max_widen`` bins where empty).  The same kind of ends,
+        paired differently.  E is then built from short-read-pair ends only
+        -- see :func:`_compute_cell_dm_expected` -- and contacts with no
+        donor are left out of the null.
+    null_strata : Series, optional
+        cell -> stratum label for link-shuffle donors (e.g. the cell type,
+        or type x batch); cells without one share an "NA" stratum.  None:
+        one stratum for the run.
     rwr_init : {"accessibility", "coordination"}
         What the cell graph is built from.  "accessibility" (default):
         pass 0 from mean accessibility (methylation for HCG), refinement
@@ -1942,6 +2038,10 @@ def compute_signed_concordance_matrix(
     if dm_prior not in ("separate", "shared"):
         raise ValueError(
             f"dm_prior must be 'separate' or 'shared'; got {dm_prior!r}.")
+    if null_type not in ("all-ends", "link-shuffle"):
+        raise ValueError(
+            f"null_type must be 'all-ends' or 'link-shuffle'; got "
+            f"{null_type!r}.")
     if null_graph not in ("own", "shared"):
         raise ValueError(
             f"null_graph must be 'own' or 'shared'; got {null_graph!r}.")
@@ -2027,24 +2127,50 @@ def compute_signed_concordance_matrix(
                     f"Distance-matched expected baseline: window=±{dm_window_bins} "
                     f"bins ({dm_window_mb} Mb), dist-bin={dm_dist_bin:,} bp"
                 )
+            link = emit_null and null_type == "link-shuffle"
+            cell_pool = [None] * len(items)
+            chrom_code = None
+            if link:
+                # Every cell's donor ends first, then one pool per stratum.
+                from . import link_shuffle as _ls
+                if n_threads > 1 and len(items) > 1:
+                    ends_ = Parallel(n_jobs=n_threads)(
+                        delayed(_ls.read_donor_ends)(path, min_distance,
+                                                     min_gch_sites)
+                        for _, path in items)
+                else:
+                    ends_ = [_ls.read_donor_ends(path, min_distance,
+                                                 min_gch_sites)
+                             for _, path in items]
+                strata_ = (["all"] * len(items) if null_strata is None else
+                           [str(null_strata.get(cn, "NA"))
+                            if pd.notna(null_strata.get(cn, np.nan))
+                            else "NA" for cn, _ in items])
+                cell_pool, chrom_code = _ls.pools_by_stratum(ends_, strata_)
+                n_ends = sum(v[0].size for e in ends_ for v in e.values())
+                logger.info(
+                    f"Drawn null: link-shuffle -- each contact keeps its "
+                    f"left end and takes as partner a long-range read end "
+                    f"from ANOTHER cell of its stratum ({len(set(strata_))} "
+                    f"strata, {n_ends:,} donor ends), same bin, matched "
+                    f"distance.")
+            _dm_args = [(path, cell_name, bin_size, min_distance,
+                         min_gch_sites, dm_window_bins, dm_dist_bin, 400,
+                         dm_mode, max_distance, random_state,
+                         emit_null and not link, null_draws)
+                        for cell_name, path in items]
+            _dm_kw = [dict(link_pool=cell_pool[i], cell_id=i,
+                           chrom_code=chrom_code,
+                           per_decade=null_dist_bins_per_decade,
+                           max_widen=null_max_widen) if link else {}
+                      for i in range(len(items))]
             if n_threads > 1 and len(items) > 1:
                 per_cell_dm = Parallel(n_jobs=n_threads)(
-                    delayed(_compute_cell_dm_expected)(
-                        path, cell_name, bin_size, min_distance, min_gch_sites,
-                        dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
-                        random_state, emit_null, null_draws,
-                    )
-                    for cell_name, path in items
-                )
+                    delayed(_compute_cell_dm_expected)(*a, **k)
+                    for a, k in zip(_dm_args, _dm_kw))
             else:
-                per_cell_dm = [
-                    _compute_cell_dm_expected(
-                        path, cell_name, bin_size, min_distance, min_gch_sites,
-                        dm_window_bins, dm_dist_bin, 400, dm_mode, max_distance,
-                        random_state, emit_null, null_draws,
-                    )
-                    for cell_name, path in items
-                ]
+                per_cell_dm = [_compute_cell_dm_expected(*a, **k)
+                               for a, k in zip(_dm_args, _dm_kw)]
             # Merge dm entries into the soft-count entries (same bin ids).
             dm_by_cell = {cn: d for cn, d in per_cell_dm}
             for cn, c in per_cell:
@@ -2089,7 +2215,28 @@ def compute_signed_concordance_matrix(
                 _kept = sum(e.get(_null_keys(_d)[3], 0.0)
                             for d in dm_by_cell.values() for e in d.values()
                             for _d in range(max(1, int(null_draws))))
-                if _kept > 0:
+                if link:
+                    # A donor from another cell can never re-form a read
+                    # pair; what there is to report is how well it matched.
+                    _sum = lambda k: sum(e.get(k, 0.0)          # noqa: E731
+                                         for d in dm_by_cell.values()
+                                         for e in d.values())
+                    _own, _wid, _no = (_sum("n_ls_own_bin"),
+                                       _sum("n_ls_widened"),
+                                       _sum("n_ls_none"))
+                    _n = max(_own + _wid + _no, 1.0)
+                    _eb = _sum("n_e_all_ends")
+                    _ncb = sum(1 for d in dm_by_cell.values()
+                               for e in d.values() if "n_ls_none" in e)
+                    logger.info(
+                        f"Drawn null (link-shuffle): of {_n:,.0f} contacts, "
+                        f"{_own / _n:.1%} got a donor at their own distance "
+                        f"bin, {_wid / _n:.1%} from a widened bin, and "
+                        f"{_no / _n:.1%} none -- those are left out of the "
+                        f"null.  E came from short-read-pair ends in "
+                        f"{1 - _eb / max(_ncb, 1):.1%} of {_ncb:,} cell-bins "
+                        f"(the rest had too few and used all their ends).")
+                elif _kept > 0:
                     logger.info(
                         f"Drawn null: {_hit:,.0f} of {_hit + _kept:,.0f} "
                         f"random pairings ({_hit / (_hit + _kept):.2%}) "
