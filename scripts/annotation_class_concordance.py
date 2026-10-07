@@ -17,7 +17,10 @@ partner) -- under up to four annotation systems:
             enhancer, transcribed, polycomb, heterochromatin, quiescent)
   pmd       PMD / HMD domains
 
-so the ordered class pairs are A-A, A-B, B-A, B-B, early-late, ... .
+plus any --annotation NAME=BED (a labelled BED's labels, or a plain BED's
+inside / outside).  A contact's class pair is UNORDERED -- which end lies on
+the left means nothing, so A-B and B-A are one pair -- unless
+--ordered-pairs asks for the split as a check.
 
 THE OBSERVED, per cell c and class pair (K1, K2) in a distance band:
 
@@ -34,16 +37,23 @@ twice a covariance, and so scales with the class's own variance -- a mostly
 closed class has a small C at any correlation -- so r = C / (2 sd sd) is
 reported beside it for comparing classes.
 
-THE NULL reshuffles the same links.  Each contact keeps its anchor; its
-partner is replaced by an end of ANOTHER cell's contact of the same stratum
-(cell type, optionally x --null-match-column), in the SAME CLASS as the real
-partner, at a distance in the contact's own log-distance bin, inside the real
-partner's --position-bin bin; within a draw no donor goes to two contacts
-(nome_hic_concordance.link_shuffle.assign_stratum).  The donor is centred on
-its OWN cell's marginal.  A contact with no such donor is left out of the
-observed and the null alike.  Two independent draws: Δ = C - C_null1 is the
-contrast; C_null2 - C_null1 is the NEGATIVE CONTROL -- what Δ looks like
-with no concordance at all, at the same depth, on the same anchors.
+THE NULL reshuffles the same links, at BOTH ends.  Keeping the left end,
+the right one is replaced by an end of ANOTHER cell's contact of the same
+stratum (cell type, optionally x --null-match-column), in the SAME CLASS as
+the end it replaces, at a distance in the contact's own log-distance bin,
+inside that end's --position-bin bin; within a draw no donor goes to two
+contacts (nome_hic_concordance.link_shuffle.assign_stratum).  Then the
+mirror image: the right end kept, the left one replaced.  The null product
+is the mean of the two, so neither end is privileged -- reshuffling the
+right end only made early-late draw late donors and late-early early ones,
+and the two orientations drifted apart.  Donors are centred on their OWN
+cell's marginal.  A contact enters only if both ends have a donor.  Two
+independent draws: Δ = C - C_null1 is the contrast; C_null2 - C_null1 is
+the NEGATIVE CONTROL -- what Δ looks like with no concordance at all, at
+the same depth, on the same contacts.  A class pair x distance band with
+fewer than --min-band-pairs contacts is flagged 'sparse' and not drawn
+(cross-class pairs barely exist at short range: two ends 1-30 kb apart are
+in different replication-timing classes only at a domain boundary).
 
 CELL-TO-CELL VARIATION is read against that control.  Per cell, Δ carries
 sampling noise; the control carries the same noise and nothing else, so
@@ -134,9 +144,10 @@ class Intervals:
     """Non-overlapping intervals per chromosome, each with a class code;
     ``lookup`` gives a position's code, -1 outside every interval."""
 
-    def __init__(self, name, classes, chrom, start, end, code):
+    def __init__(self, name, classes, chrom, start, end, code, outside=-1):
         self.name = name
         self.classes = tuple(classes)
+        self.outside = int(outside)    # code off the intervals (-1: none)
         df = pd.DataFrame({"chrom": [_canon(c) for c in chrom],
                            "start": np.asarray(start, np.int64),
                            "end": np.asarray(end, np.int64),
@@ -156,12 +167,46 @@ class Intervals:
             if t is None:
                 continue
             sel = np.flatnonzero(codes == j)
+            if self.outside >= 0:
+                out[sel] = self.outside
             s, e, k = t
             i = np.searchsorted(s, pos[sel], side="right") - 1
             ok = i >= 0
             ok[ok] = pos[sel][ok] < e[i[ok]]
             out[sel[ok]] = k[i[ok]]
         return out
+
+
+def _merged(df: pd.DataFrame) -> pd.DataFrame:
+    """Overlapping or touching intervals merged, per chromosome."""
+    out = []
+    for c, g in df.groupby("chrom", sort=False):
+        g = g.sort_values("start")
+        st, en = g["start"].to_numpy(), g["end"].to_numpy()
+        new = np.r_[True, st[1:] > np.maximum.accumulate(en)[:-1]]
+        out.append(pd.DataFrame({
+            "chrom": c, "start": st[new],
+            "end": np.maximum.reduceat(en, np.flatnonzero(new))}))
+    return pd.concat(out, ignore_index=True) if out else df
+
+
+def read_annotation(name, path, max_labels: int = 12) -> Intervals:
+    """Any BED as an annotation system.  With a 4th column of at most
+    ``max_labels`` distinct labels, its labels are the classes (the BED's
+    intervals must not overlap); otherwise two classes, inside the
+    (merged) intervals and outside them -- e.g. LAD / non-LAD."""
+    df = pd.read_csv(path, sep="\t", header=None, comment="#",
+                     compression="infer", dtype={0: str})
+    if df.shape[1] >= 4 and df[3].astype(str).nunique() <= max_labels:
+        lab = df[3].astype(str)
+        classes = tuple(dict.fromkeys(sorted(lab.unique())))
+        code = lab.map({c: i for i, c in enumerate(classes)})
+        return Intervals(name, classes, df[0], df[1], df[2], code)
+    iv = _merged(pd.DataFrame({"chrom": df[0].astype(str),
+                               "start": df[1].astype(np.int64),
+                               "end": df[2].astype(np.int64)}))
+    return Intervals(name, (name, f"non-{name}"), iv["chrom"], iv["start"],
+                     iv["end"], np.zeros(len(iv), int), outside=1)
 
 
 def read_pmd(path, class_col: int = 5, common_only: bool = False) -> Intervals:
@@ -444,40 +489,71 @@ def _pool(g, v, cell):
 
 def reshuffle(g_lo, g_hi, d, cell, x_cls, y_cls, a_c, p_c, stratum, n_cls,
               dbins, position_bin, max_widen, seed):
-    """Two null draws of a CENTRED partner for every contact.
+    """Two null draws for BOTH ends of every contact.
 
-    Per stratum and partner class K: the donors are both ends of the
-    stratum's contacts that sit in K (``a_c``/``p_c``: each end's posterior
-    centred on its own cell's class marginal); every contact whose partner
-    is in K gets one per draw from another cell, at a distance in its own
-    log bin, inside its partner's ``position_bin`` bin, never a donor
-    another contact got in that draw.  Returns (level, null draws 2 x n,
-    reused): level -1 = no donor."""
+    The right end first: keep the left end, and replace the right one by a
+    donor -- an end of another cell's contact in the same stratum, in the
+    right end's class, at a distance in the contact's own log bin, inside
+    the right end's ``position_bin`` bin, never a donor another contact got
+    in that draw (link_shuffle.assign_stratum).  Then the mirror image: keep
+    the right end and replace the left one, from donors to ITS left, in the
+    left end's class and bin.  Reshuffling only one end would make the null
+    depend on which end sits on the left -- an early-late contact would
+    always draw a late donor and a late-early one an early donor -- so
+    orientations that should agree could not.  Donor values are centred on
+    their own cell's class marginal (``a_c``/``p_c`` for every end).
+
+    Returns (ok, right 2 x n, left 2 x n, reused): ``ok`` -- both ends have
+    a donor; ``right``/``left`` -- the centred donor of each end per draw."""
     n = g_lo.size
-    level = np.full(n, -1, np.int64)
-    null = np.full((2, n), np.nan)
-    reused = 0
+    right = np.full((2, n), np.nan)
+    left = np.full((2, n), np.nan)
+    lv_r = np.full(n, -1, np.int64)
+    lv_l = np.full(n, -1, np.int64)
+    usable = (x_cls >= 0) & (y_cls >= 0) & np.isfinite(a_c) & np.isfinite(p_c)
     pb = np.int64(position_bin)
+    # Mirror: g -> M - g turns "to the left" into "to the right".
+    M = np.int64(max(int(g_hi.max()) if n else 0, 0)
+                 + int(np.ceil(dbins[-1])) + int(pb) + 2)
+    reused = 0
     for s in np.unique(stratum):
         in_s = stratum == s
         for k in range(n_cls):
             lo_k = in_s & (x_cls == k) & np.isfinite(a_c)
             hi_k = in_s & (y_cls == k) & np.isfinite(p_c)
-            ask = np.flatnonzero(in_s & (y_cls == k) & (x_cls >= 0)
-                                 & np.isfinite(a_c) & np.isfinite(p_c))
-            if ask.size == 0 or not (lo_k.any() or hi_k.any()):
+            if not (lo_k.any() or hi_k.any()):
                 continue
-            pool = _pool(np.concatenate([g_lo[lo_k], g_hi[hi_k]]),
-                         np.concatenate([a_c[lo_k], p_c[hi_k]]),
-                         np.concatenate([cell[lo_k], cell[hi_k]]))
-            start = (g_hi[ask] // pb) * pb
-            lv, _, dp, ru = _ls.assign_stratum(
-                g_lo[ask], d[ask], cell[ask], pool, pool, dbins,
-                np.random.default_rng([seed, zlib.crc32(str(s).encode()), k]),
-                n_draws=2, bounds=(start, start + pb), max_widen=max_widen)
-            level[ask], null[:, ask] = lv, dp
-            reused += ru
-    return level, null, reused
+            pg = np.concatenate([g_lo[lo_k], g_hi[hi_k]])
+            pv = np.concatenate([a_c[lo_k], p_c[hi_k]])
+            pc = np.concatenate([cell[lo_k], cell[hi_k]])
+            key = zlib.crc32(str(s).encode())
+            for side, ask in (("right", np.flatnonzero(usable & in_s
+                                                       & (y_cls == k))),
+                              ("left", np.flatnonzero(usable & in_s
+                                                      & (x_cls == k)))):
+                if ask.size == 0:
+                    continue
+                rng = np.random.default_rng([seed, key, k,
+                                             0 if side == "right" else 1])
+                if side == "right":
+                    pool = _pool(pg, pv, pc)
+                    start = (g_hi[ask] // pb) * pb
+                    lv, _, dp, ru = _ls.assign_stratum(
+                        g_lo[ask], d[ask], cell[ask], pool, pool, dbins, rng,
+                        n_draws=2, bounds=(start, start + pb),
+                        max_widen=max_widen)
+                    lv_r[ask], right[:, ask] = lv, dp
+                else:
+                    pool = _pool(M - pg, pv, pc)
+                    b0 = (g_lo[ask] // pb) * pb
+                    lv, _, dp, ru = _ls.assign_stratum(
+                        M - g_hi[ask], d[ask], cell[ask], pool, pool, dbins,
+                        rng, n_draws=2, bounds=(M - b0 - pb + 1, M - b0 + 1),
+                        max_widen=max_widen)
+                    lv_l[ask], left[:, ask] = lv, dp
+                reused += ru
+    ok = usable & (lv_r >= 0) & (lv_l >= 0)
+    return ok, right, left, reused
 
 
 # -------------------------------------------------------------- statistics --
@@ -816,7 +892,9 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
     if summary.empty or "delta_r" not in summary:
         return
     ctxs = list(dict.fromkeys(summary["context"]))
-    systems = [x for x in SYSTEMS if x in set(summary["system"])]
+    systems = ([x for x in SYSTEMS if x in set(summary["system"])]
+               + [x for x in dict.fromkeys(summary["system"])
+                  if x not in SYSTEMS])
     all_b = next(b for b in dict.fromkeys(summary["band"])
                  if str(b).startswith("all"))
     rows = []
@@ -885,7 +963,7 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
             if ci == 0:
                 lo_, hi_ = ax.get_ylim()
                 ax.set_ylim(lo_, hi_ + 0.35 * (hi_ - lo_))   # room for key
-                ax.set_title(f"d  By distance ({SYSTEM_LABEL[dsys]})",
+                ax.set_title(f"d  By distance ({SYSTEM_LABEL.get(dsys, dsys)})",
                              loc="left")
                 ax.legend(ncol=4, fontsize=5, handlelength=1.6,
                           columnspacing=0.8, loc="upper left")
@@ -957,7 +1035,8 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
             tr = ax_g.get_yaxis_transform()
             ax_g.plot([1.04, 1.04], [a0 - 0.35, a1 + 0.35], color="0.4",
                       lw=0.7, transform=tr, clip_on=False)
-            ax_g.text(1.08, (a0 + a1) / 2, SYSTEM_LABEL[sy], transform=tr,
+            ax_g.text(1.08, (a0 + a1) / 2, SYSTEM_LABEL.get(sy, sy),
+                      transform=tr,
                       va="center", ha="left", fontsize=6, color="0.25",
                       rotation=90 if a1 - a0 >= 3 else 0)
         if note:
@@ -1068,6 +1147,21 @@ def main(argv=None) -> int:
                     help="1-based column holding PMD / HMD (5).")
     ap.add_argument("--pmd-common-only", action="store_true",
                     help="Use column 6's commonPMD / commonHMD instead.")
+    ap.add_argument("--annotation", action="append", default=None,
+                    metavar="NAME=BED",
+                    help="Any further annotation, repeatable: a BED whose "
+                         "4th column holds up to 12 labels is classed by "
+                         "label; any other BED is inside vs outside its "
+                         "intervals (e.g. LAD=lads.bed gives LAD / non-LAD).")
+    ap.add_argument("--ordered-pairs", action="store_true",
+                    help="Keep a contact's class pair ordered (left end "
+                         "first) -- A-B apart from B-A.  Only as a check: "
+                         "the orientation means nothing, and with the "
+                         "two-ended null the two should agree.")
+    ap.add_argument("--min-band-pairs", type=int, default=500,
+                    help="A class pair x distance band with fewer contacts "
+                         "is flagged sparse and left out of the figures "
+                         "(500).")
     ap.add_argument("--gene-annotation", default=None,
                     help="GTF/BED for --ab-orient genes; --genome fills it.")
     ap.add_argument("--genome", default=None,
@@ -1132,6 +1226,13 @@ def main(argv=None) -> int:
                                       args.pmd_common_only)
         else:
             logger.warning("pmd: needs --pmd; skipped")
+    for k, v in _parse_pairs(args.annotation).items():
+        if k in SYSTEMS:
+            sys.exit(f"--annotation {k}: that name is a built-in system")
+        rv = enr._resolve(v, cache, f"annotation {k}")
+        if rv:
+            systems[k] = read_annotation(k, rv)
+            logger.info(f"annotation {k}: classes {systems[k].classes}")
 
     from joblib import Parallel, delayed
     first = next(iter(contexts.values()))
@@ -1229,8 +1330,10 @@ def main(argv=None) -> int:
         logger.info(f"{ctx}: {lo.size:,} contacts in {len(cells):,} cells")
         dbins = _ls.log_dbins(args.min_distance, args.max_distance,
                               args.bins_per_decade)
-        for si, name in enumerate(s for s in SYSTEMS
-                                  if s in systems or (s == "ab" and ab_maps)):
+        order = ([x for x in SYSTEMS if x in systems
+                  or (x == "ab" and ab_maps)]
+                 + [x for x in systems if x not in SYSTEMS])
+        for si, name in enumerate(order):
             classes = (ab_maps["__all__"].classes if name == "ab"
                        else systems[name].classes)
             n_k = len(classes)
@@ -1244,22 +1347,25 @@ def main(argv=None) -> int:
                 np.int64)
             a_c = np.where(kx >= 0, a - mu[cell, np.maximum(kx, 0)], np.nan)
             p_c = np.where(ky >= 0, p - mu[cell, np.maximum(ky, 0)], np.nan)
-            level, null, reused = reshuffle(
+            ok, right, left, reused = reshuffle(
                 g_lo, g_hi, dist, cell, kx, ky, a_c, p_c, stratum[cell], n_k,
-                dbins,
-                args.position_bin, args.max_widen,
+                dbins, args.position_bin, args.max_widen,
                 seed=args.seed + 7919 * ci_ctx + si)
-            ok = (level >= 0) & np.isfinite(a_c) & np.isfinite(p_c)
+            # The pair's classes, unordered unless asked: which end of a
+            # contact lies on the left carries no meaning.
+            if args.ordered_pairs:
+                k1s, k2s = kx, ky
+            else:
+                k1s, k2s = np.minimum(kx, ky), np.maximum(kx, ky)
             for k1 in range(n_k):
                 for k2 in range(n_k):
-                    s_ = (kx == k1) & (ky == k2)
+                    s_ = (k1s == k1) & (k2s == k2) & (kx >= 0) & (ky >= 0)
+                    if not s_.any():
+                        continue
                     cov_rows.append({
                         "context": ctx, "system": name, "anchor": classes[k1],
                         "partner": classes[k2], "contacts": int(s_.sum()),
-                        "with_donor": float(ok[s_].mean()) if s_.any()
-                        else np.nan,
-                        "own_bin": float((level[s_] == 0).mean())
-                        if s_.any() else np.nan})
+                        "with_donor": float(ok[s_].mean())})
             cov_rows.append({"context": ctx, "system": name,
                              "anchor": "any", "partner": "any",
                              "contacts": int(lo.size),
@@ -1269,9 +1375,12 @@ def main(argv=None) -> int:
                              else np.nan,
                              "donors_shared": reused / max(2 * ok.sum(), 1)})
             idx = np.flatnonzero(ok)
-            acc = accumulate(cell[idx], kx[idx], ky[idx], band[idx],
-                             half[idx], a_c[idx] * p_c[idx],
-                             a_c[idx] * null[0, idx], a_c[idx] * null[1, idx],
+            x_, y_ = a_c[idx], p_c[idx]
+            # null product: the mean of reshuffling either end
+            n1 = 0.5 * (x_ * right[0, idx] + left[0, idx] * y_)
+            n2 = 0.5 * (x_ * right[1, idx] + left[1, idx] * y_)
+            acc = accumulate(cell[idx], k1s[idx], k2s[idx], band[idx],
+                             half[idx], x_ * y_, n1, n2,
                              len(cells), n_k, len(edges) - 1)
             summary_rows += summarize(acc, sd, mu, cells, types, classes,
                                       band_labels, edges, args.min_pairs,
@@ -1310,6 +1419,9 @@ def main(argv=None) -> int:
     percell = (pd.concat(percell_rows, ignore_index=True) if percell_rows
                else pd.DataFrame())
     summary = pd.DataFrame(summary_rows)
+    if not summary.empty:
+        summary["ordered"] = bool(args.ordered_pairs)
+        summary["sparse"] = summary["pairs"] < args.min_band_pairs
     percell.to_csv(out / "percell.tsv.gz", sep="\t", index=False)
     summary.to_csv(out / "summary.tsv", sep="\t", index=False)
     pd.DataFrame(marg_rows).to_csv(out / "marginal_summary.tsv", sep="\t",
@@ -1317,10 +1429,11 @@ def main(argv=None) -> int:
     pd.DataFrame(cov_rows).to_csv(out / "coverage.tsv", sep="\t", index=False)
     for (ctx, name), s in summary.groupby(["context", "system"], sort=False):
         pc = percell[(percell["context"] == ctx) & (percell["system"] == name)]
-        plot(s, pc, out / f"fig_{ctx}_{name}.{args.plot_format}",
+        plot(s[~s["sparse"] | s["band"].str.startswith("all")], pc,
+             out / f"fig_{ctx}_{name}.{args.plot_format}",
              f"{ctx} — {name}: long-range concordance by class pair")
     plot_main(summary, percell, out / f"main_figure.{args.plot_format}",
-              note=args.figure_note)
+              note=args.figure_note, min_band_pairs=args.min_band_pairs)
     logger.info(f"wrote {out}")
     return 0
 

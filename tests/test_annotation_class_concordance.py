@@ -237,3 +237,54 @@ def test_intervals_lookup_edges_and_chrom_names():
     got = iv.lookup(["1", "chr1", "chr1", "chr2", "chr3"],
                     [99, 100, 200, 10, 10])
     assert got.tolist() == [0, 1, -1, 1, -1]
+
+
+# -------------------------------------------------------------- symmetry --
+
+
+def test_both_ends_are_reshuffled_from_their_own_side_and_class():
+    """Two cells, one contact each, each the other's only donor: the right
+    end's donor lies to the right in the right end's class and bin, the
+    left end's to the left in the left end's -- mirrored, not borrowed."""
+    S = acc._ls.GENOME_STRIDE
+    g_lo = np.array([1_000_000, 1_010_000], np.int64) + S
+    g_hi = np.array([1_050_000, 1_060_000], np.int64) + S
+    ok, right, left, _ = acc.reshuffle(
+        g_lo, g_hi, g_hi - g_lo, np.array([0, 1]), np.array([0, 0]),
+        np.array([1, 1]), np.array([0.4, 0.3]), np.array([-0.1, -0.2]),
+        np.array(["s", "s"]), 2, acc._ls.log_dbins(1000, 10_000_000, 4),
+        250_000, 2, seed=0)
+    assert ok.all()
+    assert right[:, 0].tolist() == [-0.2, -0.2]   # cell 1's right end
+    assert left[:, 0].tolist() == [0.3, 0.3]      # cell 1's left end
+    assert right[:, 1].tolist() == [-0.1, -0.1]
+    assert left[:, 1].tolist() == [0.4, 0.4]
+
+
+def test_pairs_are_unordered_unless_asked(planted, tmp_path):
+    s, _, _ = planted
+    pmd = s[s["system"] == "pmd"]
+    pairs = set(zip(pmd["anchor"], pmd["partner"]))
+    assert ("HMD", "PMD") in pairs and ("PMD", "HMD") not in pairs
+    d = make_data(tmp_path, per=8, seed=2)
+    s2, _, _ = run(d, systems="pmd", extra=("--ordered-pairs",))
+    pairs = set(zip(s2["anchor"], s2["partner"]))
+    assert ("HMD", "PMD") in pairs and ("PMD", "HMD") in pairs
+    assert s2["ordered"].all() and not s["ordered"].any()
+
+
+def test_a_plain_bed_is_inside_versus_outside(tmp_path):
+    p = tmp_path / "lad.bed"
+    pd.DataFrame([("chr1", 100, 200), ("chr1", 150, 300),
+                  ("chr1", 500, 600)]).to_csv(p, sep="\t", header=False,
+                                               index=False)
+    iv = acc.read_annotation("LAD", p)
+    assert iv.classes == ("LAD", "non-LAD")
+    got = iv.lookup(["chr1"] * 5 + ["chr2"], [50, 120, 250, 400, 550, 10])
+    assert got.tolist() == [1, 0, 0, 1, 0, -1]
+    q = tmp_path / "lab.bed"
+    pd.DataFrame([("chr1", 0, 100, "x"), ("chr1", 100, 200, "y")]).to_csv(
+        q, sep="\t", header=False, index=False)
+    lab = acc.read_annotation("st", q)
+    assert lab.classes == ("x", "y")
+    assert lab.lookup(["chr1"] * 3, [50, 150, 250]).tolist() == [0, 1, -1]
