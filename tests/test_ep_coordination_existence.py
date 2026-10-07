@@ -142,9 +142,10 @@ def test_each_region_gets_as_many_null_pairs_as_contacts(tmp_path):
         path, [1], 20_000, 2_000_000, 1, 4000, 0, None, True, 3)
     stats = null_part["stats"]["1"]
     assert stats[2] == 0                            # every contact got one
-    for draw in null_part["out"]:
-        for region, (_d, _m, n_real) in out["1"].items():
-            assert draw["1"][region][2] == n_real
+    n_null = null_part["out"]["1"]["n"]
+    assert n_null.shape == (3, out["1"]["keys"].size)
+    for draw in n_null:                             # same regions, same keys
+        assert np.array_equal(draw, out["1"]["n"])
 
 
 def test_without_null_nothing_changes_shape(tmp_path):
@@ -153,6 +154,8 @@ def test_without_null_nothing_changes_shape(tmp_path):
     cell, out, _, null_part = ep.process_cell(path, [1], 20_000, 2_000_000,
                                               1, 4000, 0, None)
     assert null_part is None and set(out) == {"1"}
+    o = out["1"]
+    assert o["keys"].size == o["delta"].size == o["marg"].size == o["n"].size
 
 
 def test_the_csv_tags_the_draws_and_the_matrices_are_written(tmp_path):
@@ -163,3 +166,18 @@ def test_the_csv_tags_the_draws_and_the_matrices_are_written(tmp_path):
     for stem in ("delta", "delta_null", "delta_mcov", "delta_mcov_null"):
         m = pd.read_parquet(d / f"o.1mb.{stem}.parquet")
         assert m.shape[1] > 0 and str(m.columns[0]).startswith("chr")
+
+
+def test_a_null_draw_computes_only_what_it_is_compared_on(tmp_path):
+    """Two forests per draw by default; every column with the flag."""
+    d = make_cells(tmp_path, per=8, chroms=2, chrom_mb=10)
+    _, _, core = run(d, classifier="lr", draws=1)
+    null = core[core["data"] == "drawn_null"].iloc[0]
+    assert np.isfinite(null["concordance_resid_full_auc"])
+    assert np.isnan(null["concordance_auc"]) and np.isnan(null["missingness_auc"])
+    _, _, full = run(d, classifier="lr", draws=1,
+                     extra=("--null-full-ladder",))
+    null = full[full["data"] == "drawn_null"].iloc[0]
+    assert np.isfinite(null["concordance_auc"])
+    assert null["concordance_resid_full_auc"] == pytest.approx(
+        core[core["data"] == "drawn_null"].iloc[0]["concordance_resid_full_auc"])

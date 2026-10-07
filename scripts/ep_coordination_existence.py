@@ -230,10 +230,13 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
                  min_gch: int, cap: int, seed: int, decay_dbins: np.ndarray = None,
                  null: bool = False, null_draws: int = 1):
     """Per-(region) Δ_signed (log2 O/E) + mean openness for one cell, at each
-    granularity.  Fully vectorized.  Returns (cell, {gran: {region:(Δ,marg,n_o)}},
-    decay, null_part) where ``decay`` holds distance-binned soft-agreement
-    sums/counts for contacts (O) and the random null (E) — for the Hi-C-style
-    distance plot.
+    granularity.  Fully vectorized.  Returns (cell, {gran: {"keys", "delta",
+    "marg", "n"}}, decay, null_part): per granularity the cell's region names
+    and, aligned with them, Δ, mean openness and contact count -- arrays, not
+    a dict per region, since 1,577 cells x three granularities x the null
+    draws would otherwise be tens of millions of Python objects.  ``decay``
+    holds distance-binned soft-agreement sums/counts for contacts (O) and the
+    random null (E) — for the Hi-C-style distance plot.
 
     ``null``: also the same Δ with each contact replaced by a NON-contact pair
     of this cell's ends in the same region at a matched distance -- what the
@@ -244,8 +247,9 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
     that same E, so real and null differ only in their O pairs.  The split
     is fixed and ``null_draws`` independent sets of null pairs are drawn from
     it, so the real Δ is the same for every draw.  ``null_part`` is ``{"out":
-    [{gran: {region: (Δ_null, marg, n_null)}} per draw], "stats": {gran:
-    (matched, other distance, none)}}``, or None."""
+    {gran: {"delta": (draws x regions), "n": (draws x regions)}}, "stats":
+    {gran: (matched, other distance, none)}}`` on the same region keys, or
+    None."""
     cell = path.stem
     if cell.endswith(".posteriors"):
         cell = cell[: -len(".posteriors")]
@@ -372,7 +376,7 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
     eps = 1e-6
     out: dict = {}
     n_draws = max(1, int(null_draws)) if null else 0
-    out_null: list = [{} for _ in range(n_draws)]
+    out_null: dict = {}
     stats: dict = {}
     draw_rngs = [np.random.default_rng(seed + 104_729 + 1_000_003 * d)
                  for d in range(n_draws)]
@@ -400,9 +404,10 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
         all_ids = np.unique(np.concatenate([ids_o, ids_e, ids_m]))
         R = all_ids.shape[0]
         if R == 0:
-            out[gk] = {}
-            for od in out_null:
-                od[gk] = {}
+            out[gk] = {"keys": np.empty(0, str), "delta": np.empty(0),
+                       "marg": np.empty(0), "n": np.empty(0, np.int32)}
+            out_null[gk] = {"delta": np.empty((n_draws, 0)),
+                            "n": np.empty((n_draws, 0), np.int32)}
             continue
 
         def place(ids, vals, fill=0.0):
@@ -430,10 +435,14 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
         else:
             keys = np.char.add(np.char.add(names.astype(str), ":"),
                                bins.astype(str))
-        out[gk] = {str(keys[i]): (float(delta[i]), float(marg[i]), int(n_o[i]))
-                   for i in range(R)}
+        out[gk] = {"keys": np.asarray(keys).astype(str), "delta": delta,
+                   "marg": marg, "n": n_o.astype(np.int32)}
+        if not null:
+            continue
         # Same E, same formula; only the O pairs differ.
-        for od, (ids_n, (no_s, nc_s), nn) in zip(out_null, draws_):
+        dn = np.empty((n_draws, R))
+        cn = np.empty((n_draws, R), np.int32)
+        for d_, (ids_n, (no_s, nc_s), nn) in enumerate(draws_):
             n_n = place(ids_n, nn.astype(float))
             with np.errstate(divide="ignore", invalid="ignore"):
                 no_ = place(ids_n, no_s) / n_n
@@ -442,9 +451,9 @@ def process_cell(path: Path, granularities: list, min_d: int, max_d: int,
                           - np.log2(np.clip(ee, eps, None)))
                          - (np.log2(np.clip(nc_, eps, None))
                             - np.log2(np.clip(ec, eps, None))))
-            dnull = np.where((n_n > 0) & (n_e > 0), dnull, np.nan)
-            od[gk] = {str(keys[i]): (float(dnull[i]), float(marg[i]),
-                                     int(n_n[i])) for i in range(R)}
+            dn[d_] = np.where((n_n > 0) & (n_e > 0), dnull, np.nan)
+            cn[d_] = n_n
+        out_null[gk] = {"delta": dn, "n": cn}
     null_part = {"out": out_null, "stats": stats} if null else None
     return cell, out, decay, null_part
 
@@ -477,7 +486,7 @@ def _zcols(X: np.ndarray) -> np.ndarray:
 
 
 def _cv_rf(X: np.ndarray, y: np.ndarray, n_folds: int, seed: int,
-           n_jobs: int = 1):
+           n_jobs: int = 1, n_trees: int = 300):
     """5-fold CV AUC with a random forest (binary → AUC, multiclass → OvR-macro).
 
     Tree ensembles weight any feature regardless of its variance, so — unlike
@@ -499,7 +508,7 @@ def _cv_rf(X: np.ndarray, y: np.ndarray, n_folds: int, seed: int,
     for tr, te in skf.split(X, yy):
         if len(np.unique(yy[tr])) < 2 or len(np.unique(yy[te])) < 2:
             continue
-        clf = RandomForestClassifier(n_estimators=300, max_features="sqrt",
+        clf = RandomForestClassifier(n_estimators=n_trees, max_features="sqrt",
                                      n_jobs=n_jobs, random_state=seed)
         clf.fit(X[tr], yy[tr]); prob = clf.predict_proba(X[te])
         aucs.append(roc_auc_score(yy[te], prob[:, 1]) if nc == 2 else
@@ -566,18 +575,22 @@ def _residualize_against(R: np.ndarray, B: np.ndarray) -> np.ndarray:
     return R - Bz @ beta
 
 
-def _make_clf(method: str, seed: int, n_jobs: int = 1):
+def _make_clf(method: str, seed: int, n_jobs: int = 1, n_trees: int = 300):
     if method == "rf":
         from sklearn.ensemble import RandomForestClassifier
-        return RandomForestClassifier(n_estimators=300, max_features="sqrt",
+        return RandomForestClassifier(n_estimators=n_trees, max_features="sqrt",
                                       n_jobs=n_jobs, random_state=seed)
+    # OvR via OneVsRestClassifier: LogisticRegression(multi_class="ovr") is
+    # deprecated in scikit-learn 1.5 and gone in 1.7.  Same K one-vs-rest fits
+    # (component_analysis._cv_auc made the same switch).
     from sklearn.linear_model import LogisticRegression
-    return LogisticRegression(max_iter=2000, solver="lbfgs", multi_class="ovr",
-                              C=1.0)
+    from sklearn.multiclass import OneVsRestClassifier
+    return OneVsRestClassifier(LogisticRegression(max_iter=2000,
+                                                  solver="lbfgs", C=1.0))
 
 
 def _cv_predict(X: np.ndarray, y: np.ndarray, method: str, n_folds: int,
-                seed: int, n_jobs: int = 1):
+                seed: int, n_jobs: int = 1, n_trees: int = 300):
     """Pooled out-of-fold predictions for an ROC curve.
 
     Binary → (y∈{0,1}, positive-class score).  Multiclass → micro-averaged
@@ -596,14 +609,14 @@ def _cv_predict(X: np.ndarray, y: np.ndarray, method: str, n_folds: int,
     if nc == 2:
         score = np.full(len(yy), np.nan)
         for tr, te in skf.split(X, yy):
-            clf = _make_clf(method, seed, n_jobs).fit(X[tr], yy[tr])
+            clf = _make_clf(method, seed, n_jobs, n_trees).fit(X[tr], yy[tr])
             score[te] = clf.predict_proba(X[te])[:, 1]
         ok = np.isfinite(score)
         return yy[ok].astype(float), score[ok]
     Yb = label_binarize(yy, classes=list(range(nc)))
     P = np.full((len(yy), nc), np.nan)
     for tr, te in skf.split(X, yy):
-        clf = _make_clf(method, seed, n_jobs).fit(X[tr], yy[tr])
+        clf = _make_clf(method, seed, n_jobs, n_trees).fit(X[tr], yy[tr])
         P[te] = clf.predict_proba(X[te])
     ok = np.isfinite(P).all(axis=1)
     return Yb[ok].ravel().astype(float), P[ok].ravel()
@@ -790,6 +803,18 @@ def main(argv=None) -> None:
                          "evidence of coordination.  With --output-prefix also "
                          "writes the per-cell x region matrices, real and "
                          "null.")
+    ap.add_argument("--null-full-ladder", action="store_true",
+                    help="Run EVERY column of the ladder on each null draw.  "
+                         "By default a draw computes only what the summary "
+                         "compares -- Δ|m+cov and, with --batch-column, "
+                         "Δ|m+cov+batch -- which is two forests per draw "
+                         "instead of seven.")
+    ap.add_argument("--rf-trees", type=int, default=300,
+                    help="Trees per random forest (default 300, as in the "
+                         "design-doc 6b results).  Fewer is proportionally "
+                         "faster and slightly noisier -- fine for a first "
+                         "look, but real and null always use the same "
+                         "number.")
     ap.add_argument("--null-draws", type=int, default=5, metavar="K",
                     help="Independent null draws with --null (default 5).  "
                          "With no coordination the real Δ is just one more "
@@ -876,7 +901,8 @@ def main(argv=None) -> None:
             # Permutations already run one process per thread; without
             # them the forest gets the threads.  Same trees either way.
             return _cv_rf(X, yy, args.n_folds, args.random_seed,
-                          n_jobs=1 if args.n_perm > 0 else args.n_threads)
+                          n_jobs=1 if args.n_perm > 0 else args.n_threads,
+                          n_trees=args.rf_trees)
         return _cv_auc(X, yy, n_folds=args.n_folds, random_state=args.random_seed)
 
     def _prep(Xstd):
@@ -912,9 +938,11 @@ def main(argv=None) -> None:
     roc_data: dict = {}
     marg_auc: dict = {}
 
-    def _ladder(gk, label, D, Mk, Cov, region_keys):
+    def _ladder(gk, label, D, Mk, Cov, region_keys, core=False):
         """The confound ladder on one cells x regions Δ matrix; prints its
-        line and returns (CSV row, the Δ|m+cov residual)."""
+        line and returns (CSV row, the Δ|m+cov residual).  ``core``: only
+        what a null draw is compared on -- Δ|m+cov and, with batches,
+        Δ|m+cov+batch; the other columns are left NaN."""
         n_reg = D.shape[1]
         covk_obs = Cov[keep][np.isfinite(Cov[keep])]
         med = int(np.median(covk_obs)) if covk_obs.size else 0
@@ -924,20 +952,23 @@ def main(argv=None) -> None:
         # PRESENCE, scHi-C-like).  A reference benchmark: if the residual AUC
         # ≈ the missingness AUC, the "signal" is just which regions a cell has
         # contacts in (coverage/contact-map), NOT epigenetic concordance.
-        Miss = np.isfinite(Dk).astype(np.float64)
-        Xc = _prep(_standardize(pd.DataFrame(Dk)))
-        Xmiss = _prep(_standardize(pd.DataFrame(Miss)))
         # Leakage controls: linear marginal, then marginal+marginal²+coverage.
-        Xr = _prep(_standardize(pd.DataFrame(_residualize(Dk, Mk))))
         R2resid = _residualize_multi(Dk, [Mk, Mk * Mk, Covk])
         Xr2 = _prep(_standardize(pd.DataFrame(R2resid)))
-        cmean, cstd, cp = _auc_perm(Xc)
-        rmean, rstd, rp = _auc_perm(Xr)
         r2mean, r2std, r2p = _auc_perm(Xr2)
         if gk not in marg_auc:            # the same for the real and the null
             marg_auc[gk] = _score(_prep(_standardize(pd.DataFrame(Mk))), y)
         mmean, mstd = marg_auc[gk]
-        missmean, _ = _score(Xmiss, y)
+        nan = float("nan")
+        cmean = cstd = cp = rmean = rstd = rp = missmean = nan
+        if not core:
+            Miss = np.isfinite(Dk).astype(np.float64)
+            Xc = _prep(_standardize(pd.DataFrame(Dk)))
+            Xmiss = _prep(_standardize(pd.DataFrame(Miss)))
+            Xr = _prep(_standardize(pd.DataFrame(_residualize(Dk, Mk))))
+            cmean, cstd, cp = _auc_perm(Xc)
+            rmean, rstd, rp = _auc_perm(Xr)
+            missmean, _ = _score(Xmiss, y)
         # Batch control: also strip per-batch offsets from Δ|m+cov.
         b3mean = b3p = np.nan
         if batch_oh is not None:
@@ -948,7 +979,7 @@ def main(argv=None) -> None:
         # significant => the signal is distributed genome-wide, not driven by a
         # few regions (rules out a region-specific artifact).
         shA = shAp = shB = shBp = np.nan
-        if args.split_half:
+        if args.split_half and not core:
             chrom_of = np.array([k.split(":")[0] for k in region_keys])
             uchr = sorted(set(chrom_of))
             setA = set(uchr[0::2])
@@ -962,7 +993,8 @@ def main(argv=None) -> None:
         if args.output_prefix and label == "real":   # out-of-fold preds for ROC
             roc_data[gk] = {
                 name: _cv_predict(X_, y, method, args.n_folds,
-                                  args.random_seed, args.n_threads)
+                                  args.random_seed, args.n_threads,
+                                  args.rf_trees)
                 for name, X_ in (("Δ", Xc), ("Δ|m", Xr), ("Δ|m+cov", Xr2))}
         sh = (f"  | even {shA:.3f}({shAp:.3f}) odd {shB:.3f}({shBp:.3f})"
               if args.split_half else "")
@@ -1013,30 +1045,30 @@ def main(argv=None) -> None:
             pd.DataFrame(M, index=pd.Index(idx, name="cell"),
                          columns=cols).to_parquet(path)
 
+    n_null = max(1, int(args.null_draws)) if args.null else 0
     for gran in grans:
         gk = str(gran)
-        all_regions = sorted({r for _, d, _ in results for r in d.get(gk, {})})
-        if not all_regions:
+        per = [d.get(gk) for _, d, _ in results]
+        have = [o["keys"] for o in per if o is not None and o["keys"].size]
+        if not have:
             continue
-        ridx = {r: j for j, r in enumerate(all_regions)}
+        all_regions = np.unique(np.concatenate(have))      # sorted, as before
+        # each cell's region columns, once; every matrix below reuses them
+        col_of = [pd.Index(all_regions).get_indexer(o["keys"])
+                  if o is not None else None for o in per]
 
-        def _matrices(per_cell):
-            D = np.full((len(cells), len(all_regions)), np.nan)
-            Mg = np.full((len(cells), len(all_regions)), np.nan)
-            Cov = np.full((len(cells), len(all_regions)), np.nan)
-            for i, d in enumerate(per_cell):
-                for r, (delta, marg, n_o) in d.get(gk, {}).items():
-                    j = ridx[r]
-                    D[i, j] = delta; Mg[i, j] = marg; Cov[i, j] = n_o
-            return D, Mg, Cov
+        def _fill(values):
+            """cells x regions from one aligned array per cell (or None)."""
+            M = np.full((len(cells), all_regions.size), np.nan)
+            for i, (cols_i, v) in enumerate(zip(col_of, values)):
+                if cols_i is not None and v is not None and cols_i.size:
+                    M[i, cols_i] = v
+            return M
 
-        D, Mg, Cov = _matrices([d for _, d, _ in results])
-        data = [("real", D, Cov)]
+        D = _fill([o["delta"] if o is not None else None for o in per])
+        Mg = _fill([o["marg"] if o is not None else None for o in per])
+        Cov = _fill([o["n"] if o is not None else None for o in per])
         if args.null:
-            for d_ in range(max(1, int(args.null_draws))):
-                Dn, _, Covn = _matrices([nulls[c]["out"][d_] if nulls[c]
-                                         else {} for c in cells])
-                data.append((f"drawn_null{d_}", Dn, Covn))
             st = np.sum([nulls[c]["stats"].get(gk, (0, 0, 0))
                          for c in cells if nulls[c]], axis=0)
             tot = max(int(np.sum(st)), 1)
@@ -1044,23 +1076,39 @@ def main(argv=None) -> None:
                   f"matched distance, {st[1] / tot:.1%} in the region at "
                   f"another distance, {st[2] / tot:.1%} none (left "
                   f"unobserved)")
-        region_keys = all_regions             # aligned with D columns
+        region_keys = list(all_regions)       # aligned with D columns
+        keep_cols = np.ones(all_regions.size, dtype=bool)
         # Region-observation filter: drop sparsely-observed regions so the
         # classifier can't exploit the missingness/imputation pattern.  Set
         # on the REAL Δ and applied to the null too, so both see the same
         # regions.
         if args.min_region_frac > 0:
             of = np.isfinite(D[keep]).mean(axis=0)
-            cols = of >= args.min_region_frac
-            if int(cols.sum()) < 2:
-                print(f"{gk:>11} {int(cols.sum()):>6}  (too few regions after "
-                      f"--min-region-frac {args.min_region_frac})")
+            keep_cols = of >= args.min_region_frac
+            if int(keep_cols.sum()) < 2:
+                print(f"{gk:>11} {int(keep_cols.sum()):>6}  (too few regions "
+                      f"after --min-region-frac {args.min_region_frac})")
                 continue
-            Mg = Mg[:, cols]
-            data = [(lab, DD[:, cols], CC[:, cols]) for lab, DD, CC in data]
-            region_keys = [r for r, c in zip(all_regions, cols) if c]
-        for label, DD, CC in data:
-            row, R2resid = _ladder(gk, label, DD, Mg[keep], CC, region_keys)
+            region_keys = [r for r, c in zip(all_regions, keep_cols) if c]
+        Mk = Mg[keep][:, keep_cols]
+
+        def _null_matrices(d_):
+            """Draw d_ as (Δ, n) matrices -- built one draw at a time."""
+            got = [nulls[c]["out"].get(gk) if nulls[c] else None
+                   for c in cells]
+            return (_fill([g["delta"][d_] if g is not None else None
+                           for g in got])[:, keep_cols],
+                    _fill([g["n"][d_] if g is not None else None
+                           for g in got])[:, keep_cols])
+
+        for label in ["real"] + [f"drawn_null{d_}" for d_ in range(n_null)]:
+            if label == "real":
+                DD, CC = D[:, keep_cols], Cov[:, keep_cols]
+            else:
+                DD, CC = _null_matrices(int(label[10:]))
+            row, R2resid = _ladder(gk, label, DD, Mk, CC, region_keys,
+                                   core=(label != "real"
+                                         and not args.null_full_ladder))
             rows.append(row)
             if args.output_prefix and label in ("real", "drawn_null0"):
                 _write_matrices(gk, label, DD, R2resid, region_keys)
