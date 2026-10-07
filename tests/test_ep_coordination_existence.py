@@ -196,9 +196,12 @@ def test_a_null_draw_computes_only_what_it_is_compared_on(tmp_path):
         core[core["data"] == "drawn_null"].iloc[0]["concordance_resid_full_auc"])
 
 
-def test_link_shuffle_keeps_long_range_ends_out_of_e_and_the_level(tmp_path):
-    """A contact end in E or in the level Δ|m+cov regresses out shares noise
-    with O, which a donor from another cell does not."""
+def test_link_shuffle_scores_the_assignment_and_keeps_contact_ends_out_of_the_level(
+        tmp_path):
+    """E and the null are the stratum assignment's (anchor x mean donor,
+    anchor x drawn donor), and the region's level Δ|m+cov regresses out
+    comes from short pairs: a contact end in it shares noise with O, which
+    a donor from another cell does not."""
     rec = []
     for i in range(40):                         # long-range: methylated ends
         a = 100_000 + i * 20_000
@@ -213,7 +216,21 @@ def test_link_shuffle_keeps_long_range_ends_out_of_e_and_the_level(tmp_path):
     path = tmp_path / "c.posteriors.parquet"
     df.to_parquet(path)
     _, plain, _, _ = ep.process_cell(path, [1], 20_000, 2_000_000, 1, 4000, 0)
-    _, ls, _, _ = ep.process_cell(path, [1], 20_000, 2_000_000, 1, 4000, 0,
-                                  None, True, 2)
+    level = np.zeros(40, np.int64)
+    level[:10] = -1                             # no donor: out of all three
+    link = {"row": np.arange(40), "level": level, "m": np.full(40, 0.5),
+            "donor_p": np.full((2, 40), 0.5)}
+    _, ls_, _, null_part = ep.process_cell(
+        path, [1], 20_000, 2_000_000, 1, 4000, 0, None, True, 2,
+        link_assign=link)
     assert np.nanmax(plain["1"]["marg"]) > 0.3      # long-range ends in it
-    assert np.nanmax(ls["1"]["marg"]) < 0.1         # short ends only
+    assert np.nanmax(ls_["1"]["marg"]) < 0.1        # short ends only
+    o = ls_["1"]
+    assert o["n"].tolist() == [30]
+    # the coordination C: agreement O (0.95^2 + 0.05^2) minus E (one half)
+    assert o["delta"][0] == pytest.approx(0.95 ** 2 + 0.05 ** 2 - 0.5)
+    assert np.allclose(null_part["out"]["1"]["delta"], 0.0)
+    assert null_part["stats"]["1"] == (30, 0, 10)
+    with pytest.raises(ValueError, match="assignment"):
+        ep.process_cell(path, [1], 20_000, 2_000_000, 1, 4000, 0, None, True,
+                        2)
