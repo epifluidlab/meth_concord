@@ -1094,15 +1094,12 @@ def main(argv=None) -> int:
                     help="Contacts at least this long (1 kb): below it most "
                          "read pairs are one unligated fragment.")
     ap.add_argument("--max-distance", type=int, default=10_000_000)
-    ap.add_argument("--bands",
-                    default="1000,3162,10000,31623,100000,316228,1000000,"
-                            "3162278,10000000",
-                    help="Distance-band edges (bp), half-decades by default, "
-                         "so each class pair has a distance curve to set "
-                         "beside Fig 5a.  A-B pairs barely exist below ~100 "
-                         "kb and the GCH excess itself rises ~10x from 1 to "
-                         "100 kb, so classes are compared within bands; an "
-                         "'all' band is added.")
+    ap.add_argument("--bands", default="1000,10000,100000,1000000,10000000",
+                    help="Distance-band edges (bp): by default the decades "
+                         "1-10 kb, 10-100 kb, 100 kb-1 Mb and 1-10 Mb.  A-B "
+                         "pairs barely exist below ~100 kb and the GCH excess "
+                         "itself rises ~10x from 1 to 100 kb, so classes are "
+                         "compared within bands; an 'all' band is added.")
     ap.add_argument("--bins-per-decade", type=int, default=4,
                     help="Log-distance bins a donor is matched in (4).")
     ap.add_argument("--position-bin", type=int, default=250_000,
