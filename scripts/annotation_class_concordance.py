@@ -90,6 +90,12 @@ an F test across cell types (for Δ and for the control) says how much of it
 is cell type.  The marginal gets the same summary -- mean, between-cell
 spread beyond its sampling noise, cell-type F -- as the reference.
 
+UNITS.  C is a difference of probabilities (excess agreement), so the
+figures show C, ΔC and the signed values in percentage points (x100); the
+tables keep fractions.  |C| <= 0.5 (at most 2 L (1 - L) at level L), the
+weight w lies in [-1, 1], so a signed value lies within ±|ΔC|; Δr is a
+correlation, in [-1, 1], and is not rescaled.
+
 Outputs (--output-dir): percell.tsv.gz (one row per cell x system x class
 pair x band), summary.tsv, marginal_summary.tsv, coverage.tsv,
 compartments_ab.tsv + compartments_qc.tsv (with ab), and one figure per
@@ -890,16 +896,19 @@ def marginal_summary(marg, cells, types, classes, min_ends, context, system):
 _STAT = {
     "delta": {"point": "delta", "ctrl": "control", "pc": "delta",
               "pc_ctrl": "control", "prefix": "",
-              "label": "Δ C  (contacts − reshuffled)"},
+              "label": "ΔC, percentage points\ncontacts − reshuffled"},
     "signed": {"point": "signed", "ctrl": "signed_control", "pc": "signed",
                "pc_ctrl": "signed_control", "prefix": "signed_",
-               "label": "ΔC × (2F − 1)   (+ co-open, − co-closed)"},
+               "label": "ΔC × (2F − 1), pp\n+ co-open, − co-closed"},
     "signed_rel": {"point": "signed_rel", "ctrl": "signed_rel_control",
                    "pc": "signed_rel", "pc_ctrl": "signed_rel_control",
                    "prefix": "signed_rel_",
-                   "label": "ΔC × w(F vs genome)   (+ more co-open, − more "
-                            "co-closed than the cell's genome)"},
+                   "label": "ΔC × w, pp\n+ more co-open, − more co-closed "
+                            "than the cell's genome"},
 }
+#: C is a difference of probabilities -- excess agreement -- so the figures
+#: show it in percentage points.  The tables keep fractions.
+PP = 100.0
 
 
 def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title,
@@ -932,12 +941,13 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title,
             r = t.loc[[pr for pr in pairs if pr in t.index]]
             col = ("0.15" if b == all_band
                    else figure_style.PALETTE[bi % len(figure_style.PALETTE)])
-            a.errorbar(r[pt], y, xerr=[r[pt] - r[pt + "_lo"],
-                                       r[pt + "_hi"] - r[pt]],
+            a.errorbar(PP * r[pt], y,
+                       xerr=[PP * (r[pt] - r[pt + "_lo"]),
+                             PP * (r[pt + "_hi"] - r[pt])],
                        fmt="o", ms=3, lw=0.8, color=col, label=b)
             if b == all_band:
-                a.scatter(r[S["ctrl"]], y, marker="d", s=10, color="0.6",
-                          zorder=3, label="control (all)")
+                a.scatter(PP * r[S["ctrl"]], y, marker="d", s=10,
+                          color="0.6", zorder=3, label="control (all)")
         a.axvline(0, color="0.4", lw=0.6)
         a.set_yticks(range(ny))
         a.set_yticklabels(labels)
@@ -952,10 +962,10 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title,
         col_ = lambda c: r[c] if c in r else pd.Series(np.nan,  # noqa: E731
                                                          index=r.index)
         yy = np.arange(ny)
-        a.barh(yy - 0.18, col_(pf + "cell_sd"), height=0.34,
+        a.barh(yy - 0.18, PP * col_(pf + "cell_sd"), height=0.34,
                color=figure_style.PALETTE[0], label="per cell")
-        a.barh(yy + 0.18, col_(pf + "control_sd"), height=0.34, color="0.7",
-               label="control")
+        a.barh(yy + 0.18, PP * col_(pf + "control_sd"), height=0.34,
+               color="0.7", label="control")
         for yi, v in zip(yy, col_(pf + "split_half_r")):
             if np.isfinite(v):
                 a.annotate(f"r½ {v:.2f}", (0, yi), xytext=(2, 0),
@@ -964,7 +974,7 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title,
         a.set_yticks(yy)
         a.set_yticklabels([])
         a.invert_yaxis()
-        a.set_xlabel("between-cell SD (all distances)")
+        a.set_xlabel("between-cell SD, pp (all distances)")
         a.set_title("How variable", loc="left")
         a.legend(loc="lower right", fontsize=5)
         a = ax[2]
@@ -973,8 +983,8 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title,
         for yi, (k1, k2) in enumerate(pairs):
             s = pc[(pc["anchor"] == k1) & (pc["partner"] == k2)
                    & pc["enough_pairs"]]
-            data += [s[S["pc"]].dropna().to_numpy(),
-                     s[S["pc_ctrl"]].dropna().to_numpy()]
+            data += [PP * s[S["pc"]].dropna().to_numpy(),
+                     PP * s[S["pc_ctrl"]].dropna().to_numpy()]
             pos += [yi - 0.18, yi + 0.18]
         bp = a.boxplot(data, positions=pos, vert=False, widths=0.3,
                        showfliers=False, patch_artist=True,
@@ -987,7 +997,7 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title,
         a.set_yticks(yy)
         a.set_yticklabels([])
         a.set_ylim(ny - 0.5, -0.5)
-        a.set_xlabel("per cell (all distances)")
+        a.set_xlabel("per cell, pp (all distances)")
         a.set_title("Per cell vs control", loc="left")
         fig.suptitle(title, fontsize=8)
         fig.tight_layout()
@@ -1027,15 +1037,18 @@ def _variance_split(pc: pd.DataFrame, val="delta_r", ctrl="control_r"):
 
 _MAIN = {
     "r": {"point": "delta_r", "excess": "excess_sd_r", "pc": "delta_r",
-          "pc_ctrl": "control_r", "ylab": "Δr", "xlab": "Δr, all distances"},
+          "pc_ctrl": "control_r", "ylab": "Δr", "xlab": "Δr, all distances",
+          "scale": 1.0, "xlab_f": "excess between-cell SD"},
     "signed": {"point": "signed", "excess": "signed_excess_sd",
                "pc": "signed", "pc_ctrl": "signed_control",
-               "ylab": "ΔC×(2F−1)",
-               "xlab": "ΔC × (2F − 1), all distances"},
+               "ylab": "ΔC×(2F−1), pp",
+               "xlab": "ΔC × (2F − 1), pp, all distances",
+               "scale": PP, "xlab_f": "excess between-cell SD, pp"},
     "signed_rel": {"point": "signed_rel", "excess": "signed_rel_excess_sd",
                    "pc": "signed_rel", "pc_ctrl": "signed_rel_control",
-                   "ylab": "ΔC×w",
-                   "xlab": "ΔC × w(F vs genome), all distances"},
+                   "ylab": "ΔC×w, pp",
+                   "xlab": "ΔC × w, pp, all distances",
+                   "scale": PP, "xlab_f": "excess between-cell SD, pp"},
 }
 
 
@@ -1055,7 +1068,7 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
     import matplotlib.pyplot as plt
     from nome_hic_concordance import figure_style
     S = _MAIN[stat]
-    pt, ex = S["point"], S["excess"]
+    pt, ex, sc = S["point"], S["excess"], S["scale"]
     if summary.empty or pt not in summary:
         return
     ctxs = list(dict.fromkeys(summary["context"]))
@@ -1115,10 +1128,10 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
                 g = g.sort_values("band_lo")
                 x = np.sqrt(g["band_lo"] * g["band_hi"])
                 cc = figure_style.PALETTE[pi % 8]
-                ax.plot(x, g[pt], "-" if k1 == k2 else "--",
+                ax.plot(x, sc * g[pt], "-" if k1 == k2 else "--",
                         marker="o", ms=2.2, lw=0.9, color=cc,
                         label=f"{k1}–{k2}")
-                ax.fill_between(x, g[pt + "_lo"], g[pt + "_hi"],
+                ax.fill_between(x, sc * g[pt + "_lo"], sc * g[pt + "_hi"],
                                 color=cc, alpha=0.15, lw=0)
             ax.axhline(0, color="0.5", lw=0.6)
             ax.set_xscale("log")
@@ -1139,9 +1152,9 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
         shade(ax_e)
         for ci, ctx in enumerate(ctxs):
             v = at_all(ctx)
-            ax_e.errorbar(v[pt], y + off[ci],
-                          xerr=[v[pt] - v[pt + "_lo"],
-                                v[pt + "_hi"] - v[pt]],
+            ax_e.errorbar(sc * v[pt], y + off[ci],
+                          xerr=[sc * (v[pt] - v[pt + "_lo"]),
+                                sc * (v[pt + "_hi"] - v[pt])],
                           fmt="o", ms=2.5, lw=0.8, color=col_of[ctx],
                           label=ctx, zorder=3)
         ax_e.axvline(0, color="0.5", lw=0.6)
@@ -1159,13 +1172,13 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
             v = at_all(ctx)
             if ex not in v:
                 continue
-            ax_f.errorbar(v[ex], y + off[ci],
-                          xerr=[v[ex] - v[ex + "_lo"],
-                                v[ex + "_hi"] - v[ex]],
+            ax_f.errorbar(sc * v[ex], y + off[ci],
+                          xerr=[sc * (v[ex] - v[ex + "_lo"]),
+                                sc * (v[ex + "_hi"] - v[ex])],
                           fmt="s", ms=2.3, lw=0.8, color=col_of[ctx])
         ax_f.set_xlim(left=0)
         ax_f.tick_params(labelleft=False)
-        ax_f.set_xlabel("excess between-cell SD")
+        ax_f.set_xlabel(S["xlab_f"])
         ax_f.set_title("f  Cell to cell", loc="left")
         # g -- what varies
         ax_g = fig.add_subplot(gs[:, 3], sharey=ax_e)
