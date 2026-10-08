@@ -75,8 +75,8 @@ def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
             df["n2"] = np.int32(3)
             df["distance"] = (df["pos2"] - df["pos1"]).abs()
             df.to_parquet(post / f"t{t}_c{c}.posteriors.parquet")
-            rows.append((f"t{t}_c{c}", f"T{t}"))
-    pd.DataFrame(rows, columns=["cell_name", "group"]).to_csv(
+            rows.append((f"t{t}_c{c}", f"T{t}", f"b{c % 2}"))
+    pd.DataFrame(rows, columns=["cell_name", "group", "batch"]).to_csv(
         out / "samples.tsv", sep="\t", index=False)
     # annotations: PMD = B, HMD = A; RT early in A; chromHMM states per domain
     tiles = [(c, s, s + 100_000) for c, n in CHROMS.items()
@@ -119,6 +119,7 @@ def run(d, systems="ab,rt,chromhmm,pmd", extra=()):
               "--pmd", str(Path(d) / "pmd.bed"),
               "--ab-resolution", "500000", "--ab-min-contacts", "1000",
               "--min-pairs", "10", "--n-boot", "100", "--n-threads", "2",
+              "--batch-column", "batch", "--n-locus-perm", "10",
               "--plot-format", "png", "--output-dir", str(o), *extra])
     return (pd.read_csv(o / "summary.tsv", sep="\t"),
             pd.read_csv(o / "percell.tsv.gz", sep="\t"), o)
@@ -446,8 +447,9 @@ def test_a_covariate_that_drives_concordance_explains_its_variation():
                        "delta": signal + rng.normal(0, 0.005, n)
                        + np.where(types == "T1", 0.01, 0),
                        "control": rng.normal(0, 0.005, n)})
-    level = {"GCH": dict(zip(cells, rng.uniform(0.2, 0.3, n)))}
-    a = acc.covariate_association(pc, cov, level, stats=("delta",))
+    ctx_cov = {"GCH": pd.DataFrame({"cell": cells,
+                                    "level": rng.uniform(0.2, 0.3, n)})}
+    a = acc.covariate_association(pc, cov, ctx_cov, stats=("delta",))
     r = a.iloc[0]
     assert r["rho_frac_mitotic"] > 0.6 and r["q_frac_mitotic"] < 1e-6
     for c in ("log10_contacts", "frac_near", "repli_score", "level"):
@@ -460,13 +462,98 @@ def test_the_covariate_outputs_are_written(planted):
     _, _, o = planted
     cov = pd.read_csv(o / "cell_covariates.tsv", sep="\t")
     assert {"frac_near", "frac_mitotic", "repli_score", "log10_contacts",
-            "level_GCH"} <= set(cov.columns)
+            "level_GCH", "frac_short", "sites_mean_GCH", "decisive_GCH",
+            "frac_called_GCH", "compartment_strength", "batch"} <= set(
+                cov.columns)
+    assert cov["compartment_strength"].notna().any()
     assert cov["repli_score"].between(0, 1).all()
     a = pd.read_csv(o / "covariate_association.tsv", sep="\t")
     assert {"rho_frac_mitotic", "q_repli_score", "explained_share",
             "bio_share", "control_R2_adj"} <= set(a.columns)
+    assert {"batch_batch_p", "R2_adj_all", "R2_adj_batch"} <= set(a.columns)
+    d = a[a["statistic"] == "delta"]
+    assert {"cell_share", "locus_share", "noise_share", "perm_p",
+            "explained_cell_share"} <= set(d.columns)
+    assert (o / "locus_reassignment.tsv").exists()
+    assert (o / "cross_class_correlation.tsv").exists()
+    assert (o / "cross_class_GCH.png").exists()
     assert (o / "covariates_GCH_delta.png").exists()
     assert (o / "covariates_GCH_delta_by_band.png").exists()
     assert (o / "cell_cycle_covariates.png").exists()
     assert a["band"].astype(str).str.startswith("all").any()
     assert (~a["band"].astype(str).str.startswith("all")).any()
+
+
+# ------------------------------------------------- what cells, what loci --
+
+
+def _loci_and_cells(cell_effect, seed=0):
+    """Contacts of 3 types x 100 cells, 150 each, at loci whose concordance
+    differs a lot (sd 0.6, against noise sd 0.5) -- plus, optionally, a
+    per-cell offset."""
+    rng = np.random.default_rng(seed)
+    n_cells, per = 300, 150
+    cell = np.repeat(np.arange(n_cells), per)
+    ctype = np.repeat(np.arange(3), n_cells // 3)
+    locus_effect = rng.normal(0, 0.6, 5000)[rng.integers(0, 5000, cell.size)]
+    noise = rng.normal(0, 0.5, cell.size)
+    d = locus_effect + noise + cell_effect * rng.normal(0, 1, n_cells)[cell]
+    c = rng.normal(0, 0.5, cell.size)
+    z = np.zeros(cell.size, np.int64)
+    return acc.locus_reassignment(cell, ctype, z, z, d, c, 1, 10, 40,
+                                  np.random.default_rng(seed + 1))
+
+
+def test_locus_sampling_alone_is_not_a_cell_difference():
+    r = _loci_and_cells(0.0).iloc[-1]                 # the 'all' band
+    assert r["locus_share"] > 0.3                     # loci differ ...
+    assert r["cell_share"] < 0.1 and r["perm_p"] > 0.05   # ... cells don't
+
+
+def test_a_real_cell_difference_survives_reassignment():
+    r = _loci_and_cells(0.15).iloc[-1]
+    assert r["cell_share"] > 0.3 and r["perm_p"] < 0.05
+
+
+def test_compartment_strength_is_excess_same_compartment_pairing():
+    res = 250_000
+    maps = {"__all__": acc.Intervals("ab", ("A", "B"), ["chr1"] * 40,
+                                     np.arange(40) * res,
+                                     (np.arange(40) + 1) * res,
+                                     np.arange(40) // 4 % 2)}   # 1 Mb domains
+    rng = np.random.default_rng(0)
+    b1 = rng.integers(0, 20, 400).astype(np.int32)
+    same = (b1 + 8).astype(np.int32)                  # 2 Mb on: same type
+    rand = (b1 + rng.integers(4, 20, 400)).astype(np.int32)
+    code = np.full(400, acc._chrom_code("chr1"), np.int64)
+    cells = [(code, b1, same, {}), (code, b1, rand, {})]
+    s_ = acc.compartment_strength(cells, ["x", "x"], maps, res, 1_000_000)
+    assert s_[0] > 0.4 and abs(s_[1]) < 0.1
+
+
+def test_cross_class_correlation_finds_one_per_cell_factor():
+    rng = np.random.default_rng(0)
+    n = 200
+    cells = [f"c{i}" for i in range(n)]
+    types = np.repeat(["T0", "T1"], n // 2)
+    shared = rng.normal(0, 1, n)
+    rows = []
+    for st, k in (("A", 1.0), ("B", 1.0), ("X", 0.0)):
+        own = rng.normal(0, 1, n) if k == 0 else 0
+        val = k * shared + own + rng.normal(0, 0.7, n)
+        rows.append(pd.DataFrame({"context": "GCH", "system": "s",
+                                  "cell": cells, "cell_type": types,
+                                  "anchor": st, "partner": st,
+                                  "band": "all 1kb-10Mb",
+                                  "enough_pairs": True, "delta": val}))
+    pc = pd.concat(rows)
+    # split-half reliability of a value 1 (or 1) signal : 0.49 noise
+    summ = pd.DataFrame({"context": "GCH", "system": "s",
+                         "anchor": ["A", "B", "X"], "partner": ["A", "B", "X"],
+                         "band": "all 1kb-10Mb",
+                         "split_half_r": [0.5, 0.5, 0.5]})
+    cc = acc.cross_class_correlation(pc, summ, min_cells=30)
+    ab = cc[(cc["state_1"] == "A") & (cc["state_2"] == "B")].iloc[0]
+    ax = cc[(cc["state_1"] == "A") & (cc["state_2"] == "X")].iloc[0]
+    assert ab["r"] > 0.5 and ab["r_disattenuated"] > ab["r"]
+    assert abs(ax["r"]) < 0.2
