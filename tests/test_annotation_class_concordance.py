@@ -31,7 +31,7 @@ def is_a(pos):
 
 
 def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
-              n_short=1500, seed=0):
+              n_short=1500, seed=0, coord_in="A"):
     """``coord(t, c)``: the chance an A-A contact's partner copies its anchor
     in cell c of type t.  ``offset(t, c)`` is added to every posterior of
     that cell AFTER the calls are drawn, so it changes nothing but level."""
@@ -54,7 +54,8 @@ def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
             pa = np.where(rng.random(n_contacts) < level(a_pos), 0.9, 0.1)
             pb = np.where(rng.random(n_contacts) < level(b_pos), 0.9, 0.1)
             if coord is not None:
-                aa = is_a(a_pos) & is_a(b_pos)
+                aa = (is_a(a_pos) & is_a(b_pos) if coord_in == "A"
+                      else ~is_a(a_pos) & ~is_a(b_pos))
                 copy = aa & (rng.random(n_contacts) < coord(t, c))
                 pb[copy] = pa[copy]
             s_chr = rng.choice(list(CHROMS), n_short)
@@ -174,6 +175,8 @@ def test_chromhmm_groups_and_the_figure(planted):
     assert r["delta"] > 0
     assert (o / "fig_GCH_pmd.png").exists()
     assert (o / "main_figure.png").exists()
+    assert (o / "fig_GCH_pmd_signed.png").exists()
+    assert (o / "main_figure_signed.png").exists()
     assert set(pc.columns) >= {"cell", "cell_type", "delta", "control",
                                "mu_anchor", "enough_pairs"}
 
@@ -288,3 +291,24 @@ def test_a_plain_bed_is_inside_versus_outside(tmp_path):
     lab = acc.read_annotation("st", q)
     assert lab.classes == ("x", "y")
     assert lab.lookup(["chr1"] * 3, [50, 150, 250]).tolist() == [0, 1, -1]
+
+
+# ---------------------------------------------------------------- signed --
+
+
+def test_signed_concordance_is_positive_when_open_and_negative_when_closed(
+        planted, tmp_path):
+    """Coordination in mostly-open A (level 0.6) is co-open: S > 0.  The
+    same in mostly-closed B (level 0.25) is co-closed: S < 0.  The control,
+    the same formula on reshuffled links alone, is centred either way."""
+    s, pc, _ = planted
+    r = _row(s, "pmd", "HMD", "HMD")
+    assert r["F"] > 0.5 and r["signed_lo"] > 0
+    assert r["signed_control_lo"] < 0 < r["signed_control_hi"] or abs(
+        r["signed_control"]) < 0.005
+    closed, _, _ = run(make_data(tmp_path, per=20, seed=4, coord_in="B",
+                                 coord=lambda t, c: 0.6), systems="pmd")
+    r = _row(closed, "pmd", "PMD", "PMD")
+    assert r["F"] < 0.5 and r["signed_hi"] < 0
+    assert abs(r["signed"]) > 5 * abs(r["signed_control"])
+    assert {"F", "F_null", "signed", "signed_control"} <= set(pc.columns)

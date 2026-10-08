@@ -55,6 +55,18 @@ fewer than --min-band-pairs contacts is flagged 'sparse' and not drawn
 (cross-class pairs barely exist at short range: two ends 1-30 kb apart are
 in different replication-timing classes only at a domain boundary).
 
+SIGNED BY CO-STATE.  C counts agreement whether it is co-open or
+co-closed.  S = ΔC x (2F - 1), with F = co-open / (co-open + co-closed) of
+the cell's real contacts in the class pair, carries the same concordance
+signed by where its mass sits: + co-open, - co-closed, ~0 with no
+concordance.  (A 2x2 table at fixed levels has a single association, so
+the sign comes from the levels; S is ΔC and the levels read together.)
+Its control is the same formula on reshuffled links alone -- draw 2 in
+place of the real partners: (C_null2 - C_null1) x (2 F_null2 - 1).  For F,
+a donor's posterior is put on the receiving cell's level in that class.
+Written beside the C figures as fig_<context>_<system>_signed and
+main_figure_signed.
+
 CELL-TO-CELL VARIATION is read against that control.  Per cell, Δ carries
 sampling noise; the control carries the same noise and nothing else, so
 
@@ -573,15 +585,17 @@ def _fmt_bp(x) -> str:
     return f"{x:g}bp"
 
 
-def accumulate(cell, kx, ky, band, half, xy, xy1, xy2, n_cells, n_k, n_band):
-    """Per (cell, anchor class, partner class, band) sums -- band n_band is
-    every band together -- of the products, overall and in half 0."""
+def accumulate(cell, kx, ky, band, half, weights: dict, n_cells, n_k,
+               n_band):
+    """Per (cell, class, class, band) sums of each of ``weights`` (and the
+    count n) -- band n_band is every band together -- overall and in half
+    0."""
     size = n_cells * n_k * n_k * (n_band + 1)
     base = (cell * n_k + kx) * n_k + ky
     out = {}
     for tag, b in (("band", band), ("all", np.full(band.size, n_band))):
         key = base * (n_band + 1) + b
-        for name, w in (("n", None), ("xy", xy), ("xy1", xy1), ("xy2", xy2)):
+        for name, w in [("n", None)] + list(weights.items()):
             out.setdefault(name, np.zeros(size))
             out[name] += np.bincount(key, weights=w, minlength=size)
             h = half == 0
@@ -618,9 +632,50 @@ def _type_f(v, types) -> tuple:
     return float(f), float(p)
 
 
+def _per_cell(val, ctrl, v0, v1, c0, c1, types, rng, n_boot, prefix=""):
+    """Between-cell statistics of one per-cell value against its control:
+    mean, share above 0, SDs, the excess SD (with a bootstrap CI over
+    cells), split-half reliability (``v0``/``v1``: the two halves of each
+    cell's contacts) and the cell-type F test -- each for the control too."""
+    ok = np.isfinite(val) & np.isfinite(ctrl)
+    val, ctrl, t = val[ok], ctrl[ok], np.asarray(types)[ok]
+    out = {}
+    if val.size < 5:
+        return out
+    out.update({f"{prefix}cell_mean": float(val.mean()),
+                f"{prefix}cell_frac_pos": float(np.mean(val > 0)),
+                f"{prefix}control_frac_pos": float(np.mean(ctrl > 0)),
+                f"{prefix}cell_sd": float(val.std(ddof=1)),
+                f"{prefix}control_sd": float(ctrl.std(ddof=1)),
+                f"{prefix}excess_sd": float(np.sqrt(max(
+                    val.var(ddof=1) - ctrl.var(ddof=1), 0)))})
+    bi = rng.integers(0, val.size, (min(n_boot, 200), val.size))
+    ex = np.sqrt(np.maximum(val[bi].var(1, ddof=1)
+                            - ctrl[bi].var(1, ddof=1), 0))
+    out[f"{prefix}excess_sd_lo"], out[f"{prefix}excess_sd_hi"] = (
+        np.percentile(ex, [2.5, 97.5]))
+    v0, v1, c0, c1 = v0[ok], v1[ok], c0[ok], c1[ok]
+    h = np.isfinite(v0) & np.isfinite(v1) & np.isfinite(c0) & np.isfinite(c1)
+    if h.sum() >= 5:
+        out[f"{prefix}split_half_r"] = float(np.corrcoef(v0[h], v1[h])[0, 1])
+        out[f"{prefix}control_split_half_r"] = float(
+            np.corrcoef(c0[h], c1[h])[0, 1])
+    out[f"{prefix}type_F"], out[f"{prefix}type_p"] = _type_f(val, t)
+    out[f"{prefix}control_type_F"], out[f"{prefix}control_type_p"] = (
+        _type_f(ctrl, t))
+    return out
+
+
+def _signed(dc, oo, oc):
+    """ΔC x (2F - 1), F = oo / (oo + oc): the co-open share of the
+    concordant mass."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return dc * (2 * oo / (oo + oc) - 1)
+
+
 def summarize(acc, sd, mu, cells, types, classes, band_labels, edges,
               min_pairs, n_boot, seed, context, system):
-    """One row per (anchor class, partner class, band)."""
+    """One row per (class, class, band)."""
     rng = np.random.default_rng(seed)
     n_cells = len(cells)
     W = rng.multinomial(n_cells, np.full(n_cells, 1.0 / n_cells),
@@ -656,6 +711,24 @@ def summarize(acc, sd, mu, cells, types, classes, band_labels, edges,
                        "control_lo": np.nanpercentile(bc, 2.5),
                        "control_hi": np.nanpercentile(bc, 97.5),
                        "r_obs": np.nan, "r_null": np.nan}
+                # Signed by where the concordant mass sits: ΔC x (2F - 1),
+                # F the co-open share of it.  Its control is the same
+                # formula on reshuffled links alone -- draw 2 standing in
+                # for the real partners: (C2 - C1) x (2 F_2 - 1).
+                oo, oc, no2, nc2 = (acc[k][:, i, j, b]
+                                    for k in ("oo", "oc", "no2", "nc2"))
+                row["F"] = float(oo.sum() / (oo.sum() + oc.sum()))
+                row["F_null"] = float(no2.sum() / (no2.sum() + nc2.sum()))
+                row["signed"] = d_pool * (2 * row["F"] - 1)
+                row["signed_control"] = c_pool * (2 * row["F_null"] - 1)
+                bs = _signed(bd, W @ oo, W @ oc)
+                bsc = _signed(bc, W @ no2, W @ nc2)
+                row["signed_lo"], row["signed_hi"] = np.nanpercentile(
+                    bs, [2.5, 97.5])
+                row["signed_p_boot"] = min(1.0, 2 * min(
+                    np.mean(bs <= 0), np.mean(bs >= 0)) + 1.0 / (n_boot + 1))
+                row["signed_control_lo"], row["signed_control_hi"] = (
+                    np.nanpercentile(bsc, [2.5, 97.5]))
                 # Correlation scale: each cell's products over its own class
                 # SDs, pooled -- comparable between classes of different
                 # variance, as C is not.
@@ -692,38 +765,25 @@ def summarize(acc, sd, mu, cells, types, classes, band_labels, edges,
                                                  - cr[bi_].var(1, ddof=1), 0))
                         row["excess_sd_r_lo"], row["excess_sd_r_hi"] = (
                             np.percentile(ex_, [2.5, 97.5]))
-                    row.update({
-                        "cell_mean": float(dc.mean()),
-                        "cell_frac_pos": float(np.mean(dc > 0)),
-                        "control_frac_pos": float(np.mean(cc > 0)),
-                        "cell_sd": float(dc.std(ddof=1)),
-                        "control_sd": float(cc.std(ddof=1)),
-                        "excess_sd": float(np.sqrt(max(dc.var(ddof=1)
-                                                       - cc.var(ddof=1), 0))),
-                    })
-                    bi = rng.integers(0, dc.size, (min(n_boot, 200), dc.size))
-                    ex = np.sqrt(np.maximum(dc[bi].var(1, ddof=1)
-                                            - cc[bi].var(1, ddof=1), 0))
-                    row["excess_sd_lo"], row["excess_sd_hi"] = np.percentile(
-                        ex, [2.5, 97.5])
-                    h0 = {k: acc[k + "_h0"][:, i, j, b][m]
-                          for k in ("n", "xy", "xy1", "xy2")}
-                    h1 = {k: acc[k][:, i, j, b][m] - h0[k]
-                          for k in ("n", "xy", "xy1", "xy2")}
+                    keys = ("n", "xy", "xy1", "xy2", "oo", "oc", "no2",
+                            "nc2")
+                    h0 = {k: acc[k + "_h0"][:, i, j, b][m] for k in keys}
+                    h1 = {k: acc[k][:, i, j, b][m] - h0[k] for k in keys}
                     with np.errstate(invalid="ignore", divide="ignore"):
                         d0 = 2 * (h0["xy"] - h0["xy1"]) / h0["n"]
                         d1 = 2 * (h1["xy"] - h1["xy1"]) / h1["n"]
                         c0 = 2 * (h0["xy2"] - h0["xy1"]) / h0["n"]
                         c1 = 2 * (h1["xy2"] - h1["xy1"]) / h1["n"]
-                    ok = np.isfinite(d0) & np.isfinite(d1)
-                    if ok.sum() >= 5:
-                        row["split_half_r"] = float(np.corrcoef(d0[ok],
-                                                                d1[ok])[0, 1])
-                        row["control_split_half_r"] = float(
-                            np.corrcoef(c0[ok], c1[ok])[0, 1])
-                    row["type_F"], row["type_p"] = _type_f(dc, t_m)
-                    row["control_type_F"], row["control_type_p"] = _type_f(
-                        cc, t_m)
+                    row.update(_per_cell(dc, cc, d0, d1, c0, c1, t_m, rng,
+                                         n_boot))
+                    # the same, signed by the co-open share of the mass
+                    row.update(_per_cell(
+                        _signed(dc, oo[m], oc[m]), _signed(cc, no2[m], nc2[m]),
+                        _signed(d0, h0["oo"], h0["oc"]),
+                        _signed(d1, h1["oo"], h1["oc"]),
+                        _signed(c0, h0["no2"], h0["nc2"]),
+                        _signed(c1, h1["no2"], h1["nc2"]),
+                        t_m, rng, n_boot, prefix="signed_"))
                     row["rho_marginal_anchor"] = _within_type_spearman(
                         dc, mu[m, i], t_m)
                     row["rho_marginal_partner"] = _within_type_spearman(
@@ -760,7 +820,24 @@ def marginal_summary(marg, cells, types, classes, min_ends, context, system):
 # ------------------------------------------------------------------ figure --
 
 
-def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title):
+#: Columns each statistic is drawn from.
+_STAT = {
+    "delta": {"point": "delta", "ctrl": "control", "pc": "delta",
+              "pc_ctrl": "control", "prefix": "",
+              "label": "Δ C  (contacts − reshuffled)"},
+    "signed": {"point": "signed", "ctrl": "signed_control", "pc": "signed",
+               "pc_ctrl": "signed_control", "prefix": "signed_",
+               "label": "ΔC × (2F − 1)   (+ co-open, − co-closed)"},
+}
+
+
+def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title,
+         stat: str = "delta"):
+    """Per context x system: the pooled value per class pair and band (95%
+    CI over cells, the control beside it), the between-cell SD against the
+    control's, and the per-cell values against the control's."""
+    S = _STAT[stat]
+    pt, pf = S["point"], S["prefix"]
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -784,18 +861,18 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title):
             r = t.loc[[pr for pr in pairs if pr in t.index]]
             col = ("0.15" if b == all_band
                    else figure_style.PALETTE[bi % len(figure_style.PALETTE)])
-            a.errorbar(r["delta"], y, xerr=[r["delta"] - r["delta_lo"],
-                                            r["delta_hi"] - r["delta"]],
+            a.errorbar(r[pt], y, xerr=[r[pt] - r[pt + "_lo"],
+                                       r[pt + "_hi"] - r[pt]],
                        fmt="o", ms=3, lw=0.8, color=col, label=b)
             if b == all_band:
-                a.scatter(r["control"], y, marker="d", s=10, color="0.6",
+                a.scatter(r[S["ctrl"]], y, marker="d", s=10, color="0.6",
                           zorder=3, label="control (all)")
         a.axvline(0, color="0.4", lw=0.6)
         a.set_yticks(range(ny))
         a.set_yticklabels(labels)
         a.invert_yaxis()
-        a.set_xlabel("Δ C  (contacts − reshuffled)")
-        a.set_title("Where: pooled Δ, 95% CI over cells", loc="left")
+        a.set_xlabel(S["label"])
+        a.set_title("Where: pooled, 95% CI over cells", loc="left")
         a.legend(loc="best", fontsize=5)
         a = ax[1]
         t = summary[summary["band"] == all_band].set_index(["anchor",
@@ -804,11 +881,11 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title):
         col_ = lambda c: r[c] if c in r else pd.Series(np.nan,  # noqa: E731
                                                          index=r.index)
         yy = np.arange(ny)
-        a.barh(yy - 0.18, col_("cell_sd"), height=0.34,
-               color=figure_style.PALETTE[0], label="per-cell Δ")
-        a.barh(yy + 0.18, col_("control_sd"), height=0.34, color="0.7",
+        a.barh(yy - 0.18, col_(pf + "cell_sd"), height=0.34,
+               color=figure_style.PALETTE[0], label="per cell")
+        a.barh(yy + 0.18, col_(pf + "control_sd"), height=0.34, color="0.7",
                label="control")
-        for yi, v in zip(yy, col_("split_half_r")):
+        for yi, v in zip(yy, col_(pf + "split_half_r")):
             if np.isfinite(v):
                 a.annotate(f"r½ {v:.2f}", (0, yi), xytext=(2, 0),
                            textcoords="offset points", va="center",
@@ -825,7 +902,8 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title):
         for yi, (k1, k2) in enumerate(pairs):
             s = pc[(pc["anchor"] == k1) & (pc["partner"] == k2)
                    & pc["enough_pairs"]]
-            data += [s["delta"].to_numpy(), s["control"].to_numpy()]
+            data += [s[S["pc"]].dropna().to_numpy(),
+                     s[S["pc_ctrl"]].dropna().to_numpy()]
             pos += [yi - 0.18, yi + 0.18]
         bp = a.boxplot(data, positions=pos, vert=False, widths=0.3,
                        showfliers=False, patch_artist=True,
@@ -838,7 +916,7 @@ def plot(summary: pd.DataFrame, percell: pd.DataFrame, path, title):
         a.set_yticks(yy)
         a.set_yticklabels([])
         a.set_ylim(ny - 0.5, -0.5)
-        a.set_xlabel("per-cell Δ (all distances)")
+        a.set_xlabel("per cell (all distances)")
         a.set_title("Per cell vs control", loc="left")
         fig.suptitle(title, fontsize=8)
         fig.tight_layout()
@@ -852,12 +930,13 @@ SYSTEM_LABEL = {"ab": "compartment", "rt": "replication timing",
                 "pmd": "PMD / HMD", "chromhmm": "chromHMM"}
 
 
-def _variance_split(pc: pd.DataFrame):
-    """Shares of the between-cell variance of Δr that are sampling noise
-    (the control's variance), cell type, and variation within cell types --
-    the biological parts each net of the same quantity on the control."""
-    d = pc["delta_r"].to_numpy(float)
-    c = pc["control_r"].to_numpy(float)
+def _variance_split(pc: pd.DataFrame, val="delta_r", ctrl="control_r"):
+    """Shares of the between-cell variance of ``val`` that are sampling
+    noise (the control's variance), cell type, and variation within cell
+    types -- the biological parts each net of the same quantity on the
+    control."""
+    d = pc[val].to_numpy(float)
+    c = pc[ctrl].to_numpy(float)
     t = pc["cell_type"].to_numpy()
     ok = np.isfinite(d) & np.isfinite(c)
     d, c, t = d[ok], c[ok], t[ok]
@@ -875,8 +954,19 @@ def _variance_split(pc: pd.DataFrame):
     return (vn / tot, vb / tot, vw / tot) if tot > 0 else None
 
 
+_MAIN = {
+    "r": {"point": "delta_r", "excess": "excess_sd_r", "pc": "delta_r",
+          "pc_ctrl": "control_r", "ylab": "Δr", "xlab": "Δr, all distances"},
+    "signed": {"point": "signed", "excess": "signed_excess_sd",
+               "pc": "signed", "pc_ctrl": "signed_control",
+               "ylab": "ΔC×(2F−1)",
+               "xlab": "ΔC × (2F − 1), all distances"},
+}
+
+
 def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
-              note: str | None = None, min_band_pairs: int = 500):
+              note: str | None = None, min_band_pairs: int = 500,
+              stat: str = "r"):
     """A candidate main-figure row: d, Δr against distance by compartment
     class pair; e, pooled Δr of contacts with both ends in the same state,
     across the annotation systems; f, excess between-cell SD beyond the
@@ -889,7 +979,9 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
     import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
     from nome_hic_concordance import figure_style
-    if summary.empty or "delta_r" not in summary:
+    S = _MAIN[stat]
+    pt, ex = S["point"], S["excess"]
+    if summary.empty or pt not in summary:
         return
     ctxs = list(dict.fromkeys(summary["context"]))
     systems = ([x for x in SYSTEMS if x in set(summary["system"])]
@@ -948,14 +1040,14 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
                 g = g.sort_values("band_lo")
                 x = np.sqrt(g["band_lo"] * g["band_hi"])
                 cc = figure_style.PALETTE[pi % 8]
-                ax.plot(x, g["delta_r"], "-" if k1 == k2 else "--",
+                ax.plot(x, g[pt], "-" if k1 == k2 else "--",
                         marker="o", ms=2.2, lw=0.9, color=cc,
                         label=f"{k1}–{k2}")
-                ax.fill_between(x, g["delta_r_lo"], g["delta_r_hi"],
+                ax.fill_between(x, g[pt + "_lo"], g[pt + "_hi"],
                                 color=cc, alpha=0.15, lw=0)
             ax.axhline(0, color="0.5", lw=0.6)
             ax.set_xscale("log")
-            ax.set_ylabel(f"{ctx}   Δr")
+            ax.set_ylabel(f"{ctx}   {S['ylab']}")
             if ci == len(ctxs) - 1:
                 ax.set_xlabel("distance between the two ends (bp)")
             else:
@@ -972,16 +1064,16 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
         shade(ax_e)
         for ci, ctx in enumerate(ctxs):
             v = at_all(ctx)
-            ax_e.errorbar(v["delta_r"], y + off[ci],
-                          xerr=[v["delta_r"] - v["delta_r_lo"],
-                                v["delta_r_hi"] - v["delta_r"]],
+            ax_e.errorbar(v[pt], y + off[ci],
+                          xerr=[v[pt] - v[pt + "_lo"],
+                                v[pt + "_hi"] - v[pt]],
                           fmt="o", ms=2.5, lw=0.8, color=col_of[ctx],
                           label=ctx, zorder=3)
         ax_e.axvline(0, color="0.5", lw=0.6)
         ax_e.set_yticks(y)
         ax_e.set_yticklabels([k for _, k in rows])
         ax_e.set_ylim(ny - 0.5, -0.5)
-        ax_e.set_xlabel("Δr, all distances")
+        ax_e.set_xlabel(S["xlab"])
         ax_e.set_title("e  Both ends in one state", loc="left")
         ax_e.legend(loc="upper center", bbox_to_anchor=(0.5, below),
                     ncol=len(ctxs))
@@ -990,11 +1082,11 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
         shade(ax_f)
         for ci, ctx in enumerate(ctxs):
             v = at_all(ctx)
-            if "excess_sd_r" not in v:
+            if ex not in v:
                 continue
-            ax_f.errorbar(v["excess_sd_r"], y + off[ci],
-                          xerr=[v["excess_sd_r"] - v["excess_sd_r_lo"],
-                                v["excess_sd_r_hi"] - v["excess_sd_r"]],
+            ax_f.errorbar(v[ex], y + off[ci],
+                          xerr=[v[ex] - v[ex + "_lo"],
+                                v[ex + "_hi"] - v[ex]],
                           fmt="s", ms=2.3, lw=0.8, color=col_of[ctx])
         ax_f.set_xlim(left=0)
         ax_f.tick_params(labelleft=False)
@@ -1012,7 +1104,8 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
                              & (percell["partner"] == k)
                              & (percell["band"] == all_b)
                              & percell["enough_pairs"]]
-                v = _variance_split(pc) if len(pc) else None
+                v = (_variance_split(pc, S["pc"], S["pc_ctrl"])
+                     if len(pc) else None)
                 if v is None:
                     continue
                 left = 0.0
@@ -1376,9 +1469,23 @@ def main(argv=None) -> int:
             # null product: the mean of reshuffling either end
             n1 = 0.5 * (x_ * right[0, idx] + left[0, idx] * y_)
             n2 = 0.5 * (x_ * right[1, idx] + left[1, idx] * y_)
+            # Co-open / co-closed mass, for F.  A donor's posterior is put
+            # on the RECEIVING cell's level in that class (its centred value
+            # plus that cell's mean), as the centring does for C, so a
+            # cell's own level does not pass for a direction.
+            a_, p_ = a[idx], p[idx]
+            mu_l = mu[cell[idx], kx[idx]]
+            mu_r = mu[cell[idx], ky[idx]]
+            w = {"xy": x_ * y_, "xy1": n1, "xy2": n2,
+                 "oo": a_ * p_, "oc": (1 - a_) * (1 - p_)}
+            for dr in (0, 1):
+                qr = np.clip(right[dr, idx] + mu_r, 0, 1)
+                ql = np.clip(left[dr, idx] + mu_l, 0, 1)
+                w[f"no{dr + 1}"] = 0.5 * (a_ * qr + ql * p_)
+                w[f"nc{dr + 1}"] = 0.5 * ((1 - a_) * (1 - qr)
+                                          + (1 - ql) * (1 - p_))
             acc = accumulate(cell[idx], k1s[idx], k2s[idx], band[idx],
-                             half[idx], x_ * y_, n1, n2,
-                             len(cells), n_k, len(edges) - 1)
+                             half[idx], w, len(cells), n_k, len(edges) - 1)
             summary_rows += summarize(acc, sd, mu, cells, types, classes,
                                       band_labels, edges, args.min_pairs,
                                       args.n_boot, args.seed + si, ctx, name)
@@ -1409,6 +1516,14 @@ def main(argv=None) -> int:
                     s12_ = np.where(s12_ > 0, s12_, np.nan)
                     pcr["delta_r"] = pcr["delta"].to_numpy() / 2 / s12_
                     pcr["control_r"] = pcr["control"].to_numpy() / 2 / s12_
+                    oo_, oc_, no2_, nc2_ = (acc[k][c_, i_, j_, b_]
+                                            for k in ("oo", "oc", "no2",
+                                                      "nc2"))
+                    pcr["F"] = oo_ / (oo_ + oc_)
+                    pcr["F_null"] = no2_ / (no2_ + nc2_)
+                    pcr["signed"] = _signed(pcr["delta"].to_numpy(), oo_, oc_)
+                    pcr["signed_control"] = _signed(
+                        pcr["control"].to_numpy(), no2_, nc2_)
             logger.info(f"{ctx} {name}: {ok.mean():.1%} of contacts "
                         f"annotated at both ends with a reshuffled partner")
         del res_
@@ -1431,6 +1546,17 @@ def main(argv=None) -> int:
              f"{ctx} — {name}: long-range concordance by class pair")
     plot_main(summary, percell, out / f"main_figure.{args.plot_format}",
               note=args.figure_note, min_band_pairs=args.min_band_pairs)
+    # The same, signed by where the concordant mass sits: ΔC x (2F - 1),
+    # against the same formula on reshuffled links alone.
+    for (ctx, name), s in summary.groupby(["context", "system"], sort=False):
+        pc = percell[(percell["context"] == ctx) & (percell["system"] == name)]
+        plot(s[~s["sparse"] | s["band"].str.startswith("all")], pc,
+             out / f"fig_{ctx}_{name}_signed.{args.plot_format}",
+             f"{ctx} — {name}: ΔC × (2F − 1) by class pair", stat="signed")
+    plot_main(summary, percell,
+              out / f"main_figure_signed.{args.plot_format}",
+              note=args.figure_note, min_band_pairs=args.min_band_pairs,
+              stat="signed")
     logger.info(f"wrote {out}")
     return 0
 
