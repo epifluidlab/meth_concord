@@ -123,7 +123,38 @@ reliability -- one per-cell factor or region-specific variation.  And Δr,
 ΔC over each cell's own class SDs (covariates_<context>_delta_r): C is a
 covariance, so it grows with a cell's variance -- with its level -- even
 when its coordination does not; what follows the level in ΔC but not in Δr
-is that scale.  In post-
+is that scale.
+
+Five further checks, each a component of the variance split.  Labeling
+efficiency: a cell's GCH methylated at sites open in nearly every cell
+(--open-sites; default CpG-island TSSs), which reads M.CviPI's reach into
+that nucleus.  mCA: GCH counts GCA, and the C of GCA is a CpA, which adult
+neurons methylate endogenously -- --context-counts GCA=... GCY=... (the
+pipeline run with --contexts GCA,GCY --steps 1,2) gives each cell's GCA less
+GCC + GCT methylated.  Division history: HMD less PMD methylation (HCG), as
+PMDs lose methylation with every division.  Substructure: within-type
+principal components of the cells' regional profiles (subtypes, area or
+layer gradients, animals).  And the scale term, the cell's two class SDs.
+The bar of covariates_<context>_<statistic> splits the cells' part by group
+-- Shapley shares of the covariates' R^2, so groups that overlap split what
+they explain together (shap_<group> in covariate_association.tsv).  Where
+the variation is about loci rather than cells, locus_hotspots_<context>
+maps it: per 1 Mb bin, the concordance of every cell's contacts with an end
+there, bins above or below the median bin at an FDR fitted to the control,
+and what the concordant bins are -- each class, PMD borders, CpG islands,
+TSSs, imprinted genes, the protocadherin cluster, olfactory-receptor and Zfp
+genes, --hotspot-annotation BEDs (locus_hotspots.tsv.gz,
+locus_hotspot_enrichment.tsv).
+
+CELL TYPE FROM CONCORDANCE.  celltype_auc_<statistic> (celltype_auc.tsv,
+celltype_auc_by_type.tsv): per context and both together, how well each
+region group's per-cell concordance predicts cell type -- a random forest,
+cross-validated, one-vs-rest macro AUC -- beside its control (a statistic
+that predicts type from reshuffled links alone carries type through its
+construction), the marginal level, and marginal + concordance, against which
+the marginal alone says what the concordance adds.  A/B is called per cell
+type, so compartment classes are type-specific by construction: read their
+rows with that in mind.  In post-
 mitotic neurons % near tracks chromatin compaction rather than the cycle,
 and only cycling glia should have S-phase repli-scores.
 
@@ -654,15 +685,22 @@ def compartments_from_contacts(by_cell: list, cell_type: list, res: int,
 
 
 def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
-               systems: dict) -> dict:
+               systems: dict, open_g=None, open_w: int = 200,
+               prof_bin: int = 0) -> dict:
     """One cell's contacts -- both ends called, min_d <= d <= max_d -- as
     genome coordinates, with every system's class at both ends, and per
     system x class the count, sum and sum of squares of ALL its called
     ends' posteriors (the marginal: every read pair's ends, short ones
-    included).  Integer work only, so threads run in parallel."""
-    df, names, ci, lut = _categorical(
-        path, ["chrom", "pos1", "pos2", "n1", "n2", "posterior1",
-               "posterior2"])
+    included).  With ``open_g``, the sites methylated and the sites of its
+    ends within ``open_w`` of an open site (the posterior instead when the
+    file has no counts); with ``prof_bin``, its called ends' posterior sum
+    and count per bin of that size.  Integer work only, so threads run in
+    parallel."""
+    import pyarrow.parquet as pq
+    cols = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
+    has_k = {"k1", "k2"} <= set(pq.read_schema(str(path)).names)
+    df, names, ci, lut = _categorical(path, cols + (["k1", "k2"] if has_k
+                                                    else []))
     ok_lut = np.array([_canon(c) not in exclude for c in names] + [False])
     keep = ok_lut[ci]
     base = lut[ci][keep] * STRIDE
@@ -685,10 +723,31 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
            "p": np.where(left, p2, p1)[cm].astype(np.float32),
            "cls": {}, "marg": {},
            "level": (float(e_p.sum()), int(e_p.size))}   # genome-wide
+    out["chroms"] = {int(lut[i]): names[i] for i in range(len(names))
+                     if ok_lut[i]}
     # How well this cell's ends are called: the share called, the sites an
     # end carries and how decisive its posterior is.
     n1_ = df["n1"].to_numpy()[keep]
     n2_ = df["n2"].to_numpy()[keep]
+    if open_g is not None and open_g.size:
+        gg = np.concatenate([g1, g2])
+        nn = np.concatenate([n1_, n2_]).astype(float)
+        m = nn > 0
+        near = np.zeros(gg.size, bool)
+        near[m] = _nearest(open_g, gg[m]) <= open_w
+        if has_k:
+            kk = np.concatenate([df["k1"].to_numpy()[keep],
+                                 df["k2"].to_numpy()[keep]]).astype(float)
+            out["open"] = (float(kk[near].sum()), float(nn[near].sum()))
+        else:
+            called = np.concatenate([inf1, inf2]) & near
+            out["open"] = (float(np.concatenate([p1, p2])[called].sum()),
+                           float(called.sum()))
+    if prof_bin:
+        key = (e_g // STRIDE) * (1 << 20) + (e_g % STRIDE) // prof_bin
+        uk, inv = np.unique(key, return_inverse=True)
+        out["prof"] = (uk, np.bincount(inv, weights=e_p).astype(np.float32),
+                       np.bincount(inv).astype(np.int32))
     n_called = int(inf1.sum() + inf2.sum())
     out["quality"] = {
         "frac_called": n_called / (2 * pos1.size) if pos1.size else np.nan,
@@ -1157,21 +1216,41 @@ def marginal_summary(marg, cells, types, classes, min_ends, context, system):
 
 # ------------------------------------------------------- cell covariates --
 
-#: Per-cell covariates the within-type variation is set against, grouped.
+#: Within-type principal components of the cells' regional profiles.
+SUB_PCS = tuple(f"sub_pc{i}" for i in range(1, 11))
+#: Per-cell covariates the within-type variation is set against, grouped:
+#: each group is one component of the variance split (with batch).
 COV_GROUPS = (
     ("technical", ("log10_contacts", "frac_short", "frac_called",
                    "sites_mean", "decisive")),
     ("level", ("level",)),
+    ("scale", ("scale",)),
     ("cell cycle", ("frac_near", "frac_mitotic", "repli_score")),
     ("3D", ("compartment_strength",)),
+    ("labeling efficiency", ("open_site_level",)),
+    ("mCA", ("mca_index",)),
+    ("division history", ("pmd_depth",)),
+    ("substructure", SUB_PCS),
 )
 COVARIATES = tuple(c for _, grp in COV_GROUPS for c in grp)
+#: Shown one by one in the heatmaps; the substructure PCs only together.
+HEATMAP_COVARIATES = tuple(c for c in COVARIATES if c not in SUB_PCS)
 COV_LABEL = {"log10_contacts": "depth", "frac_short": "% short pairs",
              "frac_called": "% ends called", "sites_mean": "sites / end",
              "decisive": "call decisiveness", "level": "level",
+             "scale": "scale (class SDs)",
              "frac_near": "% near", "frac_mitotic": "% mitotic",
              "repli_score": "repli-score",
-             "compartment_strength": "compartment strength"}
+             "compartment_strength": "compartment strength",
+             "open_site_level": "open-site GCH", "mca_index": "mCA index",
+             "pmd_depth": "PMD depth",
+             **{c: c.replace("sub_pc", "substructure PC") for c in SUB_PCS}}
+#: The components of the variance split, in the order the bar shows them.
+GROUP_COLOR = {"technical": "#08519c", "level": "#54278f",
+               "scale": "#9e9ac8", "cell cycle": "#006d2c", "3D": "#74c476",
+               "batch": "#8c510a", "labeling efficiency": "#e6550d",
+               "mCA": "#c51b7d", "division history": "#525252",
+               "substructure": "#cb181d"}
 #: Covariates measured per context (from that context's calls).
 CTX_COVARIATES = ("level", "sites_mean", "decisive", "frac_called")
 _CONTROL_OF = {"delta": "control", "delta_r": "control_r",
@@ -1205,6 +1284,163 @@ def _r2(v, Z, n_types):
     r2 = 1 - ((v - Z @ beta) ** 2).sum() / (v ** 2).sum()
     return (float(r2), float(1 - (1 - r2) * (n - n_types - 1) / dfr), k,
             dfr)
+
+
+def _center_obs(v, t):
+    """Type-centred, each type's mean taken over its observed values; a
+    missing value becomes its type's mean (0)."""
+    s_ = pd.Series(np.asarray(v, float))
+    out = (s_ - s_.groupby(np.asarray(t)).transform("mean")).to_numpy(float)
+    return np.where(np.isfinite(out), out, 0.0)
+
+
+def _shapley_r2(y, Z, groups: dict):
+    """The R^2 of an OLS of ``y`` on ``Z`` (both type-centred, no intercept)
+    shared out among column groups by their Shapley values: each group's
+    marginal R^2 averaged over every order the groups could enter in, so
+    variance two groups explain together is split between them and the
+    values add up to the full R^2.  Returns ({group: share}, full R^2)."""
+    from math import factorial
+    sd = Z.std(0) if Z.size else np.zeros(0)
+    keep = np.flatnonzero(sd > 0)
+    remap = {j: i for i, j in enumerate(keep)}
+    Z = Z[:, keep] / sd[keep]
+    cols = {g: np.array([remap[j] for j in jj if j in remap], np.int64)
+            for g, jj in groups.items()}
+    cols = {g: c for g, c in cols.items() if c.size}
+    names = list(cols)
+    m = len(names)
+    yy = float(y @ y)
+    if m == 0 or yy <= 0:
+        return {g: np.nan for g in groups}, np.nan
+    G, b = Z.T @ Z, Z.T @ y
+    ridge = 1e-9 * max(float(np.trace(G)), 1.0) / G.shape[0]
+    v = np.zeros(1 << m)
+    for mask in range(1, 1 << m):
+        idx = np.concatenate([cols[names[i]] for i in range(m)
+                              if mask >> i & 1])
+        Gs = G[np.ix_(idx, idx)] + ridge * np.eye(idx.size)
+        try:
+            beta = np.linalg.solve(Gs, b[idx])
+        except np.linalg.LinAlgError:
+            beta = np.linalg.lstsq(Gs, b[idx], rcond=None)[0]
+        v[mask] = float(b[idx] @ beta) / yy
+    size = np.array([bin(x).count("1") for x in range(1 << m)])
+    wt = np.array([factorial(k) * factorial(m - k - 1) / factorial(m)
+                   for k in range(m)])
+    masks = np.arange(1 << m)
+    phi = {}
+    for i, g in enumerate(names):
+        bit = 1 << i
+        wo = masks[(masks & bit) == 0]
+        phi[g] = float(np.sum(wt[size[wo]] * (v[wo | bit] - v[wo])))
+    return {g: phi.get(g, np.nan) for g in groups}, float(v[-1])
+
+
+def _nearest(sites, g) -> np.ndarray:
+    """Distance from each genome coordinate ``g`` to the nearest of the
+    sorted genome coordinates ``sites`` (never across chromosomes: they are
+    STRIDE apart)."""
+    g = np.asarray(g, np.int64)
+    if sites is None or sites.size == 0:
+        return np.full(g.size, np.iinfo(np.int64).max, np.int64)
+    i = np.searchsorted(sites, g)
+    lo = sites[np.maximum(i - 1, 0)]
+    hi = sites[np.minimum(i, sites.size - 1)]
+    return np.minimum(np.abs(g - lo), np.abs(hi - g))
+
+
+def open_site_coords(path=None, genes=None, cpg=None, exclude=()):
+    """Sorted genome coordinates of sites open in (nearly) every cell, and
+    what they are: the midpoints of the BED ``path`` (e.g. CTCF motifs in
+    constitutive peaks), else the TSSs of ``genes`` that lie in a CpG
+    island (``cpg``) -- CpG-island promoters are open and unmethylated in
+    almost every cell type -- or every TSS without islands."""
+    if path:
+        df = pd.read_csv(path, sep="\t", header=None, comment="#",
+                         compression="infer", dtype={0: str}, usecols=[0, 1, 2])
+        chrom = df[0].astype(str).to_numpy()
+        pos = ((df[1].to_numpy(np.int64) + df[2].to_numpy(np.int64)) // 2)
+        label = Path(path).name
+    elif genes is not None and len(genes):
+        chrom = genes["chrom"].astype(str).to_numpy()
+        pos = np.where(genes["strand"].to_numpy() == "-",
+                       genes["end"].to_numpy(np.int64) - 1,
+                       genes["start"].to_numpy(np.int64))
+        label = "TSSs"
+        if cpg is not None and len(cpg):
+            iv = Intervals("cgi", ("cgi",), cpg["chrom"].astype(str),
+                           cpg["start"], cpg["end"], np.zeros(len(cpg)))
+            inside = iv.lookup(chrom, pos) >= 0
+            chrom, pos = chrom[inside], pos[inside]
+            label = "CpG-island TSSs"
+    else:
+        return None, None
+    keep = np.array([_canon(c) not in exclude for c in chrom], bool)
+    g = np.unique(_codes_of(chrom[keep]) * STRIDE + pos[keep])
+    return g, label
+
+
+def _count_pass(path, exclude) -> tuple:
+    """One cell's raw methylation from a read-pairs file (k methylated of n
+    sites per end): the sites methylated and the sites, over all its
+    ends."""
+    df, names, ci, lut = _categorical(path, ["chrom", "k1", "n1", "k2", "n2"])
+    ok = np.array([_canon(c) not in exclude for c in names] + [False])[ci]
+    k = float(df["k1"].to_numpy()[ok].sum() + df["k2"].to_numpy()[ok].sum())
+    n = float(df["n1"].to_numpy()[ok].sum() + df["n2"].to_numpy()[ok].sum())
+    return k, n
+
+
+def substructure_pcs(profiles: dict, types: dict, n_pcs: int = 5,
+                     min_cells: int = 20, min_cover: float = 0.5
+                     ) -> pd.DataFrame:
+    """Within-type substructure: the cells' regional profiles, reduced.
+
+    ``profiles``: {context: {cell: (bin keys, posterior sums, ends)}} -- per
+    cell, its ends' mean posterior in each bin, less the cell's own mean (its
+    level, a covariate of its own).  Within each cell type of at least
+    ``min_cells`` cells: the bins observed in ``min_cover`` of its cells, of
+    every context, each centred and scaled over the type's cells (a missing
+    value at the type's mean), and the top ``n_pcs`` principal components,
+    as z-scores within the type.  Subtypes, a cortical-area or layer
+    gradient, or an animal, show as such components."""
+    cells = sorted(set().union(*[set(p) for p in profiles.values()]))
+    out = np.full((len(cells), n_pcs), np.nan)
+    if not cells:
+        return pd.DataFrame({"cell": cells})
+    row = {c: i for i, c in enumerate(cells)}
+    blocks = []
+    for prof in profiles.values():
+        if not prof:
+            continue
+        keys = np.unique(np.concatenate([v[0] for v in prof.values()]))
+        M = np.full((len(cells), keys.size), np.nan, np.float32)
+        for c, (k, sm, n) in prof.items():
+            if n.sum() == 0:
+                continue
+            M[row[c], np.searchsorted(keys, k)] = sm / n - sm.sum() / n.sum()
+        blocks.append(M)
+    M = np.concatenate(blocks, 1) if blocks else np.empty((len(cells), 0))
+    t = np.array([types.get(c, "") for c in cells])
+    for ty in np.unique(t):
+        r = np.flatnonzero(t == ty)
+        if r.size < min_cells:
+            continue
+        X = M[r]
+        X = X[:, np.isfinite(X).mean(0) >= min_cover]
+        if X.shape[1] <= n_pcs:
+            continue
+        with np.errstate(invalid="ignore"):
+            mu, sd = np.nanmean(X, 0), np.nanstd(X, 0)
+        X = np.nan_to_num((X - mu) / np.where(sd > 0, sd, 1))
+        U, S, _ = np.linalg.svd(X - X.mean(0), full_matrices=False)
+        k = min(n_pcs, U.shape[1])
+        sc = U[:, :k] * S[:k]
+        sd_ = sc.std(0)
+        out[r, :k] = (sc - sc.mean(0)) / np.where(sd_ > 0, sd_, 1)
+    return pd.DataFrame({"cell": cells, **{f"sub_pc{i + 1}": out[:, i]
+                                           for i in range(n_pcs)}})
 
 
 def locus_reassignment(cell, ctype, pair, band, parts: dict, n_band: int,
@@ -1374,12 +1610,24 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
     cells with enough contacts:
 
     - each covariate's within-type Spearman rho (ranks with each type's
-      mean rank removed; p from t on n - types - 1 df; BH q over the table);
-    - all numeric covariates together, batch alone and both: the adjusted
-      R^2 of a no-intercept OLS on type-centred values (R2_adj, R2_adj_batch,
-      R2_adj_all), and per batch column an F test (batch_<col>_p);
+      mean rank removed, over the cells it is measured in; p from t on
+      n - types - 1 df; BH q over the table's single covariates);
+    - all covariates together, batch alone and both: the adjusted R^2 of a
+      no-intercept OLS on type-centred values (R2_adj, R2_adj_batch,
+      R2_adj_all; a cell missing a covariate is put at its type's mean),
+      and per batch column an F test (batch_<col>_p);
     - the same full fit on the control, which has nothing to explain
-      (control_R2_adj: well above 0 means a covariate tracks noise).
+      (control_R2_adj: well above 0 means a covariate tracks noise);
+    - for same-state pairs, R2_adj_all shared out among the covariate
+      groups (COV_GROUPS, and batch) by their Shapley values -- each
+      group's added R^2 averaged over every order the groups could enter
+      in, so what two groups explain together is split between them --
+      as shap_<group>, shares of the total within-type variance that add up
+      to R2_adj_all.
+
+    'scale' is the cell's two class SDs multiplied: C is a covariance, so a
+    cell whose posteriors vary more in these classes has a larger ΔC at the
+    same coordination.
 
     R^2 is of the TOTAL within-type variance.  bio_share = 1 -
     Var_w(control) / Var_w(value) is the part beyond sampling noise, and
@@ -1412,6 +1660,8 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
         cx = ctx_cov.get(ctx)
         if cx is not None:
             d = d.merge(cx, on="cell", how="left")
+        if "sd_anchor" in d and "sd_partner" in d:
+            d["scale"] = d["sd_anchor"] * d["sd_partner"]
         avail = [c for c in COVARIATES if c in d
                  and d[c].notna().sum() >= min_cells and d[c].nunique() > 1]
         X0 = d[avail].to_numpy(float) if avail else np.empty((len(d), 0))
@@ -1421,15 +1671,16 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                 continue
             y0 = d[stat].to_numpy(float)
             c0 = d[_CONTROL_OF[stat]].to_numpy(float)
-            ok = np.isfinite(y0) & np.isfinite(c0) & np.isfinite(X0).all(1)
+            ok = np.isfinite(y0) & np.isfinite(c0)
             if ok.sum() < min_cells:
                 continue
             t = d["cell_type"].to_numpy()[ok]
             n, n_t = int(ok.sum()), len(set(t))
             y, c = _center(y0[ok], t), _center(c0[ok], t)
-            X = (np.column_stack([_center(X0[ok, j], t)
-                                  for j in range(X0.shape[1])])
-                 if X0.shape[1] else np.empty((n, 0)))
+            Xo = X0[ok]
+            X = (np.column_stack([_center_obs(Xo[:, j], t)
+                                  for j in range(Xo.shape[1])])
+                 if Xo.shape[1] else np.empty((n, 0)))
             Bs = {}
             for b in bcols:
                 dm = pd.get_dummies(d.loc[ok, b].astype(str), drop_first=True)
@@ -1441,17 +1692,20 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                     else np.empty((n, 0)))
             row = {"context": ctx, "system": sy, "anchor": k1, "partner": k2,
                    "band": bl, "statistic": stat, "cells": n}
-            ry = _center(pd.Series(y0[ok]).rank().to_numpy(), t)
-            df_ = max(n - n_t - 1, 1)
             for cname in COVARIATES:
                 rho = p_ = np.nan
                 if cname in avail:
-                    j = avail.index(cname)
-                    rx = _center(pd.Series(X0[ok, j]).rank().to_numpy(), t)
-                    if rx.std() > 0 and ry.std() > 0:
-                        rho = float(np.corrcoef(rx, ry)[0, 1])
-                        tt = rho * np.sqrt(df_ / max(1 - rho ** 2, 1e-12))
-                        p_ = float(2 * t_dist.sf(abs(tt), df_))
+                    xv = Xo[:, avail.index(cname)]
+                    f_ = np.isfinite(xv)
+                    if f_.sum() >= min_cells:
+                        rx = _center(pd.Series(xv[f_]).rank().to_numpy(), t[f_])
+                        ry = _center(pd.Series(y0[ok][f_]).rank().to_numpy(),
+                                     t[f_])
+                        if rx.std() > 0 and ry.std() > 0:
+                            rho = float(np.corrcoef(rx, ry)[0, 1])
+                            df_ = max(int(f_.sum()) - len(set(t[f_])) - 1, 1)
+                            tt = rho * np.sqrt(df_ / max(1 - rho ** 2, 1e-12))
+                            p_ = float(2 * t_dist.sf(abs(tt), df_))
                 row[f"rho_{cname}"], row[f"p_{cname}"] = rho, p_
             row["R2_adj"] = _r2(y, X, n_t)[1]
             row["R2_adj_batch"] = _r2(y, Ball, n_t)[1]
@@ -1480,13 +1734,29 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                 if np.isfinite(r2a) and np.isfinite(cs) and cs > 0:
                     row["explained_cell_share"] = float(
                         np.clip(max(r2a, 0) / cs, 0, 1))
+            if k1 == k2 and np.isfinite(r2a):
+                groups = {}
+                for gname, cols in COV_GROUPS:
+                    jj = [avail.index(x) for x in cols if x in avail]
+                    if jj:
+                        groups[gname] = jj
+                if Ball.size:
+                    groups["batch"] = list(range(X.shape[1],
+                                                 X.shape[1] + Ball.shape[1]))
+                if groups:
+                    phi, r2 = _shapley_r2(y, XB, groups)
+                    f_ = max(r2a, 0) / r2 if np.isfinite(r2) and r2 > 0 else 0
+                    for gname, v in phi.items():
+                        row[f"shap_{gname}"] = (v * f_ if np.isfinite(v)
+                                                else np.nan)
             rows.append(row)
     out = pd.DataFrame(rows)
     if not out.empty:
-        pcols = [f"p_{c}" for c in COVARIATES]
-        q = fdr_bh(out[pcols].to_numpy(float).ravel())
-        for j, c in enumerate(COVARIATES):
-            out[f"q_{c}"] = q.reshape(len(out), len(COVARIATES))[:, j]
+        pcols = [f"p_{c}" for c in HEATMAP_COVARIATES]
+        q = fdr_bh(out[pcols].to_numpy(float).ravel()).reshape(
+            len(out), len(pcols))
+        for j, c in enumerate(HEATMAP_COVARIATES):
+            out[f"q_{c}"] = q[:, j]
     return out
 
 
@@ -1539,6 +1809,523 @@ def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
                                  if ra >= min_reliability
                                  and rb >= min_reliability else np.nan)})
     return pd.DataFrame(rows)
+
+
+# ------------------------------------------------- cell-type prediction --
+
+#: The feature sets each region group predicts cell type from.
+AUC_VARIANTS = ("concordance", "control", "marginal",
+                "marginal + concordance", "marginal + control")
+
+
+def _auc(pos, score) -> float:
+    """ROC AUC from ranks (Mann-Whitney U), ties shared."""
+    from scipy.stats import rankdata
+    pos = np.asarray(pos, bool)
+    n1 = int(pos.sum())
+    n0 = pos.size - n1
+    if n1 == 0 or n0 == 0:
+        return np.nan
+    r = rankdata(score)
+    return float((r[pos].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+def _cv_type_auc(X, y, n_folds: int, seed: int, n_boot: int = 200,
+                 n_trees: int = 300):
+    """Cell type from ``X``: out-of-fold class probabilities of a random
+    forest (300 trees, max_features sqrt, as coordination_eval.cv_rf;
+    leaves of >= 5 cells), stratified ``n_folds``-fold.  Returns the macro
+    one-vs-rest AUC, its 95% bootstrap interval over cells, and every
+    type's own AUC -- or None with under two types."""
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import StratifiedKFold
+    labels, yy = np.unique(np.asarray(y).astype(str), return_inverse=True)
+    if labels.size < 2:
+        return None
+    folds = min(n_folds, int(np.bincount(yy).min()))
+    if folds < 2:
+        return None
+    P = np.zeros((yy.size, labels.size))
+    for tr, te in StratifiedKFold(folds, shuffle=True,
+                                  random_state=seed).split(X, yy):
+        clf = RandomForestClassifier(n_estimators=n_trees,
+                                     max_features="sqrt", min_samples_leaf=5,
+                                     n_jobs=1, random_state=seed)
+        clf.fit(X[tr], yy[tr])
+        P[np.ix_(te, clf.classes_)] = clf.predict_proba(X[te])
+    per = np.array([_auc(yy == j, P[:, j]) for j in range(labels.size)])
+    rng = np.random.default_rng(seed)
+    boot = []
+    for _ in range(n_boot):
+        i = rng.integers(0, yy.size, yy.size)
+        boot.append(np.nanmean([_auc(yy[i] == j, P[i, j])
+                                for j in range(labels.size)]))
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    return float(per.mean()), float(lo), float(hi), dict(zip(labels, per))
+
+
+def celltype_auc(percell: pd.DataFrame, stat: str = "signed_rel",
+                 n_folds: int = 5, seed: int = 0, n_threads: int = 1,
+                 min_type_cells: int = 10, n_trees: int = 300):
+    """How well does a region group's per-cell concordance predict cell
+    type?
+
+    Per context -- and the contexts together -- over all distances, the
+    same-state class pairs ("region groups": A-A, early-early, promoter-
+    promoter, ...): each group alone, each system's groups together and all
+    groups together, as features of a cross-validated random forest
+    (:func:`_cv_type_auc`), five ways --
+
+      concordance             the statistic ``stat`` itself
+      control                 the same on reshuffled links alone: an AUC
+                              here is cell-type information the statistic
+                              carries without any coordination
+      marginal                the cell's mean posterior in the class
+      marginal + concordance  against marginal alone: what the
+                              concordance adds to the level
+      marginal + control      the same for the control
+
+    The same cells in all five: those with enough contacts in the group
+    (with several groups, in any of them, a missing value at the column's
+    median); types with fewer than ``min_type_cells`` of them are left out.
+    Returns (macro AUC table, per-type AUC table)."""
+    from joblib import Parallel, delayed
+    all_b = next((b for b in dict.fromkeys(percell["band"])
+                  if str(b).startswith("all")), None)
+    pc = percell[(percell["band"] == all_b) & percell["enough_pairs"]
+                 & (percell["anchor"] == percell["partner"])]
+    ctrl = _CONTROL_OF[stat]
+    if pc.empty or stat not in pc or ctrl not in pc:
+        return pd.DataFrame(), pd.DataFrame()
+    W = {m: pc.pivot_table(index="cell", values=m, aggfunc="first",
+                           columns=["context", "system", "anchor"])
+         for m in (stat, ctrl, "mu_anchor")}
+    types = pc.drop_duplicates("cell").set_index("cell")["cell_type"].astype(
+        str)
+    contexts = list(dict.fromkeys(pc["context"]))
+    ctx_sets = [(c, [c]) for c in contexts]
+    if len(contexts) > 1:
+        ctx_sets.append((" + ".join(contexts), contexts))
+    feats = {"concordance": (stat,), "control": (ctrl,),
+             "marginal": ("mu_anchor",),
+             "marginal + concordance": ("mu_anchor", stat),
+             "marginal + control": ("mu_anchor", ctrl)}
+    tasks = []
+    for ctx_name, ctxs in ctx_sets:
+        cols_ctx = [c for c in W[stat].columns if c[0] in ctxs]
+        groups = list(dict.fromkeys((sy, k) for _, sy, k in cols_ctx))
+        sets = [(sy, k, [(sy, k)]) for sy, k in groups]
+        systems_ = list(dict.fromkeys(sy for sy, _ in groups))
+        for sy in systems_:
+            gs = [g for g in groups if g[0] == sy]
+            if len(gs) > 1:
+                sets.append((sy, "all classes", gs))
+        if len(systems_) > 1:
+            sets.append(("all", "all classes", groups))
+        for sy, name, gs in sets:
+            cols = [c for c in cols_ctx if (c[1], c[2]) in gs]
+            M = W[stat].reindex(columns=cols)
+            cells = M.index[M.notna().any(axis=1).to_numpy()]
+            y = types.reindex(cells)
+            cnt = y.value_counts()
+            cells = cells[y.isin(cnt.index[cnt >= min_type_cells]).to_numpy()]
+            y = types.reindex(cells).to_numpy()
+            if len(set(y)) < 2:
+                continue
+            for variant in AUC_VARIANTS:
+                X = np.column_stack([W[m].reindex(index=cells, columns=cols)
+                                     .to_numpy(float) for m in feats[variant]])
+                with np.errstate(all="ignore"):
+                    med = np.nanmedian(np.where(np.isfinite(X), X, np.nan), 0)
+                X = np.where(np.isfinite(X), X, np.nan_to_num(med)[None, :])
+                tasks.append(((ctx_name, sy, name, variant, len(cells),
+                               len(set(y))), X, y))
+    # processes: a forest's per-tree Python work holds the GIL
+    res = Parallel(n_jobs=n_threads)(
+        delayed(_cv_type_auc)(X, y, n_folds, seed, n_trees=n_trees)
+        for _, X, y in tasks)
+    rows, per_rows = [], []
+    for (key, _, _), r in zip(tasks, res):
+        if r is None:
+            continue
+        ctx_name, sy, name, variant, n, nt = key
+        base = {"context": ctx_name, "system": sy, "group": name,
+                "features": variant, "statistic": stat}
+        rows.append({**base, "cells": n, "types": nt, "auc": r[0],
+                     "auc_lo": r[1], "auc_hi": r[2]})
+        per_rows += [{**base, "cell_type": t, "auc": a}
+                     for t, a in r[3].items()]
+    return pd.DataFrame(rows), pd.DataFrame(per_rows)
+
+
+def _auc_rows(res: pd.DataFrame) -> list:
+    """Row order of the AUC figures: system by system, its groups then all
+    its classes; all groups last."""
+    keys = list(dict.fromkeys(zip(res["system"], res["group"])))
+    order = [x for x in SYSTEMS if any(k[0] == x for k in keys)] + [
+        x for x in dict.fromkeys(k[0] for k in keys)
+        if x not in SYSTEMS and x != "all"]
+    out = []
+    for sy in order:
+        out += [k for k in keys if k[0] == sy and k[1] != "all classes"]
+        out += [k for k in keys if k[0] == sy and k[1] == "all classes"]
+    return out + [k for k in keys if k[0] == "all"]
+
+
+def plot_celltype_auc(res: pd.DataFrame, per: pd.DataFrame, stat: str, path):
+    """a: per context, the cross-validated macro AUC of cell type from each
+    region group's concordance (filled, 95% CI), its control (open), the
+    marginal (grey square) and marginal + concordance (black diamond); b:
+    the concordance's AUC for every cell type."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    if res.empty:
+        return
+    contexts = list(dict.fromkeys(res["context"]))
+    rows = _auc_rows(res)
+    ny = len(rows)
+    label = [f"{SYSTEM_LABEL.get(sy, sy)}: {g}" if sy != "all"
+             else "all region groups" for sy, g in rows]
+    types = sorted(per["cell_type"].astype(str).unique())
+    style = {"concordance": dict(marker="o", color="#2b7bba", ms=3.5),
+             "control": dict(marker="o", mfc="none", color="0.45", ms=3.5),
+             "marginal": dict(marker="s", color="0.7", ms=3),
+             "marginal + concordance": dict(marker="D", color="0.1", ms=2.8),
+             "marginal + control": dict(marker="D", mfc="none", color="0.45",
+                                        ms=2.8)}
+    with plt.rc_context(figure_style.RC):
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN,
+                                  1.2 + 0.32 * ny))
+        gs = fig.add_gridspec(2, len(contexts), height_ratios=[1, 1],
+                              hspace=0.18, wspace=0.08, top=0.94,
+                              bottom=0.07)
+        x_lo = min(0.4, float(np.nanmin(res["auc"])) - 0.03)
+        hm_axes = []
+        for j, ctx in enumerate(contexts):
+            ax = fig.add_subplot(gs[0, j])
+            r = res[res["context"] == ctx].set_index(["system", "group",
+                                                      "features"])
+            for k, v in enumerate(AUC_VARIANTS):
+                dy = (k - 2) * 0.12
+                for i, key in enumerate(rows):
+                    if key + (v,) not in r.index:
+                        continue
+                    x = r.loc[key + (v,)]
+                    if v in ("concordance", "marginal + concordance"):
+                        ax.plot([x["auc_lo"], x["auc_hi"]], [i + dy] * 2,
+                                color=style[v]["color"], lw=0.6)
+                    ax.plot([x["auc"]], [i + dy], ls="none", label=v,
+                            **style[v])
+            ax.axvline(0.5, color="0.5", lw=0.5, ls="--")
+            ax.set_xlim(x_lo, 1.0)
+            ax.set_xlabel("macro AUC (one-vs-rest)", fontsize=5.5)
+            ax.set_ylim(ny - 0.5, -0.5)
+            ax.set_yticks(range(ny))
+            ax.set_yticklabels(label if j == 0 else [], fontsize=5)
+            for i, (sy, g) in enumerate(rows):
+                if g == "all classes" or sy == "all":
+                    ax.axhspan(i - 0.5, i + 0.5, color="0.93", zorder=0)
+            ax.set_title(f"{'a' if j == 0 else ''}  {ctx}", loc="left",
+                         fontsize=6.5)
+            if j == len(contexts) - 1:
+                h, lab = ax.get_legend_handles_labels()
+                uniq = dict(zip(lab, h))
+                ax.legend(uniq.values(), uniq.keys(), fontsize=4.5,
+                          loc="upper left", bbox_to_anchor=(1.02, 1.0),
+                          borderaxespad=0)
+            ax2 = fig.add_subplot(gs[1, j])
+            p_ = per[(per["context"] == ctx)
+                     & (per["features"] == "concordance")]
+            H = (p_.set_index(["system", "group", "cell_type"])["auc"]
+                 .unstack("cell_type").reindex(index=pd.MultiIndex.from_tuples(
+                     rows), columns=types))
+            im = ax2.imshow(H.to_numpy(float), cmap="magma_r", vmin=0.5,
+                            vmax=1.0, aspect="auto")
+            hm_axes.append(ax2)
+            for i in range(ny):
+                for k_, t in enumerate(types):
+                    v_ = H.iat[i, k_]
+                    if np.isfinite(v_):
+                        ax2.text(k_, i, f"{v_:.2f}"[1:], ha="center",
+                                 va="center", fontsize=3.5,
+                                 color="w" if v_ > 0.8 else "k")
+            ax2.set_yticks(range(ny))
+            ax2.set_yticklabels(label if j == 0 else [], fontsize=5)
+            ax2.set_xticks(range(len(types)))
+            ax2.set_xticklabels(types, rotation=60, ha="right", fontsize=5)
+            if j == 0:
+                ax2.set_title("b  each cell type against the rest "
+                              "(concordance)", loc="left", fontsize=6.5)
+        cb = fig.colorbar(im, ax=hm_axes, fraction=0.03, pad=0.02)
+        cb.ax.tick_params(labelsize=5)
+        cb.set_label("AUC", fontsize=6)
+        fig.suptitle(f"How well {_STAT_LABEL.get(stat, stat)} in each region "
+                     f"group predicts cell type (random forest, cross-"
+                     f"validated)", fontsize=7, y=0.985)
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+# ---------------------------------------------------------- locus hotspots --
+
+#: Mouse genes with established parent-of-origin (imprinted) expression and
+#: an imprinting DMR at or near them.  One allele is methylated and the
+#: other not, and a contact joins two loci on the same chromosome copy, so
+#: allele-specific methylation reads as concordance -- in these loci first.
+IMPRINTED_GENES = (
+    "H19", "Igf2", "Igf2r", "Airn", "Kcnq1ot1", "Kcnq1", "Cdkn1c", "Phlda2",
+    "Ascl2", "Peg3", "Zim1", "Zim2", "Snrpn", "Snurf", "Ube3a", "Ndn",
+    "Magel2", "Mkrn3", "Peg12", "Mest", "Plagl1", "Grb10", "Meg3", "Rian",
+    "Mirg", "Dlk1", "Rtl1", "Dio3", "Gnas", "Nnat", "Peg10", "Sgce", "Zrsr1",
+    "Impact", "Rasgrf1", "Zdbf2", "Peg13", "Kcnk9", "Nap1l5", "Commd1",
+    "Slc38a4", "Sfmbt2", "Mcts2", "H13", "Blcap")
+#: Gene families tested as hotspot annotations, by gene name.
+GENE_FAMILIES = {"protocadherin cluster": r"^Pcdh[abg]",
+                 "olfactory receptor genes": r"^Olfr\d",
+                 "Zfp zinc-finger genes": r"^Zfp\d"}
+
+
+class BinGrid:
+    """Genome bins of one size, as one dense index: chromosome (by code)
+    x bin."""
+
+    def __init__(self, codes, max_pos: int, size: int):
+        self.codes = np.unique(np.asarray(list(codes), np.int64))
+        self.size = int(size)
+        self.per = int(max_pos // size) + 1
+        self.n = self.codes.size * self.per
+
+    def index_g(self, g) -> np.ndarray:
+        """The bin of each genome coordinate; -1 off the grid."""
+        g = np.asarray(g, np.int64)
+        code = g // STRIDE
+        if self.codes.size == 0:
+            return np.full(g.size, -1, np.int64)
+        r = np.minimum(np.searchsorted(self.codes, code), self.codes.size - 1)
+        b = (g % STRIDE) // self.size
+        ok = (self.codes[r] == code) & (b < self.per)
+        return np.where(ok, r * self.per + b, -1)
+
+    def coverage_g(self, g0, g1) -> np.ndarray:
+        """Per bin, the share of it the intervals [g0, g1) cover (genome
+        coordinates; overlaps are not merged here)."""
+        g0, g1 = np.asarray(g0, np.int64), np.asarray(g1, np.int64)
+        code = g0 // STRIDE
+        out = np.zeros(self.n)
+        if g0.size == 0 or self.codes.size == 0:
+            return out
+        r = np.minimum(np.searchsorted(self.codes, code), self.codes.size - 1)
+        ok = (self.codes[r] == code) & (g1 > g0)
+        st, en, r = g0[ok] % STRIDE, g1[ok] - code[ok] * STRIDE, r[ok]
+        b0, b1 = st // self.size, (en - 1) // self.size
+        span = b1 - b0 + 1
+        rep = np.repeat(np.arange(st.size), span)
+        b = b0[rep] + (np.arange(rep.size)
+                       - np.repeat(np.cumsum(span) - span, span))
+        bp = (np.minimum(en[rep], (b + 1) * self.size)
+              - np.maximum(st[rep], b * self.size))
+        keep = b < self.per
+        np.add.at(out, r[rep][keep] * self.per + b[keep], bp[keep])
+        return out / self.size
+
+    def coverage(self, df: pd.DataFrame) -> np.ndarray:
+        """:meth:`coverage_g` of a chrom / start / end table, merged."""
+        if df is None or not len(df):
+            return np.zeros(self.n)
+        m = _merged(df.assign(chrom=df["chrom"].map(_canon)))
+        c = _codes_of(m["chrom"].to_numpy()) * STRIDE
+        return self.coverage_g(c + m["start"].to_numpy(np.int64),
+                               c + m["end"].to_numpy(np.int64))
+
+    def counts_g(self, g) -> np.ndarray:
+        i = self.index_g(g)
+        return np.bincount(i[i >= 0], minlength=self.n).astype(float)
+
+
+def locus_hotspots(grid: BinGrid, g_lo, g_hi, cell, d, c, band,
+                   n_band: int) -> pd.DataFrame:
+    """Where concordance concentrates along the genome, pooled over cells.
+
+    Per bin of ``grid`` and band (index ``n_band`` = all distances): the
+    contacts with an end in the bin -- counted once when both ends are --
+    their mean contribution to ΔC (``d``: the real partner's product less
+    the reshuffled one's) and to the control (``c``: reshuffled draw 2 less
+    draw 1), with per-contact standard errors and z-scores, and for 'all'
+    the cells they come from."""
+    i_lo, i_hi = grid.index_g(g_lo), grid.index_g(g_hi)
+    nb = n_band + 1
+    band = np.asarray(band, np.int64)
+    sel_lo, sel_hi = i_lo >= 0, (i_hi >= 0) & (i_hi != i_lo)
+
+    def acc(w=None):
+        out = np.zeros(grid.n * nb)
+        for idx, sel in ((i_lo, sel_lo), (i_hi, sel_hi)):
+            out += np.bincount(idx[sel] * nb + band[sel],
+                               weights=None if w is None else w[sel],
+                               minlength=grid.n * nb)
+        out = out.reshape(grid.n, nb)
+        out[:, n_band] = out[:, :n_band].sum(1)
+        return out
+    n, s1, s2, t1, t2 = acc(), acc(d), acc(d * d), acc(c), acc(c * c)
+    cell = np.asarray(cell, np.int64)
+    o = (np.argsort(cell, kind="stable") if cell.size > 1
+         and np.any(np.diff(cell) < 0) else np.arange(cell.size))
+    cs, lo_, hi_ = cell[o], i_lo[o], i_hi[o]
+    bounds = np.flatnonzero(np.r_[True, cs[1:] != cs[:-1], True])
+    n_cells = np.zeros(grid.n, np.int64)
+    for a_, e_ in zip(bounds[:-1], bounds[1:]):
+        u = np.unique(np.concatenate([lo_[a_:e_], hi_[a_:e_]]))
+        n_cells[u[u >= 0]] += 1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        md, mc = s1 / n, t1 / n
+        se = np.sqrt(np.maximum(s2 / n - md ** 2, 0) / n)
+        sec = np.sqrt(np.maximum(t2 / n - mc ** 2, 0) / n)
+    rows = []
+    for b in range(nb):
+        nz = np.flatnonzero(n[:, b] > 0)
+        rows.append(pd.DataFrame({
+            "grid_index": nz, "code": grid.codes[nz // grid.per],
+            "start": (nz % grid.per) * grid.size,
+            "end": (nz % grid.per + 1) * grid.size, "band_index": b,
+            "contacts": n[nz, b].astype(np.int64),
+            "cells": n_cells[nz] if b == n_band else -1,
+            "delta": md[nz, b], "control": mc[nz, b], "se": se[nz, b],
+            "se_control": sec[nz, b]}))
+    out = pd.concat(rows, ignore_index=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out["z"] = out["delta"] / out["se"]
+        out["z_control"] = out["control"] / out["se_control"]
+    return out
+
+
+def _empirical_q(z, z0) -> np.ndarray:
+    """BH q of each observed z (large = called) against an empirical null
+    fitted to the control's z0: normal, centred at their median and as wide
+    as their MAD says -- contacts of one cell and one locus are not
+    independent, so the per-contact z is wider than N(0, 1), and the control
+    shows by how much."""
+    from scipy.stats import norm
+    z = np.asarray(z, float)
+    z0 = np.asarray(z0, float)
+    z0 = z0[np.isfinite(z0)]
+    q = np.full(z.size, np.nan)
+    ok = np.isfinite(z)
+    if not ok.any() or z0.size < 5:
+        return q
+    m0 = float(np.median(z0))
+    s0 = max(float(1.4826 * np.median(np.abs(z0 - m0))), 1.0)
+    q[ok] = fdr_bh(norm.sf((z[ok] - m0) / s0))
+    return q
+
+
+def call_hotspots(hs: pd.DataFrame, n_band: int, fdr: float,
+                  min_contacts: int, min_cells: int = 10) -> pd.DataFrame:
+    """Hot and cold bins of :func:`locus_hotspots` (per context, all
+    distances): tested when they have ``min_contacts`` contacts from
+    ``min_cells`` cells.  Concordance is positive over most of the genome,
+    so a bin is hot or cold against the typical bin -- ``excess``, its ΔC
+    less the median tested bin's, in z units ``z_excess`` -- called at an
+    FDR against a null fitted to the control's same z (:func:`_empirical_q`):
+    reshuffled draw 2 less draw 1 has the same per-contact dependence as
+    the real partners, and no concordance."""
+    hs = hs.copy()
+    hs["tested"] = ((hs["band_index"] == n_band)
+                    & (hs["contacts"] >= min_contacts)
+                    & (hs["cells"] >= min_cells))
+    for col in ("excess", "z_excess", "q_hot", "q_cold"):
+        hs[col] = np.nan
+    for _, g in hs[hs["tested"]].groupby("context", sort=False):
+        ex = g["delta"] - g["delta"].median()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            z = ex / g["se"]
+            z0 = (g["control"] - g["control"].median()) / g["se_control"]
+        hs.loc[g.index, "excess"] = ex
+        hs.loc[g.index, "z_excess"] = z
+        hs.loc[g.index, "q_hot"] = _empirical_q(z, z0)
+        hs.loc[g.index, "q_cold"] = _empirical_q(-z, -z0)
+    hs["hot"] = (hs["q_hot"] < fdr) & (hs["excess"] > 0)
+    hs["cold"] = (hs["q_cold"] < fdr) & (hs["excess"] < 0)
+    return hs
+
+
+def hotspot_tracks(grid: BinGrid, systems: dict, ab_maps, genes, cpg,
+                   user: dict) -> dict:
+    """Per-bin annotation values the hotspot map is tested against: the
+    share of the bin in each class of each system, PMD borders, CpG
+    islands, TSSs, imprinted genes, the clustered gene families, and any
+    --hotspot-annotation BED."""
+    import re
+    tracks = {}
+    sy = dict(systems)
+    if ab_maps:
+        sy["ab"] = ab_maps["__all__"]
+    for name, iv in sy.items():
+        lab = SYSTEM_LABEL.get(name, name)
+        for k, cls in enumerate(iv.classes):
+            sel = iv._k == k
+            tracks[f"{lab}: {cls}"] = grid.coverage_g(iv._g0[sel], iv._g1[sel])
+        if name == "pmd" and "PMD" in iv.classes:
+            sel = iv._k == iv.classes.index("PMD")
+            tracks["PMD borders"] = grid.counts_g(
+                np.concatenate([iv._g0[sel], iv._g1[sel] - 1]))
+    if cpg is not None and len(cpg):
+        tracks["CpG islands"] = grid.coverage(cpg)
+    if genes is not None and len(genes):
+        g = genes.assign(chrom=genes["chrom"].map(_canon))
+        tss = np.where(g["strand"].to_numpy() == "-",
+                       g["end"].to_numpy(np.int64) - 1,
+                       g["start"].to_numpy(np.int64))
+        tracks["TSSs (count)"] = grid.counts_g(
+            _codes_of(g["chrom"].to_numpy()) * STRIDE + tss)
+        names = g["name"].astype(str)
+        tracks["imprinted genes"] = grid.coverage(
+            g[names.isin(IMPRINTED_GENES)])
+        for fam, rx in GENE_FAMILIES.items():
+            tracks[fam] = grid.coverage(
+                g[names.map(lambda x: re.match(rx, x) is not None)])
+    for name, df in (user or {}).items():
+        tracks[name] = grid.coverage(df)
+    return {k: v for k, v in tracks.items() if np.any(v > 0)}
+
+
+def hotspot_enrichment(hs: pd.DataFrame, tracks: dict) -> pd.DataFrame:
+    """Per context and annotation track, over the tested bins: Spearman rho
+    between a bin's ΔC and the track (and the control's ΔC, for scale), and
+    whether hot / cold bins fall where the track is more often than other
+    bins (odds ratio and Fisher's exact p)."""
+    from scipy.stats import fisher_exact, spearmanr
+    rows = []
+    for ctx, a in hs[hs["tested"]].groupby("context", sort=False):
+        gi = a["grid_index"].to_numpy()
+        for name, v in tracks.items():
+            x = v[gi]
+            if np.ptp(x) == 0:
+                continue
+            rho, p = spearmanr(a["delta"], x)
+            rho0, _ = spearmanr(a["control"], x)
+            row = {"context": ctx, "track": name, "bins": int(gi.size),
+                   "bins_with": int((x > 0).sum()), "rho": float(rho),
+                   "p_rho": float(p), "rho_control": float(rho0)}
+            for kind in ("hot", "cold"):
+                h = a[kind].to_numpy(bool)
+                tab = [[int((h & (x > 0)).sum()), int((h & (x == 0)).sum())],
+                       [int((~h & (x > 0)).sum()),
+                        int((~h & (x == 0)).sum())]]
+                row[f"{kind}_with"] = tab[0][0]
+                row[f"{kind}_total"] = int(h.sum())
+                if h.any():
+                    orr, pf = fisher_exact(tab)
+                    row[f"{kind}_odds_ratio"] = float(orr)
+                    row[f"{kind}_p"] = float(pf)
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["q_rho"] = np.nan
+        for _, g in out.groupby("context", sort=False):
+            out.loc[g.index, "q_rho"] = fdr_bh(g["p_rho"].to_numpy())
+    return out
 
 
 def plot_cross_class(cc: pd.DataFrame, context: str, path):
@@ -1663,6 +2450,137 @@ def plot_cell_cycle(cov: pd.DataFrame, path):
         plt.close(fig)
 
 
+def plot_extra_covariates(cov: pd.DataFrame, path):
+    """The cell covariates of the later checks, by cell type: GCH at open
+    sites (M.CviPI labeling efficiency), PMD depth (HMD less PMD
+    methylation: division history), the mCA index (GCA less GCC + GCT
+    methylated: endogenous CpA methylation read as accessibility), and the
+    first two substructure PCs."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    panels = [(c, lab) for c, lab in (
+        ("open_site_level", "GCH methylated at open sites"),
+        ("pmd_depth", "PMD depth (HMD − PMD, HCG)"),
+        ("mca_index", "mCA index (GCA − GCC/GCT)"))
+        if c in cov and cov[c].notna().sum() > 2]
+    has_pc = all(c in cov and cov[c].notna().sum() > 2
+                 for c in ("sub_pc1", "sub_pc2"))
+    n = len(panels) + int(has_pc)
+    if n == 0:
+        return
+    types = sorted(cov["cell_type"].astype(str).unique())
+    cmap = plt.get_cmap("tab10" if len(types) <= 10 else "tab20")
+    col = {t: cmap(i % cmap.N) for i, t in enumerate(types)}
+    with plt.rc_context(figure_style.RC):
+        fig, ax = plt.subplots(1, n, figsize=(min(figure_style.FIG_W_IN,
+                                                  2.0 * n + 0.6), 2.4),
+                               squeeze=False)
+        ax = ax[0]
+        for a_, (c, lab) in zip(ax, panels):
+            data = [cov.loc[cov["cell_type"].astype(str) == t, c].dropna()
+                    .to_numpy() for t in types]
+            keep = [i for i, x in enumerate(data) if x.size]
+            bp = a_.boxplot([data[i] for i in keep], widths=0.6,
+                            patch_artist=True, flierprops={"markersize": 1.5},
+                            medianprops={"color": "0.1", "lw": 0.8})
+            for b, i in zip(bp["boxes"], keep):
+                b.set_facecolor(col[types[i]])
+                b.set_linewidth(0.5)
+            a_.set_xticks(range(1, len(keep) + 1))
+            a_.set_xticklabels([types[i] for i in keep], rotation=60,
+                               ha="right")
+            a_.set_ylabel(lab)
+            if c == "mca_index":
+                a_.axhline(0, color="0.5", lw=0.5, ls="--")
+        if has_pc:
+            a_ = ax[-1]
+            for t in types:
+                d = cov[cov["cell_type"].astype(str) == t]
+                a_.scatter(d["sub_pc1"], d["sub_pc2"], s=3, color=col[t],
+                           label=t, alpha=0.7, lw=0)
+            a_.set_xlabel("substructure PC1 (z, within type)")
+            a_.set_ylabel("substructure PC2")
+            a_.legend(fontsize=4.5, markerscale=2, ncol=2, loc="best")
+        for a_, lab in zip(ax, "abcd"):
+            a_.set_title(lab, loc="left", fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+def plot_hotspots(hs: pd.DataFrame, enrich: pd.DataFrame, context: str,
+                  path, note: str = "", fdr: float = 0.05):
+    """a: along the genome, per bin, the concordance of the contacts with an
+    end in it, pooled over cells (ΔC, pp; dotted: the median bin) -- bins
+    above it red, below it blue, the control grey; b: per annotation track,
+    Spearman rho across bins between ΔC and the track (bar), and the
+    control's (open circle); * q < 0.05."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    a = hs[(hs["context"] == context) & hs["tested"]]
+    if a.empty:
+        return
+    e = (enrich[enrich["context"] == context].sort_values("rho")
+         if not enrich.empty else enrich)
+    codes = np.sort(a["code"].unique())
+    span = a.groupby("code")["end"].max().reindex(codes).to_numpy(float)
+    off = dict(zip(codes, np.r_[0, np.cumsum(span)[:-1]]))
+    x = a["code"].map(off).to_numpy() + (a["start"] + a["end"]) / 2
+    rank = a["code"].map({c: i for i, c in enumerate(codes)}).to_numpy()
+    names = a.groupby("code")["chrom"].first().reindex(codes)
+    with plt.rc_context(figure_style.RC):
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN,
+                                  1.9 + 0.13 * max(len(e), 4)))
+        gs = fig.add_gridspec(2, 1, height_ratios=[1.3, 0.13 * max(len(e), 4)],
+                              hspace=0.6)
+        ax = fig.add_subplot(gs[0])
+        ax.scatter(x, 100 * a["control"], s=1, color="0.8", lw=0,
+                   label="control (reshuffled draw 2 − draw 1)")
+        ax.scatter(x, 100 * a["delta"], s=1.5, lw=0,
+                   c=np.where(rank % 2, "0.2", "0.55"))
+        for k, c_, lab in (("hot", "#cb181d", "hot"),
+                           ("cold", "#2171b5", "cold")):
+            m = a[k].to_numpy(bool)
+            ax.scatter(x[m], 100 * a["delta"][m], s=3, color=c_, lw=0,
+                       label=f"{lab} ({int(m.sum())} bins, FDR {fdr:g})")
+        ax.axhline(0, color="0.4", lw=0.4)
+        ax.axhline(100 * float(a["delta"].median()), color="#cb181d", lw=0.4,
+                   ls=":")
+        mids = [off[c] + s_ / 2 for c, s_ in zip(codes, span)]
+        ax.set_xticks(mids)
+        ax.set_xticklabels([_canon(n) for n in names], fontsize=4.5)
+        ax.set_xlim(0, float(np.sum(span)))
+        ax.set_ylabel("ΔC (pp)")
+        ax.legend(fontsize=4.5, markerscale=2, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False)
+        ax.set_title(f"a  {context}: concordance along the genome, pooled "
+                     f"over cells{note}", loc="left", fontsize=6.5)
+        if not e.empty:
+            ax2 = fig.add_subplot(gs[1])
+            yy = np.arange(len(e))
+            ax2.barh(yy, e["rho"], color=np.where(e["rho"] > 0, "#cb181d",
+                                                  "#2171b5"), height=0.7)
+            ax2.scatter(e["rho_control"], yy, s=8, facecolors="none",
+                        edgecolors="0.2", lw=0.5, zorder=3, label="control")
+            for y_, (r_, q_) in enumerate(zip(e["rho"], e["q_rho"])):
+                if q_ < 0.05:
+                    ax2.text(r_, y_, " *" if r_ >= 0 else "* ", va="center",
+                             ha="left" if r_ >= 0 else "right", fontsize=6)
+            ax2.axvline(0, color="0.4", lw=0.4)
+            ax2.set_yticks(yy)
+            ax2.set_yticklabels(e["track"], fontsize=5)
+            ax2.set_xlabel("Spearman ρ across bins: ΔC against the track")
+            ax2.legend(fontsize=4.5, loc="lower right")
+            ax2.set_title("b  what the concordant bins are", loc="left",
+                          fontsize=6.5)
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
 def _same_state(assoc, context, stat, band):
     a = assoc[(assoc["context"] == context) & (assoc["statistic"] == stat)
               & (assoc["band"] == band) & (assoc["anchor"] == assoc["partner"])]
@@ -1675,8 +2593,10 @@ def plot_covariates(assoc: pd.DataFrame, context: str, stat: str, path,
                     q_cut: float = 0.05):
     """Same-state class pairs (rows, by annotation system) x covariates, all
     distances: the within-type Spearman rho (colour; * q < q_cut), and on
-    the right the share of the within-type variance that is real (light)
-    and the part of it the covariates explain together (dark)."""
+    the right the within-type variance split into its components --
+    sampling noise, which loci were sampled, and the cells' own part, that
+    split again into what each covariate group explains (Shapley shares,
+    so overlapping groups split what they explain together) and the rest."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1688,17 +2608,19 @@ def plot_covariates(assoc: pd.DataFrame, context: str, stat: str, path,
     a = _same_state(assoc, context, stat, all_b)
     if a.empty:
         return
-    covs = [c for c in COVARIATES if a[f"rho_{c}"].notna().any()]
+    covs = [c for c in HEATMAP_COVARIATES
+            if f"rho_{c}" in a and a[f"rho_{c}"].notna().any()]
     R = a[[f"rho_{c}" for c in covs]].to_numpy(float)
     Q = a[[f"q_{c}" for c in covs]].to_numpy(float)
     ny = len(a)
     lim = max(0.1, float(np.nanmax(np.abs(R))) if np.isfinite(R).any()
               else 0.1)
     with plt.rc_context(figure_style.RC):
-        fig = plt.figure(figsize=(figure_style.FIG_W_IN * 0.8,
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN * 0.8
+                                  + 0.12 * max(len(covs) - 6, 0),
                                   1.3 + 0.2 * ny))
-        gs = fig.add_gridspec(1, 3, width_ratios=[2.2, 0.08, 1.1],
-                              wspace=0.4)
+        gs = fig.add_gridspec(1, 3, width_ratios=[2.2 + 0.2 * max(
+            len(covs) - 6, 0), 0.08, 1.1], wspace=0.4)
         ax0, cax, ax1 = (fig.add_subplot(gs[0, i]) for i in range(3))
         im = ax0.imshow(R, cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
         for i in range(ny):
@@ -1725,17 +2647,32 @@ def plot_covariates(assoc: pd.DataFrame, context: str, stat: str, path,
         locus = np.nan_to_num(col("locus_share"))
         cell_ = np.where(np.isfinite(col("cell_share")), col("cell_share"),
                          np.clip(col("bio_share"), 0, 1))
-        expl = cell_ * np.nan_to_num(np.where(
-            np.isfinite(col("explained_cell_share")),
-            col("explained_cell_share"), col("explained_share")))
-        left = np.zeros(ny)
         split = np.isfinite(col("locus_share")).any()
-        for w, c_, lab in ((noise, "0.85", "sampling noise"),
-                           (locus, "#f4c58f", "which loci were sampled"),
-                           (expl, "#08519c", "cells: explained by covariates"),
-                           (cell_ - expl, "#9ecae1",
-                            "cells: unexplained" if split else
-                            "cells + loci (not split): unexplained")):
+        rest = ("cells: unexplained" if split else
+                "cells + loci (not split): unexplained")
+        cell_ = np.clip(np.nan_to_num(cell_), 0, None)
+        groups = [g for g in GROUP_COLOR
+                  if f"shap_{g}" in a and a[f"shap_{g}"].notna().any()]
+        parts = [(noise, "0.85", "sampling noise"),
+                 (locus, "#f4c58f", "which loci were sampled")]
+        if groups:
+            # each group's Shapley share, within the cells' part
+            S = np.column_stack([np.clip(np.nan_to_num(col(f"shap_{g}")),
+                                         0, None) for g in groups])
+            tot = S.sum(1)
+            S = S * np.where(tot > cell_, cell_ / np.where(tot > 0, tot, 1),
+                             1)[:, None]
+            parts += [(S[:, i], GROUP_COLOR[g], f"cells: {g}")
+                      for i, g in enumerate(groups)]
+            parts.append((cell_ - S.sum(1), "#9ecae1", rest))
+        else:
+            expl = cell_ * np.nan_to_num(np.where(
+                np.isfinite(col("explained_cell_share")),
+                col("explained_cell_share"), col("explained_share")))
+            parts += [(expl, "#08519c", "cells: explained by covariates"),
+                      (cell_ - expl, "#9ecae1", rest)]
+        left = np.zeros(ny)
+        for w, c_, lab in parts:
             w = np.clip(np.nan_to_num(w), 0, None)
             ax1.barh(yy, w, left=left, color=c_, label=lab, height=0.7)
             left = left + w
@@ -1744,11 +2681,12 @@ def plot_covariates(assoc: pd.DataFrame, context: str, stat: str, path,
         ax1.set_yticklabels([])
         ax1.set_xlim(0, 1)
         ax1.set_xlabel("share of within-type var.")
-        leg = ax1.legend(fontsize=5, loc="lower left",
-                         bbox_to_anchor=(0, 1.0), ncol=1, borderaxespad=0.2)
+        leg = ax1.legend(fontsize=5, loc="upper left",
+                         bbox_to_anchor=(1.03, 1.0), ncol=1, borderaxespad=0)
         fig.canvas.draw()
-        top = max(leg.get_window_extent().y1,
-                  ax0.title.get_window_extent().y1)
+        rnd = fig.canvas.get_renderer()
+        top = max(leg.get_window_extent(rnd).y1,
+                  ax0.get_tightbbox(rnd).y1, ax1.get_tightbbox(rnd).y1)
         fig.suptitle(f"{context} — {_STAT_LABEL.get(stat, stat)}: what "
                      f"explains the within-type variation", fontsize=7,
                      va="bottom",
@@ -1780,8 +2718,9 @@ def plot_covariates_by_band(assoc: pd.DataFrame, context: str, stat: str,
     rows = list(dict.fromkeys(
         (sy, k) for _, x in blocks for sy, k in zip(x["system"], x["anchor"])))
     ny = len(rows)
-    covs = [c for c in COVARIATES
-            if any(x[f"rho_{c}"].notna().any() for _, x in blocks)]
+    covs = [c for c in HEATMAP_COVARIATES
+            if any(f"rho_{c}" in x and x[f"rho_{c}"].notna().any()
+                   for _, x in blocks)]
     lim = 0.1
     mats = []
     for b, x in blocks:
@@ -1813,8 +2752,9 @@ def plot_covariates_by_band(assoc: pd.DataFrame, context: str, stat: str,
         cb = fig.colorbar(im, ax=axes[0].tolist(), fraction=0.02, pad=0.01)
         cb.ax.tick_params(labelsize=5)
         cb.set_label("within-type ρ", fontsize=6)
-        fig.suptitle(f"{context} — {stat}: within-type ρ by distance band "
-                     f"(* q < {q_cut:g})", fontsize=7)
+        fig.suptitle(f"{context} — {_STAT_LABEL.get(stat, stat)}: "
+                     f"within-type ρ by distance band (* q < {q_cut:g})",
+                     fontsize=7)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
 
@@ -2312,6 +3252,60 @@ def main(argv=None) -> int:
     ap.add_argument("--covariate-min-cells", type=int, default=30,
                     help="Cells a class pair needs (with --min-pairs "
                          "contacts each) for its covariate analysis (30).")
+    ap.add_argument("--open-sites", default=None,
+                    help="BED of sites open in (nearly) every cell -- e.g. "
+                         "CTCF motifs in constitutive peaks.  A cell's GCH "
+                         "methylated at its ends near one reads its M.CviPI "
+                         "labeling efficiency.  Default: the TSSs of "
+                         "--gene-annotation (or --genome's) in a CpG "
+                         "island.")
+    ap.add_argument("--open-site-window", type=int, default=200,
+                    help="An end this close to an open site counts as at it "
+                         "(200 bp).")
+    ap.add_argument("--cpg-islands", default=None,
+                    help="CpG islands (the UCSC cpgIslandExt table or a "
+                         "BED), for the default open sites and the hotspot "
+                         "tracks; --genome fills it.")
+    ap.add_argument("--context-counts", action="append", default=None,
+                    metavar="NAME=DIR",
+                    help="A further context's read-pair counts (its "
+                         "02_read_pair_counts or 04_posteriors directory), "
+                         "read for each cell's raw methylation only; "
+                         "repeatable.  GCA=... and GCY=... (the pipeline run "
+                         "with --contexts GCA,GCY --steps 1,2) give the mCA "
+                         "index: the GCA sites methylated less the GCC + GCT "
+                         "ones -- endogenous CpA methylation, high in "
+                         "neurons, which GCH reads as accessibility.")
+    ap.add_argument("--substructure-bin", type=int, default=1_000_000,
+                    help="Bin of the cells' regional profiles, whose "
+                         "within-type principal components are the "
+                         "substructure covariates (1 Mb).")
+    ap.add_argument("--n-substructure-pcs", type=int, default=5,
+                    help="Substructure PCs per cell type (5; 0 skips them).")
+    ap.add_argument("--hotspot-bin", type=int, default=1_000_000,
+                    help="Bin of the locus-hotspot map (1 Mb).")
+    ap.add_argument("--hotspot-system", default="auto",
+                    help="The system whose class-matched null the hotspot "
+                         "map uses (auto: the one with the most contacts "
+                         "with a reshuffled partner).")
+    ap.add_argument("--hotspot-annotation", action="append", default=None,
+                    metavar="NAME=BED",
+                    help="A further track the hotspot map is tested "
+                         "against (e.g. imprinting control regions, IAP "
+                         "elements); repeatable.")
+    ap.add_argument("--celltype-auc-stats", default="signed_rel",
+                    help="Per-cell statistics whose power to predict cell "
+                         "type, per region group, is tested (comma-separated "
+                         "from delta, delta_r, signed_rel, signed_sgn; "
+                         "'none' skips): celltype_auc.tsv and figures.")
+    ap.add_argument("--celltype-auc-folds", type=int, default=5)
+    ap.add_argument("--celltype-auc-trees", type=int, default=300,
+                    help="Trees per random forest (300, as "
+                         "coordination_eval.cv_rf).")
+    ap.add_argument("--hotspot-fdr", type=float, default=0.05)
+    ap.add_argument("--hotspot-min-contacts", type=int, default=200,
+                    help="Contacts a bin needs to be tested (200).")
+    ap.add_argument("--no-hotspots", action="store_true")
     ap.add_argument("--min-band-pairs", type=int, default=500,
                     help="A class pair x distance band with fewer contacts "
                          "is flagged sparse and left out of the figures "
@@ -2393,6 +3387,40 @@ def main(argv=None) -> int:
         if rv:
             systems[k] = read_annotation(k, rv)
             logger.info(f"annotation {k}: classes {systems[k].classes}")
+
+    # Genes and CpG islands: the default open sites (CpG-island TSSs) and
+    # the hotspot map's tracks.
+    genes = cpg = None
+    if not (args.no_covariates and args.no_hotspots):
+        ga = enr._resolve(args.gene_annotation
+                          or preset.get("gene_annotation"), cache,
+                          "gene-annotation")
+        if ga:
+            genes = enr._read_genes(ga)
+        cp = enr._resolve(args.cpg_islands or preset.get("cpg_islands"),
+                          cache, "CpG islands")
+        if cp:
+            cpg = (enr._read_ucsc_bed(cp, cols=(1, 2, 3))
+                   if "cpgisland" in Path(cp).name.lower()
+                   else enr._read_bed(cp))
+    open_g = None
+    if not args.no_covariates:
+        open_g, open_label = open_site_coords(args.open_sites, genes, cpg,
+                                              exclude)
+        if open_g is None:
+            logger.warning("labeling efficiency: needs --open-sites, "
+                           "--gene-annotation or --genome; skipped")
+        else:
+            logger.info(f"labeling efficiency: GCH at {open_g.size:,} "
+                        f"{open_label}")
+    acc_ctx = next((c for c in contexts if c.upper() == "GCH"),
+                   next((c for c in contexts if c.upper().startswith("GC")),
+                        None))
+    hcg_ctx = next((c for c in contexts if c.upper() == "HCG"),
+                   next((c for c in contexts if c.upper().endswith("CG")),
+                        None))
+    hot_user = {k: enr._read_bed(enr._resolve(v, cache, f"hotspot {k}"))
+                for k, v in _parse_pairs(args.hotspot_annotation).items()}
 
     from joblib import Parallel, delayed
     first = next(iter(contexts.values()))
@@ -2479,6 +3507,11 @@ def main(argv=None) -> int:
     percell_rows, summary_rows, marg_rows, cov_rows = [], [], [], []
     ctx_cov: dict = {}
     locus_rows: list = []
+    extra_cov: dict = {}           # cell-level covariates of the later checks
+    profiles: dict = {}            # per context: the cells' regional profiles
+    hot_rows, enrich_rows = [], []
+    prof_bin = (args.substructure_bin if cell_cov is not None
+                and args.n_substructure_pcs > 0 else 0)
     for ci_ctx, (ctx, d) in enumerate(contexts.items()):
         cells = [c for c in cells_all
                  if (Path(d) / f"{c}.posteriors.parquet").exists()]
@@ -2496,7 +3529,8 @@ def main(argv=None) -> int:
                 sysd["ab"] = ab_maps.get(t, ab_maps["__all__"])
             return _read_cell(Path(d) / f"{c}.posteriors.parquet", ms,
                               args.min_distance, args.max_distance, exclude,
-                              sysd)
+                              sysd, open_g if ctx == acc_ctx else None,
+                              args.open_site_window, prof_bin)
         logger.info(f"{ctx}: reading {len(cells):,} cells")
         res_ = Parallel(n_jobs=args.n_threads, prefer="threads")(
             delayed(one)(i, c) for i, c in enumerate(cells))
@@ -2506,6 +3540,20 @@ def main(argv=None) -> int:
                       else np.nan for r in res_],
             **{k: [r["quality"][k] for r in res_]
                for k in ("sites_mean", "decisive", "frac_called")}})
+        chrom_names = {}
+        for r in res_:
+            chrom_names.update(r["chroms"])
+        if ctx == acc_ctx and open_g is not None:
+            # GCH methylated at open sites: labeling efficiency
+            extra_cov["open_site_level"] = {
+                c: (r["open"][0] / r["open"][1]
+                    if r.get("open") and r["open"][1] >= 30 else np.nan)
+                for c, r in zip(cells, res_)}
+        if prof_bin:
+            profiles[ctx] = {c: r["prof"] for c, r in zip(cells, res_)
+                             if r.get("prof") is not None}
+        grid = BinGrid(chrom_names, 300_000_000, args.hotspot_bin)
+        best_hot = None
         type_code = pd.factorize(types)[0]
         cell = np.concatenate([np.full(r["g_lo"].size, i, np.int64)
                                for i, r in enumerate(res_)])
@@ -2571,6 +3619,15 @@ def main(argv=None) -> int:
             # null product: the mean of reshuffling either end
             n1 = 0.5 * (x_ * right[0, idx] + left[0, idx] * y_)
             n2 = 0.5 * (x_ * right[1, idx] + left[1, idx] * y_)
+            # each contact's part of ΔC, and of the control
+            d_, c_ = 2 * (x_ * y_ - n1), 2 * (n2 - n1)
+            if not args.no_hotspots and idx.size and (
+                    args.hotspot_system == name
+                    or (args.hotspot_system == "auto" and (
+                        best_hot is None or idx.size > best_hot[0]))):
+                best_hot = (idx.size, name, locus_hotspots(
+                    grid, g_lo[idx], g_hi[idx], cell[idx], d_, c_,
+                    band[idx], len(edges) - 1))
             # Co-open / co-closed mass, for F.  A donor's posterior is put
             # on the RECEIVING cell's level in that class (its centred value
             # plus that cell's mean), as the centring does for C, so a
@@ -2599,7 +3656,6 @@ def main(argv=None) -> int:
                           for k in ("oo", "oc", "no2", "nc2")}
                     fg_c = gk["oo"] / (gk["oo"] + gk["oc"])
                     fgn_c = gk["no2"] / (gk["no2"] + gk["nc2"])
-                d_, c_ = 2 * (x_ * y_ - n1), 2 * (n2 - n1)
                 lr = locus_reassignment(
                     ci_, type_code, pr, band[idx],
                     {"d": d_, "c": c_, "r": d_ * inv, "rc": c_ * inv,
@@ -2673,6 +3729,36 @@ def main(argv=None) -> int:
                         pcr["control"].to_numpy(), no2_, nc2_, fgn_)
             logger.info(f"{ctx} {name}: {ok.mean():.1%} of contacts "
                         f"annotated at both ends with a reshuffled partner")
+        if ctx == hcg_ctx and "pmd" in systems and cell_cov is not None:
+            # HMD less PMD methylation: PMDs lose methylation with every
+            # division, so their depth is a cell's division history
+            mg = np.stack([r["marg"]["pmd"] for r in res_])
+            ih = systems["pmd"].classes.index("HMD")
+            ip = systems["pmd"].classes.index("PMD")
+            with np.errstate(invalid="ignore", divide="ignore"):
+                mu_ = mg[:, 1] / mg[:, 0]
+            enough = (mg[:, 0, ih] >= 30) & (mg[:, 0, ip] >= 30)
+            extra_cov["pmd_depth"] = dict(zip(cells, np.where(
+                enough, mu_[:, ih] - mu_[:, ip], np.nan)))
+        if best_hot is not None:
+            hs = best_hot[2]
+            hs.insert(0, "context", ctx)
+            hs.insert(1, "system", best_hot[1])
+            hs = call_hotspots(hs, len(edges) - 1, args.hotspot_fdr,
+                               args.hotspot_min_contacts)
+            hs["chrom"] = hs["code"].map(chrom_names)
+            hs["band"] = np.asarray(band_labels)[hs["band_index"]]
+            tracks = hotspot_tracks(grid, systems, ab_maps, genes, cpg,
+                                    hot_user)
+            enrich_rows.append(hotspot_enrichment(hs, tracks))
+            for k, v in tracks.items():
+                hs[k] = v[hs["grid_index"].to_numpy()]
+            hot_rows.append(hs)
+            t_ = hs[hs["tested"]]
+            logger.info(f"{ctx} hotspots ({best_hot[1]} null, "
+                        f"{args.hotspot_bin:,} bp bins): {int(t_['hot'].sum())}"
+                        f" hot and {int(t_['cold'].sum())} cold of "
+                        f"{len(t_):,} bins at FDR {args.hotspot_fdr:g}")
         del res_
 
     percell = (pd.concat(percell_rows, ignore_index=True) if percell_rows
@@ -2686,6 +3772,36 @@ def main(argv=None) -> int:
     pd.DataFrame(marg_rows).to_csv(out / "marginal_summary.tsv", sep="\t",
                                    index=False)
     pd.DataFrame(cov_rows).to_csv(out / "coverage.tsv", sep="\t", index=False)
+    # How well each region group's concordance predicts cell type.
+    auc_stats = [x.strip() for x in args.celltype_auc_stats.split(",")
+                 if x.strip() and x.strip() != "none"]
+    bad = set(auc_stats) - set(COV_STATS)
+    if bad:
+        sys.exit(f"unknown --celltype-auc-stats {sorted(bad)}; choose from "
+                 f"{COV_STATS}")
+    if auc_stats and not percell.empty:
+        aucs, pers = [], []
+        for st_ in auc_stats:
+            logger.info(f"cell-type AUC of {st_} per region group")
+            r_, p_ = celltype_auc(percell, st_, args.celltype_auc_folds,
+                                  args.seed, args.n_threads,
+                                  n_trees=args.celltype_auc_trees)
+            if r_.empty:
+                continue
+            aucs.append(r_)
+            pers.append(p_)
+            plot_celltype_auc(r_, p_, st_, out / f"celltype_auc_{st_}."
+                                                 f"{args.plot_format}")
+            tab = r_.pivot_table(index=["context", "system", "group"],
+                                 columns="features", values="auc").reindex(
+                columns=list(AUC_VARIANTS))
+            logger.info(f"cell-type AUC from {st_} (macro, one-vs-rest):\n"
+                        + tab.to_string(float_format=lambda v: f"{v:.3f}"))
+        if aucs:
+            pd.concat(aucs).to_csv(out / "celltype_auc.tsv", sep="\t",
+                                   index=False)
+            pd.concat(pers).to_csv(out / "celltype_auc_by_type.tsv",
+                                   sep="\t", index=False)
     for (ctx, name), s in summary.groupby(["context", "system"], sort=False):
         pc = percell[(percell["context"] == ctx) & (percell["system"] == name)]
         plot(s[~s["sparse"] | s["band"].str.startswith("all")], pc,
@@ -2709,6 +3825,68 @@ def main(argv=None) -> int:
                   stat=_SIGNED_STAT[tag])
     # What explains the within-type variation: the cell-cycle covariates
     # (with depth and the cell's level beside them).
+    if cell_cov is not None:
+        for k, v in extra_cov.items():
+            cell_cov[k] = cell_cov["cell"].map(v)
+        if profiles:
+            sp = substructure_pcs(
+                profiles, dict(zip(cell_cov["cell"], cell_cov["cell_type"])),
+                args.n_substructure_pcs)
+            cell_cov = cell_cov.merge(sp, on="cell", how="left")
+            logger.info(f"substructure: {args.n_substructure_pcs} PCs within "
+                        f"each cell type of {sp.iloc[:, 1].notna().sum():,} "
+                        f"cells")
+        profiles.clear()
+        meth = {}
+        for nm, dirp in _parse_pairs(args.context_counts).items():
+            files = {}
+            for c in cells_all:
+                f = next((f for f in (Path(dirp) / f"{c}.read_pairs.parquet",
+                                      Path(dirp) / f"{c}.posteriors.parquet")
+                          if f.exists()), None)
+                if f is not None:
+                    files[c] = f
+            if not files:
+                logger.warning(f"--context-counts {nm}: no cells' read pairs "
+                               f"under {dirp}")
+                continue
+            kn = Parallel(n_jobs=args.n_threads, prefer="threads")(
+                delayed(_count_pass)(f, exclude) for f in files.values())
+            meth[nm] = {c: (k / n if n >= 100 else np.nan)
+                        for c, (k, n) in zip(files, kn)}
+            cell_cov[f"meth_{nm}"] = cell_cov["cell"].map(meth[nm])
+        gca = next((k for k in meth if k.upper() == "GCA"), None)
+        gcy = next((k for k in meth if k.upper() == "GCY"), None)
+        if gca and gcy:
+            cell_cov["mca_index"] = (cell_cov[f"meth_{gca}"]
+                                     - cell_cov[f"meth_{gcy}"])
+            logger.info("mCA index (GCA less GCC+GCT methylated) by cell "
+                        "type:\n" + cell_cov.groupby("cell_type")[
+                            "mca_index"].describe()[["count", "mean", "50%"]]
+                        .to_string(float_format=lambda v: f"{v:.4f}"))
+        elif meth:
+            logger.warning("the mCA index needs --context-counts GCA=... and "
+                           "GCY=...")
+    if hot_rows:
+        hs = pd.concat(hot_rows, ignore_index=True)
+        en = pd.concat(enrich_rows, ignore_index=True)
+        lead = ["context", "system", "chrom", "start", "end", "band",
+                "contacts", "cells", "delta", "control", "se", "se_control",
+                "z", "z_control", "tested", "excess", "z_excess", "q_hot",
+                "q_cold", "hot", "cold"]
+        hs[lead + [c for c in hs.columns if c not in lead + [
+            "grid_index", "code", "band_index"]]].to_csv(
+            out / "locus_hotspots.tsv.gz", sep="\t", index=False)
+        en.to_csv(out / "locus_hotspot_enrichment.tsv", sep="\t",
+                  index=False)
+        for ctx_ in contexts:
+            sy_ = hs.loc[hs["context"] == ctx_, "system"]
+            plot_hotspots(hs, en, ctx_, out / f"locus_hotspots_{ctx_}."
+                                              f"{args.plot_format}",
+                          note=(f" ({SYSTEM_LABEL.get(sy_.iloc[0], sy_.iloc[0])}"
+                                f"-matched null, {_fmt_bp(args.hotspot_bin)}"
+                                f" bins)" if len(sy_) else ""),
+                          fdr=args.hotspot_fdr)
     if cell_cov is not None and not percell.empty:
         batch_cols = [b.strip() for b in (args.batch_column or "").split(",")
                       if b.strip()]
@@ -2726,6 +3904,8 @@ def main(argv=None) -> int:
         wide.to_csv(out / "cell_covariates.tsv", sep="\t", index=False)
         plot_cell_cycle(cell_cov, out / f"cell_cycle_covariates."
                                          f"{args.plot_format}")
+        plot_extra_covariates(cell_cov, out / f"cell_covariates_extra."
+                                              f"{args.plot_format}")
         locus = (pd.concat(locus_rows, ignore_index=True) if locus_rows
                  else pd.DataFrame())
         locus.to_csv(out / "locus_reassignment.tsv", sep="\t", index=False)
@@ -2751,7 +3931,9 @@ def main(argv=None) -> int:
                                  "cells", "noise_share", "locus_share",
                                  "cell_share", "perm_p", "R2_adj_all",
                                  "explained_cell_share", "control_R2_adj")
-                     if c in top]
+                     if c in top] + [f"shap_{g}" for g in GROUP_COLOR
+                                     if f"shap_{g}" in top
+                                     and top[f"shap_{g}"].notna().any()]
             logger.info("within-type variation of ΔC (all distances): "
                         "noise | which loci | cells, and the share of the "
                         "cell part the covariates explain:\n"

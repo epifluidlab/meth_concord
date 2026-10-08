@@ -69,10 +69,12 @@ def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
                 "pos2": np.concatenate([b_pos, s_end]),
                 "posterior1": np.concatenate([pa, sa]),
                 "posterior2": np.concatenate([pb, sb])})
-            if offset is not None:
-                df[["posterior1", "posterior2"]] += offset(t, c)
             df["n1"] = np.int32(3)
             df["n2"] = np.int32(3)
+            df["k1"] = np.round(df["posterior1"] * 3).astype(np.int32)
+            df["k2"] = np.round(df["posterior2"] * 3).astype(np.int32)
+            if offset is not None:
+                df[["posterior1", "posterior2"]] += offset(t, c)
             df["distance"] = (df["pos2"] - df["pos1"]).abs()
             df.to_parquet(post / f"t{t}_c{c}.posteriors.parquet")
             rows.append((f"t{t}_c{c}", f"T{t}", f"b{c % 2}"))
@@ -99,6 +101,11 @@ def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
                            np.where(alt, "1_mTSS1", "2_mEnhA1"),
                            np.where(alt, "3_mHET1", "4_mQuies1"))
     sg.to_csv(out / "chromhmm.bed", sep="\t", header=False, index=False)
+    # "open sites" every 20 kb
+    st = [(c, s, s + 1) for c, n in CHROMS.items()
+          for s in range(10_000, n, 20_000)]
+    pd.DataFrame(st).to_csv(out / "open_sites.bed", sep="\t", header=False,
+                            index=False)
     pd.DataFrame({"state": ["1", "2", "3", "4"],
                   "group": ["TSS", "enhancers", "HET", "quiescent"],
                   "mneumonics": ["mTSS1", "mEnhA1", "mHET1", "mQuies1"]}
@@ -120,6 +127,8 @@ def run(d, systems="ab,rt,chromhmm,pmd", extra=()):
               "--ab-resolution", "500000", "--ab-min-contacts", "1000",
               "--min-pairs", "10", "--n-boot", "100", "--n-threads", "2",
               "--batch-column", "batch", "--n-locus-perm", "10",
+              "--open-sites", str(Path(d) / "open_sites.bed"),
+              "--celltype-auc-trees", "40",
               "--plot-format", "png", "--output-dir", str(o), *extra])
     return (pd.read_csv(o / "summary.tsv", sep="\t"),
             pd.read_csv(o / "percell.tsv.gz", sep="\t"), o)
@@ -480,6 +489,19 @@ def test_the_covariate_outputs_are_written(planted):
     assert {"delta", "delta_r", "signed_rel", "signed_sgn"} <= set(
         lr["statistic"])
     assert (o / "covariates_GCH_delta_r.png").exists()
+    # the bar's components: Shapley shares adding up to the explained part
+    same = a[(a["anchor"] == a["partner"]) & a["R2_adj_all"].notna()]
+    sh = [c for c in a.columns if c.startswith("shap_")]
+    assert {"shap_technical", "shap_level", "shap_scale",
+            "shap_labeling efficiency", "shap_substructure",
+            "shap_batch"} <= set(sh)
+    tot = same[sh].sum(1, min_count=1)
+    np.testing.assert_allclose(tot, same["R2_adj_all"].clip(lower=0),
+                               atol=1e-6)
+    assert a.loc[a["anchor"] != a["partner"], sh].isna().all().all()
+    assert {"open_site_level", "sub_pc1", "sub_pc5"} <= set(cov.columns)
+    assert cov["open_site_level"].between(0.2, 0.7).all()
+    assert (o / "cell_covariates_extra.png").exists()
     assert (o / "cross_class_correlation.tsv").exists()
     assert (o / "cross_class_GCH.png").exists()
     assert (o / "covariates_GCH_delta.png").exists()
@@ -609,3 +631,194 @@ def test_cross_class_correlation_finds_one_per_cell_factor():
     cc = acc.cross_class_correlation(pc, summ, min_cells=30)
     ab = cc[(cc["state_1"] == "A") & (cc["state_2"] == "B")].iloc[0]
     assert np.isnan(ab["r_disattenuated"]) and ab["r"] > 0.5
+
+
+# ------------------------------------------------- the components, checked --
+
+
+def test_shapley_shares_split_r2_between_groups():
+    rng = np.random.default_rng(0)
+    n = 2000
+    x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+    x3 = 0.8 * x1 + 0.6 * rng.normal(0, 1, n)      # shares x1's variance
+    y = 1.0 * x1 + 0.5 * x2 + rng.normal(0, 1, n)
+    Z = np.column_stack([x1, x2, x3]) - [x1.mean(), x2.mean(), x3.mean()]
+    y = y - y.mean()
+    phi, r2 = acc._shapley_r2(y, Z, {"a": [0], "b": [1], "c": [2],
+                                     "none": []})
+    assert sum(v for v in phi.values() if np.isfinite(v)) == \
+        pytest.approx(r2)
+    assert np.isnan(phi["none"])
+    assert phi["a"] > phi["c"] > 0.01 and phi["b"] == pytest.approx(
+        0.25 / 2.25, abs=0.03)
+
+
+def test_open_site_level_reads_the_ends_at_open_sites(tmp_path):
+    pos1 = np.array([1_000, 5_000, 50_000, 90_000])
+    pos2 = pos1 + 20_000
+    df = pd.DataFrame({"chrom": "chr1", "pos1": pos1, "pos2": pos2,
+                       "n1": np.int32(4), "n2": np.int32(4),
+                       "k1": np.int32([4, 3, 0, 1]),
+                       "k2": np.int32([0, 0, 0, 0]),
+                       "posterior1": 0.5, "posterior2": 0.5})
+    f = tmp_path / "c.posteriors.parquet"
+    df.to_parquet(f)
+    sites = acc._codes_of(["chr1"]) * acc.STRIDE + np.array([1_100, 4_950])
+    r = acc._read_cell(f, 2, 1000, 10**7, set(), {}, open_g=np.sort(sites),
+                       open_w=200, prof_bin=1_000_000)
+    assert r["open"] == (7.0, 8.0)                 # the first two left ends
+    keys, sums, counts = r["prof"]
+    assert counts.sum() == 8 and sums.sum() == pytest.approx(4.0)
+    assert acc._count_pass(f, set()) == (8.0, 32.0)
+
+
+def test_substructure_pcs_find_a_split_within_a_type():
+    rng = np.random.default_rng(1)
+    prof, types = {}, {}
+    keys = np.arange(200)
+    pattern = rng.normal(0, 1, 200)
+    for i in range(80):
+        sub = i % 2
+        v = 0.5 + 0.05 * (1 if sub else -1) * pattern + rng.normal(0, .02, 200)
+        prof[f"c{i}"] = (keys, (v * 10).astype(np.float32),
+                         np.full(200, 10, np.int32))
+        types[f"c{i}"] = "T"
+    sp = acc.substructure_pcs({"GCH": prof}, types, n_pcs=3)
+    sub = np.array([int(c[1:]) % 2 for c in sp["cell"]])
+    assert abs(np.corrcoef(sp["sub_pc1"], sub)[0, 1]) > 0.95
+    assert sp["sub_pc1"].std() == pytest.approx(1, abs=0.02)
+
+
+def test_hotspots_are_called_where_planted_and_annotated():
+    rng = np.random.default_rng(2)
+    code = acc._chrom_code("chr1")
+    grid = acc.BinGrid({code: "chr1"}, 50_000_000, 1_000_000)
+    n = 200_000
+    lo = rng.integers(0, 45_000_000, n)
+    # short contacts, so that a planted bin's contacts end in it too (a
+    # contact counts in both its ends' bins)
+    hi = lo + rng.integers(1_000, 20_000, n)
+    cell = np.sort(rng.integers(0, 100, n))
+    hot = ((lo // 1_000_000) % 10 == 3) & ((hi // 1_000_000) % 10 == 3)
+    d = rng.normal(0, 1, n) + 0.3 * hot
+    c = rng.normal(0, 1, n)
+    hs = acc.locus_hotspots(grid, code * acc.STRIDE + lo,
+                            code * acc.STRIDE + hi, cell, d, c,
+                            np.zeros(n, np.int64), 1)
+    hs.insert(0, "context", "GCH")
+    hs = acc.call_hotspots(hs, 1, 0.05, 200)
+    t = hs[hs["tested"]]
+    called = set(t.loc[t["hot"], "start"] // 1_000_000)
+    planted = {3, 13, 23, 33, 43}
+    assert called >= planted and len(called - planted) <= 1   # FDR 5%
+    assert t["cold"].sum() <= 1
+    track = np.zeros(grid.n)
+    track[[3, 13, 23, 33, 43]] = 1.0
+    en = acc.hotspot_enrichment(hs, {"planted": track})
+    r = en.iloc[0]
+    assert r["rho"] > 0.3 and r["q_rho"] < 0.05 and r["hot_odds_ratio"] > 5
+    assert abs(r["rho_control"]) < 0.3
+
+
+def test_bin_grid_coverage_splits_intervals_across_bins():
+    code = acc._chrom_code("chr2")
+    grid = acc.BinGrid([code], 10_000_000, 1_000_000)
+    cov = grid.coverage(pd.DataFrame({"chrom": ["chr2", "2"],
+                                      "start": [500_000, 2_900_000],
+                                      "end": [1_500_000, 3_100_000]}))
+    np.testing.assert_allclose(cov[:4], [0.5, 0.5, 0.1, 0.1])
+
+
+def test_pmd_depth_is_hmd_less_pmd_methylation(tmp_path):
+    d = make_data(tmp_path, per=10, n_types=2)
+    o = tmp_path / "out_hcg"
+    acc.main(["--posteriors", f"HCG={d / 'GCH'}",
+              "--samples", str(d / "samples.tsv"), "--systems", "pmd",
+              "--pmd", str(d / "pmd.bed"), "--min-pairs", "10",
+              "--n-boot", "20", "--n-threads", "2", "--n-locus-perm", "0",
+              "--covariate-min-cells", "10", "--no-hotspots",
+              "--celltype-auc-stats", "none",
+              "--plot-format", "png", "--output-dir", str(o)])
+    cov = pd.read_csv(o / "cell_covariates.tsv", sep="\t")
+    # HMD = A (posterior 0.9 w.p. 0.6), PMD = B (w.p. 0.25)
+    assert cov["pmd_depth"].mean() == pytest.approx(0.8 * 0.35, abs=0.04)
+
+
+def test_the_mca_index_is_gca_less_gcy_methylation(tmp_path):
+    d = make_data(tmp_path, per=10, n_types=2)
+    for name, frac in (("GCA", 0.30), ("GCY", 0.20)):
+        dd = tmp_path / name
+        dd.mkdir()
+        for f in (d / "GCH").glob("*.posteriors.parquet"):
+            x = pd.read_parquet(f)[["chrom", "pos1", "pos2", "distance"]]
+            x["n1"] = np.int32(10)
+            x["n2"] = np.int32(10)
+            x["k1"] = np.int32(round(10 * frac))
+            x["k2"] = np.int32(round(10 * frac))
+            x.to_parquet(dd / f.name.replace("posteriors", "read_pairs"))
+    o = tmp_path / "out_mca"
+    acc.main(["--posteriors", f"GCH={d / 'GCH'}",
+              "--samples", str(d / "samples.tsv"), "--systems", "pmd",
+              "--pmd", str(d / "pmd.bed"), "--min-pairs", "10",
+              "--n-boot", "20", "--n-threads", "2", "--n-locus-perm", "0",
+              "--context-counts", f"GCA={tmp_path / 'GCA'}",
+              "--context-counts", f"GCY={tmp_path / 'GCY'}",
+              "--covariate-min-cells", "10", "--no-hotspots",
+              "--celltype-auc-stats", "none",
+              "--plot-format", "png", "--output-dir", str(o)])
+    cov = pd.read_csv(o / "cell_covariates.tsv", sep="\t")
+    np.testing.assert_allclose(cov["mca_index"], 0.1, atol=1e-9)
+    assert cov["meth_GCA"].iloc[0] == pytest.approx(0.3)
+
+
+def test_hotspot_outputs_follow_the_planted_compartment(planted):
+    _, _, o = planted
+    hs = pd.read_csv(o / "locus_hotspots.tsv.gz", sep="\t")
+    en = pd.read_csv(o / "locus_hotspot_enrichment.tsv", sep="\t")
+    t = hs[hs["tested"].astype(bool)]
+    assert len(t) > 20 and t["cells"].min() >= 10
+    # coordination is planted in A-A contacts: A bins are the concordant ones
+    r = en[en["track"] == "compartment: A"].iloc[0]
+    assert r["rho"] > 0.3 and r["rho"] > r["rho_control"] + 0.2
+    assert (o / "locus_hotspots_GCH.png").exists()
+
+
+def test_celltype_auc_finds_the_group_whose_concordance_differs_by_type():
+    rng = np.random.default_rng(3)
+    n = 180
+    cells = [f"c{i}" for i in range(n)]
+    types = np.repeat(["T0", "T1", "T2"], n // 3)
+    rows = []
+    for grp, effect in (("A", 1.0), ("B", 0.0)):
+        shift = effect * (types == "T1") - effect * (types == "T2")
+        rows.append(pd.DataFrame({
+            "context": "GCH", "system": "ab", "cell": cells,
+            "cell_type": types, "anchor": grp, "partner": grp,
+            "band": "all 1kb-10Mb", "enough_pairs": True,
+            "signed_rel": shift + rng.normal(0, 0.5, n),
+            "signed_rel_control": rng.normal(0, 0.5, n),
+            "mu_anchor": rng.normal(0.3, 0.05, n)}))
+    pc = pd.concat(rows, ignore_index=True)
+    res, per = acc.celltype_auc(pc, "signed_rel", n_folds=5, seed=0,
+                                n_threads=2, n_trees=100)
+    r = res.set_index(["group", "features"])["auc"]
+    assert r[("A", "concordance")] > 0.8
+    assert r[("A", "marginal + concordance")] > 0.75
+    for g in ("A", "B"):
+        assert r[(g, "control")] < 0.65 and r[(g, "marginal")] < 0.65
+    assert r[("B", "concordance")] < 0.65
+    assert r[("all classes", "concordance")] > 0.75
+    # T0 sits between T1 and T2: still told apart, less well
+    pa = per[(per["group"] == "A") & (per["features"] == "concordance")
+             ].set_index("cell_type")["auc"]
+    assert pa["T1"] > 0.85 and pa["T2"] > 0.85 and pa["T0"] > 0.6
+
+
+def test_celltype_auc_outputs_without_type_differences(planted):
+    _, _, o = planted
+    res = pd.read_csv(o / "celltype_auc.tsv", sep="\t")
+    assert set(res["features"]) == set(acc.AUC_VARIANTS)
+    # the mock's types differ in nothing
+    assert res["auc"].between(0.3, 0.75).all()
+    assert (o / "celltype_auc_signed_rel.png").exists()
+    assert (o / "celltype_auc_by_type.tsv").exists()
