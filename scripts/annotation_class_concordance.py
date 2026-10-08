@@ -1234,22 +1234,22 @@ def _variance_split(pc: pd.DataFrame, val="delta_r", ctrl="control_r"):
 _MAIN = {
     "r": {"point": "delta_r", "excess": "excess_sd_r", "pc": "delta_r",
           "pc_ctrl": "control_r", "ylab": "Δr", "xlab": "Δr, all distances",
-          "scale": 1.0, "xlab_f": "excess between-cell SD"},
+          "scale": 1.0, "xlab_f": "excess SD"},
     "signed": {"point": "signed", "excess": "signed_excess_sd",
                "pc": "signed", "pc_ctrl": "signed_control",
                "ylab": "ΔC×(2F−1), pp",
                "xlab": "ΔC × (2F − 1), pp, all distances",
-               "scale": PP, "xlab_f": "excess between-cell SD, pp"},
+               "scale": PP, "xlab_f": "excess SD, pp"},
     "signed_rel": {"point": "signed_rel", "excess": "signed_rel_excess_sd",
                    "pc": "signed_rel", "pc_ctrl": "signed_rel_control",
                    "ylab": "ΔC×w, pp",
                    "xlab": "ΔC × w, pp, all distances",
-                   "scale": PP, "xlab_f": "excess between-cell SD, pp"},
+                   "scale": PP, "xlab_f": "excess SD, pp"},
     "signed_sgn": {"point": "signed_sgn", "excess": "signed_sgn_excess_sd",
                    "pc": "signed_sgn", "pc_ctrl": "signed_sgn_control",
                    "ylab": "ΔC×sign(w), pp",
                    "xlab": "ΔC × sign(w), pp, all distances",
-                   "scale": PP, "xlab_f": "excess between-cell SD, pp"},
+                   "scale": PP, "xlab_f": "excess SD, pp"},
 }
 
 
@@ -1405,7 +1405,7 @@ def plot_main(summary: pd.DataFrame, percell: pd.DataFrame, path,
                     left += frac
         ax_g.set_xlim(0, 1)
         ax_g.tick_params(labelleft=False)
-        ax_g.set_xlabel("share of between-cell variance")
+        ax_g.set_xlabel("share of variance")
         ax_g.set_title("g  What varies", loc="left")
         ax_g.legend(handles=[mpatches.Patch(color="0.82", label="noise"),
                              mpatches.Patch(color="0.3", label="cell type"),
