@@ -175,8 +175,9 @@ def test_chromhmm_groups_and_the_figure(planted):
     assert r["delta"] > 0
     assert (o / "fig_GCH_pmd.png").exists()
     assert (o / "main_figure.png").exists()
-    assert (o / "fig_GCH_pmd_signed.png").exists()
-    assert (o / "main_figure_signed.png").exists()
+    for tag in ("rel", "sign", "even"):
+        assert (o / f"fig_GCH_pmd_signed_{tag}.png").exists()
+        assert (o / f"main_figure_signed_{tag}.png").exists()
     assert set(pc.columns) >= {"cell", "cell_type", "delta", "control",
                                "mu_anchor", "enough_pairs"}
 
@@ -327,7 +328,7 @@ def test_against_the_genome_a_rare_open_state_still_reads_co_open(tmp_path):
     assert r["signed_hi"] < 0                     # absolute: "co-closed"
     assert r["signed_rel_lo"] > 0                 # against the genome: co-open
     assert r["F_ref"] < r["F"] < 0.5
-    assert (o / "fig_GCH_pmd_signed.png").exists()
+    assert (o / "fig_GCH_pmd_signed_rel.png").exists()
     s, _, _ = run(make_data(tmp_path / "b", seed=7, coord_in="B", **gch),
                   systems="pmd")
     r = _row(s, "pmd", "PMD", "PMD")
@@ -343,3 +344,15 @@ def test_the_weight_is_two_f_minus_one_against_an_even_split():
     assert np.allclose(acc._weight(F, 0.5), 2 * F - 1)
     assert acc._weight(0.2, 0.2) == 0
     assert acc._weight(0.3, 0.1) > 0 > acc._weight(0.05, 0.1)
+
+
+def test_the_sign_version_keeps_delta_c_whole(planted):
+    """ΔC x sign(w): |ΔC| unchanged, the direction that of ΔC x w."""
+    s, pc, _ = planted
+    r = s[np.isfinite(s["signed_rel"]) & (s["signed_rel"] != 0)]
+    assert np.allclose(np.abs(r["signed_sgn"]), np.abs(r["delta"]))
+    assert (np.sign(r["signed_sgn"]) == np.sign(r["signed_rel"])).all()
+    c = pc[np.isfinite(pc["signed_rel"]) & (pc["signed_rel"] != 0)]
+    assert np.allclose(np.abs(c["signed_sgn"]), np.abs(c["delta"]))
+    h = _row(s, "pmd", "HMD", "HMD")
+    assert h["signed_sgn_lo"] > 0 and h["signed_sgn"] >= h["signed_rel"]
