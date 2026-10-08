@@ -159,6 +159,34 @@ def _canon(c) -> str:
     return s[3:] if s[:3].lower() == "chr" else s
 
 
+#: Genome coordinate = chromosome code x STRIDE + position (link_shuffle's).
+STRIDE = _ls.GENOME_STRIDE
+
+
+def _chrom_code(name) -> int:
+    """A stable integer per chromosome name -- the same in every thread and
+    every annotation, so genome coordinates agree without a shared table:
+    numbered chromosomes as their number, X / Y / M fixed, any other name
+    hashed ('chr' ignored)."""
+    c = _canon(name).upper()
+    if c.isdigit():
+        return int(c)
+    special = {"X": 1001, "Y": 1002, "M": 1003, "MT": 1003}
+    if c in special:
+        return special[c]
+    return 2000 + zlib.crc32(c.encode()) % 100_000
+
+
+def _codes_of(chrom) -> np.ndarray:
+    """:func:`_chrom_code` of every name, computed once per distinct name;
+    integers are taken as codes already."""
+    arr = np.asarray(chrom)
+    if arr.dtype.kind in "iu":
+        return arr.astype(np.int64)
+    idx, uniq = pd.factorize(arr)
+    return np.array([_chrom_code(c) for c in uniq], np.int64)[idx]
+
+
 def _enrichment():
     """scripts/marker_bin_enrichment.py: its mm10 downloads (cached where
     that script caches them) and its BED / bigWig / chromHMM readers."""
@@ -174,40 +202,40 @@ def _enrichment():
 
 
 class Intervals:
-    """Non-overlapping intervals per chromosome, each with a class code;
-    ``lookup`` gives a position's code, -1 outside every interval."""
+    """Non-overlapping intervals, each with a class code, on one genome
+    coordinate (chromosome code x STRIDE + position): ``lookup_g`` gives a
+    coordinate's code in a single sorted search, whatever the chromosome --
+    -1 outside every interval, or ``outside`` on a chromosome the intervals
+    are on."""
 
     def __init__(self, name, classes, chrom, start, end, code, outside=-1):
         self.name = name
         self.classes = tuple(classes)
-        self.outside = int(outside)    # code off the intervals (-1: none)
-        df = pd.DataFrame({"chrom": [_canon(c) for c in chrom],
-                           "start": np.asarray(start, np.int64),
-                           "end": np.asarray(end, np.int64),
-                           "code": np.asarray(code, np.int8)})
-        df = df[df["code"] >= 0]
-        self._by = {c: (g["start"].to_numpy(), g["end"].to_numpy(),
-                        g["code"].to_numpy())
-                    for c, g in df.sort_values(["chrom", "start"])
-                    .groupby("chrom", sort=False)}
+        self.outside = int(outside)
+        cc = _codes_of(chrom)
+        code = np.asarray(code, np.int64)
+        keep = code >= 0
+        g0 = (cc * STRIDE + np.asarray(start, np.int64))[keep]
+        g1 = (cc * STRIDE + np.asarray(end, np.int64))[keep]
+        o = np.argsort(g0, kind="mergesort")
+        self._g0, self._g1 = g0[o], g1[o]
+        self._k = code[keep][o].astype(np.int8)
+        self._chroms = np.unique(cc)
+
+    def lookup_g(self, g) -> np.ndarray:
+        g = np.asarray(g, np.int64)
+        out = np.full(g.size, -1, np.int8)
+        if self.outside >= 0:
+            out[np.isin(g // STRIDE, self._chroms)] = self.outside
+        i = np.searchsorted(self._g0, g, side="right") - 1
+        ok = i >= 0
+        ok[ok] = g[ok] < self._g1[i[ok]]
+        out[ok] = self._k[i[ok]]
+        return out
 
     def lookup(self, chrom, pos) -> np.ndarray:
-        pos = np.asarray(pos, np.int64)
-        out = np.full(pos.size, -1, np.int8)
-        codes, uniq = pd.factorize(np.asarray(chrom))
-        for j, c in enumerate(uniq):
-            t = self._by.get(_canon(c))
-            if t is None:
-                continue
-            sel = np.flatnonzero(codes == j)
-            if self.outside >= 0:
-                out[sel] = self.outside
-            s, e, k = t
-            i = np.searchsorted(s, pos[sel], side="right") - 1
-            ok = i >= 0
-            ok[ok] = pos[sel][ok] < e[i[ok]]
-            out[sel[ok]] = k[i[ok]]
-        return out
+        return self.lookup_g(_codes_of(chrom) * STRIDE
+                             + np.asarray(pos, np.int64))
 
 
 def _merged(df: pd.DataFrame) -> pd.DataFrame:
@@ -277,24 +305,90 @@ def read_chromhmm(bed, groups_tsv, enr) -> Intervals:
                      seg["end"], code.fillna(-1).astype(int))
 
 
-def _track_extents(path) -> dict:
-    """{chrom: length} covered by a bigWig (its header) or bedGraph."""
-    p = str(path).lower()
-    if p.endswith((".bw", ".bigwig")):
+_TRACKS: dict = {}
+
+
+def _track(path) -> dict:
+    """{chromosome code: (starts, ends, values)} of a bigWig -- all its
+    intervals -- or a bedGraph, read once per run."""
+    path = str(path)
+    if path in _TRACKS:
+        return _TRACKS[path]
+    out = {}
+    if path.lower().endswith((".bw", ".bigwig")):
         import pyBigWig
-        bw = pyBigWig.open(str(path))
-        out = dict(bw.chroms())
+        bw = pyBigWig.open(path)
+        for c in bw.chroms():
+            iv = bw.intervals(c)
+            if iv:
+                a_ = np.asarray(iv, float)
+                out[_chrom_code(c)] = (a_[:, 0].astype(np.int64),
+                                       a_[:, 1].astype(np.int64), a_[:, 2])
         bw.close()
-        return out
-    df = pd.read_csv(path, sep="\t", header=None, comment="#",
-                     compression="infer", dtype={0: str})
-    return df.groupby(0)[2].max().astype(int).to_dict()
+    else:
+        df = pd.read_csv(path, sep="\t", header=None, comment="#",
+                         compression="infer", dtype={0: str})
+        for c, g in df.groupby(0):
+            out[_chrom_code(c)] = (g[1].to_numpy(np.int64),
+                                   g[2].to_numpy(np.int64),
+                                   pd.to_numeric(g[3], errors="coerce")
+                                   .to_numpy(float))
+    for c, (st, en, v) in list(out.items()):
+        ok = np.isfinite(v) & (en > st)
+        o = np.argsort(st[ok], kind="mergesort")
+        out[c] = (st[ok][o], en[ok][o], v[ok][o])
+    _TRACKS[path] = out
+    return out
 
 
-def rt_log2(early, late, windows: pd.DataFrame, enr) -> np.ndarray:
-    """log2(early / late) per window, each side the mean of its tracks."""
-    e = np.nanmean([enr._signal_bin_means(windows, t) for t in early], 0)
-    lt = np.nanmean([enr._signal_bin_means(windows, t) for t in late], 0)
+def _window_means(track: dict, code, start, end) -> np.ndarray:
+    """Coverage-weighted mean of a track over windows [start, end) of one
+    chromosome, all at once from the track's running integral; NaN where
+    nothing covers a window.  The track's intervals must not overlap."""
+    start = np.asarray(start, np.int64)
+    end = np.asarray(end, np.int64)
+    t = track.get(int(code))
+    if t is None or t[0].size == 0:
+        return np.full(start.size, np.nan)
+    st, en, v = t
+    cum_i = np.concatenate([[0.0], np.cumsum(v * (en - st))])
+    cum_l = np.concatenate([[0.0], np.cumsum((en - st).astype(float))])
+
+    def upto(x):          # integral and covered length over [0, x)
+        j = np.searchsorted(st, x, side="right") - 1
+        jj = np.maximum(j, 0)
+        part = np.where(j >= 0, np.clip(np.minimum(x, en[jj]) - st[jj], 0,
+                                        None), 0)
+        return (np.where(j >= 0, cum_i[jj] + v[jj] * part, 0.0),
+                np.where(j >= 0, cum_l[jj] + part, 0.0))
+    i1, l1 = upto(end)
+    i0, l0 = upto(start)
+    cov = l1 - l0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(cov > 0, (i1 - i0) / cov, np.nan)
+
+
+def rt_log2(early, late, chrom, start, end) -> np.ndarray:
+    """log2(early / late) per window (chromosome, start, end), each side the
+    mean of its tracks."""
+    import warnings
+    codes = _codes_of(chrom)
+    start = np.asarray(start, np.int64)
+    end = np.asarray(end, np.int64)
+
+    def side(paths):
+        vals = []
+        for pth in paths:
+            tr = _track(pth)
+            v = np.full(codes.size, np.nan)
+            for c in np.unique(codes):
+                sel = codes == c
+                v[sel] = _window_means(tr, c, start[sel], end[sel])
+            vals.append(v)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # empty windows
+            return np.nanmean(vals, 0)
+    e, lt = side(early), side(late)
     pos = np.concatenate([e[np.isfinite(e) & (e > 0)],
                           lt[np.isfinite(lt) & (lt > 0)]])
     eps = 1e-3 * float(np.median(pos)) if pos.size else 1e-9
@@ -304,46 +398,62 @@ def rt_log2(early, late, windows: pd.DataFrame, enr) -> np.ndarray:
     return r
 
 
-def _windows(extents: dict, size: int, exclude=()) -> pd.DataFrame:
-    rows = [(c, s, min(s + size, n)) for c, n in extents.items()
-            if _canon(c) not in exclude for s in range(0, int(n), size)]
-    return pd.DataFrame(rows, columns=["chrom", "start", "end"])
-
-
-def read_rt(early, late, window: int, mid: float, enr,
-            exclude=()) -> Intervals:
+def read_rt(early, late, window: int, mid: float, exclude=()) -> Intervals:
     """Early / late (and, with ``mid`` > 0, mid: |log2 E/L| <= mid) per
     window.  In post-mitotic neurons this is a chromatin-state proxy (early
     ~ A), not replication."""
-    w = _windows(_track_extents(early[0]), window, exclude)
-    r = rt_log2(early, late, w, enr)
-    code = np.full(len(w), -1)
+    excl = {_chrom_code(c) for c in exclude}
+    ext: dict = {}
+    for pth in list(early) + list(late):
+        for c, (st, en, _) in _track(pth).items():
+            if c not in excl and en.size:
+                ext[c] = max(ext.get(c, 0), int(en.max()))
+    st = [np.arange(0, n, window, dtype=np.int64) for _, n in sorted(ext.items())]
+    ch = np.concatenate([np.full(x.size, c, np.int64)
+                         for (c, _), x in zip(sorted(ext.items()), st)])
+    st = np.concatenate(st)
+    r = rt_log2(early, late, ch, st, st + window)
+    code = np.full(st.size, -1)
     code[r > mid] = 0
     code[r < -mid] = 1
     classes = ("early", "late")
     if mid > 0:
         code[np.isfinite(r) & (np.abs(r) <= mid)] = 2
         classes = ("early", "late", "mid")
-    logger.info(f"RT: {len(w):,} windows of {window:,} bp; "
+    logger.info(f"RT: {st.size:,} windows of {window:,} bp; "
                 + ", ".join(f"{c} {np.mean(code == i):.1%}"
                             for i, c in enumerate(classes)))
-    return Intervals("rt", classes, w["chrom"], w["start"], w["end"], code)
+    return Intervals("rt", classes, ch, st, st + window, code)
 
 
 # ------------------------------------------------------- A/B per cell type --
 
 
+def _categorical(path, columns):
+    """A cell's parquet with its chromosome column as a category, the codes
+    of the categories (:func:`_chrom_code`, -1 last, for a missing name) and
+    whether each is kept, so per-row work is integer indexing."""
+    import pyarrow.parquet as pq
+    df = pq.read_table(str(path), columns=columns).to_pandas(
+        categories=["chrom"])
+    names = [str(c) for c in df["chrom"].cat.categories]
+    ci = df["chrom"].cat.codes.to_numpy().astype(np.int64)  # -1: missing
+    lut = np.array([_chrom_code(c) for c in names] + [-1], np.int64)
+    return df, names, ci, lut
+
+
 def _contact_bins(path, min_d: int, res: int, exclude) -> tuple:
-    """One cell's read pairs >= min_d as (chromosome names, per-pair index
-    into them, left bin, right bin) at ``res``."""
-    df = pd.read_parquet(path, columns=["chrom", "pos1", "pos2"])
-    lo = np.minimum(df["pos1"].to_numpy(np.int64), df["pos2"].to_numpy(np.int64))
-    hi = np.maximum(df["pos1"].to_numpy(np.int64), df["pos2"].to_numpy(np.int64))
-    idx, uniq = pd.factorize(df["chrom"].astype(str).to_numpy())
-    uniq = np.array([_canon(c) for c in uniq])
-    keep = ((hi - lo) >= min_d) & ~np.isin(uniq, list(exclude))[idx]
-    return (uniq, idx[keep].astype(np.int16), (lo[keep] // res).astype(np.int32),
-            (hi[keep] // res).astype(np.int32))
+    """One cell's read pairs >= min_d: (chromosome code, left bin, right
+    bin) at ``res``, and {code: chromosome name}."""
+    df, names, ci, lut = _categorical(path, ["chrom", "pos1", "pos2"])
+    ok_lut = np.array([_canon(c) not in exclude for c in names] + [False])
+    p1 = df["pos1"].to_numpy(np.int64)
+    p2 = df["pos2"].to_numpy(np.int64)
+    lo, hi = np.minimum(p1, p2), np.maximum(p1, p2)
+    keep = ok_lut[ci] & ((hi - lo) >= min_d)
+    return (lut[ci][keep], (lo[keep] // res).astype(np.int32),
+            (hi[keep] // res).astype(np.int32),
+            {int(lut[j]): _canon(n) for j, n in enumerate(names)})
 
 
 def _top_eigvecs(M: np.ndarray, k: int = 3) -> np.ndarray:
@@ -388,34 +498,40 @@ def compartments_from_contacts(by_cell: list, cell_type: list, res: int,
     """A/B per cell type from its POOLED contacts.
 
     ``by_cell[i]``: :func:`_contact_bins` of cell i.  Per type and
-    chromosome: the bin x bin count matrix and its compartment track
-    (:func:`compartment_track`: the eigenvector of the O/E correlation that
-    best follows ``orient(chrom, n_bins)``, an A-like reference per bin,
-    signed to correlate positively with it).  A type with fewer than
-    ``min_contacts`` contacts takes the all-cell call.  Returns ({type:
-    Intervals}, the per-bin table, QC)."""
-    chroms = sorted({c for u, *_ in by_cell for c in u})
-    nb = {c: 0 for c in chroms}
-    for u, idx, b1, b2 in by_cell:
-        for j, c in enumerate(u):
-            s = idx == j
-            if s.any():
-                nb[c] = max(nb[c], int(b2[s].max()) + 1)
+    chromosome: the bin x bin count matrix -- each type's contacts counted
+    in one pass -- and its compartment track (:func:`compartment_track`:
+    the eigenvector of the O/E correlation that best follows
+    ``orient(code, name, n_bins)``, an A-like reference per bin, signed to
+    correlate positively with it).  A type with fewer than ``min_contacts``
+    contacts takes the all-cell call.  Returns ({type: Intervals}, the
+    per-bin table, QC)."""
+    name_of: dict = {}
+    nb: dict = {}
+    for cc, b1, b2, nm in by_cell:
+        name_of.update(nm)
+        for c in np.unique(cc):
+            nb[int(c)] = max(nb.get(int(c), 0), int(b2[cc == c].max()) + 1)
+    chroms = sorted(nb)
     types = sorted(set(cell_type))
-    counts = {t: {c: np.zeros(nb[c] * nb[c]) for c in chroms}
-              for t in types + ["__all__"]}
+    flats: dict = {}
     n_type = dict.fromkeys(types + ["__all__"], 0)
-    for (u, idx, b1, b2), t in zip(by_cell, cell_type):
-        for j, c in enumerate(u):
-            s = idx == j
-            if not s.any():
-                continue
-            flat = np.bincount(b1[s].astype(np.int64) * nb[c] + b2[s],
-                               minlength=nb[c] * nb[c])
-            counts[t][c] += flat
-            counts["__all__"][c] += flat
-            n_type[t] += int(s.sum())
-            n_type["__all__"] += int(s.sum())
+    for (cc, b1, b2, _), t in zip(by_cell, cell_type):
+        for c in np.unique(cc):
+            sel = cc == c
+            flats.setdefault((t, int(c)), []).append(
+                b1[sel].astype(np.int64) * nb[int(c)] + b2[sel])
+            n_type[t] += int(sel.sum())
+            n_type["__all__"] += int(sel.sum())
+    counts = {t: {} for t in types + ["__all__"]}
+    for c in chroms:
+        tot = np.zeros(nb[c] * nb[c])
+        for t in types:
+            f = flats.pop((t, c), [])
+            v = (np.bincount(np.concatenate(f), minlength=nb[c] * nb[c])
+                 .astype(float) if f else np.zeros(nb[c] * nb[c]))
+            counts[t][c] = v
+            tot += v
+        counts["__all__"][c] = tot
     scores, refs, picked = {}, {}, {}
     for t in types + ["__all__"]:
         scores[t], picked[t] = {}, []
@@ -423,9 +539,10 @@ def compartments_from_contacts(by_cell: list, cell_type: list, res: int,
             U = counts[t][c].reshape(nb[c], nb[c])
             M = U + U.T - np.diag(np.diag(U))
             if c not in refs:
-                refs[c] = np.asarray(orient(c, nb[c]), float)
+                refs[c] = np.asarray(orient(c, name_of.get(c, str(c)),
+                                            nb[c]), float)
             scores[t][c], which, r = compartment_track(M, refs[c])
-            picked[t].append(f"{c}:PC{which}")
+            picked[t].append(f"{name_of.get(c, c)}:PC{which}")
     rows, qc, maps = [], [], {}
     allv = np.concatenate([scores["__all__"][c] for c in chroms])
     for t in types + ["__all__"]:
@@ -452,7 +569,8 @@ def compartments_from_contacts(by_cell: list, cell_type: list, res: int,
             st.append(b * res)
             en.append((b + 1) * res)
             code.append(np.where(pc[b] > 0, 0, 1))
-            rows.append(pd.DataFrame({"cell_type": t, "chrom": c,
+            rows.append(pd.DataFrame({"cell_type": t,
+                                      "chrom": name_of.get(c, str(c)),
                                       "start": np.arange(nb[c]) * res,
                                       "end": (np.arange(nb[c]) + 1) * res,
                                       "pc1": pc,
@@ -469,44 +587,44 @@ def compartments_from_contacts(by_cell: list, cell_type: list, res: int,
 
 def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
                systems: dict) -> dict:
-    """One cell's contacts -- both ends called, min_d <= d <= max_d -- with
-    every system's class at both ends, and per system x class the count,
-    sum and sum of squares of ALL its called ends' posteriors (the
-    marginal: every read pair's ends, short ones included)."""
-    df = pd.read_parquet(path, columns=["chrom", "pos1", "pos2", "n1", "n2",
-                                        "posterior1", "posterior2"])
-    idx, uniq = pd.factorize(df["chrom"].astype(str).to_numpy())
-    uniq = np.array([_canon(c) for c in uniq])
-    keep = ~np.isin(uniq, list(exclude))[idx]
-    chrom = uniq[idx[keep]]
+    """One cell's contacts -- both ends called, min_d <= d <= max_d -- as
+    genome coordinates, with every system's class at both ends, and per
+    system x class the count, sum and sum of squares of ALL its called
+    ends' posteriors (the marginal: every read pair's ends, short ones
+    included).  Integer work only, so threads run in parallel."""
+    df, names, ci, lut = _categorical(
+        path, ["chrom", "pos1", "pos2", "n1", "n2", "posterior1",
+               "posterior2"])
+    ok_lut = np.array([_canon(c) not in exclude for c in names] + [False])
+    keep = ok_lut[ci]
+    base = lut[ci][keep] * STRIDE
     pos1 = df["pos1"].to_numpy(np.int64)[keep]
     pos2 = df["pos2"].to_numpy(np.int64)[keep]
     p1 = df["posterior1"].to_numpy(np.float64, na_value=np.nan)[keep]
     p2 = df["posterior2"].to_numpy(np.float64, na_value=np.nan)[keep]
     inf1 = (df["n1"].to_numpy()[keep] >= min_sites) & np.isfinite(p1)
     inf2 = (df["n2"].to_numpy()[keep] >= min_sites) & np.isfinite(p2)
-    e_chr = np.concatenate([chrom[inf1], chrom[inf2]])
-    e_pos = np.concatenate([pos1[inf1], pos2[inf2]])
+    g1, g2 = base + pos1, base + pos2
+    e_g = np.concatenate([g1[inf1], g2[inf2]])
     e_p = np.concatenate([p1[inf1], p2[inf2]])
     sep = np.abs(pos2 - pos1)
     cm = inf1 & inf2 & (sep >= min_d) & (sep <= max_d)
     left = pos1 <= pos2
-    lo = np.where(left, pos1, pos2)[cm]
-    hi = np.where(left, pos2, pos1)[cm]
-    out = {"chrom": chrom[cm], "lo": lo, "hi": hi,
+    g_lo = np.where(left, g1, g2)[cm]
+    g_hi = np.where(left, g2, g1)[cm]
+    out = {"g_lo": g_lo, "g_hi": g_hi,
            "a": np.where(left, p1, p2)[cm].astype(np.float32),
            "p": np.where(left, p2, p1)[cm].astype(np.float32),
            "cls": {}, "marg": {}}
     for name, lk in systems.items():
-        k = lk.lookup(e_chr, e_pos)
+        k = lk.lookup_g(e_g)
         ok = k >= 0
         n_k = len(lk.classes)
         out["marg"][name] = np.stack([
             np.bincount(k[ok], minlength=n_k).astype(float),
             np.bincount(k[ok], weights=e_p[ok], minlength=n_k),
             np.bincount(k[ok], weights=e_p[ok] ** 2, minlength=n_k)])
-        out["cls"][name] = (lk.lookup(out["chrom"], lo),
-                            lk.lookup(out["chrom"], hi))
+        out["cls"][name] = (lk.lookup_g(g_lo), lk.lookup_g(g_hi))
     return out
 
 
@@ -521,7 +639,7 @@ def _pool(g, v, cell):
 
 
 def reshuffle(g_lo, g_hi, d, cell, x_cls, y_cls, a_c, p_c, stratum, n_cls,
-              dbins, position_bin, max_widen, seed):
+              dbins, position_bin, max_widen, seed, names=None, n_threads=1):
     """Two null draws for BOTH ends of every contact.
 
     The right end first: keep the left end, and replace the right one by a
@@ -536,6 +654,10 @@ def reshuffle(g_lo, g_hi, d, cell, x_cls, y_cls, a_c, p_c, stratum, n_cls,
     orientations that should agree could not.  Donor values are centred on
     their own cell's class marginal (``a_c``/``p_c`` for every end).
 
+    ``stratum``: an integer per contact (or labels), ``names`` the label of
+    each integer, which seeds its draws.  The stratum x class x end
+    assignments are independent and run on ``n_threads`` threads.
+
     Returns (ok, right 2 x n, left 2 x n, reused): ``ok`` -- both ends have
     a donor; ``right``/``left`` -- the centred donor of each end per draw."""
     n = g_lo.size
@@ -548,43 +670,73 @@ def reshuffle(g_lo, g_hi, d, cell, x_cls, y_cls, a_c, p_c, stratum, n_cls,
     # Mirror: g -> M - g turns "to the left" into "to the right".
     M = np.int64(max(int(g_hi.max()) if n else 0, 0)
                  + int(np.ceil(dbins[-1])) + int(pb) + 2)
-    reused = 0
-    for s in np.unique(stratum):
-        in_s = stratum == s
+    stratum = np.asarray(stratum)
+    if stratum.dtype.kind not in "iu":
+        stratum, names = pd.factorize(stratum)
+        names = list(names)
+    stratum = stratum.astype(np.int64)
+    n_s = int(stratum.max()) + 1 if n else 0
+    order = np.argsort(stratum, kind="stable")
+    bnd = np.searchsorted(stratum[order], np.arange(n_s + 1))
+    tasks = []
+    for si in range(n_s):
+        idx = order[bnd[si]:bnd[si + 1]]
+        if idx.size == 0:
+            continue
+        xs, ys, us = x_cls[idx], y_cls[idx], usable[idx]
+        fa, fp = np.isfinite(a_c[idx]), np.isfinite(p_c[idx])
+        key = zlib.crc32(str(names[si] if names is not None else si).encode())
         for k in range(n_cls):
-            lo_k = in_s & (x_cls == k) & np.isfinite(a_c)
-            hi_k = in_s & (y_cls == k) & np.isfinite(p_c)
-            if not (lo_k.any() or hi_k.any()):
+            lo_i = idx[(xs == k) & fa]
+            hi_i = idx[(ys == k) & fp]
+            if lo_i.size + hi_i.size == 0:
                 continue
-            pg = np.concatenate([g_lo[lo_k], g_hi[hi_k]])
-            pv = np.concatenate([a_c[lo_k], p_c[hi_k]])
-            pc = np.concatenate([cell[lo_k], cell[hi_k]])
-            key = zlib.crc32(str(s).encode())
-            for side, ask in (("right", np.flatnonzero(usable & in_s
-                                                       & (y_cls == k))),
-                              ("left", np.flatnonzero(usable & in_s
-                                                      & (x_cls == k)))):
-                if ask.size == 0:
-                    continue
-                rng = np.random.default_rng([seed, key, k,
-                                             0 if side == "right" else 1])
-                if side == "right":
-                    pool = _pool(pg, pv, pc)
-                    start = (g_hi[ask] // pb) * pb
-                    lv, _, dp, ru = _ls.assign_stratum(
-                        g_lo[ask], d[ask], cell[ask], pool, pool, dbins, rng,
-                        n_draws=2, bounds=(start, start + pb),
-                        max_widen=max_widen)
-                    lv_r[ask], right[:, ask] = lv, dp
-                else:
-                    pool = _pool(M - pg, pv, pc)
-                    b0 = (g_lo[ask] // pb) * pb
-                    lv, _, dp, ru = _ls.assign_stratum(
-                        M - g_hi[ask], d[ask], cell[ask], pool, pool, dbins,
-                        rng, n_draws=2, bounds=(M - b0 - pb + 1, M - b0 + 1),
-                        max_widen=max_widen)
-                    lv_l[ask], left[:, ask] = lv, dp
-                reused += ru
+            for side, ask in (("right", idx[us & (ys == k)]),
+                              ("left", idx[us & (xs == k)])):
+                if ask.size:
+                    tasks.append((key, k, side, lo_i, hi_i, ask))
+
+    def bin_start(g):
+        """The start of g's position bin, counted from its chromosome's
+        start: STRIDE is not a multiple of the bin, so g // pb would shift
+        every chromosome but the first by its own offset."""
+        return (g // STRIDE) * STRIDE + ((g % STRIDE) // pb) * pb
+
+    def run(task):
+        key, k, side, lo_i, hi_i, ask = task
+        pg = np.concatenate([g_lo[lo_i], g_hi[hi_i]])
+        pv = np.concatenate([a_c[lo_i], p_c[hi_i]])
+        pc = np.concatenate([cell[lo_i], cell[hi_i]])
+        rng = np.random.default_rng([seed, key, k,
+                                     0 if side == "right" else 1])
+        if side == "right":
+            pool = _pool(pg, pv, pc)
+            start = bin_start(g_hi[ask])
+            lv, _, dp, ru = _ls.assign_stratum(
+                g_lo[ask], d[ask], cell[ask], pool, pool, dbins, rng,
+                n_draws=2, bounds=(start, start + pb), max_widen=max_widen)
+        else:
+            pool = _pool(M - pg, pv, pc)
+            b0 = bin_start(g_lo[ask])
+            lv, _, dp, ru = _ls.assign_stratum(
+                M - g_hi[ask], d[ask], cell[ask], pool, pool, dbins, rng,
+                n_draws=2, bounds=(M - b0 - pb + 1, M - b0 + 1),
+                max_widen=max_widen)
+        return side, ask, lv, dp, ru
+
+    if n_threads > 1 and len(tasks) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=int(n_threads)) as ex:
+            results = list(ex.map(run, tasks))
+    else:
+        results = [run(t) for t in tasks]
+    reused = 0
+    for side, ask, lv, dp, ru in results:
+        if side == "right":
+            lv_r[ask], right[:, ask] = lv, dp
+        else:
+            lv_l[ask], left[:, ask] = lv, dp
+        reused += ru
     ok = usable & (lv_r >= 0) & (lv_l >= 0)
     return ok, right, left, reused
 
@@ -1452,7 +1604,7 @@ def main(argv=None) -> int:
     if "rt" in want:
         if args.rt_early and args.rt_late:
             systems["rt"] = read_rt(args.rt_early, args.rt_late,
-                                    args.rt_window, args.rt_mid, enr, exclude)
+                                    args.rt_window, args.rt_mid, exclude)
         else:
             logger.warning("rt: needs --rt-early and --rt-late; skipped")
     if "chromhmm" in want:
@@ -1498,11 +1650,10 @@ def main(argv=None) -> int:
             if not (args.rt_early and args.rt_late):
                 sys.exit("--ab-orient rt needs --rt-early and --rt-late")
 
-            def ref(c, nb):
-                w = pd.DataFrame({"chrom": "chr" + c,
-                                  "start": np.arange(nb) * res,
-                                  "end": (np.arange(nb) + 1) * res})
-                return rt_log2(args.rt_early, args.rt_late, w, enr)
+            def ref(code, name, nb):
+                st = np.arange(nb, dtype=np.int64) * res
+                return rt_log2(args.rt_early, args.rt_late,
+                               np.full(nb, code, np.int64), st, st + res)
         else:
             ga = enr._resolve(args.gene_annotation
                               or preset.get("gene_annotation"), cache,
@@ -1516,8 +1667,9 @@ def main(argv=None) -> int:
                            genes["start"].to_numpy())
             gch = genes["chrom"].map(_canon).to_numpy()
 
-            def ref(c, nb):
-                return np.bincount(np.minimum(tss[gch == c] // res, nb - 1),
+            def ref(code, name, nb):
+                return np.bincount(np.minimum(tss[gch == name] // res,
+                                              nb - 1),
                                    minlength=nb).astype(float)
         logger.info(f"A/B: pooling contacts per cell type at {res:,} bp, "
                     f"oriented by {orient}")
@@ -1541,6 +1693,7 @@ def main(argv=None) -> int:
                           for c in cells])
         stratum = np.array(["|".join(str(samples.at[c, k]) for k in strat_cols)
                             for c in cells])
+        strat_code, strat_names = pd.factorize(stratum)
         ms = _min_sites(args.min_sites, ctx)
 
         def one(i, c):
@@ -1554,26 +1707,18 @@ def main(argv=None) -> int:
         logger.info(f"{ctx}: reading {len(cells):,} cells")
         res_ = Parallel(n_jobs=args.n_threads, prefer="threads")(
             delayed(one)(i, c) for i, c in enumerate(cells))
-        chrom_code = {c: i for i, c in enumerate(sorted(
-            {x for r in res_ for x in np.unique(r["chrom"])}))}
-        cell = np.concatenate([np.full(r["lo"].size, i, np.int64)
+        cell = np.concatenate([np.full(r["g_lo"].size, i, np.int64)
                                for i, r in enumerate(res_)])
-        code = np.concatenate([pd.Series(r["chrom"], dtype=object)
-                               .map(chrom_code).to_numpy(np.int64)
-                               if r["lo"].size else np.empty(0, np.int64)
-                               for r in res_])
-        lo = np.concatenate([r["lo"] for r in res_])
-        hi = np.concatenate([r["hi"] for r in res_])
+        g_lo = np.concatenate([r["g_lo"] for r in res_])
+        g_hi = np.concatenate([r["g_hi"] for r in res_])
         a = np.concatenate([r["a"] for r in res_]).astype(float)
         p = np.concatenate([r["p"] for r in res_]).astype(float)
-        dist = hi - lo
-        g_lo = code * _ls.GENOME_STRIDE + lo
-        g_hi = code * _ls.GENOME_STRIDE + hi
+        dist = g_hi - g_lo
         band = np.clip(np.searchsorted(edges, dist, side="right") - 1, 0,
                        len(edges) - 2)
         half = np.random.default_rng([args.seed, ci_ctx]).integers(
-            0, 2, lo.size)
-        logger.info(f"{ctx}: {lo.size:,} contacts in {len(cells):,} cells")
+            0, 2, g_lo.size)
+        logger.info(f"{ctx}: {g_lo.size:,} contacts in {len(cells):,} cells")
         dbins = _ls.log_dbins(args.min_distance, args.max_distance,
                               args.bins_per_decade)
         order = ([x for x in SYSTEMS if x in systems
@@ -1594,9 +1739,10 @@ def main(argv=None) -> int:
             a_c = np.where(kx >= 0, a - mu[cell, np.maximum(kx, 0)], np.nan)
             p_c = np.where(ky >= 0, p - mu[cell, np.maximum(ky, 0)], np.nan)
             ok, right, left, reused = reshuffle(
-                g_lo, g_hi, dist, cell, kx, ky, a_c, p_c, stratum[cell], n_k,
-                dbins, args.position_bin, args.max_widen,
-                seed=args.seed + 7919 * ci_ctx + si)
+                g_lo, g_hi, dist, cell, kx, ky, a_c, p_c, strat_code[cell],
+                n_k, dbins, args.position_bin, args.max_widen,
+                seed=args.seed + 7919 * ci_ctx + si,
+                names=list(strat_names), n_threads=args.n_threads)
             # The pair's classes, unordered unless asked: which end of a
             # contact lies on the left carries no meaning.
             if args.ordered_pairs:
@@ -1614,7 +1760,7 @@ def main(argv=None) -> int:
                         "with_donor": float(ok[s_].mean())})
             cov_rows.append({"context": ctx, "system": name,
                              "anchor": "any", "partner": "any",
-                             "contacts": int(lo.size),
+                             "contacts": int(g_lo.size),
                              "annotated": float(np.mean((kx >= 0)
                                                         & (ky >= 0))),
                              "with_donor": float(ok.mean()) if ok.size

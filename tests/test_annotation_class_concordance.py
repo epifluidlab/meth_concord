@@ -356,3 +356,50 @@ def test_the_sign_version_keeps_delta_c_whole(planted):
     assert np.allclose(np.abs(c["signed_sgn"]), np.abs(c["delta"]))
     h = _row(s, "pmd", "HMD", "HMD")
     assert h["signed_sgn_lo"] > 0 and h["signed_sgn"] >= h["signed_rel"]
+
+
+def test_a_donor_stays_in_its_partners_bin_on_every_chromosome():
+    """The 250 kb position bin is counted from each chromosome's start: on
+    chromosome 7 a donor 1 kb past the partner's bin edge is refused."""
+    S = acc._ls.GENOME_STRIDE
+    c = 7 * S
+    g_lo = np.array([1_200_000, 1_190_000], np.int64) + c
+    g_hi = np.array([1_249_000, 1_251_500], np.int64) + c   # bins 4 and 5
+    ok, right, _, _ = acc.reshuffle(
+        g_lo, g_hi, g_hi - g_lo, np.array([0, 1]), np.array([0, 0]),
+        np.array([0, 0]), np.array([0.1, 0.2]), np.array([0.3, 0.4]),
+        np.array([0, 0]), 1, acc._ls.log_dbins(1000, 10_000_000, 4),
+        250_000, 0, seed=0, names=["s"])
+    # each right end's only other-cell donor sits in the other bin
+    assert not ok.any() and np.isnan(right).all()
+
+
+def test_window_means_match_a_per_base_average(tmp_path):
+    """The running-integral window mean equals averaging the covered bases
+    one by one -- from a bedGraph and from the same data as a bigWig."""
+    rng = np.random.default_rng(0)
+    edges = np.sort(rng.choice(np.arange(1, 9_999), 60, replace=False))
+    st, en = edges[0::2], edges[1::2]                  # gaps between them
+    val = rng.uniform(0, 5, st.size)
+    bg = tmp_path / "t.bedGraph"
+    pd.DataFrame({"c": "chr1", "s": st, "e": en, "v": val}).to_csv(
+        bg, sep="\t", header=False, index=False)
+    w0 = np.array([0, 500, 2_000, 9_000, 9_990])
+    w1 = np.array([1_000, 2_500, 2_001, 10_000, 9_995])
+    base = np.full(10_000, np.nan)
+    for s_, e_, v_ in zip(st, en, val):
+        base[s_:e_] = v_
+    want = np.array([np.nanmean(base[a:b]) if np.isfinite(base[a:b]).any()
+                     else np.nan for a, b in zip(w0, w1)])
+    code = acc._chrom_code("chr1")
+    got = acc._window_means(acc._track(bg), code, w0, w1)
+    assert np.allclose(got, want, equal_nan=True)
+    pyBigWig = pytest.importorskip("pyBigWig")
+    bw_path = str(tmp_path / "t.bw")
+    bw = pyBigWig.open(bw_path, "w")
+    bw.addHeader([("chr1", 10_000)])
+    bw.addEntries(["chr1"] * st.size, st.tolist(), ends=en.tolist(),
+                  values=val.tolist())
+    bw.close()
+    got_bw = acc._window_means(acc._track(bw_path), code, w0, w1)
+    assert np.allclose(got_bw, want, equal_nan=True, rtol=1e-5)

@@ -201,8 +201,9 @@ def assign_stratum(anchor_g, d, anchor_cell, pool_e, pool_n, dbins, rng,
     if (max(int(ce.max()), int(cn.max()), int(anchor_cell.max())) + 1
             >= (1 << (62 - shift))):
         raise ValueError("too many cells for (cell, coordinate) keys")
+    same = pool_n is pool_e            # one pool for both: search it once
     own_ke, own_cume = _by_cell(pool_e, shift)
-    own_kn, _ = _by_cell(pool_n, shift)
+    own_kn = own_ke if same else _by_cell(pool_n, shift)[0]
     base = anchor_cell << np.int64(shift)
     win = np.zeros((n, 2), np.int64)          # the null half's window
     for w in range(int(max_widen) + 1):
@@ -218,13 +219,16 @@ def assign_stratum(anchor_g, d, anchor_cell, pool_e, pool_n, dbins, rng,
         hi = np.maximum(np.ceil(hi).astype(np.int64), lo)
         el = np.searchsorted(ge, lo, side="left")
         eh = np.searchsorted(ge, hi, side="left")
-        nl = np.searchsorted(gn, lo, side="left")
-        nh = np.searchsorted(gn, hi, side="left")
         b = base[todo]
         ol = np.searchsorted(own_ke, b + lo, side="left")
         oh = np.searchsorted(own_ke, b + hi, side="left")
-        own_n = (np.searchsorted(own_kn, b + hi, side="left")
-                 - np.searchsorted(own_kn, b + lo, side="left"))
+        if same:
+            nl, nh, own_n = el, eh, oh - ol
+        else:
+            nl = np.searchsorted(gn, lo, side="left")
+            nh = np.searchsorted(gn, hi, side="left")
+            own_n = (np.searchsorted(own_kn, b + hi, side="left")
+                     - np.searchsorted(own_kn, b + lo, side="left"))
         cnt_e = eh - el - (oh - ol)
         ok = (cnt_e >= 1) & ((nh - nl - own_n) >= 1)
         hit = todo[ok]
