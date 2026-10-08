@@ -403,3 +403,70 @@ def test_window_means_match_a_per_base_average(tmp_path):
     bw.close()
     got_bw = acc._window_means(acc._track(bw_path), code, w0, w1)
     assert np.allclose(got_bw, want, equal_nan=True, rtol=1e-5)
+
+
+# ------------------------------------------------------ cell covariates --
+
+
+def test_cell_cycle_covariates_from_a_cells_read_pairs(tmp_path):
+    rows = ([("chr1", 0, 10_000)] * 4                 # < 25 kb: not counted
+            + [("chr1", 0, 100_000)] * 6              # near
+            + [("chr1", 0, 5_000_000)] * 3            # mitotic band
+            + [("chr1", 0, 20_000_000)])              # far
+    df = pd.DataFrame(rows, columns=["chrom", "pos1", "pos2"])
+    df.to_parquet(tmp_path / "c.parquet")
+    rt = acc.Intervals("rt", ("early", "late"), ["chr1", "chr1"],
+                       [0, 1_000_000], [1_000_000, 30_000_000], [0, 1])
+    _, cov = acc._contact_pass(tmp_path / "c.parquet", 1000, 250_000, set(),
+                               rt)
+    assert cov["contacts_25kb"] == 10
+    assert cov["frac_near"] == pytest.approx(0.6)
+    assert cov["frac_mitotic"] == pytest.approx(0.3)
+    # 14 left ends at 0 (early), 4 + 6 right ends early, 4 late
+    assert cov["repli_score"] == pytest.approx(24 / 28)
+
+
+def test_a_covariate_that_drives_concordance_explains_its_variation():
+    """Within each type ΔC follows % mitotic plus sampling noise; the
+    control is the noise alone.  % mitotic is found, nothing else is, and
+    most of the REAL within-type variation is explained."""
+    rng = np.random.default_rng(0)
+    n = 300
+    cells = [f"c{i}" for i in range(n)]
+    types = np.repeat(["T0", "T1", "T2"], n // 3)
+    cov = pd.DataFrame({"cell": cells, "cell_type": types,
+                        "log10_contacts": rng.normal(4, 0.2, n),
+                        "frac_near": rng.uniform(0.4, 0.6, n),
+                        "frac_mitotic": rng.uniform(0.05, 0.2, n),
+                        "repli_score": rng.uniform(0.45, 0.55, n)})
+    signal = 0.4 * (cov["frac_mitotic"] - 0.125)
+    pc = pd.DataFrame({"context": "GCH", "system": "ab", "cell": cells,
+                       "cell_type": types, "anchor": "A", "partner": "A",
+                       "band": "all 1kb-10Mb", "enough_pairs": True,
+                       "delta": signal + rng.normal(0, 0.005, n)
+                       + np.where(types == "T1", 0.01, 0),
+                       "control": rng.normal(0, 0.005, n)})
+    level = {"GCH": dict(zip(cells, rng.uniform(0.2, 0.3, n)))}
+    a = acc.covariate_association(pc, cov, level, stats=("delta",))
+    r = a.iloc[0]
+    assert r["rho_frac_mitotic"] > 0.6 and r["q_frac_mitotic"] < 1e-6
+    for c in ("log10_contacts", "frac_near", "repli_score", "level"):
+        assert abs(r[f"rho_{c}"]) < 0.2
+    assert r["explained_share"] > 0.7
+    assert abs(r["control_R2_adj"]) < 0.05
+
+
+def test_the_covariate_outputs_are_written(planted):
+    _, _, o = planted
+    cov = pd.read_csv(o / "cell_covariates.tsv", sep="\t")
+    assert {"frac_near", "frac_mitotic", "repli_score", "log10_contacts",
+            "level_GCH"} <= set(cov.columns)
+    assert cov["repli_score"].between(0, 1).all()
+    a = pd.read_csv(o / "covariate_association.tsv", sep="\t")
+    assert {"rho_frac_mitotic", "q_repli_score", "explained_share",
+            "bio_share", "control_R2_adj"} <= set(a.columns)
+    assert (o / "covariates_GCH_delta.png").exists()
+    assert (o / "covariates_GCH_delta_by_band.png").exists()
+    assert (o / "cell_cycle_covariates.png").exists()
+    assert a["band"].astype(str).str.startswith("all").any()
+    assert (~a["band"].astype(str).str.startswith("all")).any()
