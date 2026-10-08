@@ -31,7 +31,7 @@ def is_a(pos):
 
 
 def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
-              n_short=1500, seed=0, coord_in="A"):
+              n_short=1500, seed=0, coord_in="A", levels=(0.6, 0.25)):
     """``coord(t, c)``: the chance an A-A contact's partner copies its anchor
     in cell c of type t.  ``offset(t, c)`` is added to every posterior of
     that cell AFTER the calls are drawn, so it changes nothing but level."""
@@ -50,7 +50,7 @@ def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
             # contacts prefer their own compartment
             move = (is_a(a_pos) != is_a(b_pos)) & (rng.random(n_contacts) < 0.7)
             b_pos[move] += DOM
-            level = lambda x: np.where(is_a(x), 0.6, 0.25)  # noqa: E731
+            level = lambda x: np.where(is_a(x), *levels)  # noqa: E731
             pa = np.where(rng.random(n_contacts) < level(a_pos), 0.9, 0.1)
             pb = np.where(rng.random(n_contacts) < level(b_pos), 0.9, 0.1)
             if coord is not None:
@@ -312,3 +312,34 @@ def test_signed_concordance_is_positive_when_open_and_negative_when_closed(
     assert r["F"] < 0.5 and r["signed_hi"] < 0
     assert abs(r["signed"]) > 5 * abs(r["signed_control"])
     assert {"F", "F_null", "signed", "signed_control"} <= set(pc.columns)
+
+
+def test_against_the_genome_a_rare_open_state_still_reads_co_open(tmp_path):
+    """GCH-like: open in 15% of A and 3% of B, so every class is mostly
+    closed and 2F - 1 calls coordination co-closed wherever it is.  Read
+    against the cell's genome-wide co-open share, coordination in the
+    (relatively) open A is co-open and in the closed B co-closed."""
+    gch = dict(per=20, n_contacts=4000, levels=(0.15, 0.03),
+               coord=lambda t, c: 0.6)
+    s, _, o = run(make_data(tmp_path / "a", seed=6, coord_in="A", **gch),
+                  systems="pmd")
+    r = _row(s, "pmd", "HMD", "HMD")
+    assert r["signed_hi"] < 0                     # absolute: "co-closed"
+    assert r["signed_rel_lo"] > 0                 # against the genome: co-open
+    assert r["F_ref"] < r["F"] < 0.5
+    assert (o / "fig_GCH_pmd_signed.png").exists()
+    s, _, _ = run(make_data(tmp_path / "b", seed=7, coord_in="B", **gch),
+                  systems="pmd")
+    r = _row(s, "pmd", "PMD", "PMD")
+    assert r["signed_rel_hi"] < 0                 # closed B: co-closed
+    for k in (("HMD", "HMD"), ("PMD", "PMD")):    # the control is centred
+        c = _row(s, "pmd", *k)
+        assert (c["signed_rel_control_lo"] < 0 < c["signed_rel_control_hi"]
+                or abs(c["signed_rel_control"]) < 0.002)
+
+
+def test_the_weight_is_two_f_minus_one_against_an_even_split():
+    F = np.array([0.1, 0.5, 0.8])
+    assert np.allclose(acc._weight(F, 0.5), 2 * F - 1)
+    assert acc._weight(0.2, 0.2) == 0
+    assert acc._weight(0.3, 0.1) > 0 > acc._weight(0.05, 0.1)

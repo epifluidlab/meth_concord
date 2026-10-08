@@ -64,8 +64,20 @@ the sign comes from the levels; S is ΔC and the levels read together.)
 Its control is the same formula on reshuffled links alone -- draw 2 in
 place of the real partners: (C_null2 - C_null1) x (2 F_null2 - 1).  For F,
 a donor's posterior is put on the receiving cell's level in that class.
-Written beside the C figures as fig_<context>_<system>_signed and
-main_figure_signed.
+2F - 1 reads F against an even split; for GCH, closed over most of the
+genome, nearly every class then reads co-closed, promoters included.  So
+signed_rel reads it against the cell's OWN genome-wide co-open share F_g
+(all its contacts annotated in that system):
+
+    w = tanh(½[logit F - logit F_g]) = (F - F_g) / (F + F_g - 2 F F_g)
+
+-- 0 at the cell's background, + more co-open than it, - more co-closed;
+2F - 1 is the case F_g = 0.5.  For independent ends logit F ~ logit L1 +
+logit L2, so w follows how much more open than the genome the two ends
+are, and a cell's overall labelling efficiency cancels.  The control uses
+the reshuffled draw's own F_g.  The signed figures
+(fig_<context>_<system>_signed, main_figure_signed) draw signed_rel;
+--signed-reference even draws ΔC x (2F - 1).
 
 CELL-TO-CELL VARIATION is read against that control.  Per cell, Δ carries
 sampling noise; the control carries the same noise and nothing else, so
@@ -673,6 +685,22 @@ def _signed(dc, oo, oc):
         return dc * (2 * oo / (oo + oc) - 1)
 
 
+def _weight(F, Fg):
+    """How much more co-open than the reference ``Fg`` a co-open share F is,
+    on [-1, 1]: tanh(½[logit F - logit Fg]) = (F - Fg) / (F + Fg - 2 F Fg).
+    0 at the reference, +1 all co-open, -1 all co-closed; 2F - 1 is the
+    case Fg = 0.5."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (F - Fg) / (F + Fg - 2 * F * Fg)
+
+
+def _signed_rel(dc, oo, oc, Fg):
+    """ΔC x the weight of this class pair's co-open share against the
+    cell's genome-wide one."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return dc * _weight(oo / (oo + oc), Fg)
+
+
 def summarize(acc, sd, mu, cells, types, classes, band_labels, edges,
               min_pairs, n_boot, seed, context, system):
     """One row per (class, class, band)."""
@@ -680,6 +708,19 @@ def summarize(acc, sd, mu, cells, types, classes, band_labels, edges,
     n_cells = len(cells)
     W = rng.multinomial(n_cells, np.full(n_cells, 1.0 / n_cells),
                         size=n_boot).astype(float)
+    # Each cell's genome-wide co-open share -- all its contacts annotated
+    # in this system, every class pair -- the reference signed_rel is read
+    # against; the reshuffled draw 2's own, for the control.
+    A = len(band_labels) - 1
+    g = {k: acc[k][:, :, :, A].sum((1, 2)) for k in ("oo", "oc", "no2",
+                                                     "nc2")}
+    with np.errstate(invalid="ignore", divide="ignore"):
+        Fg = g["oo"] / (g["oo"] + g["oc"])
+        Fgn = g["no2"] / (g["no2"] + g["nc2"])
+        bFg = (W @ g["oo"]) / (W @ g["oo"] + W @ g["oc"])
+        bFgn = (W @ g["no2"]) / (W @ g["no2"] + W @ g["nc2"])
+    Fg_pool = g["oo"].sum() / (g["oo"].sum() + g["oc"].sum())
+    Fgn_pool = g["no2"].sum() / (g["no2"].sum() + g["nc2"].sum())
     rows = []
     for i, k1 in enumerate(classes):
         for j, k2 in enumerate(classes):
@@ -729,6 +770,22 @@ def summarize(acc, sd, mu, cells, types, classes, band_labels, edges,
                     np.mean(bs <= 0), np.mean(bs >= 0)) + 1.0 / (n_boot + 1))
                 row["signed_control_lo"], row["signed_control_hi"] = (
                     np.nanpercentile(bsc, [2.5, 97.5]))
+                # The same against the cell's genome-wide co-open share
+                # instead of an even split: GCH is closed over most of the
+                # genome, so against 1:1 every class reads co-closed.
+                row["F_ref"], row["F_ref_null"] = Fg_pool, Fgn_pool
+                row["signed_rel"] = d_pool * _weight(row["F"], Fg_pool)
+                row["signed_rel_control"] = c_pool * _weight(row["F_null"],
+                                                             Fgn_pool)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    br_ = bd * _weight((W @ oo) / (W @ oo + W @ oc), bFg)
+                    brc = bc * _weight((W @ no2) / (W @ no2 + W @ nc2), bFgn)
+                row["signed_rel_lo"], row["signed_rel_hi"] = (
+                    np.nanpercentile(br_, [2.5, 97.5]))
+                row["signed_rel_p_boot"] = min(1.0, 2 * min(
+                    np.mean(br_ <= 0), np.mean(br_ >= 0)) + 1.0 / (n_boot + 1))
+                row["signed_rel_control_lo"], row["signed_rel_control_hi"] = (
+                    np.nanpercentile(brc, [2.5, 97.5]))
                 # Correlation scale: each cell's products over its own class
                 # SDs, pooled -- comparable between classes of different
                 # variance, as C is not.
@@ -784,6 +841,15 @@ def summarize(acc, sd, mu, cells, types, classes, band_labels, edges,
                         _signed(c0, h0["no2"], h0["nc2"]),
                         _signed(c1, h1["no2"], h1["nc2"]),
                         t_m, rng, n_boot, prefix="signed_"))
+                    fg, fgn = Fg[m], Fgn[m]
+                    row.update(_per_cell(
+                        _signed_rel(dc, oo[m], oc[m], fg),
+                        _signed_rel(cc, no2[m], nc2[m], fgn),
+                        _signed_rel(d0, h0["oo"], h0["oc"], fg),
+                        _signed_rel(d1, h1["oo"], h1["oc"], fg),
+                        _signed_rel(c0, h0["no2"], h0["nc2"], fgn),
+                        _signed_rel(c1, h1["no2"], h1["nc2"], fgn),
+                        t_m, rng, n_boot, prefix="signed_rel_"))
                     row["rho_marginal_anchor"] = _within_type_spearman(
                         dc, mu[m, i], t_m)
                     row["rho_marginal_partner"] = _within_type_spearman(
@@ -828,6 +894,11 @@ _STAT = {
     "signed": {"point": "signed", "ctrl": "signed_control", "pc": "signed",
                "pc_ctrl": "signed_control", "prefix": "signed_",
                "label": "ΔC × (2F − 1)   (+ co-open, − co-closed)"},
+    "signed_rel": {"point": "signed_rel", "ctrl": "signed_rel_control",
+                   "pc": "signed_rel", "pc_ctrl": "signed_rel_control",
+                   "prefix": "signed_rel_",
+                   "label": "ΔC × w(F vs genome)   (+ more co-open, − more "
+                            "co-closed than the cell's genome)"},
 }
 
 
@@ -961,6 +1032,10 @@ _MAIN = {
                "pc": "signed", "pc_ctrl": "signed_control",
                "ylab": "ΔC×(2F−1)",
                "xlab": "ΔC × (2F − 1), all distances"},
+    "signed_rel": {"point": "signed_rel", "excess": "signed_rel_excess_sd",
+                   "pc": "signed_rel", "pc_ctrl": "signed_rel_control",
+                   "ylab": "ΔC×w",
+                   "xlab": "ΔC × w(F vs genome), all distances"},
 }
 
 
@@ -1248,6 +1323,16 @@ def main(argv=None) -> int:
                          "first) -- A-B apart from B-A.  Only as a check: "
                          "the orientation means nothing, and with the "
                          "two-ended null the two should agree.")
+    ap.add_argument("--signed-reference", choices=["genome", "even"],
+                    default="genome",
+                    help="What the signed figures read the co-open share F "
+                         "against.  'genome' (default): the cell's own "
+                         "genome-wide F -- a class pair is + when its "
+                         "concordant contacts are more co-open than the "
+                         "cell's contacts overall.  'even': 1:1, i.e. "
+                         "ΔC x (2F - 1); for GCH, closed over most of the "
+                         "genome, nearly every class then reads co-closed.  "
+                         "summary.tsv carries both (signed, signed_rel).")
     ap.add_argument("--min-band-pairs", type=int, default=500,
                     help="A class pair x distance band with fewer contacts "
                          "is flagged sparse and left out of the figures "
@@ -1524,6 +1609,16 @@ def main(argv=None) -> int:
                     pcr["signed"] = _signed(pcr["delta"].to_numpy(), oo_, oc_)
                     pcr["signed_control"] = _signed(
                         pcr["control"].to_numpy(), no2_, nc2_)
+                    A_ = len(band_labels) - 1
+                    gk = {k: acc[k][:, :, :, A_].sum((1, 2))
+                          for k in ("oo", "oc", "no2", "nc2")}
+                    fg_ = (gk["oo"] / (gk["oo"] + gk["oc"]))[c_]
+                    fgn_ = (gk["no2"] / (gk["no2"] + gk["nc2"]))[c_]
+                    pcr["F_ref"] = fg_
+                    pcr["signed_rel"] = _signed_rel(
+                        pcr["delta"].to_numpy(), oo_, oc_, fg_)
+                    pcr["signed_rel_control"] = _signed_rel(
+                        pcr["control"].to_numpy(), no2_, nc2_, fgn_)
             logger.info(f"{ctx} {name}: {ok.mean():.1%} of contacts "
                         f"annotated at both ends with a reshuffled partner")
         del res_
@@ -1550,13 +1645,18 @@ def main(argv=None) -> int:
     # against the same formula on reshuffled links alone.
     for (ctx, name), s in summary.groupby(["context", "system"], sort=False):
         pc = percell[(percell["context"] == ctx) & (percell["system"] == name)]
+        sk = "signed_rel" if args.signed_reference == "genome" else "signed"
         plot(s[~s["sparse"] | s["band"].str.startswith("all")], pc,
              out / f"fig_{ctx}_{name}_signed.{args.plot_format}",
-             f"{ctx} — {name}: ΔC × (2F − 1) by class pair", stat="signed")
+             f"{ctx} — {name}: " + (
+                 "ΔC × w(F against the cell's genome) by class pair"
+                 if sk == "signed_rel" else "ΔC × (2F − 1) by class pair"),
+             stat=sk)
     plot_main(summary, percell,
               out / f"main_figure_signed.{args.plot_format}",
               note=args.figure_note, min_band_pairs=args.min_band_pairs,
-              stat="signed")
+              stat="signed_rel" if args.signed_reference == "genome"
+              else "signed")
     logger.info(f"wrote {out}")
     return 0
 
