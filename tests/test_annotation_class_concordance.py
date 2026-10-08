@@ -474,7 +474,12 @@ def test_the_covariate_outputs_are_written(planted):
     d = a[a["statistic"] == "delta"]
     assert {"cell_share", "locus_share", "noise_share", "perm_p",
             "explained_cell_share"} <= set(d.columns)
-    assert (o / "locus_reassignment.tsv").exists()
+    for st in ("delta", "delta_r", "signed_rel", "signed_sgn"):
+        assert a.loc[a["statistic"] == st, "cell_share"].notna().any(), st
+    lr = pd.read_csv(o / "locus_reassignment.tsv", sep="\t")
+    assert {"delta", "delta_r", "signed_rel", "signed_sgn"} <= set(
+        lr["statistic"])
+    assert (o / "covariates_GCH_delta_r.png").exists()
     assert (o / "cross_class_correlation.tsv").exists()
     assert (o / "cross_class_GCH.png").exists()
     assert (o / "covariates_GCH_delta.png").exists()
@@ -500,8 +505,8 @@ def _loci_and_cells(cell_effect, seed=0):
     d = locus_effect + noise + cell_effect * rng.normal(0, 1, n_cells)[cell]
     c = rng.normal(0, 0.5, cell.size)
     z = np.zeros(cell.size, np.int64)
-    return acc.locus_reassignment(cell, ctype, z, z, d, c, 1, 10, 40,
-                                  np.random.default_rng(seed + 1))
+    return acc.locus_reassignment(cell, ctype, z, z, {"d": d, "c": c}, 1, 10,
+                                  40, np.random.default_rng(seed + 1))
 
 
 def test_locus_sampling_alone_is_not_a_cell_difference():
@@ -513,6 +518,48 @@ def test_locus_sampling_alone_is_not_a_cell_difference():
 def test_a_real_cell_difference_survives_reassignment():
     r = _loci_and_cells(0.15).iloc[-1]
     assert r["cell_share"] > 0.3 and r["perm_p"] < 0.05
+
+
+def _signed_parts(cell_effect, seed=0):
+    """As _loci_and_cells, with the parts of every statistic: the
+    correlation scale, and a co-open share well above the cells'
+    genome-wide one, so that ΔC x w carries ΔC's variation."""
+    rng = np.random.default_rng(seed)
+    n_cells, per = 300, 150
+    cell = np.repeat(np.arange(n_cells), per)
+    ctype = np.repeat(np.arange(3), n_cells // 3)
+    locus = rng.normal(0, 0.6, 5000)[rng.integers(0, 5000, cell.size)]
+    d = (locus + rng.normal(0, 0.5, cell.size)
+         + cell_effect * rng.normal(0, 1, n_cells)[cell])
+    c = rng.normal(0, 0.5, cell.size)
+    s12 = rng.uniform(0.15, 0.25, n_cells)[cell]
+    parts = {"d": d, "c": c, "r": d / 2 / s12, "rc": c / 2 / s12,
+             "oo": rng.uniform(0.6, 0.8, cell.size),
+             "oc": rng.uniform(0.1, 0.3, cell.size),
+             "no2": rng.uniform(0.3, 0.5, cell.size),
+             "nc2": rng.uniform(0.3, 0.5, cell.size)}
+    z = np.zeros(cell.size, np.int64)
+    fg = rng.uniform(0.45, 0.55, n_cells)
+    return acc.locus_reassignment(cell, ctype, z, z, parts, 1, 10, 30,
+                                  np.random.default_rng(seed + 1), fg=fg,
+                                  fgn=fg)
+
+
+def test_the_locus_split_covers_every_statistic():
+    for eff, cell_hi in ((0.0, False), (0.15, True)):
+        lr = _signed_parts(eff)
+        a = lr[lr["band_index"] == 1].set_index("statistic")
+        assert set(a.index) == {"delta", "delta_r", "signed_rel",
+                                "signed_sgn"}
+        for st in a.index:
+            shares = a.loc[st, ["noise_share", "locus_share", "cell_share"]]
+            assert shares.sum() == pytest.approx(1, abs=0.05)
+            if cell_hi:
+                assert a.loc[st, "cell_share"] > 0.25, st
+                assert a.loc[st, "perm_p"] < 0.05, st
+            else:
+                assert a.loc[st, "cell_share"] < 0.12, st
+                assert a.loc[st, "locus_share"] > 0.3, st
 
 
 def test_compartment_strength_is_excess_same_compartment_pairing():
@@ -557,3 +604,8 @@ def test_cross_class_correlation_finds_one_per_cell_factor():
     ax = cc[(cc["state_1"] == "A") & (cc["state_2"] == "X")].iloc[0]
     assert ab["r"] > 0.5 and ab["r_disattenuated"] > ab["r"]
     assert abs(ax["r"]) < 0.2
+    # a class too noisy across cells is not divided by its reliability
+    summ["split_half_r"] = [0.5, 0.05, 0.5]
+    cc = acc.cross_class_correlation(pc, summ, min_cells=30)
+    ab = cc[(cc["state_1"] == "A") & (cc["state_2"] == "B")].iloc[0]
+    assert np.isnan(ab["r_disattenuated"]) and ab["r"] > 0.5

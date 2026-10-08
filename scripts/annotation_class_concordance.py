@@ -116,10 +116,14 @@ anything about the CELLS to explain.  Locus reassignment
 happened to sample, so cells differ where loci differ even if cells do
 not; reassigning contacts among a type's cells at random, each keeping its
 count, leaves noise plus that, and only the rest -- cell_share -- is a
-property of cells.  Cross-class correlation (cross_class_correlation.tsv,
-cross_class_<context>): whether a cell's ΔC in one state predicts it in
-another, corrected for noise by split-half reliability -- one per-cell
-factor or region-specific variation.  In post-
+property of cells (split for every statistic).  Cross-class correlation
+(cross_class_correlation.tsv, cross_class_<context>): whether a cell's ΔC in
+one state predicts it in another, corrected for noise by split-half
+reliability -- one per-cell factor or region-specific variation.  And Δr,
+ΔC over each cell's own class SDs (covariates_<context>_delta_r): C is a
+covariance, so it grows with a cell's variance -- with its level -- even
+when its coordination does not; what follows the level in ΔC but not in Δr
+is that scale.  In post-
 mitotic neurons % near tracks chromatin compaction rather than the cycle,
 and only cycling glia should have S-phase repli-scores.
 
@@ -1170,9 +1174,15 @@ COV_LABEL = {"log10_contacts": "depth", "frac_short": "% short pairs",
              "compartment_strength": "compartment strength"}
 #: Covariates measured per context (from that context's calls).
 CTX_COVARIATES = ("level", "sites_mean", "decisive", "frac_called")
-_CONTROL_OF = {"delta": "control", "signed_rel": "signed_rel_control",
+_CONTROL_OF = {"delta": "control", "delta_r": "control_r",
+               "signed_rel": "signed_rel_control",
                "signed_sgn": "signed_sgn_control",
                "signed": "signed_control"}
+#: Statistics the within-type variation is examined for.
+COV_STATS = ("delta", "delta_r", "signed_rel", "signed_sgn")
+_STAT_LABEL = {"delta": "ΔC", "delta_r": "Δr (ΔC on the correlation scale)",
+               "signed_rel": "ΔC × w", "signed_sgn": "ΔC × sign(w)",
+               "signed": "ΔC × (2F − 1)"}
 
 
 def _center(v, t):
@@ -1197,23 +1207,40 @@ def _r2(v, Z, n_types):
             dfr)
 
 
-def locus_reassignment(cell, ctype, pair, band, d, c, n_band: int,
-                       min_pairs: int, n_perm: int, rng) -> pd.DataFrame:
-    """How much of the within-type variance of per-cell ΔC is a property of
-    the CELLS, not of which loci each happened to sample?
+def locus_reassignment(cell, ctype, pair, band, parts: dict, n_band: int,
+                       min_pairs: int, n_perm: int, rng, fg=None,
+                       fgn=None) -> pd.DataFrame:
+    """How much of the within-type variance of a per-cell statistic is a
+    property of the CELLS, not of which loci each happened to sample?
 
-    ``d``/``c``: each contact's contribution to its cell's ΔC and to the
-    control (a cell's value is their mean).  Within each cell type, class
-    pair and band, the contributions are reassigned to cells at random --
-    every cell keeping its number of contacts -- ``n_perm`` times: the
-    variance left is sampling noise plus locus sampling, with no cell
-    differences.  Returned per (pair, band; band ``n_band`` = all), over
-    the cells with >= ``min_pairs`` contacts: the within-type variance
-    observed, of the control, and reassigned (mean, sd, permutation p), and
-    the split  noise_share + locus_share + cell_share = 1."""
+    ``parts``: per contact, its contribution to its cell's ΔC and to the
+    control (``d``, ``c``; a cell's value is their mean), optionally the
+    same on the correlation scale (``r``, ``rc``: each over 2 sd sd of its
+    own cell) and the co-open / co-closed mass of the real partners and of
+    reshuffled draw 2 (``oo``, ``oc``, ``no2``, ``nc2``; with ``fg``/``fgn``,
+    each cell's genome-wide co-open share, for ΔC x w and ΔC x sign(w)).
+    Within each cell type, class pair and band, the contacts are reassigned
+    to cells at random -- every cell keeping its number of contacts, each
+    contact its parts -- ``n_perm`` times: the variance left is sampling
+    noise plus locus sampling, with no cell differences (a reassigned cell
+    is read against its type's mean co-open share).  Returned per statistic
+    and (pair, band; band ``n_band`` = all), over the cells with >=
+    ``min_pairs`` contacts: the within-type variance observed, of the
+    control, and reassigned (mean, sd, permutation p), and the split
+    noise_share + locus_share + cell_share = 1."""
     n_cells = ctype.size
     T = int(ctype.max()) + 1 if n_cells else 1
     ct = ctype[cell]
+    stats = ["delta"] + (["delta_r"] if "r" in parts else [])
+    signed = fg is not None and all(k in parts for k in ("oo", "oc", "no2",
+                                                         "nc2"))
+    if signed:
+        stats += ["signed_rel", "signed_sgn"]
+        fg, fgn = np.asarray(fg, float), np.asarray(fgn, float)
+        fg_t = np.array([np.nanmean(fg[ctype == t])
+                         if np.isfinite(fg[ctype == t]).any() else np.nan
+                         for t in range(T)])
+    moved = [k for k in ("d", "r", "oo", "oc") if k in parts]
     out = []
     for b_arr in (band, np.full(band.size, n_band)):
         grp = pair.astype(np.int64) * (n_band + 1) + b_arr
@@ -1229,53 +1256,82 @@ def locus_reassignment(cell, ctype, pair, band, d, c, n_band: int,
             continue
         gg, cc_ = el // n_cells, el % n_cells
         gt = gg * T + ctype[cc_]
-        cnt_gt = np.bincount(gt, minlength=G * T)
-        ncell = np.bincount(gg, minlength=G)
-        ntype = np.bincount(np.unique(gt) // T, minlength=G)
-        den = np.maximum(ncell - ntype, 1)
+        Ne = N[el].astype(float)
 
-        def wvar(w):
-            m = np.bincount(key, weights=w, minlength=size)[el] / N[el]
-            mean = np.bincount(gt, weights=m, minlength=G * T) / np.maximum(
-                cnt_gt, 1)
-            return np.bincount(gg, weights=(m - mean[gt]) ** 2,
-                               minlength=G) / den
-        v_obs, v_ctrl = wvar(d), wvar(c)
-        perm = np.full((max(int(n_perm), 0), G), np.nan)
+        def sums(w, key_=key):
+            return np.bincount(key_, weights=w, minlength=size)[el]
+
+        def values(S, ref, ctrl=False):
+            m = S["c" if ctrl else "d"] / Ne
+            v = {"delta": m}
+            if "delta_r" in stats:
+                v["delta_r"] = S["rc" if ctrl else "r"] / Ne
+            if signed:
+                o_, c_ = ("no2", "nc2") if ctrl else ("oo", "oc")
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    w = _weight(S[o_] / (S[o_] + S[c_]), ref)
+                v["signed_rel"], v["signed_sgn"] = m * w, m * np.sign(w)
+            return v
+
+        def wvar(x):
+            f = np.isfinite(x)
+            x0 = np.where(f, x, 0.0)
+            cnt = np.bincount(gt, weights=f.astype(float), minlength=G * T)
+            mean = np.bincount(gt, weights=x0, minlength=G * T) / np.maximum(
+                cnt, 1)
+            nc = np.bincount(gg, weights=f.astype(float), minlength=G)
+            nt = np.bincount(np.flatnonzero(cnt > 0) // T, minlength=G)
+            ss = np.bincount(gg, weights=np.where(f, (x0 - mean[gt]) ** 2,
+                                                  0.0), minlength=G)
+            return ss / np.maximum(nc - nt, 1), nc
+
+        S = {k: sums(w) for k, w in parts.items()}
+        v_obs = values(S, fg[cc_] if signed else None)
+        v_ctl = values(S, fgn[cc_] if signed else None, ctrl=True)
+        var_o = {st: wvar(v_obs[st]) for st in stats}
+        var_c = {st: wvar(v_ctl[st])[0] for st in stats}
+        perm = {st: np.full((max(int(n_perm), 0), G), np.nan) for st in stats}
         if n_perm > 0:
             blk = g * T + ct
             o = np.argsort(blk, kind="stable")
             bs = blk[o]
-            st = np.flatnonzero(np.r_[True, bs[1:] != bs[:-1]])
-            en = np.r_[st[1:], bs.size]
-            ds = d[o]
+            st_ = np.flatnonzero(np.r_[True, bs[1:] != bs[:-1]])
+            en = np.r_[st_[1:], bs.size]
+            multi = [(a_, e_) for a_, e_ in zip(st_, en) if e_ - a_ > 1]
+            key_o = key[o]
+            P = {k: parts[k][o] for k in moved}
+            ref_p = fg_t[ctype[cc_]] if signed else None
             for b_ in range(int(n_perm)):
-                dp = ds.copy()
-                for a_, e_ in zip(st, en):
-                    if e_ - a_ > 1:
-                        dp[a_:e_] = dp[a_:e_][rng.permutation(e_ - a_)]
-                back = np.empty_like(d)
-                back[o] = dp
-                perm[b_] = wvar(back)
-        for i in range(G):
-            if ncell[i] < 3:
-                continue
-            vo, vc = float(v_obs[i]), float(v_ctrl[i])
-            vp = float(np.nanmean(perm[:, i])) if n_perm > 0 else np.nan
-            row = {"pair": int(g_ids[i] // (n_band + 1)),
-                   "band_index": int(g_ids[i] % (n_band + 1)),
-                   "cells": int(ncell[i]), "var_obs": vo, "var_ctrl": vc,
-                   "var_perm": vp,
-                   "var_perm_sd": (float(np.nanstd(perm[:, i], ddof=1))
-                                   if n_perm > 1 else np.nan),
-                   "perm_p": ((1 + int((perm[:, i] >= vo).sum()))
-                              / (n_perm + 1) if n_perm > 0 else np.nan)}
-            if vo > 0 and np.isfinite(vp):
-                row["noise_share"] = min(vc / vo, 1.0)
-                row["locus_share"] = float(np.clip((vp - vc) / vo, 0,
-                                                   1 - row["noise_share"]))
-                row["cell_share"] = float(np.clip(1 - vp / vo, 0, 1))
-            out.append(row)
+                pidx = np.arange(bs.size)
+                for a_, e_ in multi:
+                    pidx[a_:e_] = a_ + rng.permutation(e_ - a_)
+                vp = values({k: sums(P[k][pidx], key_o) for k in moved},
+                            ref_p)
+                for st in stats:
+                    perm[st][b_] = wvar(vp[st])[0]
+        for st in stats:
+            v_o, nc_ = var_o[st]
+            for i in range(G):
+                if nc_[i] < 3:
+                    continue
+                vo, vc = float(v_o[i]), float(var_c[st][i])
+                pi = perm[st][:, i]
+                vp = float(np.nanmean(pi)) if n_perm > 0 else np.nan
+                row = {"statistic": st,
+                       "pair": int(g_ids[i] // (n_band + 1)),
+                       "band_index": int(g_ids[i] % (n_band + 1)),
+                       "cells": int(nc_[i]), "var_obs": vo, "var_ctrl": vc,
+                       "var_perm": vp,
+                       "var_perm_sd": (float(np.nanstd(pi, ddof=1))
+                                       if n_perm > 1 else np.nan),
+                       "perm_p": ((1 + int((pi >= vo).sum())) / (n_perm + 1)
+                                  if n_perm > 0 else np.nan)}
+                if vo > 0 and np.isfinite(vp):
+                    row["noise_share"] = min(vc / vo, 1.0)
+                    row["locus_share"] = float(np.clip(
+                        (vp - vc) / vo, 0, 1 - row["noise_share"]))
+                    row["cell_share"] = float(np.clip(1 - vp / vo, 0, 1))
+                out.append(row)
     return pd.DataFrame(out)
 
 
@@ -1309,8 +1365,7 @@ def compartment_strength(by_cell, cell_type, maps: dict, res: int,
 
 def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                           ctx_cov: dict, locus: pd.DataFrame = None,
-                          batch_cols=(), stats=("delta", "signed_rel",
-                                                "signed_sgn"),
+                          batch_cols=(), stats=COV_STATS,
                           min_cells: int = 30) -> pd.DataFrame:
     """What explains the WITHIN-cell-type variation of a class pair's
     per-cell concordance?
@@ -1329,10 +1384,10 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
     R^2 is of the TOTAL within-type variance.  bio_share = 1 -
     Var_w(control) / Var_w(value) is the part beyond sampling noise, and
     explained_share = R2_adj_all / bio_share the share of it the
-    covariates (with batch) explain.  For ΔC, ``locus``
-    (:func:`locus_reassignment`) also takes out what merely follows which
-    loci a cell sampled: cell_share is the part that is a property of the
-    cells, and explained_cell_share = R2_adj_all / cell_share.
+    covariates (with batch) explain.  ``locus`` (:func:`locus_reassignment`)
+    also takes out what merely follows which loci a cell sampled:
+    cell_share is the part that is a property of the cells, and
+    explained_cell_share = R2_adj_all / cell_share.
 
     Read the bands as well as 'all'.  ΔC changes with distance -- GCH's
     excess rises ~10x from 1 to 100 kb -- so a cell's all-distance value
@@ -1345,8 +1400,10 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
     pc = percell[percell["enough_pairs"]]
     lk = None
     if locus is not None and not locus.empty:
+        if "statistic" not in locus:
+            locus = locus.assign(statistic="delta")
         lk = locus.set_index(["context", "system", "anchor", "partner",
-                              "band"])
+                              "band", "statistic"])
     rows = []
     for (ctx, sy, k1, k2, bl), g in pc.groupby(
             ["context", "system", "anchor", "partner", "band"], sort=False):
@@ -1414,9 +1471,8 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                 row["explained_share"] = float(np.clip(max(r2a, 0)
                                                        / row["bio_share"],
                                                        0, 1))
-            if stat == "delta" and lk is not None and \
-                    (ctx, sy, k1, k2, bl) in lk.index:
-                L = lk.loc[(ctx, sy, k1, k2, bl)]
+            if lk is not None and (ctx, sy, k1, k2, bl, stat) in lk.index:
+                L = lk.loc[(ctx, sy, k1, k2, bl, stat)]
                 for col in ("noise_share", "locus_share", "cell_share",
                             "perm_p", "var_obs", "var_perm"):
                     row[col] = float(L[col]) if col in L else np.nan
@@ -1435,7 +1491,8 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
 
 
 def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
-                            min_cells: int = 30) -> pd.DataFrame:
+                            min_cells: int = 30,
+                            min_reliability: float = 0.2) -> pd.DataFrame:
     """Is the within-type variation one per-cell factor or region-specific?
 
     Per context and system, between DISJOINT same-state class pairs (A-A
@@ -1445,8 +1502,10 @@ def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
     each pair's split-half reliability (Spearman-Brown, 2r / (1 + r)):
     r_disattenuated = r / sqrt(rel_1 rel_2).  Near 1: the classes move
     together -- one per-cell factor, technical or a nuclear state.  Near 0:
-    each class varies on its own.  Classes of different systems share
-    contacts, so they are not compared."""
+    each class varies on its own.  Not corrected (NaN) when a reliability
+    is under ``min_reliability``: dividing by a near-zero reliability gives
+    anything.  Classes of different systems share contacts, so they are not
+    compared."""
     all_b = next((b for b in dict.fromkeys(percell["band"])
                   if str(b).startswith("all")), None)
     pc = percell[(percell["band"] == all_b) & percell["enough_pairs"]
@@ -1475,9 +1534,10 @@ def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
                 rows.append({"context": ctx, "system": sy, "state_1": a,
                              "state_2": b, "cells": int(both.sum()), "r": r_,
                              "reliability_1": ra, "reliability_2": rb,
-                             "r_disattenuated": (r_ / np.sqrt(ra * rb)
-                                                 if ra > 0 and rb > 0
-                                                 else np.nan)})
+                             "r_disattenuated": (
+                                 r_ / np.sqrt(ra * rb)
+                                 if ra >= min_reliability
+                                 and rb >= min_reliability else np.nan)})
     return pd.DataFrame(rows)
 
 
@@ -1509,19 +1569,30 @@ def plot_cross_class(cc: pd.DataFrame, context: str, path):
             b = a[a["system"] == sy]
             st = states[sy]
             M = np.full((len(st), len(st)), np.nan)
+            Mr = M.copy()
             np.fill_diagonal(M, 1.0)
             for _, r in b.iterrows():
                 i, j = st.index(r["state_1"]), st.index(r["state_2"])
                 M[i, j] = M[j, i] = r["r_disattenuated"]
+                Mr[i, j] = Mr[j, i] = r["r"]
+            # raw r, faint, where a class is too noisy to correct for
+            ax.imshow(np.where(np.isfinite(M), np.nan, np.clip(Mr, -1, 1)),
+                      cmap="RdBu_r", vmin=-1, vmax=1, alpha=0.35)
             im = ax.imshow(np.clip(M, -1, 1), cmap="RdBu_r", vmin=-1, vmax=1)
             for i in range(len(st)):
                 for j in range(len(st)):
-                    if i != j and np.isfinite(M[i, j]):
+                    if i == j:
+                        continue
+                    if np.isfinite(M[i, j]):
                         # noise correction can overshoot 1 when the
                         # reliabilities are themselves noisy
                         ax.text(j, i, ">1" if M[i, j] > 1 else
                                 f"{M[i, j]:.2f}".replace("0.", ".", 1),
                                 ha="center", va="center", fontsize=4.5)
+                    elif np.isfinite(Mr[i, j]):
+                        ax.text(j, i, f"({Mr[i, j]:.2f})".replace(
+                            "0.", ".", 1), ha="center", va="center",
+                            fontsize=4.5, color="0.4")
             ax.set_xticks(range(len(st)))
             ax.set_xticklabels(st, rotation=60, ha="right", fontsize=5)
             ax.set_yticks(range(len(st)))
@@ -1531,7 +1602,8 @@ def plot_cross_class(cc: pd.DataFrame, context: str, path):
         cb.ax.tick_params(labelsize=5)
         cb.set_label("r across cells, noise-corrected", fontsize=6)
         fig.suptitle(f"{context}: does a cell's ΔC move together across "
-                     f"states?", fontsize=7)
+                     f"states?\n(in brackets, faint: raw r -- a class too "
+                     f"noisy across cells to correct for)", fontsize=7)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
 
@@ -1657,10 +1729,13 @@ def plot_covariates(assoc: pd.DataFrame, context: str, stat: str, path,
             np.isfinite(col("explained_cell_share")),
             col("explained_cell_share"), col("explained_share")))
         left = np.zeros(ny)
+        split = np.isfinite(col("locus_share")).any()
         for w, c_, lab in ((noise, "0.85", "sampling noise"),
                            (locus, "#f4c58f", "which loci were sampled"),
                            (expl, "#08519c", "cells: explained by covariates"),
-                           (cell_ - expl, "#9ecae1", "cells: unexplained")):
+                           (cell_ - expl, "#9ecae1",
+                            "cells: unexplained" if split else
+                            "cells + loci (not split): unexplained")):
             w = np.clip(np.nan_to_num(w), 0, None)
             ax1.barh(yy, w, left=left, color=c_, label=lab, height=0.7)
             left = left + w
@@ -1674,8 +1749,9 @@ def plot_covariates(assoc: pd.DataFrame, context: str, stat: str, path,
         fig.canvas.draw()
         top = max(leg.get_window_extent().y1,
                   ax0.title.get_window_extent().y1)
-        fig.suptitle(f"{context} — {stat}: what explains the within-type "
-                     f"variation", fontsize=7, va="bottom",
+        fig.suptitle(f"{context} — {_STAT_LABEL.get(stat, stat)}: what "
+                     f"explains the within-type variation", fontsize=7,
+                     va="bottom",
                      y=fig.transFigure.inverted().transform((0, top))[1]
                      + 0.01)
         fig.savefig(path, bbox_inches="tight", dpi=300)
@@ -2514,11 +2590,24 @@ def main(argv=None) -> int:
                              half[idx], w, len(cells), n_k, len(edges) - 1)
             if cell_cov is not None and args.n_locus_perm > 0 and idx.size:
                 pr = k1s[idx] * n_k + k2s[idx]
+                ci_ = cell[idx]
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    s12 = sd[ci_, k1s[idx]] * sd[ci_, k2s[idx]]
+                    inv = np.where(s12 > 0, 0.5 / np.where(s12 > 0, s12, 1),
+                                   0.0)
+                    gk = {k: acc[k][:, :, :, len(edges) - 1].sum((1, 2))
+                          for k in ("oo", "oc", "no2", "nc2")}
+                    fg_c = gk["oo"] / (gk["oo"] + gk["oc"])
+                    fgn_c = gk["no2"] / (gk["no2"] + gk["nc2"])
+                d_, c_ = 2 * (x_ * y_ - n1), 2 * (n2 - n1)
                 lr = locus_reassignment(
-                    cell[idx], type_code, pr, band[idx],
-                    2 * (x_ * y_ - n1), 2 * (n2 - n1), len(edges) - 1,
+                    ci_, type_code, pr, band[idx],
+                    {"d": d_, "c": c_, "r": d_ * inv, "rc": c_ * inv,
+                     "oo": w["oo"], "oc": w["oc"], "no2": w["no2"],
+                     "nc2": w["nc2"]}, len(edges) - 1,
                     args.min_pairs, args.n_locus_perm,
-                    np.random.default_rng([args.seed, ci_ctx, si, 4049]))
+                    np.random.default_rng([args.seed, ci_ctx, si, 4049]),
+                    fg=fg_c, fgn=fgn_c)
                 if not lr.empty:
                     lr.insert(0, "context", ctx)
                     lr.insert(1, "system", name)
@@ -2646,7 +2735,7 @@ def main(argv=None) -> int:
         assoc.to_csv(out / "covariate_association.tsv", sep="\t",
                      index=False)
         for ctx_ in contexts:
-            for st_ in ("delta", "signed_rel"):
+            for st_ in ("delta", "delta_r", "signed_rel"):
                 plot_covariates(assoc, ctx_, st_,
                                 out / f"covariates_{ctx_}_{st_}."
                                       f"{args.plot_format}")
