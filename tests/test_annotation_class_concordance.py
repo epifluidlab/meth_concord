@@ -500,6 +500,15 @@ def test_the_covariate_outputs_are_written(planted):
                                atol=1e-6)
     assert a.loc[a["anchor"] != a["partner"], sh].isna().all().all()
     assert {"open_site_level", "sub_pc1", "sub_pc5"} <= set(cov.columns)
+    # over all cells: noise + loci + every group (cell type one) + the rest
+    tot = a[(a["anchor"] == a["partner"]) & a["tot_noise"].notna()]
+    parts = ["tot_noise", "tot_loci", "tot_residual"] + [
+        c for c in a.columns if c.startswith("tot_") and c not in (
+            "tot_noise", "tot_loci", "tot_residual")]
+    assert "tot_cell type" in parts and "residual_q" in a
+    s_ = tot[parts].sum(1)
+    assert ((s_ > 0.97) | (tot["residual_var"] < 0)).all()
+    assert (o / "variance_total_GCH_delta.png").exists()
     assert cov["open_site_level"].between(0.2, 0.7).all()
     assert (o / "cell_covariates_extra.png").exists()
     assert (o / "cross_class_correlation.tsv").exists()
@@ -822,3 +831,62 @@ def test_celltype_auc_outputs_without_type_differences(planted):
     assert res["auc"].between(0.3, 0.75).all()
     assert (o / "celltype_auc_signed_rel.png").exists()
     assert (o / "celltype_auc_by_type.tsv").exists()
+
+
+def test_the_total_split_finds_cell_type_and_what_is_left():
+    rng = np.random.default_rng(4)
+    n = 900
+    t_ = np.repeat(["T0", "T1", "T2"], n // 3)
+    tech = rng.normal(0, 1, n)
+    noise_v, perm_v = 1.0, 1.5                       # noise, + loci
+    for resid_sd, left in ((0.0, False), (0.8, True)):
+        y = (0.7 * (t_ == "T1") - 0.7 * (t_ == "T2") + 0.5 * tech
+             + rng.normal(0, resid_sd, n) + rng.normal(0, np.sqrt(perm_v), n))
+        X = tech[:, None].copy()
+        X[:30, 0] = np.nan                           # some cells unmeasured
+        r = acc._total_split(y, t_, X, ["log10_contacts"],
+                             np.empty((n, 0)), noise_v, perm_v, 0.08)
+        V = np.var(y, ddof=1)
+        assert r["tot_cell type"] == pytest.approx(
+            (2 * 0.7 ** 2 / 3) / V, rel=0.3)
+        assert r["tot_technical"] == pytest.approx(0.25 / V, abs=0.04)
+        assert r["tot_noise"] == pytest.approx(noise_v / V)
+        if left:
+            assert r["tot_residual"] == pytest.approx(0.64 / V, abs=0.05)
+            assert r["residual_p"] < 1e-6
+        else:
+            assert r["tot_residual"] < 0.05 and r["residual_p"] > 0.01
+        assert r["type_r2_unique"] <= r["type_r2_alone"] + 0.02
+
+
+def test_auc_after_removing_technical_factors():
+    """Concordance that follows a technical factor which differs by type
+    predicts type -- until the factor is regressed out (cell type kept in
+    the fit); a real type difference survives the same correction."""
+    rng = np.random.default_rng(5)
+    n = 240
+    cells = [f"c{i}" for i in range(n)]
+    types = np.repeat(["T0", "T1", "T2"], n // 3)
+    eff = rng.normal(0, 1, n) + 1.5 * (types == "T1")    # differs by type
+    rows = []
+    for grp, real in (("A", 0.0), ("B", 1.0)):
+        rows.append(pd.DataFrame({
+            "context": "GCH", "system": "ab", "cell": cells,
+            "cell_type": types, "anchor": grp, "partner": grp,
+            "band": "all 1kb-10Mb", "enough_pairs": True,
+            "signed_rel": 0.8 * eff + real * (types == "T2")
+            + rng.normal(0, 0.3, n),
+            "signed_rel_control": rng.normal(0, 0.5, n),
+            "mu_anchor": rng.normal(0.3, 0.05, n),
+            "sd_anchor": 0.4, "sd_partner": 0.4}))
+    pc = pd.concat(rows, ignore_index=True)
+    cov = pd.DataFrame({"cell": cells, "cell_type": types,
+                        "open_site_level": eff})
+    res, _ = acc.celltype_auc(pc, "signed_rel", n_folds=5, seed=0,
+                              n_threads=2, n_trees=100, cov=cov)
+    r = res.set_index(["group", "features"])["auc"]
+    assert r[("A", "concordance")] > 0.62
+    assert r[("A", "concordance, technical removed")] < 0.58
+    assert r[("A", "concordance")] - r[("A", "concordance, technical "
+                                         "removed")] > 0.08
+    assert r[("B", "concordance, technical removed")] > 0.75

@@ -1249,8 +1249,16 @@ COV_LABEL = {"log10_contacts": "depth", "frac_short": "% short pairs",
 GROUP_COLOR = {"technical": "#08519c", "level": "#54278f",
                "scale": "#9e9ac8", "cell cycle": "#006d2c", "3D": "#74c476",
                "batch": "#8c510a", "labeling efficiency": "#e6550d",
-               "mCA": "#c51b7d", "division history": "#525252",
+               "mCA": "#c51b7d", "division history": "#1b9e77",
                "substructure": "#cb181d"}
+#: How the cell was measured, not what it is: removed for the corrected
+#: cell-type AUC, and grouped first in the split of the total variance.
+TECHNICAL_GROUPS = ("technical", "batch", "labeling efficiency", "scale")
+#: The total split's components in the order its bar shows them.
+TOTAL_ORDER = ("technical", "batch", "labeling efficiency", "scale",
+               "cell type", "level", "cell cycle", "3D", "mCA",
+               "division history", "substructure")
+TOTAL_COLOR = {**GROUP_COLOR, "cell type": "#000000"}
 #: Covariates measured per context (from that context's calls).
 CTX_COVARIATES = ("level", "sites_mean", "decisive", "frac_called")
 _CONTROL_OF = {"delta": "control", "delta_r": "control_r",
@@ -1292,6 +1300,80 @@ def _center_obs(v, t):
     s_ = pd.Series(np.asarray(v, float))
     out = (s_ - s_.groupby(np.asarray(t)).transform("mean")).to_numpy(float)
     return np.where(np.isfinite(out), out, 0.0)
+
+
+def _type_impute(v, t) -> np.ndarray:
+    """A missing value at its cell type's mean (the overall mean in a type
+    with none measured)."""
+    s_ = pd.Series(np.asarray(v, float))
+    m = s_.groupby(np.asarray(t)).transform("mean")
+    return np.nan_to_num(s_.fillna(m).fillna(s_.mean()).to_numpy(float))
+
+
+def _total_split(y, t, Xo, avail, B, noise_v, perm_v, perm_sd) -> dict:
+    """The variance of a per-cell statistic over ALL cells, split.
+
+    Sampling noise (``noise_v``: the control's within-type variance); which
+    loci were sampled (``perm_v``, the within-type variance left after
+    reassigning contacts among a type's cells, less the noise); cell type
+    and each covariate group, batch included (Shapley shares of the
+    adjusted R^2 of one OLS on all of them -- batch effects are estimated
+    with cell type in the model, so a batch that holds more of one type
+    does not take that type's difference with it); and the rest: the
+    variation between cells that none of them accounts for, the residual
+    variance less ``perm_v`` -- with a one-sided p against the
+    reassignment's spread ``perm_sd``.  Also cell type's R^2 alone and its
+    unique part (with everything else in the model first)."""
+    from scipy.stats import norm
+    n = y.size
+    yc = y - y.mean()
+    V = float(yc @ yc) / max(n - 1, 1)
+    out = {"total_var": V}
+    if not V > 0:
+        return out
+    Tm = pd.get_dummies(pd.Series(np.asarray(t).astype(str)),
+                        drop_first=True).to_numpy(float)
+    X = (np.column_stack([_type_impute(Xo[:, j], t)
+                          for j in range(Xo.shape[1])])
+         if Xo.shape[1] else np.empty((n, 0)))
+    blocks = [m_ for m_ in (Tm, X, B) if m_.size]
+    Z = np.column_stack(blocks) if blocks else np.empty((n, 0))
+    if Z.size:
+        Z = Z - Z.mean(0)
+    groups, off = {}, Tm.shape[1]
+    if Tm.shape[1]:
+        groups["cell type"] = list(range(Tm.shape[1]))
+    for gname, cols in COV_GROUPS:
+        jj = [off + avail.index(c) for c in cols if c in avail]
+        if jj:
+            groups[gname] = jj
+    off += X.shape[1]
+    if B.size:
+        groups["batch"] = list(range(off, off + B.shape[1]))
+    r2a = _r2(yc, Z, 0)[1] if Z.size else 0.0
+    r2a = max(r2a, 0.0) if np.isfinite(r2a) else 0.0
+    if groups:
+        phi, r2 = _shapley_r2(yc, Z, groups)
+        f_ = r2a / r2 if np.isfinite(r2) and r2 > 0 else 0.0
+        for g, v in phi.items():
+            out[f"tot_{g}"] = v * f_ if np.isfinite(v) else np.nan
+    if Tm.shape[1]:
+        a_ = _r2(yc, Z[:, :Tm.shape[1]], 0)[1]
+        rest = Z[:, Tm.shape[1]:]
+        b_ = _r2(yc, rest, 0)[1] if rest.shape[1] else 0.0
+        out["type_r2_alone"] = a_
+        out["type_r2_unique"] = r2a - max(b_ if np.isfinite(b_) else 0, 0)
+    out["tot_noise"] = min(noise_v / V, 1.0)
+    base = noise_v
+    if np.isfinite(perm_v):
+        out["tot_loci"] = max(perm_v - noise_v, 0) / V
+        base = max(perm_v, noise_v)
+    resid = (1 - r2a) * V - base
+    out["tot_residual"] = max(resid, 0) / V
+    out["residual_var"] = resid
+    if np.isfinite(perm_sd) and perm_sd > 0:
+        out["residual_p"] = float(norm.sf(resid / perm_sd))
+    return out
 
 
 def _shapley_r2(y, Z, groups: dict):
@@ -1728,7 +1810,8 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
             if lk is not None and (ctx, sy, k1, k2, bl, stat) in lk.index:
                 L = lk.loc[(ctx, sy, k1, k2, bl, stat)]
                 for col in ("noise_share", "locus_share", "cell_share",
-                            "perm_p", "var_obs", "var_perm"):
+                            "perm_p", "var_obs", "var_perm", "var_perm_sd",
+                            "var_ctrl"):
                     row[col] = float(L[col]) if col in L else np.nan
                 cs = row.get("cell_share", np.nan)
                 if np.isfinite(r2a) and np.isfinite(cs) and cs > 0:
@@ -1749,6 +1832,17 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                     for gname, v in phi.items():
                         row[f"shap_{gname}"] = (v * f_ if np.isfinite(v)
                                                 else np.nan)
+            if k1 == k2:
+                # over all cells, cell type a component of its own
+                Bt = [pd.get_dummies(d.loc[ok, b].astype(str),
+                                     drop_first=True).to_numpy(float)
+                      for b in bcols]
+                Bt = (np.column_stack(Bt) if Bt and sum(x.shape[1] for x in Bt)
+                      else np.empty((n, 0)))
+                row.update(_total_split(
+                    y0[ok], t, Xo, avail, Bt, vc,
+                    row.get("var_perm", np.nan),
+                    row.get("var_perm_sd", np.nan)))
             rows.append(row)
     out = pd.DataFrame(rows)
     if not out.empty:
@@ -1757,6 +1851,8 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
             len(out), len(pcols))
         for j, c in enumerate(HEATMAP_COVARIATES):
             out[f"q_{c}"] = q[:, j]
+        if "residual_p" in out:
+            out["residual_q"] = fdr_bh(out["residual_p"].to_numpy(float))
     return out
 
 
@@ -1814,8 +1910,8 @@ def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
 # ------------------------------------------------- cell-type prediction --
 
 #: The feature sets each region group predicts cell type from.
-AUC_VARIANTS = ("concordance", "control", "marginal",
-                "marginal + concordance", "marginal + control")
+AUC_VARIANTS = ("concordance", "concordance, technical removed", "control",
+                "marginal", "marginal + concordance", "marginal + control")
 
 
 def _auc(pos, score) -> float:
@@ -1864,9 +1960,53 @@ def _cv_type_auc(X, y, n_folds: int, seed: int, n_boot: int = 200,
     return float(per.mean()), float(lo), float(hi), dict(zip(labels, per))
 
 
+def _remove_technical(pc: pd.DataFrame, stat: str, cov: pd.DataFrame,
+                      ctx_cov: dict, batch_cols=()) -> pd.DataFrame:
+    """Per region group, the statistic with the technical groups
+    (TECHNICAL_GROUPS: depth and call quality, batch, labeling efficiency,
+    scale) regressed out -- their effects estimated with cell type in the
+    model, as ComBat does with cell type as a covariate, so a difference
+    between types that the technical factors do not account for stays.
+    Cells x (context, system, class)."""
+    tech = [c for g, cols in COV_GROUPS if g in TECHNICAL_GROUPS
+            for c in cols]
+    out = {}
+    for key, g in pc.groupby(["context", "system", "anchor"], sort=False):
+        d = g.merge(cov.drop(columns=["cell_type"], errors="ignore"),
+                    on="cell", how="left")
+        cx = (ctx_cov or {}).get(key[0])
+        if cx is not None:
+            d = d.merge(cx, on="cell", how="left")
+        if "sd_anchor" in d and "sd_partner" in d:
+            d["scale"] = d["sd_anchor"] * d["sd_partner"]
+        y = d[stat].to_numpy(float)
+        ok = np.isfinite(y)
+        t = d["cell_type"].astype(str).to_numpy()
+        res = y.copy()
+        av = [c for c in tech if c in d and d[c].notna().sum() >= 10
+              and d[c].nunique() > 1]
+        Z = [_type_impute(d[c].to_numpy(float)[ok], t[ok]) for c in av]
+        for b in batch_cols:
+            if b in d and d[b].nunique() > 1:
+                Z += list(pd.get_dummies(d.loc[ok, b].astype(str),
+                                         drop_first=True).to_numpy(float).T)
+        if Z and ok.sum() > len(Z) + 10:
+            Z = np.column_stack(Z)
+            Z = Z - Z.mean(0)
+            Tm = pd.get_dummies(pd.Series(t[ok]), drop_first=True).to_numpy(
+                float)
+            M = np.column_stack([Tm - Tm.mean(0), Z]) if Tm.size else Z
+            beta = np.linalg.lstsq(M, y[ok] - y[ok].mean(), rcond=None)[0]
+            res[ok] = y[ok] - Z @ beta[M.shape[1] - Z.shape[1]:]
+        out[key] = pd.Series(res, index=d["cell"].to_numpy())
+    return pd.DataFrame(out)
+
+
 def celltype_auc(percell: pd.DataFrame, stat: str = "signed_rel",
                  n_folds: int = 5, seed: int = 0, n_threads: int = 1,
-                 min_type_cells: int = 10, n_trees: int = 300):
+                 min_type_cells: int = 10, n_trees: int = 300,
+                 cov: pd.DataFrame = None, ctx_cov: dict = None,
+                 batch_cols=()):
     """How well does a region group's per-cell concordance predict cell
     type?
 
@@ -1877,6 +2017,9 @@ def celltype_auc(percell: pd.DataFrame, stat: str = "signed_rel",
     (:func:`_cv_type_auc`), five ways --
 
       concordance             the statistic ``stat`` itself
+      concordance, technical  the same with the technical groups and batch
+        removed               regressed out, cell type protected
+                              (:func:`_remove_technical`; needs ``cov``)
       control                 the same on reshuffled links alone: an AUC
                               here is cell-type information the statistic
                               carries without any coordination
@@ -1900,13 +2043,17 @@ def celltype_auc(percell: pd.DataFrame, stat: str = "signed_rel",
     W = {m: pc.pivot_table(index="cell", values=m, aggfunc="first",
                            columns=["context", "system", "anchor"])
          for m in (stat, ctrl, "mu_anchor")}
+    if cov is not None:
+        W["corrected"] = _remove_technical(pc, stat, cov, ctx_cov, batch_cols)
     types = pc.drop_duplicates("cell").set_index("cell")["cell_type"].astype(
         str)
     contexts = list(dict.fromkeys(pc["context"]))
     ctx_sets = [(c, [c]) for c in contexts]
     if len(contexts) > 1:
         ctx_sets.append((" + ".join(contexts), contexts))
-    feats = {"concordance": (stat,), "control": (ctrl,),
+    feats = {"concordance": (stat,),
+             "concordance, technical removed": ("corrected",),
+             "control": (ctrl,),
              "marginal": ("mu_anchor",),
              "marginal + concordance": ("mu_anchor", stat),
              "marginal + control": ("mu_anchor", ctrl)}
@@ -1933,6 +2080,8 @@ def celltype_auc(percell: pd.DataFrame, stat: str = "signed_rel",
             if len(set(y)) < 2:
                 continue
             for variant in AUC_VARIANTS:
+                if any(m not in W for m in feats[variant]):
+                    continue
                 X = np.column_stack([W[m].reindex(index=cells, columns=cols)
                                      .to_numpy(float) for m in feats[variant]])
                 with np.errstate(all="ignore"):
@@ -1990,6 +2139,8 @@ def plot_celltype_auc(res: pd.DataFrame, per: pd.DataFrame, stat: str, path):
              else "all region groups" for sy, g in rows]
     types = sorted(per["cell_type"].astype(str).unique())
     style = {"concordance": dict(marker="o", color="#2b7bba", ms=3.5),
+             "concordance, technical removed": dict(marker="^",
+                                                    color="#e6550d", ms=3.5),
              "control": dict(marker="o", mfc="none", color="0.45", ms=3.5),
              "marginal": dict(marker="s", color="0.7", ms=3),
              "marginal + concordance": dict(marker="D", color="0.1", ms=2.8),
@@ -2008,12 +2159,13 @@ def plot_celltype_auc(res: pd.DataFrame, per: pd.DataFrame, stat: str, path):
             r = res[res["context"] == ctx].set_index(["system", "group",
                                                       "features"])
             for k, v in enumerate(AUC_VARIANTS):
-                dy = (k - 2) * 0.12
+                dy = (k - 2.5) * 0.11
                 for i, key in enumerate(rows):
                     if key + (v,) not in r.index:
                         continue
                     x = r.loc[key + (v,)]
-                    if v in ("concordance", "marginal + concordance"):
+                    if v in ("concordance", "concordance, technical removed",
+                             "marginal + concordance"):
                         ax.plot([x["auc_lo"], x["auc_hi"]], [i + dy] * 2,
                                 color=style[v]["color"], lw=0.6)
                     ax.plot([x["auc"]], [i + dy], ls="none", label=v,
@@ -2446,6 +2598,74 @@ def plot_cell_cycle(cov: pd.DataFrame, path):
         for a, lab in zip(ax, "abc"):
             a.set_title(lab, loc="left", fontweight="bold")
         fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+def plot_variance_total(assoc: pd.DataFrame, context: str, stat: str, path,
+                        q_cut: float = 0.05):
+    """Same-state class pairs (rows), all distances: the variance of the
+    per-cell statistic over ALL cells, split into sampling noise, which loci
+    were sampled, the technical groups (batch with them), cell type, the
+    other covariate groups, and what is left -- variation between cells
+    none of them accounts for (* q < q_cut that it is more than sampling)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    if assoc.empty or "tot_noise" not in assoc:
+        return
+    all_b = next((b for b in dict.fromkeys(assoc["band"])
+                  if str(b).startswith("all")), None)
+    a = _same_state(assoc, context, stat, all_b)
+    a = a[a["tot_noise"].notna()] if not a.empty else a
+    if a.empty:
+        return
+    ny = len(a)
+    col = lambda c: (a[c].to_numpy(float) if c in a  # noqa: E731
+                     else np.full(ny, np.nan))
+    groups = [g for g in TOTAL_ORDER
+              if f"tot_{g}" in a and a[f"tot_{g}"].notna().any()]
+    parts = [(np.nan_to_num(col("tot_noise")), "0.85", "sampling noise"),
+             (np.nan_to_num(col("tot_loci")), "#f4c58f",
+              "which loci were sampled")]
+    parts += [(np.clip(np.nan_to_num(col(f"tot_{g}")), 0, None),
+               TOTAL_COLOR[g], g) for g in groups]
+    resid = np.nan_to_num(col("tot_residual"))
+    parts.append((resid, "#9ecae1", "between cells, unexplained"))
+    tot = np.sum([w for w, _, _ in parts], axis=0)
+    parts = [(w / np.where(tot > 0, tot, 1), c_, lab) for w, c_, lab in parts]
+    q = col("residual_q")
+    with plt.rc_context(figure_style.RC):
+        fig, ax = plt.subplots(figsize=(figure_style.FIG_W_IN * 0.75,
+                                        0.9 + 0.2 * ny))
+        yy = np.arange(ny)
+        left = np.zeros(ny)
+        for w, c_, lab in parts:
+            ax.barh(yy, w, left=left, color=c_, label=lab, height=0.72)
+            left = left + w
+        for i in range(ny):
+            r_ = parts[-1][0][i]
+            ax.text(1.01, i, f"{100 * r_:.0f}%"
+                    + ("*" if np.isfinite(q[i]) and q[i] < q_cut else ""),
+                    va="center", ha="left", fontsize=5)
+            ct = col("tot_cell type")[i]
+            if np.isfinite(ct):
+                ax.text(-0.01, i, f"type {100 * ct:.0f}%", va="center",
+                        ha="right", fontsize=4.5, color="0.3")
+        ax.set_yticks(yy)
+        ax.set_yticklabels([f"{SYSTEM_LABEL.get(sy, sy)}: {k}–{k}"
+                            for sy, k in zip(a["system"], a["anchor"])],
+                           fontsize=5.5)
+        ax.tick_params(axis="y", pad=28)
+        ax.set_ylim(ny - 0.5, -0.5)
+        ax.set_xlim(0, 1)
+        ax.set_xlabel("share of the variance across all cells")
+        ax.legend(fontsize=5, loc="upper left", bbox_to_anchor=(1.07, 1.0),
+                  borderaxespad=0)
+        ax.set_title(f"{context} — {_STAT_LABEL.get(stat, stat)}: what varies "
+                     f"between cells (right: unexplained, * more than "
+                     f"sampling at q < {q_cut:g})", loc="left", fontsize=6.5)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
 
@@ -3341,6 +3561,11 @@ def main(argv=None) -> int:
     bad = set(want) - set(SYSTEMS)
     if bad:
         sys.exit(f"unknown --systems {sorted(bad)}; choose from {SYSTEMS}")
+    bad = {x.strip() for x in args.celltype_auc_stats.split(",")
+           if x.strip() and x.strip() != "none"} - set(COV_STATS)
+    if bad:
+        sys.exit(f"unknown --celltype-auc-stats {sorted(bad)}; choose from "
+                 f"{COV_STATS}")
     edges = np.array([float(x) for x in args.bands.split(",")])
     band_labels = _bands(edges)
     contexts = _parse_pairs(args.posteriors)
@@ -3772,36 +3997,6 @@ def main(argv=None) -> int:
     pd.DataFrame(marg_rows).to_csv(out / "marginal_summary.tsv", sep="\t",
                                    index=False)
     pd.DataFrame(cov_rows).to_csv(out / "coverage.tsv", sep="\t", index=False)
-    # How well each region group's concordance predicts cell type.
-    auc_stats = [x.strip() for x in args.celltype_auc_stats.split(",")
-                 if x.strip() and x.strip() != "none"]
-    bad = set(auc_stats) - set(COV_STATS)
-    if bad:
-        sys.exit(f"unknown --celltype-auc-stats {sorted(bad)}; choose from "
-                 f"{COV_STATS}")
-    if auc_stats and not percell.empty:
-        aucs, pers = [], []
-        for st_ in auc_stats:
-            logger.info(f"cell-type AUC of {st_} per region group")
-            r_, p_ = celltype_auc(percell, st_, args.celltype_auc_folds,
-                                  args.seed, args.n_threads,
-                                  n_trees=args.celltype_auc_trees)
-            if r_.empty:
-                continue
-            aucs.append(r_)
-            pers.append(p_)
-            plot_celltype_auc(r_, p_, st_, out / f"celltype_auc_{st_}."
-                                                 f"{args.plot_format}")
-            tab = r_.pivot_table(index=["context", "system", "group"],
-                                 columns="features", values="auc").reindex(
-                columns=list(AUC_VARIANTS))
-            logger.info(f"cell-type AUC from {st_} (macro, one-vs-rest):\n"
-                        + tab.to_string(float_format=lambda v: f"{v:.3f}"))
-        if aucs:
-            pd.concat(aucs).to_csv(out / "celltype_auc.tsv", sep="\t",
-                                   index=False)
-            pd.concat(pers).to_csv(out / "celltype_auc_by_type.tsv",
-                                   sep="\t", index=False)
     for (ctx, name), s in summary.groupby(["context", "system"], sort=False):
         pc = percell[(percell["context"] == ctx) & (percell["system"] == name)]
         plot(s[~s["sparse"] | s["band"].str.startswith("all")], pc,
@@ -3887,6 +4082,7 @@ def main(argv=None) -> int:
                                 f"-matched null, {_fmt_bp(args.hotspot_bin)}"
                                 f" bins)" if len(sy_) else ""),
                           fdr=args.hotspot_fdr)
+    batch_cols = []
     if cell_cov is not None and not percell.empty:
         batch_cols = [b.strip() for b in (args.batch_column or "").split(",")
                       if b.strip()]
@@ -3923,6 +4119,9 @@ def main(argv=None) -> int:
                     assoc, ctx_, st_,
                     out / f"covariates_{ctx_}_{st_}_by_band."
                           f"{args.plot_format}")
+                plot_variance_total(assoc, ctx_, st_,
+                                    out / f"variance_total_{ctx_}_{st_}."
+                                          f"{args.plot_format}")
         if not assoc.empty:
             top = assoc[(assoc["statistic"] == "delta")
                         & assoc["band"].astype(str).str.startswith("all")
@@ -3946,6 +4145,38 @@ def main(argv=None) -> int:
         for ctx_ in contexts:
             plot_cross_class(cc_, ctx_, out / f"cross_class_{ctx_}."
                                               f"{args.plot_format}")
+    # How well each region group's concordance predicts cell type.
+    auc_stats = [x.strip() for x in args.celltype_auc_stats.split(",")
+                 if x.strip() and x.strip() != "none"]
+    bad = set(auc_stats) - set(COV_STATS)
+    if bad:
+        sys.exit(f"unknown --celltype-auc-stats {sorted(bad)}; choose from "
+                 f"{COV_STATS}")
+    if auc_stats and not percell.empty:
+        aucs, pers = [], []
+        for st_ in auc_stats:
+            logger.info(f"cell-type AUC of {st_} per region group")
+            r_, p_ = celltype_auc(percell, st_, args.celltype_auc_folds,
+                                  args.seed, args.n_threads,
+                                  n_trees=args.celltype_auc_trees,
+                                  cov=cell_cov, ctx_cov=ctx_cov,
+                                  batch_cols=batch_cols)
+            if r_.empty:
+                continue
+            aucs.append(r_)
+            pers.append(p_)
+            plot_celltype_auc(r_, p_, st_, out / f"celltype_auc_{st_}."
+                                                 f"{args.plot_format}")
+            tab = r_.pivot_table(index=["context", "system", "group"],
+                                 columns="features", values="auc").reindex(
+                columns=list(AUC_VARIANTS))
+            logger.info(f"cell-type AUC from {st_} (macro, one-vs-rest):\n"
+                        + tab.to_string(float_format=lambda v: f"{v:.3f}"))
+        if aucs:
+            pd.concat(aucs).to_csv(out / "celltype_auc.tsv", sep="\t",
+                                   index=False)
+            pd.concat(pers).to_csv(out / "celltype_auc_by_type.tsv",
+                                   sep="\t", index=False)
     logger.info(f"wrote {out}")
     return 0
 
