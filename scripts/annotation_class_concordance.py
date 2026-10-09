@@ -165,6 +165,16 @@ and along the genome, each 1 Mb bin's difference, the bins that differ, and
 what they are (contrast_hotspots.tsv.gz, contrast_hotspot_enrichment.tsv,
 contrast_hotspots_<ctx>).
 
+VARIABLE AND STABLE LOCI.  Per 1 Mb bin, each cell type's concordance, and
+how much it varies between types beyond sampling (a heterogeneity test
+against the control): the most variable bins, the variable ones beyond each
+type's genome-wide level (a type that is more concordant everywhere does not
+count), and the most stable concordant ones -- with what each set is
+enriched in (locus_variability.tsv.gz, locus_variability_enrichment.tsv,
+locus_variability_<ctx>_<stat>) and as plain BEDs for
+marker_bin_enrichment.py (locus_<set>_<ctx>_<stat>.bed, with
+locus_tested_* as the background).
+
 CELL TYPE FROM CONCORDANCE.  celltype_auc_<statistic> (celltype_auc.tsv,
 celltype_auc_by_type.tsv): per context and both together, how well each
 region group's per-cell concordance predicts cell type -- a random forest,
@@ -2743,7 +2753,7 @@ def hotspot_contrast(grid, arrays, groups: dict, n_band: int,
                      min_cells: int = 10) -> pd.DataFrame:
     """Where two groups of cells differ in concordance along the genome.
 
-    ``arrays``: (g_lo, cell, d, pair, g_hi, c, band) of the contacts;
+    ``arrays``: (g_lo, cell, d, pair, g_hi, c, band, ...) of the contacts;
     ``groups``: {name: boolean over the cells}, first minus second.  Per bin
     of ``grid``, all distances: each group's ΔC (:func:`locus_hotspots`),
     the difference with its standard error, and two calls at an FDR
@@ -2752,7 +2762,7 @@ def hotspot_contrast(grid, arrays, groups: dict, n_band: int,
     (higher_A / higher_B), and -- the groups may differ everywhere, which
     the class comparison reports -- bins whose difference departs from the
     median bin's (above_median / below_median)."""
-    g_lo, cell, d, _, g_hi, c, band = arrays
+    g_lo, cell, d, _, g_hi, c, band = arrays[:7]
     per = {}
     for nm, cm in groups.items():
         m = np.asarray(cm, bool)[cell]
@@ -3076,6 +3086,281 @@ def plot_hotspot_contrast(hc: pd.DataFrame, enr: pd.DataFrame, context: str,
             ax2.legend(fontsize=4.5, loc="lower right")
             ax2.set_title("b  what the differing bins are", loc="left",
                           fontsize=6.5)
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+# ------------------------------------------- variable and stable loci --
+
+
+def locus_variability(grid, g_lo, g_hi, ctype_contact, parts: dict,
+                      type_names, min_contacts: int = 100, min_types: int = 3,
+                      fraction: float = 0.1, fdr: float = 0.05,
+                      min_z: float = 3.0) -> pd.DataFrame:
+    """Which loci are concordant in one cell type and not another, and which
+    the same in every one?
+
+    Per bin of ``grid`` (all distances) and statistic (``parts``: {name:
+    (each contact's part, the control's)}, a contact counted in both its
+    ends' bins, once when they share one): each cell type's mean with its
+    standard error (types with >= ``min_contacts`` contacts in the bin), the
+    pooled value over every type, and the between-type variance beyond
+    sampling -- DerSimonian-Laird tau^2 from Cochran's Q -- with a
+    heterogeneity q against a null fitted to the controls' Q
+    (:func:`_empirical_q`).  Bins with ``min_types`` types are tested.
+
+      variable  heterogeneous (q < ``fdr``), the ``fraction`` of tested bins
+                with the largest between-type SD
+      stable    concordant (|pooled z| >= ``min_z``), the ``fraction`` of
+                tested bins whose between-type SD is smallest relative to
+                their concordance -- concordance the same in every type;
+                bins without any would be 'stable' trivially
+
+    A cell type whose concordance is higher everywhere -- labeling, depth,
+    or a global state -- makes the most concordant bins the most 'variable'
+    with the same order of types in each.  ``set_scaled`` is the variable
+    set after each type is divided by its genome-wide level (its contacts'
+    mean |value| over the tested bins, relative to the types' mean): bins
+    whose pattern of types differs from the types' overall one."""
+    T = len(type_names)
+    i_lo, i_hi = grid.index_g(g_lo), grid.index_g(g_hi)
+    sel_lo, sel_hi = i_lo >= 0, (i_hi >= 0) & (i_hi != i_lo)
+    ct = np.asarray(ctype_contact, np.int64)
+    out = []
+    for stat, (v, vc) in parts.items():
+        v, vc = np.asarray(v, float), np.asarray(vc, float)
+
+        def acc_(w=None):
+            o = np.zeros(grid.n * T)
+            for idx, sel in ((i_lo, sel_lo), (i_hi, sel_hi)):
+                o += np.bincount(idx[sel] * T + ct[sel],
+                                 weights=None if w is None else w[sel],
+                                 minlength=grid.n * T)
+            return o.reshape(grid.n, T)
+        n, s1, s2, c1, c2 = acc_(), acc_(v), acc_(v * v), acc_(vc), acc_(vc * vc)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            x, xc = s1 / n, c1 / n
+            se = np.sqrt(np.maximum(s2 / n - x ** 2, 0) / n)
+            sec = np.sqrt(np.maximum(c2 / n - xc ** 2, 0) / n)
+            ok = (n >= min_contacts) & (se > 0) & (sec > 0)
+            k = ok.sum(1)
+            test = k >= min_types
+
+            def het(val, err):
+                w = np.where(ok, 1.0 / np.where(ok, err, 1) ** 2, 0.0)
+                sw = w.sum(1)
+                mw = (w * np.where(ok, val, 0)).sum(1) / np.where(sw > 0, sw,
+                                                                  1)
+                Q = (w * np.where(ok, val - mw[:, None], 0) ** 2).sum(1)
+                df = np.maximum(k - 1, 1)
+                den = sw - (w ** 2).sum(1) / np.where(sw > 0, sw, 1)
+                tau2 = np.maximum((Q - df) / np.where(den > 0, den, np.inf), 0)
+                return Q, df, tau2, (Q - df) / np.sqrt(2 * df)
+            Q, df, tau2, zq = het(x, se)
+            _, _, _, zq0 = het(xc, sec)
+            N = n.sum(1)
+            pooled = s1.sum(1) / N
+            pse = np.sqrt(np.maximum(s2.sum(1) / N - pooled ** 2, 0) / N)
+            zp = pooled / pse
+        b = np.flatnonzero(test)
+        if b.size == 0:
+            continue
+        # each type's genome-wide level, for the scaled call
+        with np.errstate(invalid="ignore", divide="ignore"):
+            wt = np.where(ok[b], n[b], 0.0)
+            lvl = (wt * np.abs(np.where(ok[b], x[b], 0))).sum(0) / wt.sum(0)
+            sc = lvl / np.nanmean(lvl[lvl > 0]) if (lvl > 0).any() else lvl
+            sc = np.where(np.isfinite(sc) & (sc > 0), sc, 1.0)
+            Qs, _, tau2s, zqs = het(x / sc, se / sc)
+            _, _, _, zqs0 = het(xc / sc, sec / sc)
+        hqs = _empirical_q(zqs[b], zqs0[b])
+        hq = _empirical_q(zq[b], zq0[b])
+        tau = np.sqrt(tau2[b])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cv = tau / np.abs(pooled[b])
+        m = int(round(fraction * b.size))
+        label = np.full(b.size, "", object)
+        var_c = np.flatnonzero(hq < fdr)
+        top = var_c[np.argsort(-tau[var_c], kind="mergesort")][:m]
+        label[top] = "variable"
+        st_c = np.flatnonzero((np.abs(zp[b]) >= min_z) & (label == ""))
+        low = st_c[np.argsort(cv[st_c], kind="mergesort")][:m]
+        label[low] = "stable"
+        taus = np.sqrt(tau2s[b])
+        label_s = np.full(b.size, "", object)
+        vs_c = np.flatnonzero(hqs < fdr)
+        label_s[vs_c[np.argsort(-taus[vs_c], kind="mergesort")][:m]] = \
+            "variable"
+        df_ = pd.DataFrame({
+            "grid_index": b, "code": grid.codes[b // grid.per],
+            "start": (b % grid.per) * grid.size,
+            "end": (b % grid.per + 1) * grid.size, "statistic": stat,
+            "types_tested": k[b], "contacts": N[b], "pooled": pooled[b],
+            "z_pooled": zp[b], "between_type_sd": tau, "cv": cv,
+            "Q": Q[b], "df": df[b], "het_q": hq, "set": label,
+            "between_type_sd_scaled": taus, "het_q_scaled": hqs,
+            "set_scaled": label_s})
+        for j, nm in enumerate(type_names):
+            df_[f"type:{nm}"] = np.where(ok[b, j], x[b, j], np.nan)
+        out.append(df_)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+#: The variable set after each cell type's genome-wide level is divided out.
+VARIABLE_SCALED = "variable beyond type level"
+
+
+def variability_enrichment(lv: pd.DataFrame, tracks: dict) -> pd.DataFrame:
+    """Per statistic, set (variable / stable) and annotation track: the
+    track's mean over the set's bins against the rest of the tested bins
+    (log2 fold), the share of bins it touches in each, and a two-sided
+    Mann-Whitney p, BH q per statistic and set."""
+    from scipy.stats import mannwhitneyu
+    rows = []
+    for (stat, ctx), g in lv.groupby(["statistic", "context"], sort=False):
+        gi = g["grid_index"].to_numpy()
+        sets = {"variable": (g["set"] == "variable").to_numpy(),
+                "stable": (g["set"] == "stable").to_numpy()}
+        if "set_scaled" in g:
+            sets[VARIABLE_SCALED] = (g["set_scaled"] == "variable").to_numpy()
+        for st, fg in sets.items():
+            if fg.sum() < 3 or (~fg).sum() < 3:
+                continue
+            for name, v in tracks.items():
+                x = v[gi]
+                if np.ptp(x) == 0:
+                    continue
+                a_, b_ = x[fg], x[~fg]
+                eps = 1e-6 + 1e-3 * float(np.mean(np.abs(x)))
+                try:
+                    p_ = float(mannwhitneyu(a_, b_,
+                                            alternative="two-sided").pvalue)
+                except ValueError:
+                    p_ = np.nan
+                rows.append({"context": ctx, "statistic": stat, "set": st,
+                             "track": name, "bins": int(fg.sum()),
+                             "mean_set": float(a_.mean()),
+                             "mean_rest": float(b_.mean()),
+                             "log2_fold": float(np.log2((a_.mean() + eps)
+                                                        / (b_.mean() + eps))),
+                             "share_set": float((a_ > 0).mean()),
+                             "share_rest": float((b_ > 0).mean()), "p": p_})
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["q"] = np.nan
+        for _, g in out.groupby(["context", "statistic", "set"], sort=False):
+            out.loc[g.index, "q"] = fdr_bh(g["p"].to_numpy())
+    return out
+
+
+def plot_locus_variability(lv: pd.DataFrame, en: pd.DataFrame, context: str,
+                           stat: str, path, q_cut: float = 0.05,
+                           n_heat: int = 60):
+    """a: per bin, the pooled concordance against its between-type SD
+    (pp), the variable and stable bins marked; b: the variable bins'
+    concordance in each cell type; c: what each set is enriched in -- log2
+    fold of every annotation track over the rest of the tested bins
+    (* q < q_cut)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    a = lv[(lv["context"] == context) & (lv["statistic"] == stat)]
+    if a.empty:
+        return
+    e = (en[(en["context"] == context) & (en["statistic"] == stat)]
+         if not en.empty else en)
+    tcols = [c for c in a.columns if c.startswith("type:")]
+    PP = 100
+    tr = (list(dict.fromkeys(e.sort_values("log2_fold")["track"]))
+          if not e.empty else [])
+    with plt.rc_context(figure_style.RC):
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN * 1.15,
+                                  max(2.6, 0.9 + 0.13 * len(tr))))
+        gs = fig.add_gridspec(1, 3, width_ratios=[1.0, 0.9, 1.2], wspace=0.9)
+        ax0, ax1, ax2 = (fig.add_subplot(gs[0, i]) for i in range(3))
+        sv = a["set_scaled"] if "set_scaled" in a else pd.Series("", a.index)
+        ax0.scatter(PP * a.loc[(sv == "variable") & (a["set"] != "variable"),
+                               "pooled"],
+                    PP * a.loc[(sv == "variable") & (a["set"] != "variable"),
+                               "between_type_sd"], s=4, lw=0, color="#fc9272",
+                    label=VARIABLE_SCALED + " only", zorder=2)
+        for st, col, ms in (("", "0.75", 2), ("stable", "#2166ac", 4),
+                            ("variable", "#b2182b", 4)):
+            m = a["set"] == st
+            ax0.scatter(PP * a.loc[m, "pooled"],
+                        PP * a.loc[m, "between_type_sd"], s=ms, lw=0,
+                        color=col, label=st or "other tested",
+                        zorder=3 if st else 1)
+        ax0.set_xlabel(f"{_STAT_LABEL.get(stat, stat)}, all types, pp")
+        ax0.set_ylabel("between-type SD, pp")
+        ax0.legend(fontsize=5, markerscale=2, loc="best")
+        v = a[a["set"] == "variable"].sort_values("between_type_sd",
+                                                  ascending=False).head(n_heat)
+        if not v.empty and tcols:
+            H = PP * v[tcols].to_numpy(float)
+            o = np.lexsort((-np.nan_to_num(np.nanmax(H, 1)),
+                            np.nanargmax(np.where(np.isfinite(H), H, -np.inf),
+                                         1)))
+            H = H[o]
+            lim = float(np.nanmax(np.abs(H))) if np.isfinite(H).any() else 1
+            im = ax1.imshow(H, cmap="RdBu_r", vmin=-lim, vmax=lim,
+                            aspect="auto", interpolation="nearest")
+            ax1.set_xticks(range(len(tcols)))
+            ax1.set_xticklabels([c[5:] for c in tcols], rotation=60,
+                                ha="right", fontsize=5)
+            names_ = v["chrom"] if "chrom" in v else v["code"].astype(str)
+            ax1.set_yticks(range(len(v)))
+            ax1.set_yticklabels([f"{_canon(c)}:{s_ // 1_000_000}Mb" for c, s_
+                                 in zip(np.asarray(names_)[o],
+                                        v["start"].to_numpy()[o])],
+                                fontsize=3.5)
+            cb = fig.colorbar(im, ax=ax1, orientation="horizontal",
+                              fraction=0.05, pad=0.22)
+            cb.ax.tick_params(labelsize=5)
+            cb.set_label("pp", fontsize=6)
+        ax1.set_title(f"b  top {len(v)} variable bins, by cell type",
+                      loc="left", fontsize=6.5)
+        if tr:
+            yy = np.arange(len(tr))
+            cap = 4.0                         # a class absent from a set
+            have = [x for x in (("variable", "#b2182b"),
+                                (VARIABLE_SCALED, "#fc9272"),
+                                ("stable", "#2166ac"))
+                    if (e["set"] == x[0]).any()]
+            hgt = 0.8 / max(len(have), 1)
+            for i_, (st, col) in enumerate(have):
+                dy = (i_ - (len(have) - 1) / 2) * hgt
+                x_ = e[e["set"] == st].set_index("track").reindex(tr)
+                f_all = x_["log2_fold"].to_numpy(float)
+                ax2.barh(yy + dy, np.clip(f_all, -cap, cap), height=hgt,
+                         color=col, label=st)
+                for y_, (f_, q_) in enumerate(zip(f_all, x_["q"])):
+                    if not np.isfinite(f_):
+                        continue
+                    fc = float(np.clip(f_, -cap, cap))
+                    txt = ("<" if f_ < -cap else ">" if f_ > cap else "") + (
+                        "*" if np.isfinite(q_) and q_ < q_cut else "")
+                    if txt:
+                        ax2.text(fc, y_ + dy, (" " + txt) if fc >= 0 else
+                                 (txt + " "), va="center",
+                                 ha="left" if fc >= 0 else "right",
+                                 fontsize=5)
+            ax2.set_xlim(-cap - 0.8, cap + 0.8)
+            ax2.axvline(0, color="0.4", lw=0.4)
+            ax2.set_yticks(yy)
+            ax2.set_yticklabels(tr, fontsize=5)
+            ax2.set_xlabel("log2 fold vs the other tested bins\n"
+                           "(< >: beyond ±4)")
+            ax2.legend(fontsize=5, loc="upper center",
+                       bbox_to_anchor=(0.5, -0.2), ncol=1, frameon=False)
+        ax0.set_title("a  concordance and how it varies", loc="left",
+                      fontsize=6.5)
+        ax2.set_title("c  what each set is enriched in", loc="left",
+                      fontsize=6.5)
+        fig.suptitle(f"{context} -- {_STAT_LABEL.get(stat, stat)}: loci that "
+                     f"vary between cell types, and loci that do not "
+                     f"(1 Mb bins)", fontsize=7)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
 
@@ -4620,6 +4905,12 @@ def main(argv=None) -> int:
                     help="A further track the hotspot map is tested "
                          "against (e.g. imprinting control regions, IAP "
                          "elements); repeatable.")
+    ap.add_argument("--variability-fraction", type=float, default=0.1,
+                    help="Share of the tested 1 Mb bins called variable "
+                         "across cell types, and stable (0.1 each).")
+    ap.add_argument("--variability-min-contacts", type=int, default=100,
+                    help="Contacts a cell type needs in a bin to enter its "
+                         "variability (100).")
     ap.add_argument("--contrast-group", action="append", default=None,
                     metavar="NAME=TYPE[,TYPE...]",
                     help="Two groups of cells to compare, given twice -- the "
@@ -4807,6 +5098,7 @@ def main(argv=None) -> int:
             f"{nm} ({sum(1 for v in group_of.values() if v == nm):,} cells)"
             for nm in contrast_names))
     contrast_rows, chot_rows, cenr_rows = [], [], []
+    var_rows, var_en = [], []
 
     from joblib import Parallel, delayed
     first = next(iter(contexts.values()))
@@ -5076,6 +5368,10 @@ def main(argv=None) -> int:
                                       minlength=len(cells) * nb1)
                         ).reshape(len(cells), nb1)
                     for k, v in sgn_parts.items()}
+            if best_hot is not None and best_hot[1] == name and \
+                    best_arrays is not None:
+                best_arrays = best_arrays[:7] + (sgn_parts["sd"],
+                                                 sgn_parts["sc"])
             if cgroups and all(v.size for v in cgroups.values()):
                 for r_ in group_contrast(
                         acc, sd, tot, S_sg, cgroups, classes, band_labels,
@@ -5263,6 +5559,35 @@ def main(argv=None) -> int:
                         f"{args.hotspot_bin:,} bp bins): {int(t_['hot'].sum())}"
                         f" hot and {int(t_['cold'].sum())} cold of "
                         f"{len(t_):,} bins at FDR {args.hotspot_fdr:g}")
+        if best_arrays is not None and len(best_arrays) >= 9 and \
+                not args.no_hotspots:
+            # loci concordant in some cell types and not others, and loci
+            # concordant alike in all
+            tnames = list(pd.factorize(types)[1])
+            lv = locus_variability(
+                grid, best_arrays[0], best_arrays[4],
+                type_code[best_arrays[1]],
+                {"delta": (best_arrays[2], best_arrays[5]),
+                 "signed_rel": (best_arrays[7], best_arrays[8])},
+                tnames, args.variability_min_contacts,
+                min(3, len(tnames)), args.variability_fraction,
+                args.hotspot_fdr)
+            if not lv.empty:
+                if tracks is None:
+                    tracks = hotspot_tracks(grid, systems, ab_maps, genes,
+                                            cpg, hot_user)
+                lv.insert(0, "context", ctx)
+                lv.insert(1, "system", best_hot[1])
+                lv["chrom"] = lv["code"].map(chrom_names)
+                var_en.append(variability_enrichment(lv, tracks))
+                var_rows.append(lv)
+                for st_, g_ in lv.groupby("statistic"):
+                    nv = int((g_["set"] == "variable").sum())
+                    nvs = int((g_["set_scaled"] == "variable").sum())
+                    ns = int((g_["set"] == "stable").sum())
+                    logger.info(f"{ctx} {st_}: {nv} variable ({nvs} beyond "
+                                f"each type's level) and {ns} stable of "
+                                f"{len(g_):,} bins tested across cell types")
         if cgroups and best_arrays is not None and not args.no_hotspots:
             # where along the genome the two groups differ
             masks = {nm: np.isin(np.arange(len(cells)), ix)
@@ -5549,6 +5874,33 @@ def main(argv=None) -> int:
                     f"all distances (smallest q):\n"
                     + top[cols_].to_string(index=False, float_format=lambda
                                            v: f"{v:.4f}"))
+    if var_rows:
+        lv_ = pd.concat(var_rows, ignore_index=True)
+        en_ = pd.concat(var_en, ignore_index=True) if var_en else \
+            pd.DataFrame()
+        lead = ["context", "system", "chrom", "start", "end", "statistic",
+                "set", "set_scaled"]
+        lv_[lead + [c for c in lv_.columns if c not in lead + [
+            "grid_index", "code"]]].to_csv(out / "locus_variability.tsv.gz",
+                                           sep="\t", index=False)
+        en_.to_csv(out / "locus_variability_enrichment.tsv", sep="\t",
+                   index=False)
+        for (ctx_, st_), g_ in lv_.groupby(["context", "statistic"],
+                                           sort=False):
+            # plain BEDs for marker_bin_enrichment.py: --bed NAME=set
+            # --background-bed NAME=tested
+            for nm, m in (("variable", g_["set"] == "variable"),
+                          ("variable_beyond_type_level",
+                           g_["set_scaled"] == "variable"),
+                          ("stable", g_["set"] == "stable"),
+                          ("tested", np.ones(len(g_), bool))):
+                g_.loc[m, ["chrom", "start", "end"]].sort_values(
+                    ["chrom", "start"]).to_csv(
+                    out / f"locus_{nm}_{ctx_}_{st_}.bed", sep="\t",
+                    header=False, index=False)
+            plot_locus_variability(lv_, en_, ctx_, st_,
+                                   out / f"locus_variability_{ctx_}_{st_}."
+                                         f"{args.plot_format}")
     if chot_rows:
         hc_ = pd.concat(chot_rows, ignore_index=True)
         hc_.drop(columns=["grid_index", "code"]).to_csv(

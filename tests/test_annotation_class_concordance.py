@@ -1251,3 +1251,81 @@ def test_two_groups_of_cells_compared_by_class_and_along_the_genome(tmp_path):
     assert en.loc["PMD / HMD: HMD", "rho_diff"] > 0.5
     assert (o / "contrast_GCH_delta.png").exists()
     assert (o / "contrast_hotspots_GCH.png").exists()
+
+
+# ------------------------------------------------ variable and stable loci --
+
+
+def test_variable_and_stable_loci_across_cell_types():
+    """Bins 5, 15, 25, 35: concordant in type 0 only; bins 8, 18, 28, 38:
+    concordant alike in all three types."""
+    rng = np.random.default_rng(15)
+    code = acc._chrom_code("chr1")
+    grid = acc.BinGrid([code], 50_000_000, 1_000_000)
+    n = 300_000
+    lo = rng.integers(0, 40_000_000, n)
+    hi = lo + rng.integers(1_000, 20_000, n)
+    ty = rng.integers(0, 3, n)
+    b = lo // 1_000_000
+    var_b, st_b = np.isin(b, [5, 15, 25, 35]), np.isin(b, [8, 18, 28, 38])
+    d = rng.normal(0, 1, n) + 0.6 * (var_b & (ty == 0)) + 0.6 * st_b
+    c = rng.normal(0, 1, n)
+    g0 = code * acc.STRIDE
+    lv = acc.locus_variability(grid, g0 + lo, g0 + hi, ty, {"delta": (d, c)},
+                               ["T0", "T1", "T2"], min_contacts=100,
+                               fraction=0.1)
+    got_v = set(lv.loc[lv["set"] == "variable", "start"] // 1_000_000)
+    got_s = set(lv.loc[lv["set"] == "stable", "start"] // 1_000_000)
+    assert got_v == {5, 15, 25, 35}
+    assert got_s == {8, 18, 28, 38}
+    assert (lv["type:T0"] > lv["type:T1"]).loc[lv["set"] == "variable"].all()
+    lv.insert(0, "context", "GCH")
+    track_v, track_s = np.zeros(grid.n), np.zeros(grid.n)
+    track_v[[5, 15, 25, 35]] = 1.0
+    track_s[[8, 18, 28, 38]] = 1.0
+    en = acc.variability_enrichment(lv, {"tv": track_v, "ts": track_s}
+                                    ).set_index(["set", "track"])
+    assert en.loc[("variable", "tv"), "log2_fold"] > 3
+    assert en.loc[("stable", "ts"), "log2_fold"] > 3
+    assert en.loc[("variable", "tv"), "q"] < 0.05
+
+
+def test_the_variability_outputs_are_written(planted):
+    _, _, o = planted
+    lv = pd.read_csv(o / "locus_variability.tsv.gz", sep="\t")
+    assert {"delta", "signed_rel"} <= set(lv["statistic"])
+    assert {"between_type_sd", "het_q", "set", "type:T0"} <= set(lv.columns)
+    for nm in ("variable", "variable_beyond_type_level", "stable",
+               "tested"):
+        assert (o / f"locus_{nm}_GCH_delta.bed").exists()
+    assert (o / "locus_variability_GCH_signed_rel.png").exists()
+    assert (o / "locus_variability_enrichment.tsv").exists()
+
+
+def test_variability_beyond_each_types_overall_level():
+    """Type 0 is twice as concordant everywhere; in bins 7, 17, 27, 37 type
+    1 alone is high.  The plain call follows type 0's scale in the most
+    concordant bins; beyond each type's level, only the four remain."""
+    rng = np.random.default_rng(16)
+    code = acc._chrom_code("chr1")
+    grid = acc.BinGrid([code], 50_000_000, 1_000_000)
+    n = 400_000
+    lo = rng.integers(0, 40_000_000, n)
+    hi = lo + rng.integers(1_000, 20_000, n)
+    ty = rng.integers(0, 3, n)
+    b = lo // 1_000_000
+    base = np.where(b % 2 == 0, 0.8, 0.2)        # even bins more concordant
+    scale = np.array([2.0, 1.0, 1.0])[ty]
+    part = np.isin(b, [7, 17, 27, 37]) & (ty == 1)
+    d = base * scale + 0.5 * part + rng.normal(0, 1, n)
+    c = rng.normal(0, 1, n)
+    g0 = code * acc.STRIDE
+    lv = acc.locus_variability(grid, g0 + lo, g0 + hi, ty, {"delta": (d, c)},
+                               ["T0", "T1", "T2"], min_contacts=100,
+                               fraction=0.1)
+    plain = set(lv.loc[lv["set"] == "variable", "start"] // 1_000_000)
+    scaled = set(lv.loc[lv["set_scaled"] == "variable", "start"]
+                 // 1_000_000)
+    assert not plain & {7, 17, 27, 37}               # the scale's bins
+    assert all(x % 2 == 0 for x in plain)
+    assert scaled == {7, 17, 27, 37}
