@@ -490,7 +490,8 @@ def test_the_covariate_outputs_are_written(planted):
         lr["statistic"])
     assert (o / "covariates_GCH_delta_r.png").exists()
     # the bar's components: Shapley shares adding up to the explained part
-    same = a[(a["anchor"] == a["partner"]) & a["R2_adj_all"].notna()]
+    same = a[(a["anchor"] == a["partner"]) & a["R2_adj_all"].notna()
+             & a["band"].astype(str).str.startswith("all")]
     sh = [c for c in a.columns if c.startswith("shap_")]
     assert {"shap_technical", "shap_level", "shap_scale",
             "shap_labeling efficiency", "shap_substructure",
@@ -509,6 +510,16 @@ def test_the_covariate_outputs_are_written(planted):
     s_ = tot[parts].sum(1)
     assert ((s_ > 0.97) | (tot["residual_var"] < 0)).all()
     assert (o / "variance_total_GCH_delta.png").exists()
+    allb = a[a["band"].astype(str).str.startswith("all")
+             & (a["anchor"] == a["partner"]) & (a["statistic"] == "delta")]
+    assert allb["R2_cv_nonlinear"].notna().any()
+    assert (allb["tot_residual_nonlinear"] <= allb["tot_residual"] + 1e-9
+            ).all()
+    cc = pd.read_csv(o / "cross_class_correlation.tsv", sep="\t")
+    assert {"delta", "signed_rel"} <= set(cc["statistic"])
+    assert cc["r_resid"].notna().any()
+    ch = pd.read_csv(o / "cell_chromosome.tsv", sep="\t")
+    assert {"cell_x_chromosome_share", "perm_p"} <= set(ch.columns)
     assert cov["open_site_level"].between(0.2, 0.7).all()
     assert (o / "cell_covariates_extra.png").exists()
     assert (o / "cross_class_correlation.tsv").exists()
@@ -959,3 +970,108 @@ def test_hotspot_enrichment_reports_the_part_beyond_gene_density():
         "track")
     assert en.loc["imprinted genes", "rho"] > 0.3
     assert abs(en.loc["imprinted genes", "rho_given_tss"]) < 0.15
+
+
+def _territory(inter_sd, seed=0):
+    """Contacts of 3 types x 60 cells on 10 chromosomes: per contact, a
+    locus effect and noise, a chromosome effect, a cell effect -- and,
+    optionally, an effect of the cell on that chromosome."""
+    rng = np.random.default_rng(seed)
+    n_cells, per = 180, 600
+    cell = np.repeat(np.arange(n_cells), per)
+    ctype = np.repeat(np.arange(3), n_cells // 3)
+    chrom = rng.integers(1, 11, cell.size)
+    g = chrom.astype(np.int64) * acc.STRIDE + rng.integers(0, 10**8, cell.size)
+    d = (rng.normal(0, 0.3, 11)[chrom] + rng.normal(0, 0.2, n_cells)[cell]
+         + inter_sd * rng.normal(0, 1, (n_cells, 11))[cell, chrom]
+         + rng.normal(0, 0.5, 5000)[rng.integers(0, 5000, cell.size)]
+         + rng.normal(0, 1, cell.size))
+    return acc.cell_chromosome_test(g, cell, ctype, d, 20,
+                                    np.random.default_rng(seed + 1))
+
+
+def test_the_territory_test_finds_cell_specific_chromosome_states():
+    r0, r1 = _territory(0.0), _territory(0.25)
+    assert r0["cell_x_chromosome_share"] < 0.05 and r0["perm_p"] > 0.05
+    assert r1["cell_x_chromosome_share"] > 0.15 and r1["perm_p"] < 0.05
+    assert r1["chromosome_share"] > 0.2 and r1["entries"] > 1000
+
+
+def test_cross_class_residual_tells_measured_from_unmeasured_factors():
+    rng = np.random.default_rng(8)
+    n = 300
+    cells = [f"c{i}" for i in range(n)]
+    types = np.repeat(["T0", "T1"], n // 2)
+    tech = rng.normal(0, 1, n)
+    hidden = rng.normal(0, 1, n)
+    for hid, want_resid in ((0.0, False), (1.0, True)):
+        rows = []
+        for st in ("A", "B"):
+            rows.append(pd.DataFrame({
+                "context": "GCH", "system": "s", "cell": cells,
+                "cell_type": types, "anchor": st, "partner": st,
+                "band": "all 1kb-10Mb", "enough_pairs": True,
+                "delta": tech + hid * hidden + rng.normal(0, 0.4, n)}))
+        pc = pd.concat(rows, ignore_index=True)
+        summ = pd.DataFrame({"context": "GCH", "system": "s",
+                             "anchor": ["A", "B"], "partner": ["A", "B"],
+                             "band": "all 1kb-10Mb", "split_half_r": 0.6})
+        cov = pd.DataFrame({"cell": cells, "cell_type": types,
+                            "open_site_level": tech})
+        cc = acc.cross_class_correlation(pc, summ, min_cells=30, cov=cov)
+        r = cc.iloc[0]
+        assert r["r"] > 0.7
+        if want_resid:
+            assert r["r_resid"] > 0.6
+        else:
+            assert abs(r["r_resid"]) < 0.15
+
+
+def test_a_nonlinear_fit_takes_what_a_straight_line_misses():
+    rng = np.random.default_rng(9)
+    n = 1200
+    t_ = np.repeat(["T0", "T1"], n // 2)
+    x = rng.uniform(-2, 2, n)
+    y = x ** 2 + rng.normal(0, 0.5, n)                 # not a straight line
+    r = acc._total_split(y, t_, x[:, None], ["open_site_level"],
+                         np.empty((n, 0)), 0.25, 0.25, 0.02, nonlinear=True)
+    assert r["R2_cv_nonlinear"] > r["R2_cv_linear"] + 0.5
+    assert r["tot_residual_nonlinear"] < 0.05 < r["tot_residual"]
+
+
+def test_doublets_scored_when_types_differ_in_few_bins_among_many():
+    """Two types apart in 20 of 600 bins: the spread of all 30 components
+    would hide that; along the line between their centroids it shows."""
+    rng = np.random.default_rng(10)
+    n_bins = 600
+    keys = np.arange(n_bins)
+    base = rng.uniform(0.3, 0.7, n_bins)
+    shift = np.zeros(n_bins)
+    shift[:20] = 0.35
+    pat = {"A": base, "B": np.clip(base + shift, 0, 1)}
+    prof, types = {}, {}
+    for i in range(160):
+        ty = "A" if i % 2 else "B"
+        h = []
+        for _ in range(2):
+            n = rng.poisson(15, n_bins).astype(np.int32)
+            h.append((rng.binomial(n, pat[ty]).astype(np.float32), n))
+        prof[f"s{i}"] = (keys, h[0][0] + h[1][0], h[0][1] + h[1][1],
+                         h[0][0], h[0][1])
+        types[f"s{i}"] = ty
+    ds = acc.doublet_scores({"GCH": prof}, types, seed=0)
+    assert ds["doublet_score"].notna().all()
+
+
+def test_methylation_at_open_sites_and_away_from_them(tmp_path):
+    df = pd.DataFrame({"chrom": "chr1", "pos1": [1_000, 50_000],
+                       "pos2": [30_000, 90_000], "n1": np.int32(10),
+                       "n2": np.int32(10), "k1": np.int32([6, 1]),
+                       "k2": np.int32([2, 1])})
+    f = tmp_path / "c.read_pairs.parquet"
+    df.to_parquet(f)
+    sites = acc._codes_of(["chr1"]) * acc.STRIDE + np.array([1_050])
+    k, n, ko, no, kd, nd = acc._count_pass(f, set(), sites, 200, 5000)
+    assert (k, n) == (10.0, 40.0)
+    assert (ko, no) == (6.0, 10.0)                  # the end at the site
+    assert (kd, nd) == (4.0, 30.0)                  # the three far from it

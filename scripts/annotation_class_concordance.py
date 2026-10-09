@@ -1331,7 +1331,8 @@ def _type_impute(v, t) -> np.ndarray:
     return np.nan_to_num(s_.fillna(m).fillna(s_.mean()).to_numpy(float))
 
 
-def _total_split(y, t, Xo, avail, B, noise_v, perm_v, perm_sd) -> dict:
+def _total_split(y, t, Xo, avail, B, noise_v, perm_v, perm_sd,
+                 nonlinear: bool = False) -> dict:
     """The variance of a per-cell statistic over ALL cells, split.
 
     Sampling noise (``noise_v``: the control's within-type variance); which
@@ -1344,7 +1345,14 @@ def _total_split(y, t, Xo, avail, B, noise_v, perm_v, perm_sd) -> dict:
     variation between cells that none of them accounts for, the residual
     variance less ``perm_v`` -- with a one-sided p against the
     reassignment's spread ``perm_sd``.  Also cell type's R^2 alone and its
-    unique part (with everything else in the model first)."""
+    unique part (with everything else in the model first).
+
+    ``nonlinear``: how much of it any function of the same covariates
+    could explain -- the cross-validated R^2 of gradient-boosted trees
+    (curves, thresholds, interactions), beside a linear fit's on the same
+    folds -- and what would be left then (tot_residual_nonlinear): an
+    effect of labeling or depth that is not a straight line would
+    otherwise pass for unexplained cell-to-cell variation."""
     from scipy.stats import norm
     n = y.size
     yc = y - y.mean()
@@ -1394,6 +1402,20 @@ def _total_split(y, t, Xo, avail, B, noise_v, perm_v, perm_sd) -> dict:
     out["residual_var"] = resid
     if np.isfinite(perm_sd) and perm_sd > 0:
         out["residual_p"] = float(norm.sf(resid / perm_sd))
+    if nonlinear and Z.size and n >= 50:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        from sklearn.linear_model import LinearRegression
+        from sklearn.model_selection import KFold, cross_val_predict
+        kf = KFold(5, shuffle=True, random_state=0)
+        ss = float(yc @ yc)
+        for nm, mdl in (("linear", LinearRegression()),
+                        ("nonlinear", HistGradientBoostingRegressor(
+                            max_iter=100, learning_rate=0.1,
+                            min_samples_leaf=20, random_state=0))):
+            pred = cross_val_predict(mdl, Z, yc, cv=kf)
+            out[f"R2_cv_{nm}"] = float(1 - ((yc - pred) ** 2).sum() / ss)
+        r2n = max(out["R2_cv_nonlinear"], out["R2_cv_linear"], r2a, 0.0)
+        out["tot_residual_nonlinear"] = max((1 - r2n) * V - base, 0) / V
     return out
 
 
@@ -1484,15 +1506,31 @@ def open_site_coords(path=None, genes=None, cpg=None, exclude=()):
     return g, label
 
 
-def _count_pass(path, exclude) -> tuple:
+def _count_pass(path, exclude, open_g=None, open_w: int = 200,
+                distal_min: int = 5000) -> tuple:
     """One cell's raw methylation from a read-pairs file (k methylated of n
-    sites per end): the sites methylated and the sites, over all its
-    ends."""
-    df, names, ci, lut = _categorical(path, ["chrom", "k1", "n1", "k2", "n2"])
+    sites per end): the sites methylated and the sites over all its ends --
+    and, with ``open_g``, over its ends within ``open_w`` of an open site
+    and its ends at least ``distal_min`` from every one (k, n, k_open,
+    n_open, k_distal, n_distal)."""
+    cols = ["chrom", "k1", "n1", "k2", "n2"]
+    if open_g is not None:
+        cols += ["pos1", "pos2"]
+    df, names, ci, lut = _categorical(path, cols)
     ok = np.array([_canon(c) not in exclude for c in names] + [False])[ci]
-    k = float(df["k1"].to_numpy()[ok].sum() + df["k2"].to_numpy()[ok].sum())
-    n = float(df["n1"].to_numpy()[ok].sum() + df["n2"].to_numpy()[ok].sum())
-    return k, n
+    k = np.concatenate([df["k1"].to_numpy()[ok], df["k2"].to_numpy()[ok]]
+                       ).astype(float)
+    n = np.concatenate([df["n1"].to_numpy()[ok], df["n2"].to_numpy()[ok]]
+                       ).astype(float)
+    out = [float(k.sum()), float(n.sum())]
+    if open_g is not None and open_g.size:
+        base = lut[ci][ok] * STRIDE
+        g = np.concatenate([base + df["pos1"].to_numpy(np.int64)[ok],
+                            base + df["pos2"].to_numpy(np.int64)[ok]])
+        dist = _nearest(open_g, g)
+        for m in (dist <= open_w, dist >= distal_min):
+            out += [float(k[m].sum()), float(n[m].sum())]
+    return tuple(out)
 
 
 def substructure_pcs(profiles: dict, types: dict, n_pcs: int = 5,
@@ -1588,11 +1626,12 @@ def doublet_scores(profiles: dict, types: dict = None, n_pcs: int = 30,
     a random half of another's, bin by bin -- one cell's depth, so a
     simulated doublet is as noisy as a real cell (merged whole, it would be
     less noisy than any real cell and crowd every neighbourhood).  With
-    ``types``, only from two types the profiles tell apart -- centroids at
-    least ``min_sep`` times their spread apart in the principal components
-    of the real cells: a doublet of two types that look alike cannot be
-    told from one cell, and simulating it would only crowd those types'
-    neighbourhoods.  Real and simulated cells share the components (bins
+    ``types``, only from two types the profiles tell apart -- d' >=
+    ``min_sep`` along the line between their centroids in the principal
+    components of the real cells (the centroids' distance over the types'
+    spread along that line; noise off the line does not count): a doublet
+    of two types that look alike cannot be told from one cell, and
+    simulating it would only crowd those types' neighbourhoods.  Real and simulated cells share the components (bins
     observed in ``min_cover`` of the real cells, each standardized over
     them); a cell's score is the share of simulated doublets among its
     ``k`` nearest neighbours (default sqrt(n) / 2).
@@ -1628,18 +1667,32 @@ def doublet_scores(profiles: dict, types: dict = None, n_pcs: int = 30,
         t = np.array([str(types.get(c, "")) for c in cells])
         ut = np.unique(t)
         cen = np.array([P[t == x].mean(0) for x in ut])
-        spr = np.array([np.sqrt(((P[t == x] - P[t == x].mean(0)) ** 2)
-                                .sum(1).mean()) for x in ut])
-        sep = (np.linalg.norm(cen[:, None] - cen[None], axis=2)
-               / np.maximum(0.5 * (spr[:, None] + spr[None]), 1e-12))
-        ok_pair = sep >= min_sep
-        np.fill_diagonal(ok_pair, False)
+        # a centroid's noise: two types that do not differ still lie
+        # sum(var) / n apart, squared -- taken off before d' is formed
+        cnoise = np.array([P[t == x].var(0).sum() / max((t == x).sum(), 1)
+                           for x in ut])
+        ok_pair = np.zeros((ut.size, ut.size), bool)
+        for i in range(ut.size):
+            for j in range(i + 1, ut.size):
+                dv = cen[j] - cen[i]
+                d2 = float(dv @ dv)
+                if d2 == 0:
+                    continue
+                u = dv / np.sqrt(d2)
+                vi = ((P[t == ut[i]] - cen[i]) @ u).var()
+                vj = ((P[t == ut[j]] - cen[j]) @ u).var()
+                dpr = (np.sqrt(max(d2 - cnoise[i] - cnoise[j], 0))
+                       / np.sqrt(max(0.5 * (vi + vj), 1e-12)))
+                ok_pair[i, j] = ok_pair[j, i] = dpr >= min_sep
         ti = np.searchsorted(ut, t)
         can = np.flatnonzero(ok_pair[ti].any(1))   # cells with a partner type
         if can.size == 0:
             logger.warning("doublet score: no two cell types are told apart "
                            "by their regional profiles; not scored")
             return none
+        logger.info(f"doublet score: {int(ok_pair.sum() // 2)} of "
+                    f"{ut.size * (ut.size - 1) // 2} type pairs told apart "
+                    f"(d' >= {min_sep:g}) and simulated")
         a = can[rng.integers(0, can.size, n_sim)]
         b = np.empty(n_sim, np.int64)
         for x in np.unique(ti[a]):
@@ -1837,12 +1890,12 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
       and per batch column an F test (batch_<col>_p);
     - the same full fit on the control, which has nothing to explain
       (control_R2_adj: well above 0 means a covariate tracks noise);
-    - for same-state pairs, R2_adj_all shared out among the covariate
-      groups (COV_GROUPS, and batch) by their Shapley values -- each
-      group's added R^2 averaged over every order the groups could enter
-      in, so what two groups explain together is split between them --
-      as shap_<group>, shares of the total within-type variance that add up
-      to R2_adj_all.
+    - for same-state pairs over all distances, R2_adj_all shared out among
+      the covariate groups (COV_GROUPS, and batch) by their Shapley values
+      -- each group's added R^2 averaged over every order the groups could
+      enter in, so what two groups explain together is split between them
+      -- as shap_<group>, shares of the total within-type variance that add
+      up to R2_adj_all.
 
     'scale' is the cell's two class SDs multiplied: C is a covariance, so a
     cell whose posteriors vary more in these classes has a larger ΔC at the
@@ -1954,7 +2007,10 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                 if np.isfinite(r2a) and np.isfinite(cs) and cs > 0:
                     row["explained_cell_share"] = float(
                         np.clip(max(r2a, 0) / cs, 0, 1))
-            if k1 == k2 and np.isfinite(r2a):
+            # the splits for the all-distance band, which the figures show
+            # (2^groups regressions each)
+            whole = k1 == k2 and str(bl).startswith("all")
+            if whole and np.isfinite(r2a):
                 groups = {}
                 for gname, cols in COV_GROUPS:
                     jj = [avail.index(x) for x in cols if x in avail]
@@ -1969,7 +2025,7 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                     for gname, v in phi.items():
                         row[f"shap_{gname}"] = (v * f_ if np.isfinite(v)
                                                 else np.nan)
-            if k1 == k2:
+            if whole:
                 # over all cells, cell type a component of its own
                 Bt = [pd.get_dummies(d.loc[ok, b].astype(str),
                                      drop_first=True).to_numpy(float)
@@ -1979,7 +2035,8 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
                 row.update(_total_split(
                     y0[ok], t, Xo, avail, Bt, vc,
                     row.get("var_perm", np.nan),
-                    row.get("var_perm_sd", np.nan)))
+                    row.get("var_perm_sd", np.nan),
+                    nonlinear=stat in ("delta", "signed_rel")))
             rows.append(row)
     out = pd.DataFrame(rows)
     if not out.empty:
@@ -1995,7 +2052,10 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
 
 def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
                             min_cells: int = 30,
-                            min_reliability: float = 0.2) -> pd.DataFrame:
+                            min_reliability: float = 0.2,
+                            stat: str = "delta", cov: pd.DataFrame = None,
+                            ctx_cov: dict = None,
+                            batch_cols=()) -> pd.DataFrame:
     """Is the within-type variation one per-cell factor or region-specific?
 
     Per context and system, between DISJOINT same-state class pairs (A-A
@@ -2008,20 +2068,30 @@ def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
     each class varies on its own.  Not corrected (NaN) when a reliability
     is under ``min_reliability``: dividing by a near-zero reliability gives
     anything.  Classes of different systems share contacts, so they are not
-    compared."""
+    compared.
+
+    With ``cov``, also r_resid: the same correlation of what is left in
+    each class after cell type, every covariate and batch are regressed out
+    (:func:`_residualize`).  If the classes still move together, what is
+    left is one per-cell factor none of them measures -- a nucleus-wide
+    state, or a technical factor not yet in the model; if not, what is left
+    is particular to regions."""
     all_b = next((b for b in dict.fromkeys(percell["band"])
                   if str(b).startswith("all")), None)
     pc = percell[(percell["band"] == all_b) & percell["enough_pairs"]
                  & (percell["anchor"] == percell["partner"])]
     rel = {}
     s_all = summary[summary["band"] == all_b]
+    hcol = "split_half_r" if stat == "delta" else f"{stat}_split_half_r"
+    resid = (_residualize(pc, stat, cov, ctx_cov, batch_cols,
+                          keep_type=False) if cov is not None else None)
     for _, r in s_all[s_all["anchor"] == s_all["partner"]].iterrows():
-        h = r.get("split_half_r", np.nan)
+        h = r.get(hcol, np.nan)
         rel[(r["context"], r["system"], r["anchor"])] = (
             2 * h / (1 + h) if np.isfinite(h) and h > 0 else np.nan)
     rows = []
     for (ctx, sy), g in pc.groupby(["context", "system"], sort=False):
-        W = g.pivot_table(index="cell", columns="anchor", values="delta")
+        W = g.pivot_table(index="cell", columns="anchor", values=stat)
         t = (g.drop_duplicates("cell").set_index("cell")["cell_type"]
              .reindex(W.index))
         Wc = W - W.groupby(t).transform("mean")
@@ -2034,7 +2104,16 @@ def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
                 r_ = float(np.corrcoef(Wc.loc[both, a], Wc.loc[both, b])[0, 1])
                 ra, rb = rel.get((ctx, sy, a), np.nan), rel.get((ctx, sy, b),
                                                                  np.nan)
-                rows.append({"context": ctx, "system": sy, "state_1": a,
+                rr = np.nan
+                if resid is not None and (ctx, sy, a) in resid and \
+                        (ctx, sy, b) in resid:
+                    xa, xb = resid[(ctx, sy, a)], resid[(ctx, sy, b)]
+                    m_ = xa.notna() & xb.notna()
+                    if m_.sum() >= min_cells and xa[m_].std() > 0 \
+                            and xb[m_].std() > 0:
+                        rr = float(np.corrcoef(xa[m_], xb[m_])[0, 1])
+                rows.append({"context": ctx, "system": sy, "statistic": stat,
+                             "state_1": a, "r_resid": rr,
                              "state_2": b, "cells": int(both.sum()), "r": r_,
                              "reliability_1": ra, "reliability_2": rb,
                              "r_disattenuated": (
@@ -2097,16 +2176,20 @@ def _cv_type_auc(X, y, n_folds: int, seed: int, n_boot: int = 200,
     return float(per.mean()), float(lo), float(hi), dict(zip(labels, per))
 
 
-def _remove_technical(pc: pd.DataFrame, stat: str, cov: pd.DataFrame,
-                      ctx_cov: dict, batch_cols=()) -> pd.DataFrame:
-    """Per region group, the statistic with the technical groups
-    (TECHNICAL_GROUPS: depth and call quality, batch, labeling efficiency,
-    scale) regressed out -- their effects estimated with cell type in the
-    model, as ComBat does with cell type as a covariate, so a difference
-    between types that the technical factors do not account for stays.
-    Cells x (context, system, class)."""
-    tech = [c for g, cols in COV_GROUPS if g in TECHNICAL_GROUPS
-            for c in cols]
+def _residualize(pc: pd.DataFrame, stat: str, cov: pd.DataFrame,
+                 ctx_cov: dict, batch_cols=(), groups=None,
+                 keep_type: bool = True) -> pd.DataFrame:
+    """Per region group (context, system, class), the per-cell statistic
+    with covariate ``groups`` (all of COV_GROUPS by default) and batch
+    regressed out of it, in one OLS with cell type in the model (a missing
+    covariate at its type's mean).  ``keep_type``: only the covariates'
+    part is taken out -- as ComBat does with cell type as a covariate, so
+    a difference between types they do not account for stays; otherwise
+    cell type's part goes too, leaving what nothing measured accounts
+    for.  Cells x (context, system, class)."""
+    want = [c for g, cols in COV_GROUPS
+            if groups is None or g in groups for c in cols]
+    use_batch = groups is None or "batch" in groups
     out = {}
     for key, g in pc.groupby(["context", "system", "anchor"], sort=False):
         d = g.merge(cov.drop(columns=["cell_type"], errors="ignore"),
@@ -2119,24 +2202,42 @@ def _remove_technical(pc: pd.DataFrame, stat: str, cov: pd.DataFrame,
         y = d[stat].to_numpy(float)
         ok = np.isfinite(y)
         t = d["cell_type"].astype(str).to_numpy()
-        res = y.copy()
-        av = [c for c in tech if c in d and d[c].notna().sum() >= 10
+        res = np.full(y.size, np.nan)
+        av = [c for c in want if c in d and d[c].notna().sum() >= 10
               and d[c].nunique() > 1]
         Z = [_type_impute(d[c].to_numpy(float)[ok], t[ok]) for c in av]
-        for b in batch_cols:
-            if b in d and d[b].nunique() > 1:
-                Z += list(pd.get_dummies(d.loc[ok, b].astype(str),
-                                         drop_first=True).to_numpy(float).T)
-        if Z and ok.sum() > len(Z) + 10:
-            Z = np.column_stack(Z)
-            Z = Z - Z.mean(0)
-            Tm = pd.get_dummies(pd.Series(t[ok]), drop_first=True).to_numpy(
-                float)
-            M = np.column_stack([Tm - Tm.mean(0), Z]) if Tm.size else Z
-            beta = np.linalg.lstsq(M, y[ok] - y[ok].mean(), rcond=None)[0]
-            res[ok] = y[ok] - Z @ beta[M.shape[1] - Z.shape[1]:]
+        if use_batch:
+            for b in batch_cols:
+                if b in d and d[b].nunique() > 1:
+                    Z += list(pd.get_dummies(d.loc[ok, b].astype(str),
+                                             drop_first=True).to_numpy(
+                        float).T)
+        yo = y[ok] - y[ok].mean()
+        Tm = pd.get_dummies(pd.Series(t[ok]), drop_first=True).to_numpy(float)
+        Tm = Tm - Tm.mean(0) if Tm.size else Tm
+        Z = np.column_stack(Z) - np.column_stack(Z).mean(0) if Z else None
+        if Z is not None and ok.sum() > Z.shape[1] + Tm.shape[1] + 10:
+            M = np.column_stack([Tm, Z]) if Tm.size else Z
+            beta = np.linalg.lstsq(M, yo, rcond=None)[0]
+            fit = Z @ beta[Tm.shape[1]:] + (
+                0 if keep_type or not Tm.size else Tm @ beta[:Tm.shape[1]])
+            res[ok] = (y[ok] if keep_type else yo) - fit
+        elif not keep_type and Tm.size:
+            beta = np.linalg.lstsq(Tm, yo, rcond=None)[0]
+            res[ok] = yo - Tm @ beta
+        else:
+            res[ok] = y[ok] if keep_type else yo
         out[key] = pd.Series(res, index=d["cell"].to_numpy())
     return pd.DataFrame(out)
+
+
+def _remove_technical(pc: pd.DataFrame, stat: str, cov: pd.DataFrame,
+                      ctx_cov: dict, batch_cols=()) -> pd.DataFrame:
+    """The statistic with the technical groups (TECHNICAL_GROUPS: depth and
+    call quality, batch, labeling efficiency, scale, doublets, bisulfite
+    conversion) regressed out, cell type protected (:func:`_residualize`)."""
+    return _residualize(pc, stat, cov, ctx_cov, batch_cols,
+                        groups=TECHNICAL_GROUPS, keep_type=True)
 
 
 def celltype_auc(percell: pd.DataFrame, stat: str = "signed_rel",
@@ -2353,6 +2454,125 @@ def plot_celltype_auc(res: pd.DataFrame, per: pd.DataFrame, stat: str, path):
         fig.suptitle(f"How well {_STAT_LABEL.get(stat, stat)} in each region "
                      f"group predicts cell type (random forest, cross-"
                      f"validated)", fontsize=7, y=0.985)
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+# --------------------------------------------------- cell x chromosome --
+
+
+def cell_chromosome_test(g_lo, cell, ctype, d, n_perm: int, rng,
+                         min_contacts: int = 50) -> dict:
+    """Does a cell's concordance differ between its own chromosomes beyond
+    sampling -- a cell-specific state of whole territories?
+
+    Per cell and chromosome with >= ``min_contacts`` contacts, the mean of
+    the contacts' parts of ΔC (``d``).  An additive fit -- a cell effect
+    plus a chromosome effect, least squares over the entries -- leaves each
+    entry's cell x chromosome interaction plus sampling.  Reassigning each
+    chromosome's contacts among the cells of a type, every cell keeping its
+    number on each chromosome, leaves sampling (and how the types differ
+    between chromosomes) only; the observed residual beyond that is the
+    cell x chromosome part.  Returns the entries' variance and its shares --
+    chromosome, cell (the fitted effects), sampling, cell x chromosome --
+    with a permutation p."""
+    cell = np.asarray(cell, np.int64)
+    ctype = np.asarray(ctype, np.int64)
+    chrom = np.asarray(g_lo, np.int64) // STRIDE
+    codes, ci = np.unique(chrom, return_inverse=True)
+    K, C = codes.size, ctype.size
+    key = cell * K + ci
+    N = np.bincount(key, minlength=C * K).reshape(C, K)
+    ok = N >= min_contacts
+    for _ in range(3):                      # cells and chromosomes enough
+        ok &= (ok.sum(1) >= 2)[:, None] & (ok.sum(0) >= 10)[None, :]
+    out = {"cells": int(ok.any(1).sum()), "chromosomes": int(ok.any(0).sum()),
+           "entries": int(ok.sum())}
+    if out["entries"] < 50:
+        return out
+    W = ok.astype(float)
+
+    def fit(dv):
+        S = np.bincount(key, weights=dv, minlength=C * K).reshape(C, K)
+        Y = np.where(ok, S / np.maximum(N, 1), 0.0)
+        a, b = np.zeros(C), np.zeros(K)
+        for _ in range(50):
+            b = (W * (Y - a[:, None])).sum(0) / np.maximum(W.sum(0), 1)
+            a = (W * (Y - b[None, :])).sum(1) / np.maximum(W.sum(1), 1)
+        R = (Y - a[:, None] - b[None, :]) * W
+        return Y, a, b, float((R ** 2).sum() / W.sum())
+    Y, a, b, r_obs = fit(np.asarray(d, float))
+    blk = ctype[cell] * K + ci
+    o = np.argsort(blk, kind="stable")
+    bs = blk[o]
+    st = np.flatnonzero(np.r_[True, bs[1:] != bs[:-1]])
+    en = np.r_[st[1:], bs.size]
+    multi = [(x, y) for x, y in zip(st, en) if y - x > 1]
+    do = np.asarray(d, float)[o]
+    null = []
+    for _ in range(int(n_perm)):
+        pidx = np.arange(bs.size)
+        for x, y in multi:
+            pidx[x:y] = x + rng.permutation(y - x)
+        dp = np.empty_like(do)
+        dp[o] = do[pidx]
+        null.append(fit(dp)[3])
+    null = np.asarray(null)
+    yv = Y[ok]
+    v = float(yv.var())
+    out.update({"var_entries": v, "residual_var": r_obs})
+    if v > 0:
+        out["chromosome_share"] = float(np.broadcast_to(b[None, :], Y.shape)[
+            ok].var() / v)
+        out["cell_share"] = float(np.broadcast_to(a[:, None], Y.shape)[
+            ok].var() / v)
+    if null.size:
+        out["null_residual_var"] = float(null.mean())
+        out["null_residual_sd"] = float(null.std(ddof=1)) if null.size > 1 \
+            else np.nan
+        out["sampling_share"] = float(null.mean() / v) if v > 0 else np.nan
+        out["cell_x_chromosome_share"] = (float(max(r_obs - null.mean(), 0)
+                                                / v) if v > 0 else np.nan)
+        out["perm_p"] = float((1 + (null >= r_obs).sum()) / (null.size + 1))
+    return out
+
+
+def plot_cell_chromosome(tab: pd.DataFrame, path):
+    """Per context, the variance of the cells' per-chromosome concordance
+    split into chromosome, cell, sampling and cell x chromosome."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    if tab.empty or "sampling_share" not in tab:
+        return
+    parts = (("chromosome_share", "#525252", "chromosome"),
+             ("cell_share", "#08519c", "cell"),
+             ("sampling_share", "0.85", "sampling (+ type x chromosome)"),
+             ("cell_x_chromosome_share", "#cb181d", "cell x chromosome"))
+    with plt.rc_context(figure_style.RC):
+        fig, ax = plt.subplots(figsize=(figure_style.FIG_W_IN * 0.6,
+                                        0.8 + 0.3 * len(tab)))
+        yy = np.arange(len(tab))
+        W_ = np.column_stack([np.clip(np.nan_to_num(tab[c].to_numpy(float)),
+                                      0, None) for c, _, _ in parts])
+        W_ = W_ / np.maximum(W_.sum(1, keepdims=True), 1e-12)
+        left = np.zeros(len(tab))
+        for j, (_, c_, lab) in enumerate(parts):
+            ax.barh(yy, W_[:, j], left=left, color=c_, label=lab, height=0.6)
+            left += W_[:, j]
+        for i, (_, r) in enumerate(tab.iterrows()):
+            ax.text(1.01, i, f"p = {r.get('perm_p', np.nan):.3g}",
+                    va="center", fontsize=5)
+        ax.set_yticks(yy)
+        ax.set_yticklabels(tab["context"])
+        ax.set_ylim(len(tab) - 0.5, -0.5)
+        ax.set_xlim(0, 1)
+        ax.set_xlabel("share of the variance of per-cell, per-chromosome ΔC")
+        ax.legend(fontsize=5, loc="upper left", bbox_to_anchor=(1.12, 1.0),
+                  borderaxespad=0)
+        ax.set_title("Does a cell's concordance differ between its own "
+                     "chromosomes?", loc="left", fontsize=6.5)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
 
@@ -2630,7 +2850,7 @@ def hotspot_enrichment(hs: pd.DataFrame, tracks: dict) -> pd.DataFrame:
     return out
 
 
-def plot_cross_class(cc: pd.DataFrame, context: str, path):
+def plot_cross_class(cc: pd.DataFrame, context: str, path, stat: str = None):
     """Per system, the noise-corrected correlation across cells between its
     same-state class pairs' per-cell ΔC."""
     import matplotlib
@@ -2638,10 +2858,16 @@ def plot_cross_class(cc: pd.DataFrame, context: str, path):
     import matplotlib.pyplot as plt
     from nome_hic_concordance import figure_style
     a = cc[cc["context"] == context] if not cc.empty else cc
+    if stat is not None and "statistic" in a:
+        a = a[a["statistic"] == stat]
     if a.empty:
         return
     systems = [x for x in SYSTEMS if x in set(a["system"])] + [
         x for x in dict.fromkeys(a["system"]) if x not in SYSTEMS]
+    rows_ = [("r_disattenuated", "r", "noise-corrected")]
+    if "r_resid" in a and a["r_resid"].notna().any():
+        rows_.append(("r_resid", "r_resid", "after cell type, every "
+                                            "covariate and batch"))
     states = {sy: list(dict.fromkeys(
         list(a.loc[a["system"] == sy, "state_1"])
         + list(a.loc[a["system"] == sy, "state_2"]))) for sy in systems}
@@ -2650,49 +2876,55 @@ def plot_cross_class(cc: pd.DataFrame, context: str, path):
         # panel widths follow the number of states, so that every cell has
         # the same size
         fig, axes = plt.subplots(
-            1, len(systems), squeeze=False,
-            figsize=(figure_style.FIG_W_IN, 1.2 + 0.3 * n_max),
-            gridspec_kw={"wspace": 0.6, "width_ratios":
+            len(rows_), len(systems), squeeze=False,
+            figsize=(figure_style.FIG_W_IN,
+                     (1.2 + 0.3 * n_max) * len(rows_)),
+            gridspec_kw={"wspace": 0.6, "hspace": 0.9, "width_ratios":
                          [max(len(states[sy]), 2) for sy in systems]})
-        for ax, sy in zip(axes[0], systems):
-            b = a[a["system"] == sy]
-            st = states[sy]
-            M = np.full((len(st), len(st)), np.nan)
-            Mr = M.copy()
-            np.fill_diagonal(M, 1.0)
-            for _, r in b.iterrows():
-                i, j = st.index(r["state_1"]), st.index(r["state_2"])
-                M[i, j] = M[j, i] = r["r_disattenuated"]
-                Mr[i, j] = Mr[j, i] = r["r"]
-            # raw r, faint, where a class is too noisy to correct for
-            ax.imshow(np.where(np.isfinite(M), np.nan, np.clip(Mr, -1, 1)),
-                      cmap="RdBu_r", vmin=-1, vmax=1, alpha=0.35)
-            im = ax.imshow(np.clip(M, -1, 1), cmap="RdBu_r", vmin=-1, vmax=1)
-            for i in range(len(st)):
-                for j in range(len(st)):
-                    if i == j:
-                        continue
-                    if np.isfinite(M[i, j]):
-                        # noise correction can overshoot 1 when the
-                        # reliabilities are themselves noisy
-                        ax.text(j, i, ">1" if M[i, j] > 1 else
-                                f"{M[i, j]:.2f}".replace("0.", ".", 1),
-                                ha="center", va="center", fontsize=4.5)
-                    elif np.isfinite(Mr[i, j]):
-                        ax.text(j, i, f"({Mr[i, j]:.2f})".replace(
-                            "0.", ".", 1), ha="center", va="center",
-                            fontsize=4.5, color="0.4")
-            ax.set_xticks(range(len(st)))
-            ax.set_xticklabels(st, rotation=60, ha="right", fontsize=5)
-            ax.set_yticks(range(len(st)))
-            ax.set_yticklabels(st, fontsize=5)
-            ax.set_title(SYSTEM_LABEL.get(sy, sy), fontsize=6)
-        cb = fig.colorbar(im, ax=axes[0].tolist(), fraction=0.02, pad=0.02)
+        for ri, (val, raw, what) in enumerate(rows_):
+            for ax, sy in zip(axes[ri], systems):
+                b = a[a["system"] == sy]
+                st = states[sy]
+                M = np.full((len(st), len(st)), np.nan)
+                Mr = M.copy()
+                np.fill_diagonal(M, 1.0)
+                for _, r in b.iterrows():
+                    i, j = st.index(r["state_1"]), st.index(r["state_2"])
+                    M[i, j] = M[j, i] = r[val]
+                    Mr[i, j] = Mr[j, i] = r[raw]
+                # raw r, faint, where a class is too noisy to correct for
+                ax.imshow(np.where(np.isfinite(M), np.nan, np.clip(Mr, -1, 1)),
+                          cmap="RdBu_r", vmin=-1, vmax=1, alpha=0.35)
+                im = ax.imshow(np.clip(M, -1, 1), cmap="RdBu_r", vmin=-1,
+                               vmax=1)
+                for i in range(len(st)):
+                    for j in range(len(st)):
+                        if i == j:
+                            continue
+                        if np.isfinite(M[i, j]):
+                            # noise correction can overshoot 1 when the
+                            # reliabilities are themselves noisy
+                            ax.text(j, i, ">1" if M[i, j] > 1 else
+                                    f"{M[i, j]:.2f}".replace("0.", ".", 1),
+                                    ha="center", va="center", fontsize=4.5)
+                        elif np.isfinite(Mr[i, j]):
+                            ax.text(j, i, f"({Mr[i, j]:.2f})".replace(
+                                "0.", ".", 1), ha="center", va="center",
+                                fontsize=4.5, color="0.4")
+                ax.set_xticks(range(len(st)))
+                ax.set_xticklabels(st, rotation=60, ha="right", fontsize=5)
+                ax.set_yticks(range(len(st)))
+                ax.set_yticklabels(st, fontsize=5)
+                ax.set_title(SYSTEM_LABEL.get(sy, sy) + (
+                    f"\n({what})" if sy == systems[0] else ""), fontsize=6)
+        cb = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02,
+                          pad=0.02)
         cb.ax.tick_params(labelsize=5)
         cb.set_label("r across cells, noise-corrected", fontsize=6)
-        fig.suptitle(f"{context}: does a cell's ΔC move together across "
-                     f"states?\n(in brackets, faint: raw r -- a class too "
-                     f"noisy across cells to correct for)", fontsize=7)
+        fig.suptitle(f"{context}: does a cell's "
+                     f"{_STAT_LABEL.get(stat or 'delta', stat)} move together "
+                     f"across states?\n(in brackets, faint: raw r -- a class "
+                     f"too noisy across cells to correct for)", fontsize=7)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
 
@@ -2794,10 +3026,13 @@ def plot_variance_total(assoc: pd.DataFrame, context: str, stat: str, path,
         for w, c_, lab in parts:
             ax.barh(yy, w, left=left, color=c_, label=lab, height=0.72)
             left = left + w
+        rn = col("tot_residual_nonlinear")
         for i in range(ny):
             r_ = parts[-1][0][i]
             ax.text(1.01, i, f"{100 * r_:.0f}%"
-                    + ("*" if np.isfinite(q[i]) and q[i] < q_cut else ""),
+                    + ("*" if np.isfinite(q[i]) and q[i] < q_cut else "")
+                    + (f" · {100 * rn[i]:.0f}% nonlin." if np.isfinite(rn[i])
+                       else ""),
                     va="center", ha="left", fontsize=5)
             ct = col("tot_cell type")[i]
             if np.isfinite(ct):
@@ -2811,11 +3046,13 @@ def plot_variance_total(assoc: pd.DataFrame, context: str, stat: str, path,
         ax.set_ylim(ny - 0.5, -0.5)
         ax.set_xlim(0, 1)
         ax.set_xlabel("share of the variance across all cells")
-        ax.legend(fontsize=5, loc="upper left", bbox_to_anchor=(1.07, 1.0),
+        ax.legend(fontsize=5, loc="upper left", bbox_to_anchor=(1.17, 1.0),
                   borderaxespad=0)
         ax.set_title(f"{context} — {_STAT_LABEL.get(stat, stat)}: what varies "
                      f"between cells (right: unexplained, * more than "
-                     f"sampling at q < {q_cut:g})", loc="left", fontsize=6.5)
+                     f"sampling at q < {q_cut:g}; nonlin.: left even by a "
+                     f"nonlinear fit of the covariates)", loc="left",
+                     fontsize=6.5)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
 
@@ -2835,7 +3072,8 @@ def plot_extra_covariates(cov: pd.DataFrame, path):
         ("pmd_depth", "PMD depth (HMD − PMD, HCG)"),
         ("mca_index", "mCA index"),
         ("doublet_score", "doublet score"),
-        ("nonconversion", "non-conversion (HCY methylated)"))
+        ("nonconversion", "non-conversion (HCY, distal)"),
+        ("hcy_open_excess", "HCY: open sites − distal"))
         if c in cov and cov[c].notna().sum() > 2]
     has_pc = all(c in cov and cov[c].notna().sum() > 2
                  for c in ("sub_pc1", "sub_pc2"))
@@ -2864,7 +3102,7 @@ def plot_extra_covariates(cov: pd.DataFrame, path):
             a_.set_xticklabels([types[i] for i in keep], rotation=60,
                                ha="right")
             a_.set_ylabel(lab)
-            if c == "mca_index":
+            if c in ("mca_index", "hcy_open_excess"):
                 a_.axhline(0, color="0.5", lw=0.5, ls="--")
         if has_pc:
             a_ = ax[-1]
@@ -3892,7 +4130,7 @@ def main(argv=None) -> int:
     locus_rows: list = []
     extra_cov: dict = {}           # cell-level covariates of the later checks
     profiles: dict = {}            # per context: the cells' regional profiles
-    hot_rows, enrich_rows = [], []
+    hot_rows, enrich_rows, chrom_rows = [], [], []
     prof_bin = args.substructure_bin if cell_cov is not None else 0
     for ci_ctx, (ctx, d) in enumerate(contexts.items()):
         cells = [c for c in cells_all
@@ -3935,7 +4173,7 @@ def main(argv=None) -> int:
             profiles[ctx] = {c: r["prof"] for c, r in zip(cells, res_)
                              if r.get("prof") is not None}
         grid = BinGrid(chrom_names, 300_000_000, args.hotspot_bin)
-        best_hot = None
+        best_hot = best_arrays = None
         type_code = pd.factorize(types)[0]
         cell = np.concatenate([np.full(r["g_lo"].size, i, np.int64)
                                for i, r in enumerate(res_)])
@@ -4003,13 +4241,15 @@ def main(argv=None) -> int:
             n2 = 0.5 * (x_ * right[1, idx] + left[1, idx] * y_)
             # each contact's part of ΔC, and of the control
             d_, c_ = 2 * (x_ * y_ - n1), 2 * (n2 - n1)
-            if not args.no_hotspots and idx.size and (
+            if idx.size and (
                     args.hotspot_system == name
                     or (args.hotspot_system == "auto" and (
                         best_hot is None or idx.size > best_hot[0]))):
-                best_hot = (idx.size, name, locus_hotspots(
-                    grid, g_lo[idx], g_hi[idx], cell[idx], d_, c_,
-                    band[idx], len(edges) - 1))
+                best_hot = (idx.size, name, None if args.no_hotspots else
+                            locus_hotspots(grid, g_lo[idx], g_hi[idx],
+                                           cell[idx], d_, c_, band[idx],
+                                           len(edges) - 1))
+                best_arrays = (g_lo[idx], cell[idx], d_)
             # Co-open / co-closed mass, for F.  A donor's posterior is put
             # on the RECEIVING cell's level in that class (its centred value
             # plus that cell's mean), as the centring does for C, so a
@@ -4122,7 +4362,22 @@ def main(argv=None) -> int:
             enough = (mg[:, 0, ih] >= 30) & (mg[:, 0, ip] >= 30)
             extra_cov["pmd_depth"] = dict(zip(cells, np.where(
                 enough, mu_[:, ih] - mu_[:, ip], np.nan)))
-        if best_hot is not None:
+        if best_arrays is not None and cell_cov is not None \
+                and args.n_locus_perm > 0:
+            # territories: a cell's concordance on each of its chromosomes
+            ct = cell_chromosome_test(
+                best_arrays[0], best_arrays[1], type_code, best_arrays[2],
+                args.n_locus_perm,
+                np.random.default_rng([args.seed, ci_ctx, 7331]))
+            ct.update({"context": ctx, "system": best_hot[1]})
+            chrom_rows.append(ct)
+            logger.info(f"{ctx} cell x chromosome ({best_hot[1]} null): "
+                        + ", ".join(f"{k} {ct[k]:.3f}" for k in (
+                            "chromosome_share", "cell_share",
+                            "sampling_share", "cell_x_chromosome_share",
+                            "perm_p") if k in ct))
+        best_arrays = None
+        if best_hot is not None and best_hot[2] is not None:
             hs = best_hot[2]
             hs.insert(0, "context", ctx)
             hs.insert(1, "system", best_hot[1])
@@ -4216,27 +4471,52 @@ def main(argv=None) -> int:
                                f"under {dirp}")
                 continue
             kn = Parallel(n_jobs=args.n_threads, prefer="threads")(
-                delayed(_count_pass)(f, exclude) for f in files.values())
-            meth[nm] = {c: (k / n if n >= 100 else np.nan)
-                        for c, (k, n) in zip(files, kn)}
+                delayed(_count_pass)(f, exclude, open_g,
+                                     args.open_site_window)
+                for f in files.values())
+            meth[nm] = {c: (x[0] / x[1] if x[1] >= 100 else np.nan)
+                        for c, x in zip(files, kn)}
             cell_cov[f"meth_{nm}"] = cell_cov["cell"].map(meth[nm])
+            if open_g is not None:
+                # at open sites and away from them: what follows
+                # accessibility is not what the chemistry left
+                for j, part in ((2, "open"), (4, "distal")):
+                    cell_cov[f"meth_{nm}_{part}"] = cell_cov["cell"].map({
+                        c: (x[j] / x[j + 1] if len(x) > j + 1
+                            and x[j + 1] >= 100 else np.nan)
+                        for c, x in zip(files, kn)})
         up = {k.upper(): k for k in meth}
+
+        def _m(nm, part=""):
+            """meth_<name>, away from open sites when that is known: GpC
+            methyltransferase off-target activity, if any, sits where the
+            DNA is open; the chemistry does not care."""
+            c_ = f"meth_{up[nm]}_distal"
+            if part == "" and c_ in cell_cov and cell_cov[c_].notna().any():
+                return cell_cov[c_]
+            return cell_cov[f"meth_{up[nm]}{part}"]
         if "HCY" in up:
             # C neither in a CpG nor a GpC, nor before an A: nothing should
             # methylate it, so what reads methylated was not converted
-            cell_cov["nonconversion"] = cell_cov[f"meth_{up['HCY']}"]
+            cell_cov["nonconversion"] = _m("HCY")
+            if f"meth_{up['HCY']}_open" in cell_cov:
+                cell_cov["hcy_open_excess"] = (
+                    cell_cov[f"meth_{up['HCY']}_open"]
+                    - cell_cov[f"meth_{up['HCY']}_distal"])
         if "GCA" in up and "GCY" in up:
             cell_cov["mca_index_gch"] = (cell_cov[f"meth_{up['GCA']}"]
                                          - cell_cov[f"meth_{up['GCY']}"])
         if "HCA" in up and "HCY" in up:
             # CpA outside GpC less the unconverted background: endogenous
             # mCA with no accessibility in it
-            cell_cov["mca_index"] = (cell_cov[f"meth_{up['HCA']}"]
-                                     - cell_cov[f"meth_{up['HCY']}"])
+            cell_cov["mca_index"] = _m("HCA") - _m("HCY")
         elif "mca_index_gch" in cell_cov:
             cell_cov["mca_index"] = cell_cov["mca_index_gch"]
         for col_, what in (("mca_index", "mCA index"),
-                           ("nonconversion", "non-conversion (HCY)")):
+                           ("nonconversion", "non-conversion (HCY, away "
+                                             "from open sites)"),
+                           ("hcy_open_excess", "HCY methylated at open "
+                                               "sites less away from them")):
             if col_ in cell_cov:
                 logger.info(f"{what} by cell type:\n" + cell_cov.groupby(
                     "cell_type")[col_].describe()[["count", "mean", "50%"]]
@@ -4244,6 +4524,13 @@ def main(argv=None) -> int:
         if meth and "mca_index" not in cell_cov:
             logger.warning("the mCA index needs --context-counts HCA=... and "
                            "HCY=... (or GCA=... and GCY=...)")
+    if chrom_rows:
+        ct_ = pd.DataFrame(chrom_rows)
+        lead = ["context", "system"]
+        ct_[lead + [c for c in ct_.columns if c not in lead]].to_csv(
+            out / "cell_chromosome.tsv", sep="\t", index=False)
+        plot_cell_chromosome(ct_, out / f"cell_chromosome."
+                                        f"{args.plot_format}")
     if hot_rows:
         hs = pd.concat(hot_rows, ignore_index=True)
         en = pd.concat(enrich_rows, ignore_index=True)
@@ -4320,13 +4607,19 @@ def main(argv=None) -> int:
                         "cell part the covariates explain:\n"
                         + top[cols_].to_string(index=False, float_format=
                                                lambda v: f"{v:.3f}"))
-        cc_ = cross_class_correlation(percell, summary,
-                                      args.covariate_min_cells)
+        cc_ = pd.concat([cross_class_correlation(
+            percell, summary, args.covariate_min_cells, stat=st_,
+            cov=cell_cov, ctx_cov=ctx_cov, batch_cols=batch_cols)
+            for st_ in ("delta", "signed_rel")], ignore_index=True)
         cc_.to_csv(out / "cross_class_correlation.tsv", sep="\t",
                    index=False)
         for ctx_ in contexts:
             plot_cross_class(cc_, ctx_, out / f"cross_class_{ctx_}."
-                                              f"{args.plot_format}")
+                                              f"{args.plot_format}",
+                             stat="delta")
+            plot_cross_class(cc_, ctx_, out / f"cross_class_{ctx_}_"
+                                              f"signed_rel.{args.plot_format}",
+                             stat="signed_rel")
     # How well each region group's concordance predicts cell type.
     auc_stats = [x.strip() for x in args.celltype_auc_stats.split(",")
                  if x.strip() and x.strip() != "none"]
