@@ -1146,3 +1146,70 @@ def test_all_regions_pool_every_contact_of_a_system(planted):
     assert (top["anchor"] == acc.ALL_REGIONS).sum() == 1
     cc = pd.read_csv(o / "cross_class_correlation.tsv", sep="\t")
     assert acc.ALL_REGIONS not in set(cc["state_1"]) | set(cc["state_2"])
+
+
+# --------------------------------------------------------------- human --
+
+
+def test_human_chromhmm_group_names_map_to_the_six_classes(tmp_path):
+    groups = {"1_Quies1": "quescient", "2_PromF1": "promoters",
+              "3_EnhWk1": "weak enhancers", "4_TxWk1": "weak transcription",
+              "5_ReprPC1": "polycomb repressed", "6_HET1": "HET",
+              "7_znf1": "znf", "8_BivProm1": "bivalent promoters",
+              "9_GapArtf1": "others"}
+    rows = []
+    for i, (st, g) in enumerate(groups.items()):
+        rows.append(("chr1", i * 1000, (i + 1) * 1000, st))
+    pd.DataFrame(rows).to_csv(tmp_path / "chmm.bed", sep="\t", header=False,
+                              index=False)
+    pd.DataFrame({"state": [k.split("_")[0] for k in groups],
+                  "mneumonics": [k.split("_")[1] for k in groups],
+                  "Group": list(groups.values())}).to_csv(
+        tmp_path / "groups.csv", index=False)
+    iv = acc.read_chromhmm(tmp_path / "chmm.bed", tmp_path / "groups.csv",
+                           acc._enrichment())
+    got = [iv.classes[k] if k >= 0 else None
+           for k in iv.lookup(["chr1"] * 9, np.arange(9) * 1000 + 500)]
+    assert got == ["quiescent", "promoter", "enhancer", "transcribed",
+                   "polycomb", "heterochromatin", "heterochromatin",
+                   "polycomb", None]
+
+
+def test_replication_timing_from_log2_tracks(tmp_path):
+    rows = [("chr1", s_, s_ + 250_000, 1.5 if (s_ // 2_000_000) % 2 == 0
+             else -1.2) for s_ in range(0, 10_000_000, 250_000)]
+    pd.DataFrame(rows).to_csv(tmp_path / "H1_RT_250kb.bedGraph", sep="\t",
+                              header=False, index=False)
+    flag = f"RT_H1={tmp_path / 'H1_RT_250kb.bedGraph'}"
+    iv = acc.read_rt(None, None, 250_000, 0.0, log2=[acc._rt_path(flag)])
+    k = iv.lookup(["chr1", "chr1"], [100_000, 2_100_000])
+    assert [iv.classes[x] for x in k] == ["early", "late"]
+
+
+def test_several_beds_make_one_system_a_class_each(tmp_path):
+    for name, (s_, e_) in (("cLAD", (0, 1000)), ("fLAD", (1000, 2000)),
+                           ("ciLAD", (2000, 3000))):
+        pd.DataFrame([("chr2", s_, e_)]).to_csv(tmp_path / f"{name}.bed",
+                                                sep="\t", header=False,
+                                                index=False)
+    iv = acc.read_annotation("LAD", [tmp_path / f"{n}.bed"
+                                     for n in ("cLAD", "fLAD", "ciLAD")])
+    assert iv.classes == ("cLAD", "fLAD", "ciLAD")
+    k = iv.lookup(["chr2"] * 3, [10, 1500, 2999])
+    assert [iv.classes[x] for x in k] == ["cLAD", "fLAD", "ciLAD"]
+
+
+def test_human_gene_symbols_reach_the_hotspot_tracks():
+    code = acc._chrom_code("chr19")
+    grid = acc.BinGrid([code], 60_000_000, 1_000_000)
+    genes = pd.DataFrame({
+        "chrom": "chr19", "start": [1_100_000, 5_100_000, 9_100_000,
+                                    13_100_000, 17_100_000],
+        "end": [1_200_000, 5_200_000, 9_200_000, 13_200_000, 17_200_000],
+        "name": ["PEG3", "ZNF331", "PCDHA1", "OR1A1", "ZNF91"],
+        "strand": "+"})
+    tr = acc.hotspot_tracks(grid, {}, None, genes, None, {})
+    assert tr["imprinted genes"][[1, 5]].min() > 0          # PEG3, ZNF331
+    assert tr["protocadherin cluster"][9] > 0
+    assert tr["olfactory receptor genes"][13] > 0
+    assert tr["zinc-finger (Zfp / ZNF) genes"][[5, 17]].min() > 0

@@ -215,6 +215,7 @@ logger = logging.getLogger("annotation_class_concordance")
 #: The full-stack chromHMM's 16 groups, collapsed so a cell keeps enough
 #: contacts per class pair.  'artifacts' is left out.
 CHROMHMM_GROUPS = {
+    # mouse full-stack (mm10) group names
     "TSS": "promoter", "Prom": "promoter",
     "enhancers": "enhancer", "WkEnh": "enhancer", "TxEnh": "enhancer",
     "OpenC": "enhancer",
@@ -223,7 +224,17 @@ CHROMHMM_GROUPS = {
     "BivProm": "polycomb",
     "HET": "heterochromatin", "ZNF": "heterochromatin",
     "quiescent": "quiescent",
+    # human full-stack (hg19 / hg38: Vu & Ernst 2022) group names -- its
+    # "quescient" is spelled so in the release; 'others' (gaps, artifacts)
+    # stays out
+    "promoters": "promoter", "bivalent promoters": "polycomb",
+    "weak enhancers": "enhancer", "transcribed and enhancer": "enhancer",
+    "acetylations": "enhancer", "DNase": "enhancer",
+    "transcription": "transcribed", "weak transcription": "transcribed",
+    "exon": "transcribed", "polycomb repressed": "polycomb",
+    "quescient": "quiescent",
 }
+_CHROMHMM_LC = {k.lower(): v for k, v in CHROMHMM_GROUPS.items()}
 CHROMHMM_ORDER = ("promoter", "enhancer", "transcribed", "polycomb",
                   "heterochromatin", "quiescent")
 SYSTEMS = ("ab", "rt", "chromhmm", "pmd")
@@ -327,11 +338,33 @@ def _merged(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(out, ignore_index=True) if out else df
 
 
+def _class_name(path) -> str:
+    n = Path(str(path)).name
+    for ext in (".gz", ".bed", ".txt"):
+        n = n[: -len(ext)] if n.lower().endswith(ext) else n
+    return n
+
+
 def read_annotation(name, path, max_labels: int = 12) -> Intervals:
     """Any BED as an annotation system.  With a 4th column of at most
     ``max_labels`` distinct labels, its labels are the classes (the BED's
     intervals must not overlap); otherwise two classes, inside the
-    (merged) intervals and outside them -- e.g. LAD / non-LAD."""
+    (merged) intervals and outside them -- e.g. LAD / non-LAD.  Several
+    BEDs (a list) are one class each, named by file -- e.g. cLAD.bed,
+    fLAD.bed, ciLAD.bed, a partition; they must not overlap."""
+    if isinstance(path, (list, tuple)):
+        parts = []
+        for pth in path:
+            x = pd.read_csv(pth, sep="\t", header=None, comment="#",
+                            compression="infer", dtype={0: str},
+                            usecols=[0, 1, 2])
+            x[3] = _class_name(pth)
+            parts.append(x)
+        df = pd.concat(parts, ignore_index=True)
+        classes = tuple(_class_name(pth) for pth in path)
+        iv = Intervals(name, classes, df[0], df[1], df[2],
+                       df[3].map({c: i for i, c in enumerate(classes)}))
+        return iv
     df = pd.read_csv(path, sep="\t", header=None, comment="#",
                      compression="infer", dtype={0: str})
     if df.shape[1] >= 4 and df[3].astype(str).nunique() <= max_labels:
@@ -372,7 +405,8 @@ def read_chromhmm(bed, groups_tsv, enr) -> Intervals:
     if gcol is None:
         sys.exit(f"{groups_tsv}: no 'group' column ({list(ann.columns)})")
     mp, hit, tot, col = enr._label_to_group(seg["name"].unique(), ann, gcol)
-    grp = seg["name"].map(mp).map(CHROMHMM_GROUPS)
+    grp = seg["name"].map(mp).map(
+        lambda g: _CHROMHMM_LC.get(str(g).strip().lower()))
     logger.info(f"chromHMM: {hit}/{tot} states matched via {col!r}; "
                 f"{grp.notna().mean():.1%} of segments in "
                 f"{len(CHROMHMM_ORDER)} groups")
@@ -474,13 +508,43 @@ def rt_log2(early, late, chrom, start, end) -> np.ndarray:
     return r
 
 
-def read_rt(early, late, window: int, mid: float, exclude=()) -> Intervals:
+def rt_from_log2(tracks, chrom, start, end) -> np.ndarray:
+    """log2(early / late) per window from tracks that already hold it (e.g.
+    fetch_4dn_repliseq.py's <cell type>_RT_250kb.bedGraph): the mean of the
+    tracks' window means."""
+    import warnings
+    codes = _codes_of(chrom)
+    start = np.asarray(start, np.int64)
+    end = np.asarray(end, np.int64)
+    vals = []
+    for pth in tracks:
+        tr = _track(pth)
+        v = np.full(codes.size, np.nan)
+        for c in np.unique(codes):
+            sel = codes == c
+            v[sel] = _window_means(tr, c, start[sel], end[sel])
+        vals.append(v)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # empty windows
+        return np.nanmean(vals, 0)
+
+
+def _rt_path(x) -> str:
+    """A --rt-log2 value: a path, or NAME=path as fetch_4dn_repliseq.py's
+    signal_track_flags.txt writes them."""
+    x = str(x)
+    return x.split("=", 1)[1] if "=" in x and not Path(x).exists() else x
+
+
+def read_rt(early, late, window: int, mid: float, exclude=(),
+            log2=None) -> Intervals:
     """Early / late (and, with ``mid`` > 0, mid: |log2 E/L| <= mid) per
-    window.  In post-mitotic neurons this is a chromatin-state proxy (early
-    ~ A), not replication."""
+    window, from early and late fraction tracks -- or from ``log2``, tracks
+    of log2(E/L) itself.  In post-mitotic neurons this is a chromatin-state
+    proxy (early ~ A), not replication."""
     excl = {_chrom_code(c) for c in exclude}
     ext: dict = {}
-    for pth in list(early) + list(late):
+    for pth in (list(log2) if log2 else list(early) + list(late)):
         for c, (st, en, _) in _track(pth).items():
             if c not in excl and en.size:
                 ext[c] = max(ext.get(c, 0), int(en.max()))
@@ -488,7 +552,8 @@ def read_rt(early, late, window: int, mid: float, exclude=()) -> Intervals:
     ch = np.concatenate([np.full(x.size, c, np.int64)
                          for (c, _), x in zip(sorted(ext.items()), st)])
     st = np.concatenate(st)
-    r = rt_log2(early, late, ch, st, st + window)
+    r = (rt_from_log2(log2, ch, st, st + window) if log2
+         else rt_log2(early, late, ch, st, st + window))
     code = np.full(st.size, -1)
     code[r > mid] = 0
     code[r < -mid] = 1
@@ -2726,11 +2791,15 @@ IMPRINTED_GENES = (
     "Magel2", "Mkrn3", "Peg12", "Mest", "Plagl1", "Grb10", "Meg3", "Rian",
     "Mirg", "Dlk1", "Rtl1", "Dio3", "Gnas", "Nnat", "Peg10", "Sgce", "Zrsr1",
     "Impact", "Rasgrf1", "Zdbf2", "Peg13", "Kcnk9", "Nap1l5", "Commd1",
-    "Slc38a4", "Sfmbt2", "Mcts2", "H13", "Blcap")
+    "Slc38a4", "Sfmbt2", "Mcts2", "H13", "Blcap",
+    # imprinted in human, without a mouse name above
+    "DIRAS3", "L3MBTL1", "ZNF597", "ZNF331", "HYMAI", "FAM50B", "MEG8",
+    "NAA60", "SLC22A18", "GNAS-AS1", "PEG3-AS1", "SNHG14", "MAGEL2",
+    "NAP1L5", "GPR1-AS1", "ZFP57")
 #: Gene families tested as hotspot annotations, by gene name.
-GENE_FAMILIES = {"protocadherin cluster": r"^Pcdh[abg]",
-                 "olfactory receptor genes": r"^Olfr\d",
-                 "Zfp zinc-finger genes": r"^Zfp\d"}
+GENE_FAMILIES = {"protocadherin cluster": r"^pcdh[abg]",
+                 "olfactory receptor genes": r"^(olfr\d|or\d+[a-z]+\d)",
+                 "zinc-finger (Zfp / ZNF) genes": r"^(zfp\d|znf\d)"}
 
 
 class BinGrid:
@@ -2925,9 +2994,10 @@ def hotspot_tracks(grid: BinGrid, systems: dict, ab_maps, genes, cpg,
                        g["start"].to_numpy(np.int64))
         tracks["TSSs (count)"] = grid.counts_g(
             _codes_of(g["chrom"].to_numpy()) * STRIDE + tss)
-        names = g["name"].astype(str)
+        # symbols compared without case: Peg3 (mouse) is PEG3 (human)
+        names = g["name"].astype(str).str.lower()
         tracks["imprinted genes"] = grid.coverage(
-            g[names.isin(IMPRINTED_GENES)])
+            g[names.isin({x.lower() for x in IMPRINTED_GENES})])
         for fam, rx in GENE_FAMILIES.items():
             tracks[fam] = grid.coverage(
                 g[names.map(lambda x: re.match(rx, x) is not None)])
@@ -3969,6 +4039,14 @@ def main(argv=None) -> int:
                     help="Early Repli-seq track (bigWig or bedGraph); "
                          "repeatable -- the tracks are averaged.")
     ap.add_argument("--rt-late", action="append", default=None)
+    ap.add_argument("--rt-log2", action="append", default=None,
+                    metavar="[NAME=]TRACK",
+                    help="A track of log2(early/late) itself (bigWig or "
+                         "bedGraph), instead of --rt-early/--rt-late; "
+                         "repeatable -- averaged.  NAME=path is accepted, so "
+                         "fetch_4dn_repliseq.py's flags file can be passed "
+                         "as $(sed 's/--signal-track/--rt-log2/g' "
+                         "annots/rt_4dn/signal_track_flags.txt).")
     ap.add_argument("--rt-window", type=int, default=50_000)
     ap.add_argument("--rt-mid", type=float, default=0.0,
                     help="|log2 early/late| at or below this is 'mid' (0: "
@@ -3978,8 +4056,9 @@ def main(argv=None) -> int:
                          "fills in the full-stack model.")
     ap.add_argument("--chromhmm-groups", default=None)
     ap.add_argument("--pmd", default=None,
-                    help="PMD/HMD file, e.g. the Zhou-lab "
-                         "PMD_coordinates_mm10.bed.gz.")
+                    help="PMD/HMD file or URL, e.g. the Zhou-lab "
+                         "PMD_coordinates_mm10.bed.gz; --genome hg38 / hg19 "
+                         "fill it.")
     ap.add_argument("--pmd-class-col", type=int, default=5,
                     help="1-based column holding PMD / HMD (5).")
     ap.add_argument("--pmd-common-only", action="store_true",
@@ -4138,12 +4217,16 @@ def main(argv=None) -> int:
         / (args.genome or "custom"))
 
     systems: dict = {}
+    rt_log2_tracks = [_rt_path(x) for x in (args.rt_log2 or [])]
+    have_rt = bool(rt_log2_tracks) or bool(args.rt_early and args.rt_late)
     if "rt" in want:
-        if args.rt_early and args.rt_late:
+        if have_rt:
             systems["rt"] = read_rt(args.rt_early, args.rt_late,
-                                    args.rt_window, args.rt_mid, exclude)
+                                    args.rt_window, args.rt_mid, exclude,
+                                    log2=rt_log2_tracks)
         else:
-            logger.warning("rt: needs --rt-early and --rt-late; skipped")
+            logger.warning("rt: needs --rt-early and --rt-late, or "
+                           "--rt-log2; skipped")
     if "chromhmm" in want:
         bed = enr._resolve(args.chromhmm or preset.get("chromhmm"), cache,
                            "chromhmm")
@@ -4156,17 +4239,23 @@ def main(argv=None) -> int:
             logger.warning("chromhmm: needs --chromhmm and --chromhmm-groups "
                            "(or --genome mm10); skipped")
     if "pmd" in want:
-        if args.pmd:
-            systems["pmd"] = read_pmd(args.pmd, args.pmd_class_col,
+        src = args.pmd or (preset.get("annotations", {}).get("PMD") or {}
+                           ).get("url")
+        pth = enr._resolve(src, cache, "PMD") if src else None
+        if pth:
+            systems["pmd"] = read_pmd(pth, args.pmd_class_col,
                                       args.pmd_common_only)
         else:
-            logger.warning("pmd: needs --pmd; skipped")
+            logger.warning("pmd: needs --pmd (or a --genome that has one: "
+                           "hg38, hg19); skipped")
     for k, v in _parse_pairs(args.annotation).items():
         if k in SYSTEMS:
             sys.exit(f"--annotation {k}: that name is a built-in system")
-        rv = enr._resolve(v, cache, f"annotation {k}")
-        if rv:
-            systems[k] = read_annotation(k, rv)
+        files = [enr._resolve(x.strip(), cache, f"annotation {k}")
+                 for x in v.split(",") if x.strip()]
+        if files and all(files):
+            systems[k] = read_annotation(
+                k, files if len(files) > 1 else files[0])
             logger.info(f"annotation {k}: classes {systems[k].classes}")
 
     # Genes and CpG islands: the default open sites (CpG-island TSSs) and
@@ -4216,10 +4305,9 @@ def main(argv=None) -> int:
     # cell-cycle covariates (unless --no-covariates).  The repli-score needs
     # the replication-timing classes even when rt is not a system.
     rt_cov = systems.get("rt")
-    if rt_cov is None and args.rt_early and args.rt_late and \
-            not args.no_covariates:
+    if rt_cov is None and have_rt and not args.no_covariates:
         rt_cov = read_rt(args.rt_early, args.rt_late, args.rt_window, 0.0,
-                         exclude)
+                         exclude, log2=rt_log2_tracks)
     cell_cov = None
     by_cell = None
     if "ab" in want or not args.no_covariates:
@@ -4244,14 +4332,19 @@ def main(argv=None) -> int:
     if "ab" in want:
         orient = args.ab_orient
         if orient == "auto":
-            orient = "rt" if args.rt_early and args.rt_late else "genes"
+            orient = "rt" if have_rt else "genes"
         res = args.ab_resolution
         if orient == "rt":
-            if not (args.rt_early and args.rt_late):
-                sys.exit("--ab-orient rt needs --rt-early and --rt-late")
+            if not have_rt:
+                sys.exit("--ab-orient rt needs --rt-early and --rt-late, or "
+                         "--rt-log2")
 
             def ref(code, name, nb):
                 st = np.arange(nb, dtype=np.int64) * res
+                if rt_log2_tracks:
+                    return rt_from_log2(rt_log2_tracks,
+                                        np.full(nb, code, np.int64), st,
+                                        st + res)
                 return rt_log2(args.rt_early, args.rt_late,
                                np.full(nb, code, np.int64), st, st + res)
         else:
