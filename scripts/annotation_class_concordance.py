@@ -125,13 +125,17 @@ covariance, so it grows with a cell's variance -- with its level -- even
 when its coordination does not; what follows the level in ΔC but not in Δr
 is that scale.
 
-Five further checks, each a component of the variance split.  Labeling
+Further checks, each a component of the variance split.  Labeling
 efficiency: a cell's GCH methylated at sites open in nearly every cell
 (--open-sites; default CpG-island TSSs), which reads M.CviPI's reach into
-that nucleus.  mCA: GCH counts GCA, and the C of GCA is a CpA, which adult
-neurons methylate endogenously -- --context-counts GCA=... GCY=... (the
-pipeline run with --contexts GCA,GCY --steps 1,2) gives each cell's GCA less
-GCC + GCT methylated.  Division history: HMD less PMD methylation (HCG), as
+that nucleus.  Doublets: Scrublet's score on the cells' regional profiles,
+doublets simulated from halves of two cells of types the profiles tell
+apart.  Bisulfite conversion: --context-counts HCY=... (C in no CpG, GpC or
+CpA, so nothing methylates it): what reads methylated was not converted.
+mCA: GCH counts GCA, and the C of GCA is a CpA, which adult neurons
+methylate endogenously -- HCA less HCY methylated (--context-counts HCA=...
+HCY=..., the pipeline run with --contexts HCA,HCY --steps 1,2), or GCA less
+GCY within GCH.  Division history: HMD less PMD methylation (HCG), as
 PMDs lose methylation with every division.  Substructure: within-type
 principal components of the cells' regional profiles (subtypes, area or
 layer gradients, animals).  And the scale term, the cell's two class SDs.
@@ -144,7 +148,9 @@ there, bins above or below the median bin at an FDR fitted to the control,
 and what the concordant bins are -- each class, PMD borders, CpG islands,
 TSSs, imprinted genes, the protocadherin cluster, olfactory-receptor and Zfp
 genes, --hotspot-annotation BEDs (locus_hotspots.tsv.gz,
-locus_hotspot_enrichment.tsv).
+locus_hotspot_enrichment.tsv) -- each also with gene density accounted for
+(rho_given_tss), as imprinted genes, CpG islands and promoters all sit
+where genes are dense.
 
 CELL TYPE FROM CONCORDANCE.  celltype_auc_<statistic> (celltype_auc.tsv,
 celltype_auc_by_type.tsv): per context and both together, how well each
@@ -746,8 +752,16 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
     if prof_bin:
         key = (e_g // STRIDE) * (1 << 20) + (e_g % STRIDE) // prof_bin
         uk, inv = np.unique(key, return_inverse=True)
+        # and a random half of the ends: two halves make a doublet with one
+        # cell's depth, so it is no less noisy than a real cell
+        half = np.random.default_rng(zlib.crc32(str(path).encode())).random(
+            e_p.size) < 0.5
         out["prof"] = (uk, np.bincount(inv, weights=e_p).astype(np.float32),
-                       np.bincount(inv).astype(np.int32))
+                       np.bincount(inv).astype(np.int32),
+                       np.bincount(inv, weights=e_p * half,
+                                   minlength=uk.size).astype(np.float32),
+                       np.bincount(inv, weights=half.astype(float),
+                                   minlength=uk.size).astype(np.int32))
     n_called = int(inf1.sum() + inf2.sum())
     out["quality"] = {
         "frac_called": n_called / (2 * pos1.size) if pos1.size else np.nan,
@@ -1223,6 +1237,8 @@ SUB_PCS = tuple(f"sub_pc{i}" for i in range(1, 11))
 COV_GROUPS = (
     ("technical", ("log10_contacts", "frac_short", "frac_called",
                    "sites_mean", "decisive")),
+    ("doublets", ("doublet_score",)),
+    ("bisulfite conversion", ("nonconversion",)),
     ("level", ("level",)),
     ("scale", ("scale",)),
     ("cell cycle", ("frac_near", "frac_mitotic", "repli_score")),
@@ -1243,6 +1259,8 @@ COV_LABEL = {"log10_contacts": "depth", "frac_short": "% short pairs",
              "repli_score": "repli-score",
              "compartment_strength": "compartment strength",
              "open_site_level": "open-site GCH", "mca_index": "mCA index",
+             "doublet_score": "doublet score",
+             "nonconversion": "non-conversion (HCY)",
              "pmd_depth": "PMD depth",
              **{c: c.replace("sub_pc", "substructure PC") for c in SUB_PCS}}
 #: The components of the variance split, in the order the bar shows them.
@@ -1250,12 +1268,15 @@ GROUP_COLOR = {"technical": "#08519c", "level": "#54278f",
                "scale": "#9e9ac8", "cell cycle": "#006d2c", "3D": "#74c476",
                "batch": "#8c510a", "labeling efficiency": "#e6550d",
                "mCA": "#c51b7d", "division history": "#1b9e77",
-               "substructure": "#cb181d"}
+               "substructure": "#cb181d", "doublets": "#bcbd22",
+               "bisulfite conversion": "#17becf"}
 #: How the cell was measured, not what it is: removed for the corrected
 #: cell-type AUC, and grouped first in the split of the total variance.
-TECHNICAL_GROUPS = ("technical", "batch", "labeling efficiency", "scale")
+TECHNICAL_GROUPS = ("technical", "batch", "labeling efficiency", "scale",
+                    "doublets", "bisulfite conversion")
 #: The total split's components in the order its bar shows them.
 TOTAL_ORDER = ("technical", "batch", "labeling efficiency", "scale",
+               "doublets", "bisulfite conversion",
                "cell type", "level", "cell cycle", "3D", "mCA",
                "division history", "substructure")
 TOTAL_COLOR = {**GROUP_COLOR, "cell type": "#000000"}
@@ -1498,7 +1519,8 @@ def substructure_pcs(profiles: dict, types: dict, n_pcs: int = 5,
             continue
         keys = np.unique(np.concatenate([v[0] for v in prof.values()]))
         M = np.full((len(cells), keys.size), np.nan, np.float32)
-        for c, (k, sm, n) in prof.items():
+        for c, v in prof.items():
+            k, sm, n = v[:3]
             if n.sum() == 0:
                 continue
             M[row[c], np.searchsorted(keys, k)] = sm / n - sm.sum() / n.sum()
@@ -1523,6 +1545,121 @@ def substructure_pcs(profiles: dict, types: dict, n_pcs: int = 5,
         out[r, :k] = (sc - sc.mean(0)) / np.where(sd_ > 0, sd_, 1)
     return pd.DataFrame({"cell": cells, **{f"sub_pc{i + 1}": out[:, i]
                                            for i in range(n_pcs)}})
+
+
+def _profile_matrices(profiles: dict):
+    """Cells x bins (every context side by side) of the profiles' posterior
+    sums and end counts -- and of a random half of the ends, when the
+    profiles carry one -- with the cells in row order."""
+    cells = sorted(set().union(*[set(p) for p in profiles.values()]))
+    row = {c: i for i, c in enumerate(cells)}
+    blocks = []
+    for prof in profiles.values():
+        if not prof:
+            continue
+        keys = np.unique(np.concatenate([v[0] for v in prof.values()]))
+        half = all(len(v) >= 5 for v in prof.values())
+        mats = [np.zeros((len(cells), keys.size), np.float32)
+                for _ in range(4 if half else 2)]
+        for c, v in prof.items():
+            j = np.searchsorted(keys, v[0])
+            for m_, x in zip(mats, v[1:]):
+                m_[row[c], j] = x
+        blocks.append(mats if half else mats + [None, None])
+    if not blocks:
+        e = np.empty((len(cells), 0))
+        return cells, e, e, None, None
+    S = np.concatenate([b[0] for b in blocks], 1)
+    N = np.concatenate([b[1] for b in blocks], 1)
+    if all(b[2] is not None for b in blocks):
+        return (cells, S, N, np.concatenate([b[2] for b in blocks], 1),
+                np.concatenate([b[3] for b in blocks], 1))
+    return cells, S, N, None, None
+
+
+def doublet_scores(profiles: dict, types: dict = None, n_pcs: int = 30,
+                   sim_ratio: float = 2.0, k: int = 0,
+                   min_cover: float = 0.5, min_sep: float = 2.0,
+                   seed: int = 0, sim_out: list = None) -> pd.DataFrame:
+    """Scrublet's doublet score on the cells' regional profiles -- the way
+    single-cell methylomes are screened (MethylScrublet, Liu et al. 2021).
+
+    Doublets are simulated by merging a random half of one cell's ends with
+    a random half of another's, bin by bin -- one cell's depth, so a
+    simulated doublet is as noisy as a real cell (merged whole, it would be
+    less noisy than any real cell and crowd every neighbourhood).  With
+    ``types``, only from two types the profiles tell apart -- centroids at
+    least ``min_sep`` times their spread apart in the principal components
+    of the real cells: a doublet of two types that look alike cannot be
+    told from one cell, and simulating it would only crowd those types'
+    neighbourhoods.  Real and simulated cells share the components (bins
+    observed in ``min_cover`` of the real cells, each standardized over
+    them); a cell's score is the share of simulated doublets among its
+    ``k`` nearest neighbours (default sqrt(n) / 2).
+
+    A doublet matters to concordance: centred on the pair's mean, each
+    nucleus's contacts agree through the nuclei's difference in level, which
+    the reshuffled partners do not, so a doublet of two levels reads as
+    concordant."""
+    from sklearn.neighbors import NearestNeighbors
+    cells, S, N, Sh, Nh = _profile_matrices(profiles)
+    n = len(cells)
+    none = pd.DataFrame({"cell": cells, "doublet_score": np.nan})
+    if n < 20 or S.shape[1] == 0:
+        return none
+    use = (N > 0).mean(0) >= min_cover
+    S, N = S[:, use], N[:, use]
+    if Sh is None:                                 # no halves: whole cells
+        Sh, Nh = S, N
+    else:
+        Sh, Nh = Sh[:, use], Nh[:, use]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        M = S / N
+        mu, sd = np.nanmean(M, 0), np.nanstd(M, 0)
+    sd = np.where(sd > 0, sd, 1)
+    Z = np.nan_to_num((M - mu) / sd)
+    c0 = Z.mean(0)
+    _, _, Vt = np.linalg.svd(Z - c0, full_matrices=False)
+    V = Vt[:min(n_pcs, Vt.shape[0])].T
+    P = (Z - c0) @ V
+    rng = np.random.default_rng(seed)
+    n_sim = int(round(sim_ratio * n))
+    if types is not None:
+        t = np.array([str(types.get(c, "")) for c in cells])
+        ut = np.unique(t)
+        cen = np.array([P[t == x].mean(0) for x in ut])
+        spr = np.array([np.sqrt(((P[t == x] - P[t == x].mean(0)) ** 2)
+                                .sum(1).mean()) for x in ut])
+        sep = (np.linalg.norm(cen[:, None] - cen[None], axis=2)
+               / np.maximum(0.5 * (spr[:, None] + spr[None]), 1e-12))
+        ok_pair = sep >= min_sep
+        np.fill_diagonal(ok_pair, False)
+        ti = np.searchsorted(ut, t)
+        can = np.flatnonzero(ok_pair[ti].any(1))   # cells with a partner type
+        if can.size == 0:
+            logger.warning("doublet score: no two cell types are told apart "
+                           "by their regional profiles; not scored")
+            return none
+        a = can[rng.integers(0, can.size, n_sim)]
+        b = np.empty(n_sim, np.int64)
+        for x in np.unique(ti[a]):
+            m = ti[a] == x
+            other = np.flatnonzero(ok_pair[x][ti])
+            b[m] = other[rng.integers(0, other.size, int(m.sum()))]
+    else:
+        a = rng.integers(0, n, n_sim)
+        b = (a + rng.integers(1, n, n_sim)) % n   # never a cell with itself
+    with np.errstate(invalid="ignore", divide="ignore"):
+        Ms = (Sh[a] + Sh[b]) / (Nh[a] + Nh[b])
+    Ps = (np.nan_to_num((Ms - mu) / sd) - c0) @ V
+    k = k or max(5, int(round(0.5 * np.sqrt(n))))
+    nn = NearestNeighbors(n_neighbors=k + 1).fit(np.vstack([P, Ps]))
+    _, ind = nn.kneighbors(P)
+    q = (ind[:, 1:] >= n).mean(1)                     # the cell itself first
+    if sim_out is not None:
+        _, ind_s = nn.kneighbors(Ps)
+        sim_out.append((ind_s[:, 1:] >= n).mean(1))
+    return pd.DataFrame({"cell": cells, "doublet_score": q})
 
 
 def locus_reassignment(cell, ctype, pair, band, parts: dict, n_band: int,
@@ -2447,10 +2584,16 @@ def hotspot_enrichment(hs: pd.DataFrame, tracks: dict) -> pd.DataFrame:
     between a bin's ΔC and the track (and the control's ΔC, for scale), and
     whether hot / cold bins fall where the track is more often than other
     bins (odds ratio and Fisher's exact p)."""
-    from scipy.stats import fisher_exact, spearmanr
+    from scipy.stats import fisher_exact, rankdata, spearmanr
     rows = []
+
+    def _resid(r, z):
+        z = np.column_stack([np.ones(z.size), z])
+        return r - z @ np.linalg.lstsq(z, r, rcond=None)[0]
     for ctx, a in hs[hs["tested"]].groupby("context", sort=False):
         gi = a["grid_index"].to_numpy()
+        tss = tracks.get("TSSs (count)")
+        rt = rankdata(tss[gi]) if tss is not None else None
         for name, v in tracks.items():
             x = v[gi]
             if np.ptp(x) == 0:
@@ -2460,6 +2603,13 @@ def hotspot_enrichment(hs: pd.DataFrame, tracks: dict) -> pd.DataFrame:
             row = {"context": ctx, "track": name, "bins": int(gi.size),
                    "bins_with": int((x > 0).sum()), "rho": float(rho),
                    "p_rho": float(p), "rho_control": float(rho0)}
+            if rt is not None and name != "TSSs (count)":
+                # gene density accounted for: imprinted genes, CpG islands
+                # and promoters all sit where genes are dense
+                ex = _resid(rankdata(a["delta"]), rt)
+                xx = _resid(rankdata(x), rt)
+                if ex.std() > 0 and xx.std() > 0:
+                    row["rho_given_tss"] = float(np.corrcoef(ex, xx)[0, 1])
             for kind in ("hot", "cold"):
                 h = a[kind].to_numpy(bool)
                 tab = [[int((h & (x > 0)).sum()), int((h & (x == 0)).sum())],
@@ -2683,7 +2833,9 @@ def plot_extra_covariates(cov: pd.DataFrame, path):
     panels = [(c, lab) for c, lab in (
         ("open_site_level", "GCH methylated at open sites"),
         ("pmd_depth", "PMD depth (HMD − PMD, HCG)"),
-        ("mca_index", "mCA index (GCA − GCC/GCT)"))
+        ("mca_index", "mCA index"),
+        ("doublet_score", "doublet score"),
+        ("nonconversion", "non-conversion (HCY methylated)"))
         if c in cov and cov[c].notna().sum() > 2]
     has_pc = all(c in cov and cov[c].notna().sum() > 2
                  for c in ("sub_pc1", "sub_pc2"))
@@ -2694,7 +2846,7 @@ def plot_extra_covariates(cov: pd.DataFrame, path):
     cmap = plt.get_cmap("tab10" if len(types) <= 10 else "tab20")
     col = {t: cmap(i % cmap.N) for i, t in enumerate(types)}
     with plt.rc_context(figure_style.RC):
-        fig, ax = plt.subplots(1, n, figsize=(min(figure_style.FIG_W_IN,
+        fig, ax = plt.subplots(1, n, figsize=(min(figure_style.FIG_W_IN * 1.4,
                                                   2.0 * n + 0.6), 2.4),
                                squeeze=False)
         ax = ax[0]
@@ -2723,7 +2875,7 @@ def plot_extra_covariates(cov: pd.DataFrame, path):
             a_.set_xlabel("substructure PC1 (z, within type)")
             a_.set_ylabel("substructure PC2")
             a_.legend(fontsize=4.5, markerscale=2, ncol=2, loc="best")
-        for a_, lab in zip(ax, "abcd"):
+        for a_, lab in zip(ax, "abcdefg"):
             a_.set_title(lab, loc="left", fontweight="bold")
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight", dpi=300)
@@ -2786,6 +2938,10 @@ def plot_hotspots(hs: pd.DataFrame, enrich: pd.DataFrame, context: str,
                                                   "#2171b5"), height=0.7)
             ax2.scatter(e["rho_control"], yy, s=8, facecolors="none",
                         edgecolors="0.2", lw=0.5, zorder=3, label="control")
+            if "rho_given_tss" in e and e["rho_given_tss"].notna().any():
+                ax2.scatter(e["rho_given_tss"], yy, s=9, marker="|",
+                            color="k", lw=1.0, zorder=4,
+                            label="given TSS density")
             for y_, (r_, q_) in enumerate(zip(e["rho"], e["q_rho"])):
                 if q_ < 0.05:
                     ax2.text(r_, y_, " *" if r_ >= 0 else "* ", va="center",
@@ -3491,11 +3647,13 @@ def main(argv=None) -> int:
                     help="A further context's read-pair counts (its "
                          "02_read_pair_counts or 04_posteriors directory), "
                          "read for each cell's raw methylation only; "
-                         "repeatable.  GCA=... and GCY=... (the pipeline run "
-                         "with --contexts GCA,GCY --steps 1,2) give the mCA "
-                         "index: the GCA sites methylated less the GCC + GCT "
-                         "ones -- endogenous CpA methylation, high in "
-                         "neurons, which GCH reads as accessibility.")
+                         "repeatable.  HCY=... is bisulfite non-conversion "
+                         "(C in no CpG, GpC or CpA: nothing methylates it); "
+                         "HCA=... with HCY=... the mCA index, endogenous CpA "
+                         "methylation (high in neurons, read by GCH as "
+                         "accessibility) less that background; GCA=... with "
+                         "GCY=... an mCA index within GCH (the pipeline run "
+                         "with --contexts HCA,HCY --steps 1,2).")
     ap.add_argument("--substructure-bin", type=int, default=1_000_000,
                     help="Bin of the cells' regional profiles, whose "
                          "within-type principal components are the "
@@ -3735,8 +3893,7 @@ def main(argv=None) -> int:
     extra_cov: dict = {}           # cell-level covariates of the later checks
     profiles: dict = {}            # per context: the cells' regional profiles
     hot_rows, enrich_rows = [], []
-    prof_bin = (args.substructure_bin if cell_cov is not None
-                and args.n_substructure_pcs > 0 else 0)
+    prof_bin = args.substructure_bin if cell_cov is not None else 0
     for ci_ctx, (ctx, d) in enumerate(contexts.items()):
         cells = [c for c in cells_all
                  if (Path(d) / f"{c}.posteriors.parquet").exists()]
@@ -4023,7 +4180,7 @@ def main(argv=None) -> int:
     if cell_cov is not None:
         for k, v in extra_cov.items():
             cell_cov[k] = cell_cov["cell"].map(v)
-        if profiles:
+        if profiles and args.n_substructure_pcs > 0:
             sp = substructure_pcs(
                 profiles, dict(zip(cell_cov["cell"], cell_cov["cell_type"])),
                 args.n_substructure_pcs)
@@ -4031,6 +4188,19 @@ def main(argv=None) -> int:
             logger.info(f"substructure: {args.n_substructure_pcs} PCs within "
                         f"each cell type of {sp.iloc[:, 1].notna().sum():,} "
                         f"cells")
+        if profiles:
+            sim = []
+            ds = doublet_scores(
+                profiles, dict(zip(cell_cov["cell"], cell_cov["cell_type"])),
+                seed=args.seed, sim_out=sim)
+            cell_cov = cell_cov.merge(ds, on="cell", how="left")
+            if sim and ds["doublet_score"].notna().any():
+                thr = float(np.median(sim[0]))
+                logger.info(
+                    f"doublet score (share of simulated doublets among a "
+                    f"cell's neighbours): median {ds['doublet_score'].median():.3f}"
+                    f"; {int((ds['doublet_score'] >= thr).sum()):,} cells at or "
+                    f"above the simulated doublets' median ({thr:.3f})")
         profiles.clear()
         meth = {}
         for nm, dirp in _parse_pairs(args.context_counts).items():
@@ -4050,18 +4220,30 @@ def main(argv=None) -> int:
             meth[nm] = {c: (k / n if n >= 100 else np.nan)
                         for c, (k, n) in zip(files, kn)}
             cell_cov[f"meth_{nm}"] = cell_cov["cell"].map(meth[nm])
-        gca = next((k for k in meth if k.upper() == "GCA"), None)
-        gcy = next((k for k in meth if k.upper() == "GCY"), None)
-        if gca and gcy:
-            cell_cov["mca_index"] = (cell_cov[f"meth_{gca}"]
-                                     - cell_cov[f"meth_{gcy}"])
-            logger.info("mCA index (GCA less GCC+GCT methylated) by cell "
-                        "type:\n" + cell_cov.groupby("cell_type")[
-                            "mca_index"].describe()[["count", "mean", "50%"]]
-                        .to_string(float_format=lambda v: f"{v:.4f}"))
-        elif meth:
-            logger.warning("the mCA index needs --context-counts GCA=... and "
-                           "GCY=...")
+        up = {k.upper(): k for k in meth}
+        if "HCY" in up:
+            # C neither in a CpG nor a GpC, nor before an A: nothing should
+            # methylate it, so what reads methylated was not converted
+            cell_cov["nonconversion"] = cell_cov[f"meth_{up['HCY']}"]
+        if "GCA" in up and "GCY" in up:
+            cell_cov["mca_index_gch"] = (cell_cov[f"meth_{up['GCA']}"]
+                                         - cell_cov[f"meth_{up['GCY']}"])
+        if "HCA" in up and "HCY" in up:
+            # CpA outside GpC less the unconverted background: endogenous
+            # mCA with no accessibility in it
+            cell_cov["mca_index"] = (cell_cov[f"meth_{up['HCA']}"]
+                                     - cell_cov[f"meth_{up['HCY']}"])
+        elif "mca_index_gch" in cell_cov:
+            cell_cov["mca_index"] = cell_cov["mca_index_gch"]
+        for col_, what in (("mca_index", "mCA index"),
+                           ("nonconversion", "non-conversion (HCY)")):
+            if col_ in cell_cov:
+                logger.info(f"{what} by cell type:\n" + cell_cov.groupby(
+                    "cell_type")[col_].describe()[["count", "mean", "50%"]]
+                    .to_string(float_format=lambda v: f"{v:.4f}"))
+        if meth and "mca_index" not in cell_cov:
+            logger.warning("the mCA index needs --context-counts HCA=... and "
+                           "HCY=... (or GCA=... and GCY=...)")
     if hot_rows:
         hs = pd.concat(hot_rows, ignore_index=True)
         en = pd.concat(enrich_rows, ignore_index=True)

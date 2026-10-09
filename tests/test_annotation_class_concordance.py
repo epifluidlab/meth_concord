@@ -676,8 +676,9 @@ def test_open_site_level_reads_the_ends_at_open_sites(tmp_path):
     r = acc._read_cell(f, 2, 1000, 10**7, set(), {}, open_g=np.sort(sites),
                        open_w=200, prof_bin=1_000_000)
     assert r["open"] == (7.0, 8.0)                 # the first two left ends
-    keys, sums, counts = r["prof"]
+    keys, sums, counts, hs, hn = r["prof"]
     assert counts.sum() == 8 and sums.sum() == pytest.approx(4.0)
+    assert (hn <= counts).all() and (hs <= sums + 1e-6).all()
     assert acc._count_pass(f, set()) == (8.0, 32.0)
 
 
@@ -755,15 +756,16 @@ def test_pmd_depth_is_hmd_less_pmd_methylation(tmp_path):
 
 def test_the_mca_index_is_gca_less_gcy_methylation(tmp_path):
     d = make_data(tmp_path, per=10, n_types=2)
-    for name, frac in (("GCA", 0.30), ("GCY", 0.20)):
+    for name, frac in (("GCA", 0.30), ("GCY", 0.20), ("HCA", 0.05),
+                       ("HCY", 0.01)):
         dd = tmp_path / name
         dd.mkdir()
         for f in (d / "GCH").glob("*.posteriors.parquet"):
             x = pd.read_parquet(f)[["chrom", "pos1", "pos2", "distance"]]
-            x["n1"] = np.int32(10)
-            x["n2"] = np.int32(10)
-            x["k1"] = np.int32(round(10 * frac))
-            x["k2"] = np.int32(round(10 * frac))
+            x["n1"] = np.int32(100)
+            x["n2"] = np.int32(100)
+            x["k1"] = np.int32(round(100 * frac))
+            x["k2"] = np.int32(round(100 * frac))
             x.to_parquet(dd / f.name.replace("posteriors", "read_pairs"))
     o = tmp_path / "out_mca"
     acc.main(["--posteriors", f"GCH={d / 'GCH'}",
@@ -772,12 +774,19 @@ def test_the_mca_index_is_gca_less_gcy_methylation(tmp_path):
               "--n-boot", "20", "--n-threads", "2", "--n-locus-perm", "0",
               "--context-counts", f"GCA={tmp_path / 'GCA'}",
               "--context-counts", f"GCY={tmp_path / 'GCY'}",
+              "--context-counts", f"HCA={tmp_path / 'HCA'}",
+              "--context-counts", f"HCY={tmp_path / 'HCY'}",
               "--covariate-min-cells", "10", "--no-hotspots",
               "--celltype-auc-stats", "none",
               "--plot-format", "png", "--output-dir", str(o)])
     cov = pd.read_csv(o / "cell_covariates.tsv", sep="\t")
-    np.testing.assert_allclose(cov["mca_index"], 0.1, atol=1e-9)
+    # HCA less HCY: no GpC in either, so no accessibility in the difference
+    np.testing.assert_allclose(cov["mca_index"], 0.04, atol=1e-9)
+    np.testing.assert_allclose(cov["mca_index_gch"], 0.1, atol=1e-9)
+    np.testing.assert_allclose(cov["nonconversion"], 0.01, atol=1e-9)
     assert cov["meth_GCA"].iloc[0] == pytest.approx(0.3)
+    # the mock's types look alike, so there is nothing to simulate
+    assert cov["doublet_score"].isna().all()
 
 
 def test_hotspot_outputs_follow_the_planted_compartment(planted):
@@ -890,3 +899,63 @@ def test_auc_after_removing_technical_factors():
     assert r[("A", "concordance")] - r[("A", "concordance, technical "
                                          "removed")] > 0.08
     assert r[("B", "concordance, technical removed")] > 0.75
+
+
+def test_the_doublet_score_picks_out_two_nuclei_in_one_well():
+    rng = np.random.default_rng(6)
+    n_bins = 300
+    keys = np.arange(n_bins)
+    a_pat = rng.uniform(0.1, 0.9, n_bins)
+    pat = {"A": a_pat, "B": 1 - a_pat}                # two distinct types
+
+    def cell(ty):
+        """(sums, ends) of both halves of a cell's ends."""
+        p_ = np.clip(pat[ty] + rng.normal(0, 0.05, n_bins), 0, 1)
+        h = []
+        for _ in range(2):
+            n = rng.poisson(15, n_bins).astype(np.int32)
+            h.append((rng.binomial(n, p_).astype(np.float32), n))
+        return h
+
+    def entry(halves):
+        (s1, n1), (s2, n2) = halves
+        return (keys, s1 + s2, n1 + n2, s1, n1)
+    prof, types = {}, {}
+    for i in range(120):
+        ty = "A" if i % 2 else "B"
+        prof[f"s{i}"], types[f"s{i}"] = entry(cell(ty)), ty
+    for i in range(8):                     # one A and one B nucleus, called A
+        a_, b_ = cell("A"), cell("B")
+        prof[f"d{i}"] = entry([(a_[0][0] + b_[0][0], a_[0][1] + b_[0][1]),
+                               (a_[1][0] + b_[1][0], a_[1][1] + b_[1][1])])
+        types[f"d{i}"] = "A"
+    ds = acc.doublet_scores({"GCH": prof}, types, seed=0).set_index("cell")
+    dbl = ds.loc[[c for c in ds.index if c.startswith("d")], "doublet_score"]
+    one = ds.loc[[c for c in ds.index if c.startswith("s")], "doublet_score"]
+    # (the planted doublets, all A + B, are each other's neighbours too)
+    assert dbl.mean() > 0.6 and one.mean() < 0.1
+    assert dbl.min() > one.quantile(0.95)
+    # two types that look alike: not simulated, not scored
+    alike = {c: ("A" if int(c[1:]) % 2 else "A2") for c in prof}
+    prof_a = {c: v for c, v in prof.items() if c.startswith("s")
+              and types[c] == "A"}
+    sc = acc.doublet_scores({"GCH": prof_a}, alike, seed=0)
+    assert sc["doublet_score"].isna().all()
+
+
+def test_hotspot_enrichment_reports_the_part_beyond_gene_density():
+    rng = np.random.default_rng(7)
+    code = acc._chrom_code("chr1")
+    grid = acc.BinGrid([code], 200_000_000, 1_000_000)
+    tss = rng.poisson(5, grid.n).astype(float)
+    imp = (tss + rng.normal(0, 1, grid.n) > 7).astype(float)   # rides on TSS
+    hs = pd.DataFrame({"context": "GCH", "grid_index": np.arange(grid.n),
+                       "tested": True,
+                       "delta": 0.01 * tss + rng.normal(0, 0.01, grid.n),
+                       "control": rng.normal(0, 0.01, grid.n),
+                       "hot": False, "cold": False})
+    en = acc.hotspot_enrichment(hs, {"TSSs (count)": tss,
+                                     "imprinted genes": imp}).set_index(
+        "track")
+    assert en.loc["imprinted genes", "rho"] > 0.3
+    assert abs(en.loc["imprinted genes", "rho_given_tss"]) < 0.15
