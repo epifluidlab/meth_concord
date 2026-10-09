@@ -1213,3 +1213,41 @@ def test_human_gene_symbols_reach_the_hotspot_tracks():
     assert tr["protocadherin cluster"][9] > 0
     assert tr["olfactory receptor genes"][13] > 0
     assert tr["zinc-finger (Zfp / ZNF) genes"][[5, 17]].min() > 0
+
+
+# ------------------------------------------------------------ two groups --
+
+
+def test_two_groups_of_cells_compared_by_class_and_along_the_genome(tmp_path):
+    """Concordance planted in A (= HMD) contacts of type T0 only: T0 against
+    T1 + T2 is higher in HMD-HMD, not in PMD-PMD, and the bins that differ
+    are HMD bins."""
+    d = make_data(tmp_path, per=20, n_types=3,
+                  coord=lambda t_, c: 0.9 if t_ == 0 else 0.0)
+    o = tmp_path / "out_contrast"
+    acc.main(["--posteriors", f"GCH={d / 'GCH'}",
+              "--samples", str(d / "samples.tsv"), "--systems", "pmd",
+              "--pmd", str(d / "pmd.bed"), "--min-pairs", "10",
+              "--n-boot", "200", "--n-threads", "2", "--n-locus-perm", "0",
+              "--covariate-min-cells", "10", "--batch-column", "batch",
+              "--celltype-auc-stats", "none", "--hotspot-min-contacts", "100",
+              "--contrast-group", "T0=T0", "--contrast-group", "rest=T1,T2",
+              "--plot-format", "png", "--output-dir", str(o)])
+    ct = pd.read_csv(o / "contrast_classes.tsv", sep="\t")
+    a = ct[ct["band"].str.startswith("all") & (ct["statistic"] == "delta")
+           & (ct["anchor"] == ct["partner"])].set_index("anchor")
+    assert a.loc["HMD", "diff"] > 0.05 and a.loc["HMD", "q_diff"] < 0.05
+    assert a.loc["HMD", "diff_lo"] > 0
+    assert abs(a.loc["PMD", "diff"]) < 0.02
+    assert a.loc["HMD", "diff_adjusted"] > 0.05
+    assert a.loc["HMD", "batch_adjusted"] == "batch"
+    assert abs(a.loc["HMD", "control_diff"]) < 0.02
+    assert {acc.ALL_REGIONS} <= set(a.index)
+    hc = pd.read_csv(o / "contrast_hotspots.tsv.gz", sep="\t")
+    hmd = is_a(hc["start"])
+    assert hc.loc[hmd, "diff"].mean() > hc.loc[~hmd, "diff"].mean() + 0.03
+    en = pd.read_csv(o / "contrast_hotspot_enrichment.tsv", sep="\t"
+                     ).set_index("track")
+    assert en.loc["PMD / HMD: HMD", "rho_diff"] > 0.5
+    assert (o / "contrast_GCH_delta.png").exists()
+    assert (o / "contrast_hotspots_GCH.png").exists()

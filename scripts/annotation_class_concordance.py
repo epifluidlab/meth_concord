@@ -156,6 +156,15 @@ ALL REGIONS.  Beside the class pairs, every annotated contact of a system
 together ("all regions"); signed, each contact carries its class pair's
 weight, so the value is the contact-weighted mean of the class pairs'.
 
+TWO GROUPS OF CELLS.  --contrast-group NAME=TYPE[,TYPE...], twice (e.g.
+tumor=Tumor1,Tumor2 and monocyte=Monocyte): per region group and band, each
+group's pooled concordance with 95% bootstrap intervals over its cells, the
+difference with its interval and BH q, and the difference adjusted for the
+technical covariates and batch (contrast_classes.tsv, contrast_<ctx>_<stat>);
+and along the genome, each 1 Mb bin's difference, the bins that differ, and
+what they are (contrast_hotspots.tsv.gz, contrast_hotspot_enrichment.tsv,
+contrast_hotspots_<ctx>).
+
 CELL TYPE FROM CONCORDANCE.  celltype_auc_<statistic> (celltype_auc.tsv,
 celltype_auc_by_type.tsv): per context and both together, how well each
 region group's per-cell concordance predicts cell type -- a random forest,
@@ -2608,6 +2617,469 @@ def plot_celltype_auc(res: pd.DataFrame, per: pd.DataFrame, stat: str, path):
         plt.close(fig)
 
 
+# ------------------------------------------------- two groups of cells --
+
+#: The statistics two groups of cells are compared on, with their controls.
+CONTRAST_STATS = {"delta": "control", "delta_r": "control_r",
+                  "signed_rel": "signed_rel_control",
+                  "signed_sgn": "signed_sgn_control"}
+
+
+def group_contrast(acc, sd, tot, S_sg, groups: dict, classes, band_labels,
+                   n_boot: int, seed: int, min_pairs: int = 50) -> list:
+    """Two groups of cells compared, pooled as the summary pools all cells.
+
+    ``groups``: {name: indices of its cells}, first minus second.  Per class
+    pair x band, and all regions x band: each group's ΔC, Δr, ΔC x w and
+    ΔC x sign(w) -- its cells' contacts pooled; the signed ones against the
+    group's own genome-wide co-open share, all regions with each contact's
+    class-pair weight (``S_sg``) -- with 95% bootstrap intervals over the
+    group's cells, and the difference with its interval (the two groups
+    resampled independently), two-sided bootstrap p, and the same
+    difference of the controls.  Rows where either group has fewer than
+    ``min_pairs`` contacts are left out."""
+    rng = np.random.default_rng(seed)
+    (na, ia), (nb_, ib) = list(groups.items())[:2]
+    n_k, nb = len(classes), len(band_labels)
+    A_ = nb - 1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s12 = sd[:, :, None] * sd[:, None, :]
+        inv = np.where(s12 > 0, 1.0 / np.where(s12 > 0, s12, 1), 0.0)
+    r_all = ((acc["xy"] - acc["xy1"]) * inv[..., None]).sum((1, 2))
+    rc_all = ((acc["xy2"] - acc["xy1"]) * inv[..., None]).sum((1, 2))
+
+    def cell_parts(ix):
+        f = (lambda a_: a_[ix].reshape(ix.size, -1))   # noqa: E731
+        P = {"n": f(acc["n"]), "d": f(2 * (acc["xy"] - acc["xy1"])),
+             "c": f(2 * (acc["xy2"] - acc["xy1"])),
+             "r": f((acc["xy"] - acc["xy1"]) * inv[..., None]),
+             "rc": f((acc["xy2"] - acc["xy1"]) * inv[..., None]),
+             "oo": f(acc["oo"]), "oc": f(acc["oc"]),
+             "no": f(acc["no2"]), "nc": f(acc["nc2"])}
+        G = {k: acc[k][ix][..., A_].sum((1, 2)) for k in ("oo", "oc", "no2",
+                                                          "nc2")}
+        Aall = {"n": tot["n"][ix], "d": 2 * (tot["xy"][ix] - tot["xy1"][ix]),
+                "c": 2 * (tot["xy2"][ix] - tot["xy1"][ix]),
+                "r": r_all[ix], "rc": rc_all[ix],
+                **{k: S_sg[k][ix] for k in ("sd", "sc", "gd", "gc")}}
+        return P, G, Aall
+
+    def pooled(Wt, P, G, Aall):
+        S = {k: Wt @ v for k, v in P.items()}
+        g = {k: Wt @ v for k, v in G.items()}
+        Sa = {k: Wt @ v for k, v in Aall.items()}
+        with np.errstate(invalid="ignore", divide="ignore"):
+            n = S["n"]
+            o = {"delta": S["d"] / n, "delta_r": S["r"] / n,
+                 "control": S["c"] / n, "control_r": S["rc"] / n}
+            w = _weight(S["oo"] / (S["oo"] + S["oc"]),
+                        (g["oo"] / (g["oo"] + g["oc"]))[:, None])
+            wn = _weight(S["no"] / (S["no"] + S["nc"]),
+                         (g["no2"] / (g["no2"] + g["nc2"]))[:, None])
+            o.update({"signed_rel": o["delta"] * w,
+                      "signed_sgn": o["delta"] * np.sign(w),
+                      "signed_rel_control": o["control"] * wn,
+                      "signed_sgn_control": o["control"] * np.sign(wn)})
+            m = Sa["n"]
+            al = {"delta": Sa["d"] / m, "delta_r": Sa["r"] / m,
+                  "control": Sa["c"] / m, "control_r": Sa["rc"] / m,
+                  "signed_rel": Sa["sd"] / m, "signed_sgn": Sa["gd"] / m,
+                  "signed_rel_control": Sa["sc"] / m,
+                  "signed_sgn_control": Sa["gc"] / m}
+        return o, al
+
+    est, boot, cnt = {}, {}, {}
+    for nm, ix in ((na, ia), (nb_, ib)):
+        ix = np.asarray(ix, np.int64)
+        P, G, Aall = cell_parts(ix)
+        est[nm] = pooled(np.ones((1, ix.size)), P, G, Aall)
+        W = rng.multinomial(ix.size, np.full(ix.size, 1.0 / ix.size),
+                            size=n_boot).astype(float) if ix.size else \
+            np.zeros((n_boot, 0))
+        boot[nm] = pooled(W, P, G, Aall)
+        cnt[nm] = (P["n"].sum(0), (P["n"] > 0).sum(0), Aall["n"].sum(0),
+                   (Aall["n"] > 0).sum(0))
+    rows = []
+
+    def emit(anchor, partner, b, which, j):
+        pa, pb = cnt[na][2 * which][j], cnt[nb_][2 * which][j]
+        if pa < min_pairs or pb < min_pairs:
+            return
+        base = {"anchor": anchor, "partner": partner,
+                "band": band_labels[b], "group_A": na, "group_B": nb_,
+                "pairs_A": int(pa), "pairs_B": int(pb),
+                "cells_A": int(cnt[na][2 * which + 1][j]),
+                "cells_B": int(cnt[nb_][2 * which + 1][j])}
+        for st, ct in CONTRAST_STATS.items():
+            va, vb = est[na][which][st][0, j], est[nb_][which][st][0, j]
+            ba, bb = boot[na][which][st][:, j], boot[nb_][which][st][:, j]
+            dif = ba - bb
+            with np.errstate(invalid="ignore"):
+                lo_a, hi_a = np.nanpercentile(ba, [2.5, 97.5])
+                lo_b, hi_b = np.nanpercentile(bb, [2.5, 97.5])
+                dlo, dhi = np.nanpercentile(dif, [2.5, 97.5])
+            fin = dif[np.isfinite(dif)]
+            pval = (min(1.0, 2 * min(np.mean(fin <= 0), np.mean(fin >= 0))
+                        + 1.0 / (fin.size + 1)) if fin.size else np.nan)
+            rows.append({**base, "statistic": st, "value_A": float(va),
+                         "lo_A": float(lo_a), "hi_A": float(hi_a),
+                         "value_B": float(vb), "lo_B": float(lo_b),
+                         "hi_B": float(hi_b), "diff": float(va - vb),
+                         "diff_lo": float(dlo), "diff_hi": float(dhi),
+                         "p_diff": float(pval),
+                         "control_diff": float(est[na][which][ct][0, j]
+                                               - est[nb_][which][ct][0, j])})
+    for k1 in range(n_k):
+        for k2 in range(n_k):
+            for b in range(nb):
+                emit(classes[k1], classes[k2], b, 0, (k1 * n_k + k2) * nb + b)
+    for b in range(nb):
+        emit(ALL_REGIONS, ALL_REGIONS, b, 1, b)
+    return rows
+
+
+def hotspot_contrast(grid, arrays, groups: dict, n_band: int,
+                     min_contacts: int, fdr: float,
+                     min_cells: int = 10) -> pd.DataFrame:
+    """Where two groups of cells differ in concordance along the genome.
+
+    ``arrays``: (g_lo, cell, d, pair, g_hi, c, band) of the contacts;
+    ``groups``: {name: boolean over the cells}, first minus second.  Per bin
+    of ``grid``, all distances: each group's ΔC (:func:`locus_hotspots`),
+    the difference with its standard error, and two calls at an FDR
+    against a null fitted to the controls' same difference
+    (:func:`_empirical_q`): bins higher in one group than the other
+    (higher_A / higher_B), and -- the groups may differ everywhere, which
+    the class comparison reports -- bins whose difference departs from the
+    median bin's (above_median / below_median)."""
+    g_lo, cell, d, _, g_hi, c, band = arrays
+    per = {}
+    for nm, cm in groups.items():
+        m = np.asarray(cm, bool)[cell]
+        if not m.any():
+            return pd.DataFrame()
+        hs = locus_hotspots(grid, g_lo[m], g_hi[m], cell[m], d[m], c[m],
+                            band[m], n_band)
+        per[nm] = hs[hs["band_index"] == n_band].set_index("grid_index")
+    na, nb_ = list(groups)[:2]
+    cols = ["contacts", "cells", "delta", "control", "se", "se_control"]
+    j = per[na][["code", "start", "end"] + cols].join(
+        per[nb_][cols], lsuffix="_A", rsuffix="_B", how="inner")
+    j = j[(j["contacts_A"] >= min_contacts) & (j["contacts_B"] >= min_contacts)
+          & (j["cells_A"] >= min_cells) & (j["cells_B"] >= min_cells)].copy()
+    if j.empty:
+        return pd.DataFrame()
+    j["diff"] = j["delta_A"] - j["delta_B"]
+    j["control_diff"] = j["control_A"] - j["control_B"]
+    se = np.sqrt(j["se_A"] ** 2 + j["se_B"] ** 2)
+    sec = np.sqrt(j["se_control_A"] ** 2 + j["se_control_B"] ** 2)
+    j["median_diff"] = float(j["diff"].median())
+    with np.errstate(invalid="ignore", divide="ignore"):
+        za, za0 = j["diff"] / se, j["control_diff"] / sec
+        zr = (j["diff"] - j["diff"].median()) / se
+        zr0 = (j["control_diff"] - j["control_diff"].median()) / sec
+    j["z_diff"] = za
+    j["q_higher_A"] = _empirical_q(za, za0)
+    j["q_higher_B"] = _empirical_q(-za, -za0)
+    j["higher_A"] = (j["q_higher_A"] < fdr) & (j["diff"] > 0)
+    j["higher_B"] = (j["q_higher_B"] < fdr) & (j["diff"] < 0)
+    j["q_above_median"] = _empirical_q(zr, zr0)
+    j["q_below_median"] = _empirical_q(-zr, -zr0)
+    j["above_median"] = (j["q_above_median"] < fdr) & (zr > 0)
+    j["below_median"] = (j["q_below_median"] < fdr) & (zr < 0)
+    j["group_A"], j["group_B"] = na, nb_
+    return j.reset_index()
+
+
+def hotspot_contrast_enrichment(hc: pd.DataFrame, tracks: dict) -> list:
+    """Per annotation track, across the compared bins: Spearman rho of the
+    groups' difference with the track (and the controls' difference), and
+    of each group's own ΔC."""
+    from scipy.stats import spearmanr
+    rows = []
+    if hc.empty:
+        return rows
+    gi = hc["grid_index"].to_numpy()
+    for name, v in tracks.items():
+        x = v[gi]
+        if np.ptp(x) == 0:
+            continue
+        r, p_ = spearmanr(hc["diff"], x)
+        row = {"track": name, "bins": int(gi.size), "rho_diff": float(r),
+               "p_diff": float(p_),
+               "rho_control_diff": float(spearmanr(hc["control_diff"], x)[0]),
+               "rho_A": float(spearmanr(hc["delta_A"], x)[0]),
+               "rho_B": float(spearmanr(hc["delta_B"], x)[0])}
+        for k in ("higher_A", "higher_B", "above_median", "below_median"):
+            h = hc[k].to_numpy(bool)
+            row[f"{k}_with"] = int((h & (x > 0)).sum())
+            row[f"{k}_total"] = int(h.sum())
+        rows.append(row)
+    return rows
+
+
+def adjusted_contrast(percell: pd.DataFrame, cov: pd.DataFrame, ctx_cov: dict,
+                      group_of: dict, names, batch_cols=(),
+                      min_cells: int = 20) -> pd.DataFrame:
+    """The groups' difference with how the cells were measured held fixed.
+
+    Per region group (same-state class pairs and all regions) x band x
+    statistic: a least-squares fit of the per-cell values, weighted by the
+    cell's contacts, on the group, the technical covariates
+    (TECHNICAL_GROUPS; a missing one at the cell type's mean) and batch --
+    the group's coefficient is the adjusted difference.  A batch column
+    whose every batch holds one group only is left out, as it would take
+    the groups' difference with it; diff_wls is the same fit on the group
+    alone."""
+    from scipy.stats import t as t_dist
+    tech = [c for g, cols in COV_GROUPS if g in TECHNICAL_GROUPS
+            for c in cols]
+    pc = percell[percell["enough_pairs"]
+                 & (percell["anchor"] == percell["partner"])
+                 & percell["cell"].isin(group_of)]
+    rows = []
+    for (ctx, sy, k, bl), g in pc.groupby(["context", "system", "anchor",
+                                           "band"], sort=False):
+        d = g.merge(cov.drop(columns=["cell_type"], errors="ignore"),
+                    on="cell", how="left")
+        cx = (ctx_cov or {}).get(ctx)
+        if cx is not None:
+            d = d.merge(cx, on="cell", how="left")
+        if "sd_anchor" in d:
+            d["scale"] = d["sd_anchor"] * d["sd_partner"]
+        grp = d["cell"].map(group_of)
+        xg = (grp == names[0]).to_numpy(float)
+        if xg.sum() < min_cells or (1 - xg).sum() < min_cells:
+            continue
+        t = d["cell_type"].astype(str).to_numpy()
+        av = [c for c in tech if c in d and d[c].notna().sum() >= 10
+              and d[c].nunique() > 1]
+        bused = []
+        for b in batch_cols:
+            if b in d and d[b].nunique() > 1 and \
+                    d.groupby(b)["cell"].apply(
+                        lambda s_: grp[s_.index].nunique()).max() > 1:
+                bused.append(b)
+        for st in CONTRAST_STATS:
+            if st not in d:
+                continue
+            y = d[st].to_numpy(float)
+            w = d["pairs"].to_numpy(float)
+            ok = np.isfinite(y) & (w > 0)
+            if xg[ok].sum() < min_cells or (1 - xg[ok]).sum() < min_cells:
+                continue
+            Z = [_type_impute(d[c].to_numpy(float)[ok], t[ok]) for c in av]
+            for b in bused:
+                Z += list(pd.get_dummies(d.loc[ok, b].astype(str),
+                                         drop_first=True).to_numpy(float).T)
+
+            def wls(cols_):
+                X = np.column_stack([np.ones(ok.sum()), xg[ok]] + cols_)
+                sw = np.sqrt(w[ok])
+                Xw, yw = X * sw[:, None], y[ok] * sw
+                beta, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
+                res = yw - Xw @ beta
+                dfr = max(Xw.shape[0] - np.linalg.matrix_rank(Xw), 1)
+                s2 = float(res @ res) / dfr
+                cv = s2 * np.linalg.pinv(Xw.T @ Xw)
+                return float(beta[1]), float(np.sqrt(max(cv[1, 1], 0))), dfr
+            b0, _, _ = wls([])
+            b1, se1, dfr = wls(Z)
+            tt = b1 / se1 if se1 > 0 else np.nan
+            rows.append({"context": ctx, "system": sy, "anchor": k,
+                         "partner": k, "band": bl, "statistic": st,
+                         "diff_wls": b0, "diff_adjusted": b1,
+                         "diff_adjusted_se": se1,
+                         "p_adjusted": (float(2 * t_dist.sf(abs(tt), dfr))
+                                        if np.isfinite(tt) else np.nan),
+                         "batch_adjusted": ",".join(bused)})
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["q_adjusted"] = np.nan
+        for _, g in out.groupby(["context", "statistic"], sort=False):
+            out.loc[g.index, "q_adjusted"] = fdr_bh(g["p_adjusted"].to_numpy())
+    return out
+
+
+def plot_contrast(tab: pd.DataFrame, context: str, stat: str, path,
+                  q_cut: float = 0.05):
+    """a: each group's pooled concordance (pp, 95% CI), all distances, per
+    region group; b: the first group less the second (filled: q < q_cut;
+    diamond: adjusted for the technical covariates and batch); c: the
+    difference by distance band (* q < q_cut)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    a = tab[(tab["context"] == context) & (tab["statistic"] == stat)
+            & (tab["anchor"] == tab["partner"])]
+    if a.empty:
+        return
+    na, nb_ = a["group_A"].iloc[0], a["group_B"].iloc[0]
+    bands = list(dict.fromkeys(a["band"]))
+    all_b = next((b for b in bands if str(b).startswith("all")), bands[-1])
+    bands = [b for b in bands if b != all_b]
+    al = a[a["anchor"] == ALL_REGIONS]
+    pick = None
+    if not al.empty:
+        x = al[al["band"] == all_b]
+        if not x.empty:
+            pick = x.assign(n_=x["cells_A"] + x["cells_B"]).sort_values(
+                "n_").iloc[-1]["system"]
+    keys = ([(pick, ALL_REGIONS)] if pick is not None else []) + [
+        (sy, k) for sy in [s_ for s_ in SYSTEMS if s_ in set(a["system"])]
+        + [s_ for s_ in dict.fromkeys(a["system"]) if s_ not in SYSTEMS]
+        for k in dict.fromkeys(a.loc[(a["system"] == sy)
+                                     & (a["anchor"] != ALL_REGIONS),
+                                     "anchor"])]
+    ix = a.set_index(["system", "anchor", "band"])
+    ny = len(keys)
+    PP = 100
+    with plt.rc_context(figure_style.RC):
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN, 1.0 + 0.2 * ny))
+        gs = fig.add_gridspec(1, 3, width_ratios=[1.2, 1.0, 1.2], wspace=0.08)
+        ax0, ax1, ax2 = (fig.add_subplot(gs[0, i]) for i in range(3))
+        yy = np.arange(ny)
+        for i, (sy, k) in enumerate(keys):
+            if (sy, k, all_b) not in ix.index:
+                continue
+            r = ix.loc[(sy, k, all_b)]
+            for dy, nm, col in ((-0.15, "A", "#d6604d"),
+                                (0.15, "B", "#4393c3")):
+                ax0.plot([PP * r[f"lo_{nm}"], PP * r[f"hi_{nm}"]],
+                         [i + dy] * 2, color=col, lw=0.8)
+                ax0.plot([PP * r[f"value_{nm}"]], [i + dy], "o", color=col,
+                         ms=3, label=(na if nm == "A" else nb_)
+                         if i == 0 else None)
+            q = r.get("q_diff", np.nan)
+            sig = np.isfinite(q) and q < q_cut
+            ax1.plot([PP * r["diff_lo"], PP * r["diff_hi"]], [i] * 2,
+                     color="0.2", lw=0.8)
+            ax1.plot([PP * r["diff"]], [i], "o", ms=3.5,
+                     mfc="0.1" if sig else "white", mec="0.1")
+            if np.isfinite(r.get("diff_adjusted", np.nan)):
+                ax1.plot([PP * r["diff_adjusted"]], [i], "D", ms=3,
+                         mfc="none", mec="#e6550d", mew=0.8,
+                         label="adjusted" if i == 0 else None)
+        ax0.axvline(0, color="0.6", lw=0.4)
+        ax1.axvline(0, color="0.6", lw=0.4)
+        for ax in (ax0, ax1):
+            ax.set_ylim(ny - 0.5, -0.5)
+            ax.set_yticks(yy)
+        ax0.set_yticklabels([_row_label(sy, k) for sy, k in keys],
+                            fontsize=5.5)
+        ax1.set_yticklabels([])
+        ax0.set_xlabel(f"{_STAT_LABEL.get(stat, stat)}, pp, all distances")
+        ax1.set_xlabel(f"{na} − {nb_}, pp")
+        ax0.legend(fontsize=5, loc="lower right")
+        h_, l_ = ax1.get_legend_handles_labels()
+        if h_:
+            ax1.legend(fontsize=5, loc="lower right")
+        M = np.full((ny, len(bands)), np.nan)
+        Q = np.full((ny, len(bands)), np.nan)
+        for i, (sy, k) in enumerate(keys):
+            for jb, bl in enumerate(bands):
+                if (sy, k, bl) in ix.index:
+                    M[i, jb] = PP * ix.loc[(sy, k, bl), "diff"]
+                    Q[i, jb] = ix.loc[(sy, k, bl)].get("q_diff", np.nan)
+        lim = (float(np.nanmax(np.abs(M))) if np.isfinite(M).any() else 1.0)
+        im = ax2.imshow(M, cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
+        for i in range(ny):
+            for jb in range(len(bands)):
+                if np.isfinite(Q[i, jb]) and Q[i, jb] < q_cut:
+                    ax2.text(jb, i, "*", ha="center", va="center",
+                             fontsize=7)
+        ax2.set_yticks([])
+        ax2.set_xticks(range(len(bands)))
+        ax2.set_xticklabels(bands, rotation=40, ha="right", fontsize=5)
+        cb = fig.colorbar(im, ax=ax2, fraction=0.05, pad=0.02)
+        cb.ax.tick_params(labelsize=5)
+        cb.set_label(f"{na} − {nb_}, pp", fontsize=6)
+        for ax, lab in zip((ax0, ax1, ax2), "abc"):
+            ax.set_title(lab, loc="left", fontweight="bold")
+        fig.suptitle(f"{context}: {na} vs {nb_} -- "
+                     f"{_STAT_LABEL.get(stat, stat)} by region group "
+                     f"(filled / *: q < {q_cut:g})", fontsize=7)
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+def plot_hotspot_contrast(hc: pd.DataFrame, enr: pd.DataFrame, context: str,
+                          path, fdr: float = 0.05):
+    """a: along the genome, per bin, the first group's ΔC less the second's
+    (pp; dotted: the median bin), bins that depart from it called; b: per
+    annotation track, Spearman rho of the difference with the track (bar),
+    the controls' (circle), and each group's own (triangles)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    a = hc[hc["context"] == context] if not hc.empty else hc
+    if a.empty:
+        return
+    na, nb_ = a["group_A"].iloc[0], a["group_B"].iloc[0]
+    e = (enr[enr["context"] == context].sort_values("rho_diff")
+         if not enr.empty else enr)
+    codes = np.sort(a["code"].unique())
+    span = a.groupby("code")["end"].max().reindex(codes).to_numpy(float)
+    off = dict(zip(codes, np.r_[0, np.cumsum(span)[:-1]]))
+    x = a["code"].map(off).to_numpy() + (a["start"] + a["end"]) / 2
+    rank = a["code"].map({c: i for i, c in enumerate(codes)}).to_numpy()
+    names = a.groupby("code")["chrom"].first().reindex(codes)
+    with plt.rc_context(figure_style.RC):
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN,
+                                  2.0 + 0.13 * max(len(e), 4)))
+        gs = fig.add_gridspec(2, 1, height_ratios=[1.3, 0.13 * max(len(e), 4)],
+                              hspace=0.6)
+        ax = fig.add_subplot(gs[0])
+        ax.scatter(x, 100 * a["diff"], s=1.5, lw=0,
+                   c=np.where(rank % 2, "0.2", "0.55"))
+        for k, c_, lab in (("higher_A", "#d6604d", f"higher in {na}"),
+                           ("higher_B", "#4393c3", f"higher in {nb_}")):
+            m = a[k].to_numpy(bool)
+            ax.scatter(x[m], 100 * a["diff"][m], s=3, color=c_, lw=0,
+                       label=f"{lab} ({int(m.sum())} bins, FDR {fdr:g})")
+        ax.axhline(0, color="0.4", lw=0.4)
+        ax.axhline(100 * float(a["diff"].median()), color="k", lw=0.4,
+                   ls=":")
+        ax.set_xticks([off[c] + s_ / 2 for c, s_ in zip(codes, span)])
+        ax.set_xticklabels([_canon(n) for n in names], fontsize=4.5)
+        ax.set_xlim(0, float(np.sum(span)))
+        ax.set_ylabel(f"ΔC {na} − {nb_} (pp)")
+        ax.legend(fontsize=4.5, markerscale=2, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.12), ncol=2, frameon=False)
+        ax.set_title(f"a  {context}: where {na} and {nb_} differ (dotted: "
+                     f"the median bin; {int(a['above_median'].sum())} bins "
+                     f"above it, {int(a['below_median'].sum())} below)",
+                     loc="left", fontsize=6.5)
+        if not e.empty:
+            ax2 = fig.add_subplot(gs[1])
+            yy = np.arange(len(e))
+            ax2.barh(yy, e["rho_diff"], height=0.7,
+                     color=np.where(e["rho_diff"] > 0, "#d6604d", "#4393c3"))
+            ax2.scatter(e["rho_control_diff"], yy, s=8, facecolors="none",
+                        edgecolors="0.2", lw=0.5, zorder=3, label="control")
+            ax2.scatter(e["rho_A"], yy, s=8, marker="^", color="#b2182b",
+                        lw=0, zorder=4, label=f"{na} alone")
+            ax2.scatter(e["rho_B"], yy, s=8, marker="v", color="#2166ac",
+                        lw=0, zorder=4, label=f"{nb_} alone")
+            for y_, (r_, q_) in enumerate(zip(e["rho_diff"],
+                                              e.get("q_diff", e["p_diff"]))):
+                if q_ < 0.05:
+                    ax2.text(r_, y_, " *" if r_ >= 0 else "* ", va="center",
+                             ha="left" if r_ >= 0 else "right", fontsize=6)
+            ax2.axvline(0, color="0.4", lw=0.4)
+            ax2.set_yticks(yy)
+            ax2.set_yticklabels(e["track"], fontsize=5)
+            ax2.set_xlabel(f"Spearman ρ across bins with the track: "
+                           f"bar, {na} − {nb_}")
+            ax2.legend(fontsize=4.5, loc="lower right")
+            ax2.set_title("b  what the differing bins are", loc="left",
+                          fontsize=6.5)
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
 # --------------------------------------------------- cell x chromosome --
 
 
@@ -4148,6 +4620,21 @@ def main(argv=None) -> int:
                     help="A further track the hotspot map is tested "
                          "against (e.g. imprinting control regions, IAP "
                          "elements); repeatable.")
+    ap.add_argument("--contrast-group", action="append", default=None,
+                    metavar="NAME=TYPE[,TYPE...]",
+                    help="Two groups of cells to compare, given twice -- the "
+                         "first minus the second -- each a list of values of "
+                         "--contrast-column (e.g. tumor=Tumor1,Tumor2 and "
+                         "monocyte=Monocyte): per region group and band, each "
+                         "group's pooled concordance and the difference "
+                         "(contrast_classes.tsv, contrast_<ctx>_<statistic>), "
+                         "and where along the genome they differ "
+                         "(contrast_hotspots.tsv.gz, "
+                         "contrast_hotspot_enrichment.tsv, "
+                         "contrast_hotspots_<ctx>).")
+    ap.add_argument("--contrast-column", default=None,
+                    help="--samples column the --contrast-group values are "
+                         "in (default --group-column).")
     ap.add_argument("--celltype-auc-stats", default="signed_rel",
                     help="Per-cell statistics whose power to predict cell "
                          "type, per region group, is tested (comma-separated "
@@ -4292,6 +4779,35 @@ def main(argv=None) -> int:
     hot_user = {k: enr._read_bed(enr._resolve(v, cache, f"hotspot {k}"))
                 for k, v in _parse_pairs(args.hotspot_annotation).items()}
 
+    # two groups of cells to compare
+    group_of: dict = {}
+    contrast_names: list = []
+    if args.contrast_group:
+        cg = _parse_pairs(args.contrast_group)
+        if len(cg) != 2:
+            sys.exit("--contrast-group: give exactly two groups, "
+                     "NAME=TYPE[,TYPE...] twice")
+        ccol = args.contrast_column or args.group_column
+        if ccol not in samples.columns:
+            sys.exit(f"--contrast-column {ccol!r} not in --samples")
+        lab = samples[ccol].astype(str).str.strip()
+        for nm, v in cg.items():
+            want = {x.strip().lower() for x in v.split(",") if x.strip()}
+            hit = lab[lab.str.lower().isin(want)]
+            if hit.empty:
+                sys.exit(f"--contrast-group {nm}: no cell with {ccol} in "
+                         f"{sorted(want)} (have: "
+                         f"{sorted(lab.unique())[:20]})")
+            for c in hit.index:
+                if c in group_of:
+                    sys.exit(f"--contrast-group: cell {c} is in both groups")
+                group_of[c] = nm
+            contrast_names.append(nm)
+        logger.info("contrast: " + " vs ".join(
+            f"{nm} ({sum(1 for v in group_of.values() if v == nm):,} cells)"
+            for nm in contrast_names))
+    contrast_rows, chot_rows, cenr_rows = [], [], []
+
     from joblib import Parallel, delayed
     first = next(iter(contexts.values()))
     cells_all = sorted(f.name[: -len(".posteriors.parquet")]
@@ -4428,6 +4944,9 @@ def main(argv=None) -> int:
         grid = BinGrid(chrom_names, 300_000_000, args.hotspot_bin)
         best_hot = best_arrays = None
         type_code = pd.factorize(types)[0]
+        cgroups = ({nm: np.flatnonzero([group_of.get(c) == nm
+                                        for c in cells])
+                    for nm in contrast_names} if contrast_names else {})
         cell = np.concatenate([np.full(r["g_lo"].size, i, np.int64)
                                for i, r in enumerate(res_)])
         g_lo = np.concatenate([r["g_lo"] for r in res_])
@@ -4503,7 +5022,8 @@ def main(argv=None) -> int:
                                            cell[idx], d_, c_, band[idx],
                                            len(edges) - 1))
                 best_arrays = (g_lo[idx], cell[idx], d_,
-                               k1s[idx] * n_k + k2s[idx])
+                               k1s[idx] * n_k + k2s[idx], g_hi[idx], c_,
+                               band[idx])
             # Co-open / co-closed mass, for F.  A donor's posterior is put
             # on the RECEIVING cell's level in that class (its centred value
             # plus that cell's mean), as the centring does for C, so a
@@ -4556,6 +5076,12 @@ def main(argv=None) -> int:
                                       minlength=len(cells) * nb1)
                         ).reshape(len(cells), nb1)
                     for k, v in sgn_parts.items()}
+            if cgroups and all(v.size for v in cgroups.values()):
+                for r_ in group_contrast(
+                        acc, sd, tot, S_sg, cgroups, classes, band_labels,
+                        args.n_boot, args.seed + 97 * si + ci_ctx):
+                    contrast_rows.append({"context": ctx, "system": name,
+                                          **r_})
             if cell_cov is not None and args.n_locus_perm > 0 and idx.size:
                 pr = k1s[idx] * n_k + k2s[idx]
                 with np.errstate(invalid="ignore", divide="ignore"):
@@ -4717,7 +5243,7 @@ def main(argv=None) -> int:
                             "chromosome_share", "cell_share",
                             "sampling_share", "cell_x_chromosome_share",
                             "perm_p") if k in ct))
-        best_arrays = None
+        tracks = None
         if best_hot is not None and best_hot[2] is not None:
             hs = best_hot[2]
             hs.insert(0, "context", ctx)
@@ -4737,6 +5263,39 @@ def main(argv=None) -> int:
                         f"{args.hotspot_bin:,} bp bins): {int(t_['hot'].sum())}"
                         f" hot and {int(t_['cold'].sum())} cold of "
                         f"{len(t_):,} bins at FDR {args.hotspot_fdr:g}")
+        if cgroups and best_arrays is not None and not args.no_hotspots:
+            # where along the genome the two groups differ
+            masks = {nm: np.isin(np.arange(len(cells)), ix)
+                     for nm, ix in cgroups.items()}
+            hc = hotspot_contrast(grid, best_arrays, masks, len(edges) - 1,
+                                  args.hotspot_min_contacts, args.hotspot_fdr)
+            if not hc.empty:
+                if tracks is None:
+                    tracks = hotspot_tracks(grid, systems, ab_maps, genes,
+                                            cpg, hot_user)
+                hc.insert(0, "context", ctx)
+                hc.insert(1, "system", best_hot[1])
+                hc["chrom"] = hc["code"].map(chrom_names)
+                en_ = pd.DataFrame(hotspot_contrast_enrichment(hc, tracks))
+                if not en_.empty:
+                    en_.insert(0, "context", ctx)
+                    en_["q_diff"] = fdr_bh(en_["p_diff"].to_numpy())
+                    cenr_rows.append(en_)
+                for k, v in tracks.items():
+                    hc[k] = v[hc["grid_index"].to_numpy()]
+                chot_rows.append(hc)
+                logger.info(f"{ctx} {contrast_names[0]} vs "
+                            f"{contrast_names[1]}: median bin difference "
+                            f"{100 * hc['median_diff'].iloc[0]:+.2f} pp; "
+                            f"{int(hc['higher_A'].sum())} bins higher in "
+                            f"{contrast_names[0]}, "
+                            f"{int(hc['higher_B'].sum())} in "
+                            f"{contrast_names[1]}; "
+                            f"{int(hc['above_median'].sum())} above the "
+                            f"median difference, "
+                            f"{int(hc['below_median'].sum())} below "
+                            f"(of {len(hc):,})")
+        best_arrays = None
         del res_
 
     percell = (pd.concat(percell_rows, ignore_index=True) if percell_rows
@@ -4961,6 +5520,48 @@ def main(argv=None) -> int:
             plot_cross_class(cc_, ctx_, out / f"cross_class_{ctx_}_"
                                               f"signed_rel.{args.plot_format}",
                              stat="signed_rel")
+    # The two groups of cells compared.
+    if contrast_rows:
+        ct = pd.DataFrame(contrast_rows)
+        ct["q_diff"] = np.nan
+        for _, g in ct.groupby(["context", "statistic"], sort=False):
+            ct.loc[g.index, "q_diff"] = fdr_bh(g["p_diff"].to_numpy())
+        if cell_cov is not None:
+            adj = adjusted_contrast(percell, cell_cov, ctx_cov, group_of,
+                                    contrast_names, batch_cols)
+            if not adj.empty:
+                ct = ct.merge(adj, on=["context", "system", "anchor",
+                                       "partner", "band", "statistic"],
+                              how="left")
+        ct.to_csv(out / "contrast_classes.tsv", sep="\t", index=False)
+        for ctx_ in contexts:
+            for st_ in ("delta", "signed_rel"):
+                plot_contrast(ct, ctx_, st_, out / f"contrast_{ctx_}_{st_}."
+                                                   f"{args.plot_format}")
+        top = ct[(ct["anchor"] == ct["partner"])
+                 & ct["band"].astype(str).str.startswith("all")
+                 & (ct["statistic"] == "signed_rel")]
+        top = top.reindex(top["q_diff"].sort_values().index).head(12)
+        cols_ = [c for c in ("context", "system", "anchor", "value_A",
+                             "value_B", "diff", "q_diff", "diff_adjusted",
+                             "q_adjusted") if c in top]
+        logger.info(f"{contrast_names[0]} vs {contrast_names[1]}, ΔC x w, "
+                    f"all distances (smallest q):\n"
+                    + top[cols_].to_string(index=False, float_format=lambda
+                                           v: f"{v:.4f}"))
+    if chot_rows:
+        hc_ = pd.concat(chot_rows, ignore_index=True)
+        hc_.drop(columns=["grid_index", "code"]).to_csv(
+            out / "contrast_hotspots.tsv.gz", sep="\t", index=False)
+        en_ = (pd.concat(cenr_rows, ignore_index=True) if cenr_rows
+               else pd.DataFrame())
+        en_.to_csv(out / "contrast_hotspot_enrichment.tsv", sep="\t",
+                   index=False)
+        for ctx_ in contexts:
+            plot_hotspot_contrast(hc_, en_, ctx_, out / f"contrast_hotspots_"
+                                                        f"{ctx_}."
+                                                        f"{args.plot_format}",
+                                  fdr=args.hotspot_fdr)
     # How well each region group's concordance predicts cell type.
     auc_stats = [x.strip() for x in args.celltype_auc_stats.split(",")
                  if x.strip() and x.strip() != "none"]
