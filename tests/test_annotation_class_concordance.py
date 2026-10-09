@@ -1253,6 +1253,123 @@ def test_two_groups_of_cells_compared_by_class_and_along_the_genome(tmp_path):
     assert (o / "contrast_hotspots_GCH.png").exists()
 
 
+def _contrast_args(d, o, *groups):
+    return ["--posteriors", f"GCH={d / 'GCH'}",
+            "--samples", str(d / "samples.tsv"), "--systems", "pmd",
+            "--pmd", str(d / "pmd.bed"), "--min-pairs", "10",
+            "--n-boot", "200", "--n-threads", "2", "--n-locus-perm", "0",
+            "--covariate-min-cells", "10", "--batch-column", "batch",
+            "--celltype-auc-stats", "none", "--hotspot-min-contacts", "100",
+            *[x for g in groups for x in ("--contrast-group", g)],
+            "--plot-format", "png", "--output-dir", str(o)]
+
+
+def test_contrast_pairs():
+    assert acc.contrast_pairs(["a", "b", "c"]) == [("a", "b"), ("a", "c"),
+                                                   ("b", "c")]
+    assert acc.contrast_pairs(["a", "b", "c"], "c") == [("a", "c"),
+                                                        ("b", "c")]
+    assert acc.contrast_pairs(["a", "b"]) == [("a", "b")]
+
+
+def test_three_groups_compared_pair_by_pair(tmp_path):
+    """Concordance planted in HMD contacts of T0 only, each type its own
+    group: T0 - T1 and T0 - T2 are higher in HMD-HMD, T1 - T2 is not; each
+    pair has its own figures and there is one overview of all; each group's
+    batches are listed."""
+    d = make_data(tmp_path, per=20, n_types=3,
+                  coord=lambda t_, c: 0.9 if t_ == 0 else 0.0)
+    o = tmp_path / "out3"
+    acc.main(_contrast_args(d, o, "T0=T0", "T1=T1", "T2=T2"))
+    ct = pd.read_csv(o / "contrast_classes.tsv", sep="\t")
+    pairs = {("T0", "T1"), ("T0", "T2"), ("T1", "T2")}
+    assert set(zip(ct["group_A"], ct["group_B"])) == pairs
+    a = ct[ct["band"].str.startswith("all") & (ct["statistic"] == "delta")
+           & (ct["anchor"] == "HMD") & (ct["partner"] == "HMD")
+           ].set_index(["group_A", "group_B"])
+    assert a.loc[("T0", "T1"), "diff"] > 0.05
+    assert a.loc[("T0", "T2"), "diff"] > 0.05
+    assert abs(a.loc[("T1", "T2"), "diff"]) < 0.02
+    assert a.loc[("T0", "T1"), "q_diff"] < 0.05
+    assert (a["batch_adjusted"] == "batch").all()
+    for tag in ("T0_vs_T1", "T0_vs_T2", "T1_vs_T2"):
+        assert (o / f"contrast_GCH_delta_{tag}.png").exists()
+        assert (o / f"contrast_GCH_signed_rel_{tag}.png").exists()
+        assert (o / f"contrast_hotspots_GCH_{tag}.png").exists()
+    assert (o / "contrast_overview_GCH_delta.png").exists()
+    hc = pd.read_csv(o / "contrast_hotspots.tsv.gz", sep="\t")
+    assert set(zip(hc["group_A"], hc["group_B"])) == pairs
+    en = pd.read_csv(o / "contrast_hotspot_enrichment.tsv", sep="\t")
+    hmd = en[en["track"] == "PMD / HMD: HMD"].set_index(["group_A",
+                                                          "group_B"])
+    assert hmd.loc[("T0", "T1"), "rho_diff"] > 0.5
+    assert abs(hmd.loc[("T1", "T2"), "rho_diff"]) < 0.5
+    g = pd.read_csv(o / "contrast_groups.tsv", sep="\t")
+    assert (g.loc[g["batch_column"] == "all"].set_index("group")["cells"]
+            == 20).all()
+    by = g[g["batch_column"] == "batch"]
+    assert set(by["batch"]) == {"b0", "b1"}
+    assert (by.groupby("group")["cells"].sum() == 20).all()
+
+
+def test_a_group_concordant_everywhere_differs_in_scale_only(tmp_path):
+    """Concordance planted in HMD contacts of every type, twice as strong in
+    T0: T0 - rest is higher in HMD-HMD and its bins follow HMD, but beyond
+    the pair's all-regions ratio the class doesn't differ, and the bins
+    don't depart from the rest's map rescaled to T0's."""
+    d = make_data(tmp_path, per=20, n_types=3,
+                  coord=lambda t_, c: 0.9 if t_ == 0 else 0.45)
+    o = tmp_path / "out_scale"
+    acc.main(_contrast_args(d, o, "T0=T0", "rest=T1,T2"))
+    ct = pd.read_csv(o / "contrast_classes.tsv", sep="\t")
+    a = ct[ct["band"].str.startswith("all") & (ct["statistic"] == "delta")
+           & (ct["anchor"] == ct["partner"])].set_index("anchor")
+    assert a.loc["HMD", "diff"] > 0.03 and a.loc["HMD", "q_diff"] < 0.05
+    assert a.loc["HMD", "scale_ratio"] > 1.5
+    assert abs(a.loc["HMD", "diff_scaled"]) < a.loc["HMD", "diff"] / 3
+    assert a.loc["HMD", "diff_scaled_lo"] < 0 < a.loc["HMD", "diff_scaled_hi"]
+    assert np.isnan(a.loc[acc.ALL_REGIONS, "diff_scaled"])
+    hc = pd.read_csv(o / "contrast_hotspots.tsv.gz", sep="\t")
+    assert hc["scale_k"].iloc[0] > 1.4 and hc["r_maps"].iloc[0] > 0.8
+    en = pd.read_csv(o / "contrast_hotspot_enrichment.tsv", sep="\t"
+                     ).set_index("track")
+    assert en.loc["PMD / HMD: HMD", "rho_diff"] > 0.5
+    assert abs(en.loc["PMD / HMD: HMD", "rho_resid"]) < \
+        en.loc["PMD / HMD: HMD", "rho_diff"] / 2
+
+
+def test_map_scale_recovers_a_rescaled_map():
+    rng = np.random.default_rng(1)
+    s = rng.normal(size=3000)
+    se_a, se_b = np.full(s.size, 0.5), np.full(s.size, 0.5)
+    b = s + rng.normal(scale=0.5, size=s.size)
+    a = 0.1 + 2 * s + rng.normal(scale=0.5, size=s.size)
+    sc = acc._map_scale(a, b, se_a, se_b)
+    assert abs(sc["k"] - 2) < 0.1 and abs(sc["offset"] - 0.1) < 0.1
+    assert abs(sc["r"] - 1) < 0.05
+
+
+def test_rotation_p_keeps_the_bins_autocorrelation():
+    """Two independent autocorrelated series correlate by chance beyond
+    what the plain Spearman p allows; against genome rotations they don't,
+    and a real association still stands."""
+    from scipy.stats import spearmanr
+    rng = np.random.default_rng(1)
+
+    def ar1(n, phi=0.95):
+        e = rng.normal(size=n)
+        x = np.empty(n)
+        x[0] = e[0]
+        for i in range(1, n):
+            x[i] = phi * x[i - 1] + e[i]
+        return x
+    x, y = ar1(3000), ar1(3000)
+    assert spearmanr(x, y)[1] < 1e-6
+    assert acc._rotation_p(x, y) > 0.05
+    assert acc._rotation_p(x, x + rng.normal(scale=x.std(), size=x.size)
+                           ) < 0.01
+
+
 # ------------------------------------------------ variable and stable loci --
 
 
