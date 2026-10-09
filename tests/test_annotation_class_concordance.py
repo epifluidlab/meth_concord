@@ -362,7 +362,9 @@ def test_the_sign_version_keeps_delta_c_whole(planted):
     r = s[np.isfinite(s["signed_rel"]) & (s["signed_rel"] != 0)]
     assert np.allclose(np.abs(r["signed_sgn"]), np.abs(r["delta"]))
     assert (np.sign(r["signed_sgn"]) == np.sign(r["signed_rel"])).all()
-    c = pc[np.isfinite(pc["signed_rel"]) & (pc["signed_rel"] != 0)]
+    # (a class pair's rows; all regions mixes the pairs' signs)
+    c = pc[np.isfinite(pc["signed_rel"]) & (pc["signed_rel"] != 0)
+           & (pc["anchor"] != acc.ALL_REGIONS)]
     assert np.allclose(np.abs(c["signed_sgn"]), np.abs(c["delta"]))
     h = _row(s, "pmd", "HMD", "HMD")
     assert h["signed_sgn_lo"] > 0 and h["signed_sgn"] >= h["signed_rel"]
@@ -493,9 +495,12 @@ def test_the_covariate_outputs_are_written(planted):
     same = a[(a["anchor"] == a["partner"]) & a["R2_adj_all"].notna()
              & a["band"].astype(str).str.startswith("all")]
     sh = [c for c in a.columns if c.startswith("shap_")]
-    assert {"shap_technical", "shap_level", "shap_scale",
-            "shap_labeling efficiency", "shap_substructure",
-            "shap_batch"} <= set(sh)
+    assert {"shap_technical", "shap_1D baseline", "shap_scale",
+            "shap_3D contacts", "shap_labeling efficiency",
+            "shap_substructure", "shap_batch"} <= set(sh)
+    assert {"rho_ps_slope", "rho_pair_share", "rho_mu_pair_1"} <= set(
+        a.columns)
+    assert cov["ps_slope"].between(-3, 0.5).all()
     tot = same[sh].sum(1, min_count=1)
     np.testing.assert_allclose(tot, same["R2_adj_all"].clip(lower=0),
                                atol=1e-6)
@@ -990,11 +995,48 @@ def _territory(inter_sd, seed=0):
                                     np.random.default_rng(seed + 1))
 
 
+def test_the_territory_test_keeps_a_cell_effect_on_one_class_pair():
+    """A cell more concordant in one class pair only -- whose share of its
+    contacts differs by chromosome by chance -- is no territory state."""
+    rng = np.random.default_rng(11)
+    n_cells, per = 180, 600
+    cell = np.repeat(np.arange(n_cells), per)
+    ctype = np.repeat(np.arange(3), n_cells // 3)
+    chrom = rng.integers(1, 11, cell.size)
+    g = chrom.astype(np.int64) * acc.STRIDE + rng.integers(0, 10**8, cell.size)
+    pair = rng.integers(0, 3, cell.size)
+    d = (np.where(pair == 0, rng.normal(0, 1.0, n_cells)[cell], 0)
+         + rng.normal(0, 1, cell.size))
+    r = acc.cell_chromosome_test(g, cell, ctype, d, 20,
+                                 np.random.default_rng(12), pair=pair)
+    assert r["cell_x_chromosome_share"] < 0.05 and r["perm_p"] > 0.05
+
+
 def test_the_territory_test_finds_cell_specific_chromosome_states():
     r0, r1 = _territory(0.0), _territory(0.25)
     assert r0["cell_x_chromosome_share"] < 0.05 and r0["perm_p"] > 0.05
     assert r1["cell_x_chromosome_share"] > 0.15 and r1["perm_p"] < 0.05
     assert r1["chromosome_share"] > 0.2 and r1["entries"] > 1000
+    # particular to cell and chromosome, not one cell effect scaled
+    assert r1["idiosyncratic_share"] > 0.6 * r1["cell_x_chromosome_share"]
+    assert r1["idiosyncratic_p"] < 0.05
+
+
+def test_a_cell_effect_scaled_by_chromosome_is_told_apart():
+    rng = np.random.default_rng(13)
+    n_cells, per = 180, 600
+    cell = np.repeat(np.arange(n_cells), per)
+    ctype = np.repeat(np.arange(3), n_cells // 3)
+    chrom = rng.integers(1, 11, cell.size)
+    g = chrom.astype(np.int64) * acc.STRIDE + rng.integers(0, 10**8, cell.size)
+    load = rng.normal(0, 1, 11)                     # per chromosome
+    eff = rng.normal(0, 0.3, n_cells)                # per cell
+    d = eff[cell] * load[chrom] + rng.normal(0, 1, cell.size)
+    r = acc.cell_chromosome_test(g, cell, ctype, d, 20,
+                                 np.random.default_rng(14))
+    assert r["perm_p"] < 0.05
+    assert r["scaled_share"] > 2 * r["idiosyncratic_share"]
+    assert r["idiosyncratic_p"] > 0.05
 
 
 def test_cross_class_residual_tells_measured_from_unmeasured_factors():
@@ -1075,3 +1117,32 @@ def test_methylation_at_open_sites_and_away_from_them(tmp_path):
     assert (k, n) == (10.0, 40.0)
     assert (ko, no) == (6.0, 10.0)                  # the end at the site
     assert (kd, nd) == (4.0, 30.0)                  # the three far from it
+
+
+def test_all_regions_pool_every_contact_of_a_system(planted):
+    _, pc, o = planted
+    allr = pc[(pc["anchor"] == acc.ALL_REGIONS)
+              & pc["band"].str.startswith("all")]
+    assert set(allr["system"]) >= {"ab", "chromhmm", "pmd", "rt"}
+    cls = pc[(pc["anchor"] != acc.ALL_REGIONS) & pc["band"].str.startswith(
+        "all") & (pc["system"] == "pmd")]
+    one = allr[allr["system"] == "pmd"].set_index("cell")
+    # its contacts are the class pairs' together
+    np.testing.assert_allclose(
+        cls.groupby("cell")["pairs"].sum().reindex(one.index), one["pairs"])
+    # signed, it is the contact-weighted mean of the class pairs' values
+    cls = cls[np.isfinite(cls["signed_rel"])]
+    want = (cls["signed_rel"] * cls["pairs"]).groupby(cls["cell"]).sum() / (
+        cls.groupby("cell")["pairs"].sum())
+    np.testing.assert_allclose(one["signed_rel"].reindex(want.index), want,
+                               rtol=1e-6, atol=1e-12)
+    assert (one["signed_rel"].abs() > 0).any()
+    a = pd.read_csv(o / "covariate_association.tsv", sep="\t")
+    r = a[(a["anchor"] == acc.ALL_REGIONS) & (a["statistic"] == "signed_rel")
+          & a["band"].str.startswith("all")]
+    assert r["tot_noise"].notna().all() and r["cell_share"].notna().all()
+    top = acc._same_state(a, "GCH", "signed_rel", r["band"].iloc[0])
+    assert top["anchor"].iloc[0] == acc.ALL_REGIONS
+    assert (top["anchor"] == acc.ALL_REGIONS).sum() == 1
+    cc = pd.read_csv(o / "cross_class_correlation.tsv", sep="\t")
+    assert acc.ALL_REGIONS not in set(cc["state_1"]) | set(cc["state_2"])

@@ -152,6 +152,10 @@ locus_hotspot_enrichment.tsv) -- each also with gene density accounted for
 (rho_given_tss), as imprinted genes, CpG islands and promoters all sit
 where genes are dense.
 
+ALL REGIONS.  Beside the class pairs, every annotated contact of a system
+together ("all regions"); signed, each contact carries its class pair's
+weight, so the value is the contact-weighted mean of the class pairs'.
+
 CELL TYPE FROM CONCORDANCE.  celltype_auc_<statistic> (celltype_auc.tsv,
 celltype_auc_by_type.tsv): per context and both together, how well each
 region group's per-cell concordance predicts cell type -- a random forest,
@@ -518,6 +522,10 @@ def _categorical(path, columns):
 #: among contacts >= 25 kb, "near" ones and the mitotic band.
 NEAR = (25_000, 2_000_000)
 MITOTIC = (2_000_000, 12_000_000)
+#: The distances the per-cell P(s) slope is fitted over.
+PS_RANGE = (50_000, 2_000_000)
+#: Every annotated contact of a system, as one region group.
+ALL_REGIONS = "all regions"
 
 
 def _contact_pass(path, min_d: int, res: int, exclude, rt=None) -> tuple:
@@ -558,6 +566,19 @@ def _contact_pass(path, min_d: int, res: int, exclude, rt=None) -> tuple:
         k = rt.lookup_g(np.concatenate([cc * STRIDE + p1, cc * STRIDE + p2]))
         e_, l_ = int((k == 0).sum()), int((k == 1).sum())
         cov["repli_score"] = e_ / (e_ + l_) if e_ + l_ else np.nan
+    # how its contacts fall off with distance: the log-log slope of the
+    # contact density between PS_RANGE's ends
+    cov["ps_slope"] = np.nan
+    m = (sep >= PS_RANGE[0]) & (sep <= PS_RANGE[1])
+    if m.sum() >= 100:
+        edges = np.logspace(np.log10(PS_RANGE[0]), np.log10(PS_RANGE[1]), 13)
+        cnt = np.histogram(sep[m], edges)[0]
+        ok_ = cnt > 0
+        if ok_.sum() >= 4:
+            mid = np.sqrt(edges[:-1] * edges[1:])
+            cov["ps_slope"] = float(np.polyfit(
+                np.log10(mid[ok_]), np.log10(cnt[ok_] / np.diff(edges)[ok_]),
+                1)[0])
     return bins, cov
 
 
@@ -1239,10 +1260,17 @@ COV_GROUPS = (
                    "sites_mean", "decisive")),
     ("doublets", ("doublet_score",)),
     ("bisulfite conversion", ("nonconversion",)),
-    ("level", ("level",)),
+    # the cell's 1D signal: its genome-wide level, its level in the pair's
+    # classes, and the other context's level
+    ("1D baseline", ("level", "level_other", "mu_pair_1", "mu_pair_2")),
     ("scale", ("scale",)),
-    ("cell cycle", ("frac_near", "frac_mitotic", "repli_score")),
-    ("3D", ("compartment_strength",)),
+    # the cell's contacts themselves: how its chromatin folds -- the
+    # distance profile (% near / % mitotic are that too: in post-mitotic
+    # neurons they read folding, not the cycle), compartments, and how
+    # many of its contacts this class pair takes
+    ("3D contacts", ("compartment_strength", "ps_slope", "frac_near",
+                     "frac_mitotic", "pair_share")),
+    ("cell cycle", ("repli_score",)),
     ("labeling efficiency", ("open_site_level",)),
     ("mCA", ("mca_index",)),
     ("division history", ("pmd_depth",)),
@@ -1254,6 +1282,9 @@ HEATMAP_COVARIATES = tuple(c for c in COVARIATES if c not in SUB_PCS)
 COV_LABEL = {"log10_contacts": "depth", "frac_short": "% short pairs",
              "frac_called": "% ends called", "sites_mean": "sites / end",
              "decisive": "call decisiveness", "level": "level",
+             "level_other": "other context's level",
+             "mu_pair_1": "class level", "mu_pair_2": "partner class level",
+             "ps_slope": "P(s) slope", "pair_share": "pair's share",
              "scale": "scale (class SDs)",
              "frac_near": "% near", "frac_mitotic": "% mitotic",
              "repli_score": "repli-score",
@@ -1264,8 +1295,9 @@ COV_LABEL = {"log10_contacts": "depth", "frac_short": "% short pairs",
              "pmd_depth": "PMD depth",
              **{c: c.replace("sub_pc", "substructure PC") for c in SUB_PCS}}
 #: The components of the variance split, in the order the bar shows them.
-GROUP_COLOR = {"technical": "#08519c", "level": "#54278f",
-               "scale": "#9e9ac8", "cell cycle": "#006d2c", "3D": "#74c476",
+GROUP_COLOR = {"technical": "#08519c", "1D baseline": "#54278f",
+               "scale": "#9e9ac8", "cell cycle": "#006d2c",
+               "3D contacts": "#74c476",
                "batch": "#8c510a", "labeling efficiency": "#e6550d",
                "mCA": "#c51b7d", "division history": "#1b9e77",
                "substructure": "#cb181d", "doublets": "#bcbd22",
@@ -1277,8 +1309,8 @@ TECHNICAL_GROUPS = ("technical", "batch", "labeling efficiency", "scale",
 #: The total split's components in the order its bar shows them.
 TOTAL_ORDER = ("technical", "batch", "labeling efficiency", "scale",
                "doublets", "bisulfite conversion",
-               "cell type", "level", "cell cycle", "3D", "mCA",
-               "division history", "substructure")
+               "cell type", "1D baseline", "3D contacts", "cell cycle",
+               "mCA", "division history", "substructure")
 TOTAL_COLOR = {**GROUP_COLOR, "cell type": "#000000"}
 #: Covariates measured per context (from that context's calls).
 CTX_COVARIATES = ("level", "sites_mean", "decisive", "frac_called")
@@ -1740,15 +1772,22 @@ def locus_reassignment(cell, ctype, pair, band, parts: dict, n_band: int,
     T = int(ctype.max()) + 1 if n_cells else 1
     ct = ctype[cell]
     stats = ["delta"] + (["delta_r"] if "r" in parts else [])
-    signed = fg is not None and all(k in parts for k in ("oo", "oc", "no2",
-                                                         "nc2"))
+    # signed parts per contact (``sd``/``sc``, ``gd``/``gc``: a contact's
+    # part of ΔC times its class pair's weight, and the control's): the
+    # signed statistics are then means like ΔC
+    direct = "sd" in parts and "sc" in parts
+    signed = (not direct and fg is not None
+              and all(k in parts for k in ("oo", "oc", "no2", "nc2")))
+    if direct:
+        stats += ["signed_rel"] + (["signed_sgn"] if "gd" in parts
+                                   and "gc" in parts else [])
     if signed:
         stats += ["signed_rel", "signed_sgn"]
         fg, fgn = np.asarray(fg, float), np.asarray(fgn, float)
         fg_t = np.array([np.nanmean(fg[ctype == t])
                          if np.isfinite(fg[ctype == t]).any() else np.nan
                          for t in range(T)])
-    moved = [k for k in ("d", "r", "oo", "oc") if k in parts]
+    moved = [k for k in ("d", "r", "oo", "oc", "sd", "gd") if k in parts]
     out = []
     for b_arr in (band, np.full(band.size, n_band)):
         grp = pair.astype(np.int64) * (n_band + 1) + b_arr
@@ -1774,6 +1813,10 @@ def locus_reassignment(cell, ctype, pair, band, parts: dict, n_band: int,
             v = {"delta": m}
             if "delta_r" in stats:
                 v["delta_r"] = S["rc" if ctrl else "r"] / Ne
+            if direct:
+                v["signed_rel"] = S["sc" if ctrl else "sd"] / Ne
+                if "signed_sgn" in stats:
+                    v["signed_sgn"] = S["gc" if ctrl else "gd"] / Ne
             if signed:
                 o_, c_ = ("no2", "nc2") if ctrl else ("oo", "oc")
                 with np.errstate(invalid="ignore", divide="ignore"):
@@ -1918,6 +1961,19 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
     from scipy.stats import f as f_dist
     from scipy.stats import t as t_dist
     pc = percell[percell["enough_pairs"]]
+    # the pair's share of the cell's contacts (of the system, in the band)
+    tot_pairs = None
+    if "pairs" in percell:
+        pr = percell[percell["anchor"] != ALL_REGIONS]
+        tot_pairs = pr.groupby(["context", "system", "band", "cell"])[
+            "pairs"].sum()
+    # the other context's genome-wide level
+    other = {}
+    for c_ in ctx_cov:
+        o_ = [x for x in ctx_cov if x != c_]
+        if o_:
+            other[c_] = ctx_cov[o_[0]][["cell", "level"]].rename(
+                columns={"level": "level_other"})
     lk = None
     if locus is not None and not locus.empty:
         if "statistic" not in locus:
@@ -1932,8 +1988,20 @@ def covariate_association(percell: pd.DataFrame, cov: pd.DataFrame,
         cx = ctx_cov.get(ctx)
         if cx is not None:
             d = d.merge(cx, on="cell", how="left")
+        if ctx in other:
+            d = d.merge(other[ctx], on="cell", how="left")
         if "sd_anchor" in d and "sd_partner" in d:
             d["scale"] = d["sd_anchor"] * d["sd_partner"]
+        if "mu_anchor" in d:
+            d["mu_pair_1"] = d["mu_anchor"]
+            d["mu_pair_2"] = d["mu_partner"] if k1 != k2 else np.nan
+        if tot_pairs is not None:
+            try:
+                tp = tot_pairs.loc[(ctx, sy, bl)]
+                d["pair_share"] = (d["pairs"].to_numpy(float)
+                                   / d["cell"].map(tp).to_numpy(float))
+            except KeyError:
+                pass
         avail = [c for c in COVARIATES if c in d
                  and d[c].notna().sum() >= min_cells and d[c].nunique() > 1]
         X0 = d[avail].to_numpy(float) if avail else np.empty((len(d), 0))
@@ -2079,7 +2147,8 @@ def cross_class_correlation(percell: pd.DataFrame, summary: pd.DataFrame,
     all_b = next((b for b in dict.fromkeys(percell["band"])
                   if str(b).startswith("all")), None)
     pc = percell[(percell["band"] == all_b) & percell["enough_pairs"]
-                 & (percell["anchor"] == percell["partner"])]
+                 & (percell["anchor"] == percell["partner"])
+                 & (percell["anchor"] != ALL_REGIONS)]
     rel = {}
     s_all = summary[summary["band"] == all_b]
     hcol = "split_half_r" if stat == "delta" else f"{stat}_split_half_r"
@@ -2197,8 +2266,14 @@ def _residualize(pc: pd.DataFrame, stat: str, cov: pd.DataFrame,
         cx = (ctx_cov or {}).get(key[0])
         if cx is not None:
             d = d.merge(cx, on="cell", how="left")
+        o_ = [x for x in (ctx_cov or {}) if x != key[0]]
+        if o_:
+            d = d.merge(ctx_cov[o_[0]][["cell", "level"]].rename(
+                columns={"level": "level_other"}), on="cell", how="left")
         if "sd_anchor" in d and "sd_partner" in d:
             d["scale"] = d["sd_anchor"] * d["sd_partner"]
+        if "mu_anchor" in d:
+            d["mu_pair_1"] = d["mu_anchor"]
         y = d[stat].to_numpy(float)
         ok = np.isfinite(y)
         t = d["cell_type"].astype(str).to_numpy()
@@ -2298,8 +2373,16 @@ def celltype_auc(percell: pd.DataFrame, stat: str = "signed_rel",
     tasks = []
     for ctx_name, ctxs in ctx_sets:
         cols_ctx = [c for c in W[stat].columns if c[0] in ctxs]
+        allr = [c for c in cols_ctx if c[2] == ALL_REGIONS]
+        cols_ctx = [c for c in cols_ctx if c[2] != ALL_REGIONS]
         groups = list(dict.fromkeys((sy, k) for _, sy, k in cols_ctx))
-        sets = [(sy, k, [(sy, k)]) for sy, k in groups]
+        sets = []
+        if allr:
+            # all regions once: the system with the most cells
+            best = max(allr, key=lambda c: int(W[stat][c].notna().sum()))
+            sets.append(("all", ALL_REGIONS, [(best[1], ALL_REGIONS)]))
+            cols_ctx = cols_ctx + [c for c in allr if c[1] == best[1]]
+        sets += [(sy, k, [(sy, k)]) for sy, k in groups]
         systems_ = list(dict.fromkeys(sy for sy, _ in groups))
         for sy in systems_:
             gs = [g for g in groups if g[0] == sy]
@@ -2308,7 +2391,8 @@ def celltype_auc(percell: pd.DataFrame, stat: str = "signed_rel",
         if len(systems_) > 1:
             sets.append(("all", "all classes", groups))
         for sy, name, gs in sets:
-            cols = [c for c in cols_ctx if (c[1], c[2]) in gs]
+            cols = [c for c in cols_ctx if (c[1], c[2]) in gs
+                    and (c[2] != ALL_REGIONS or name == ALL_REGIONS)]
             M = W[stat].reindex(columns=cols)
             cells = M.index[M.notna().any(axis=1).to_numpy()]
             y = types.reindex(cells)
@@ -2352,11 +2436,11 @@ def _auc_rows(res: pd.DataFrame) -> list:
     order = [x for x in SYSTEMS if any(k[0] == x for k in keys)] + [
         x for x in dict.fromkeys(k[0] for k in keys)
         if x not in SYSTEMS and x != "all"]
-    out = []
+    out = [k for k in keys if k[1] == ALL_REGIONS]
     for sy in order:
         out += [k for k in keys if k[0] == sy and k[1] != "all classes"]
         out += [k for k in keys if k[0] == sy and k[1] == "all classes"]
-    return out + [k for k in keys if k[0] == "all"]
+    return out + [k for k in keys if k[0] == "all" and k[1] != ALL_REGIONS]
 
 
 def plot_celltype_auc(res: pd.DataFrame, per: pd.DataFrame, stat: str, path):
@@ -2373,8 +2457,9 @@ def plot_celltype_auc(res: pd.DataFrame, per: pd.DataFrame, stat: str, path):
     contexts = list(dict.fromkeys(res["context"]))
     rows = _auc_rows(res)
     ny = len(rows)
-    label = [f"{SYSTEM_LABEL.get(sy, sy)}: {g}" if sy != "all"
-             else "all region groups" for sy, g in rows]
+    label = [("all regions (pooled contacts)" if g == ALL_REGIONS else
+              f"{SYSTEM_LABEL.get(sy, sy)}: {g}" if sy != "all"
+              else "all region groups") for sy, g in rows]
     types = sorted(per["cell_type"].astype(str).unique())
     style = {"concordance": dict(marker="o", color="#2b7bba", ms=3.5),
              "concordance, technical removed": dict(marker="^",
@@ -2462,18 +2547,27 @@ def plot_celltype_auc(res: pd.DataFrame, per: pd.DataFrame, stat: str, path):
 
 
 def cell_chromosome_test(g_lo, cell, ctype, d, n_perm: int, rng,
-                         min_contacts: int = 50) -> dict:
+                         min_contacts: int = 50, pair=None) -> dict:
     """Does a cell's concordance differ between its own chromosomes beyond
     sampling -- a cell-specific state of whole territories?
 
     Per cell and chromosome with >= ``min_contacts`` contacts, the mean of
     the contacts' parts of ΔC (``d``).  An additive fit -- a cell effect
     plus a chromosome effect, least squares over the entries -- leaves each
-    entry's cell x chromosome interaction plus sampling.  Reassigning each
-    chromosome's contacts among the cells of a type, every cell keeping its
-    number on each chromosome, leaves sampling (and how the types differ
-    between chromosomes) only; the observed residual beyond that is the
-    cell x chromosome part.  Returns the entries' variance and its shares --
+    entry's cell x chromosome interaction plus sampling.  The null keeps
+    every cell's own effect in each class pair (``pair``) -- a cell whose
+    A-A contacts are more concordant is so on every chromosome, by however
+    many A-A contacts each chromosome happens to give it: each contact's
+    part, less its cell's mean in its class pair, is reassigned among the
+    cells of a type within its chromosome and class pair, and the receiving
+    cell's mean added back.  That leaves sampling (and how the types differ
+    between chromosomes); the observed residual beyond it is the cell x
+    chromosome part.  It is split in two, with at least five chromosomes:
+    a cell effect scaled chromosome by chromosome (the leading rank-one
+    term of the residual -- e.g. a cell's A-versus-B difference, carried
+    by how pure each chromosome's A and B labels are), and what is beyond
+    it, particular to a cell and a chromosome -- the part a territory or
+    condensate state would show as.  Returns the entries' variance and its shares --
     chromosome, cell (the fitted effects), sampling, cell x chromosome --
     with a permutation p."""
     cell = np.asarray(cell, np.int64)
@@ -2481,6 +2575,9 @@ def cell_chromosome_test(g_lo, cell, ctype, d, n_perm: int, rng,
     chrom = np.asarray(g_lo, np.int64) // STRIDE
     codes, ci = np.unique(chrom, return_inverse=True)
     K, C = codes.size, ctype.size
+    pair = (np.zeros(cell.size, np.int64) if pair is None
+            else np.unique(np.asarray(pair), return_inverse=True)[1])
+    P_ = int(pair.max()) + 1 if pair.size else 1
     key = cell * K + ci
     N = np.bincount(key, minlength=C * K).reshape(C, K)
     ok = N >= min_contacts
@@ -2492,6 +2589,8 @@ def cell_chromosome_test(g_lo, cell, ctype, d, n_perm: int, rng,
         return out
     W = ok.astype(float)
 
+    rank1 = int(ok.any(0).sum()) >= 5
+
     def fit(dv):
         S = np.bincount(key, weights=dv, minlength=C * K).reshape(C, K)
         Y = np.where(ok, S / np.maximum(N, 1), 0.0)
@@ -2500,15 +2599,32 @@ def cell_chromosome_test(g_lo, cell, ctype, d, n_perm: int, rng,
             b = (W * (Y - a[:, None])).sum(0) / np.maximum(W.sum(0), 1)
             a = (W * (Y - b[None, :])).sum(1) / np.maximum(W.sum(1), 1)
         R = (Y - a[:, None] - b[None, :]) * W
-        return Y, a, b, float((R ** 2).sum() / W.sum())
-    Y, a, b, r_obs = fit(np.asarray(d, float))
-    blk = ctype[cell] * K + ci
+        r1 = np.nan
+        if rank1:
+            # the leading rank-one term of the residual, entries observed
+            u = np.linalg.svd(R, full_matrices=False)[0][:, 0]
+            for _ in range(30):
+                v = (W * R * u[:, None]).sum(0) / np.maximum(
+                    (W * u[:, None] ** 2).sum(0), 1e-12)
+                u = (W * R * v[None, :]).sum(1) / np.maximum(
+                    (W * v[None, :] ** 2).sum(1), 1e-12)
+            R1 = (R - np.outer(u, v)) * W
+            r1 = float((R1 ** 2).sum() / W.sum())
+        return Y, a, b, float((R ** 2).sum() / W.sum()), r1
+    d = np.asarray(d, float)
+    Y, a, b, r_obs, r1_obs = fit(d)
+    # each contact less its cell's mean in its class pair
+    cp = cell * P_ + pair
+    m_cp = (np.bincount(cp, weights=d, minlength=C * P_)
+            / np.maximum(np.bincount(cp, minlength=C * P_), 1))[cp]
+    dc = d - m_cp
+    blk = (ctype[cell] * K + ci) * P_ + pair
     o = np.argsort(blk, kind="stable")
     bs = blk[o]
     st = np.flatnonzero(np.r_[True, bs[1:] != bs[:-1]])
     en = np.r_[st[1:], bs.size]
     multi = [(x, y) for x, y in zip(st, en) if y - x > 1]
-    do = np.asarray(d, float)[o]
+    do = dc[o]
     null = []
     for _ in range(int(n_perm)):
         pidx = np.arange(bs.size)
@@ -2516,8 +2632,9 @@ def cell_chromosome_test(g_lo, cell, ctype, d, n_perm: int, rng,
             pidx[x:y] = x + rng.permutation(y - x)
         dp = np.empty_like(do)
         dp[o] = do[pidx]
-        null.append(fit(dp)[3])
-    null = np.asarray(null)
+        null.append(fit(dp + m_cp)[3:])
+    null = np.asarray(null, float).reshape(-1, 2)
+    null, null1 = null[:, 0], null[:, 1]
     yv = Y[ok]
     v = float(yv.var())
     out.update({"var_entries": v, "residual_var": r_obs})
@@ -2534,6 +2651,14 @@ def cell_chromosome_test(g_lo, cell, ctype, d, n_perm: int, rng,
         out["cell_x_chromosome_share"] = (float(max(r_obs - null.mean(), 0)
                                                 / v) if v > 0 else np.nan)
         out["perm_p"] = float((1 + (null >= r_obs).sum()) / (null.size + 1))
+        if rank1 and v > 0 and np.isfinite(null1).all():
+            idio = max(r1_obs - null1.mean(), 0) / v
+            out["idiosyncratic_share"] = float(min(
+                idio, out["cell_x_chromosome_share"]))
+            out["scaled_share"] = float(out["cell_x_chromosome_share"]
+                                        - out["idiosyncratic_share"])
+            out["idiosyncratic_p"] = float(
+                (1 + (null1 >= r1_obs).sum()) / (null1.size + 1))
     return out
 
 
@@ -2546,10 +2671,20 @@ def plot_cell_chromosome(tab: pd.DataFrame, path):
     from nome_hic_concordance import figure_style
     if tab.empty or "sampling_share" not in tab:
         return
+    tab = tab.copy()
+    if "idiosyncratic_share" in tab:
+        # where the split is known, the interaction in its two parts
+        known = tab["idiosyncratic_share"].notna()
+        tab.loc[known, "cell_x_chromosome_share"] = np.nan
     parts = (("chromosome_share", "#525252", "chromosome"),
              ("cell_share", "#08519c", "cell"),
              ("sampling_share", "0.85", "sampling (+ type x chromosome)"),
-             ("cell_x_chromosome_share", "#cb181d", "cell x chromosome"))
+             ("cell_x_chromosome_share", "#cb181d", "cell x chromosome"),
+             ("scaled_share", "#fc9272",
+              "cell x chromosome: a cell effect, scaled"),
+             ("idiosyncratic_share", "#99000d",
+              "cell x chromosome: particular (territory?)"))
+    parts = tuple(x for x in parts if x[0] in tab)
     with plt.rc_context(figure_style.RC):
         fig, ax = plt.subplots(figsize=(figure_style.FIG_W_IN * 0.6,
                                         0.8 + 0.3 * len(tab)))
@@ -2562,14 +2697,16 @@ def plot_cell_chromosome(tab: pd.DataFrame, path):
             ax.barh(yy, W_[:, j], left=left, color=c_, label=lab, height=0.6)
             left += W_[:, j]
         for i, (_, r) in enumerate(tab.iterrows()):
-            ax.text(1.01, i, f"p = {r.get('perm_p', np.nan):.3g}",
-                    va="center", fontsize=5)
+            ax.text(1.01, i, f"p = {r.get('perm_p', np.nan):.3g}"
+                    + (f"; particular p = {r['idiosyncratic_p']:.3g}"
+                       if np.isfinite(r.get("idiosyncratic_p", np.nan))
+                       else ""), va="center", fontsize=5)
         ax.set_yticks(yy)
         ax.set_yticklabels(tab["context"])
         ax.set_ylim(len(tab) - 0.5, -0.5)
         ax.set_xlim(0, 1)
         ax.set_xlabel("share of the variance of per-cell, per-chromosome ΔC")
-        ax.legend(fontsize=5, loc="upper left", bbox_to_anchor=(1.12, 1.0),
+        ax.legend(fontsize=5, loc="upper left", bbox_to_anchor=(1.3, 1.0),
                   borderaxespad=0)
         ax.set_title("Does a cell's concordance differ between its own "
                      "chromosomes?", loc="left", fontsize=6.5)
@@ -3039,7 +3176,7 @@ def plot_variance_total(assoc: pd.DataFrame, context: str, stat: str, path,
                 ax.text(-0.01, i, f"type {100 * ct:.0f}%", va="center",
                         ha="right", fontsize=4.5, color="0.3")
         ax.set_yticks(yy)
-        ax.set_yticklabels([f"{SYSTEM_LABEL.get(sy, sy)}: {k}–{k}"
+        ax.set_yticklabels([_row_label(sy, k)
                             for sy, k in zip(a["system"], a["anchor"])],
                            fontsize=5.5)
         ax.tick_params(axis="y", pad=28)
@@ -3195,12 +3332,35 @@ def plot_hotspots(hs: pd.DataFrame, enrich: pd.DataFrame, context: str,
         plt.close(fig)
 
 
+def _all_regions_system(assoc, context):
+    """The system whose all-regions row the figures show: the one most
+    cells enter over all distances."""
+    a = assoc[(assoc["context"] == context)
+              & (assoc["anchor"] == ALL_REGIONS)]
+    if a.empty:
+        return None
+    all_b = a[a["band"].astype(str).str.startswith("all")]
+    a = all_b if not all_b.empty else a
+    return a.groupby("system")["cells"].max().idxmax()
+
+
 def _same_state(assoc, context, stat, band):
     a = assoc[(assoc["context"] == context) & (assoc["statistic"] == stat)
               & (assoc["band"] == band) & (assoc["anchor"] == assoc["partner"])]
+    allr = a[a["anchor"] == ALL_REGIONS]
+    a = a[a["anchor"] != ALL_REGIONS]
     order = [x for x in SYSTEMS if x in set(a["system"])] + [
         x for x in dict.fromkeys(a["system"]) if x not in SYSTEMS]
-    return pd.concat([a[a["system"] == x] for x in order]) if order else a
+    out = pd.concat([a[a["system"] == x] for x in order]) if order else a
+    sy = _all_regions_system(assoc, context) if not allr.empty else None
+    if sy is not None and (allr["system"] == sy).any():
+        out = pd.concat([allr[allr["system"] == sy], out])
+    return out
+
+
+def _row_label(sy, k) -> str:
+    return ("all regions" if k == ALL_REGIONS
+            else f"{SYSTEM_LABEL.get(sy, sy)}: {k}–{k}")
 
 
 def plot_covariates(assoc: pd.DataFrame, context: str, stat: str, path,
@@ -3247,7 +3407,7 @@ def plot_covariates(assoc: pd.DataFrame, context: str, stat: str, path,
         ax0.set_xticklabels([COV_LABEL[c] for c in covs], rotation=40,
                             ha="right")
         ax0.set_yticks(range(ny))
-        ax0.set_yticklabels([f"{SYSTEM_LABEL.get(sy, sy)}: {k}–{k}"
+        ax0.set_yticklabels([_row_label(sy, k)
                              for sy, k in zip(a["system"], a["anchor"])])
         ax0.set_title(f"within-type ρ, all distances  (* q < {q_cut:g})",
                       loc="left")
@@ -3361,8 +3521,8 @@ def plot_covariates_by_band(assoc: pd.DataFrame, context: str, stat: str,
                                rotation=60, ha="right", fontsize=5)
             ax.set_title(str(b), fontsize=6)
         axes[0][0].set_yticks(range(ny))
-        axes[0][0].set_yticklabels([f"{SYSTEM_LABEL.get(sy, sy)}: {k}–{k}"
-                                    for sy, k in rows], fontsize=5)
+        axes[0][0].set_yticklabels([_row_label(sy, k) for sy, k in rows],
+                                   fontsize=5)
         cb = fig.colorbar(im, ax=axes[0].tolist(), fraction=0.02, pad=0.01)
         cb.ax.tick_params(labelsize=5)
         cb.set_label("within-type ρ", fontsize=6)
@@ -4249,7 +4409,8 @@ def main(argv=None) -> int:
                             locus_hotspots(grid, g_lo[idx], g_hi[idx],
                                            cell[idx], d_, c_, band[idx],
                                            len(edges) - 1))
-                best_arrays = (g_lo[idx], cell[idx], d_)
+                best_arrays = (g_lo[idx], cell[idx], d_,
+                               k1s[idx] * n_k + k2s[idx])
             # Co-open / co-closed mass, for F.  A donor's posterior is put
             # on the RECEIVING cell's level in that class (its centred value
             # plus that cell's mean), as the centring does for C, so a
@@ -4267,17 +4428,47 @@ def main(argv=None) -> int:
                                           + (1 - ql) * (1 - p_))
             acc = accumulate(cell[idx], k1s[idx], k2s[idx], band[idx],
                              half[idx], w, len(cells), n_k, len(edges) - 1)
+            # every annotated contact of the system together.  Its signed
+            # value gives each contact its class pair's weight (the pair's
+            # co-open share against the cell's genome-wide one, all
+            # distances) and averages: the contact-weighted mean of the class
+            # pairs' signed values -- over all classes at once the share is
+            # the genome-wide one, and the weight 0 by definition
+            A_ = len(edges) - 1
+            tot = {k: acc[k].sum((1, 2)) for k in ("n", "xy", "xy1", "xy2",
+                                                   "oo", "oc", "no2", "nc2")}
+            ci_ = cell[idx]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                fg_c = tot["oo"][:, A_] / (tot["oo"][:, A_] + tot["oc"][:, A_])
+                fgn_c = tot["no2"][:, A_] / (tot["no2"][:, A_]
+                                              + tot["nc2"][:, A_])
+                Fp = acc["oo"][..., A_] / (acc["oo"][..., A_]
+                                           + acc["oc"][..., A_])
+                Fpn = acc["no2"][..., A_] / (acc["no2"][..., A_]
+                                             + acc["nc2"][..., A_])
+                wk = np.nan_to_num(_weight(Fp[ci_, k1s[idx], k2s[idx]],
+                                           fg_c[ci_]))
+                wkn = np.nan_to_num(_weight(Fpn[ci_, k1s[idx], k2s[idx]],
+                                            fgn_c[ci_]))
+                ek = np.nan_to_num(2 * Fp[ci_, k1s[idx], k2s[idx]] - 1)
+                ekn = np.nan_to_num(2 * Fpn[ci_, k1s[idx], k2s[idx]] - 1)
+            sgn_parts = {"sd": d_ * wk, "sc": c_ * wkn,
+                         "gd": d_ * np.sign(wk), "gc": c_ * np.sign(wkn),
+                         "ed": d_ * ek, "ec": c_ * ekn}
+            nb1 = len(edges)
+            kb_ = ci_ * nb1 + band[idx]
+            ka_ = ci_ * nb1 + A_
+            S_sg = {k: (np.bincount(kb_, weights=v, minlength=len(cells) * nb1)
+                        + np.bincount(ka_, weights=v,
+                                      minlength=len(cells) * nb1)
+                        ).reshape(len(cells), nb1)
+                    for k, v in sgn_parts.items()}
             if cell_cov is not None and args.n_locus_perm > 0 and idx.size:
                 pr = k1s[idx] * n_k + k2s[idx]
-                ci_ = cell[idx]
                 with np.errstate(invalid="ignore", divide="ignore"):
                     s12 = sd[ci_, k1s[idx]] * sd[ci_, k2s[idx]]
                     inv = np.where(s12 > 0, 0.5 / np.where(s12 > 0, s12, 1),
                                    0.0)
-                    gk = {k: acc[k][:, :, :, len(edges) - 1].sum((1, 2))
-                          for k in ("oo", "oc", "no2", "nc2")}
-                    fg_c = gk["oo"] / (gk["oo"] + gk["oc"])
-                    fgn_c = gk["no2"] / (gk["no2"] + gk["nc2"])
                 lr = locus_reassignment(
                     ci_, type_code, pr, band[idx],
                     {"d": d_, "c": c_, "r": d_ * inv, "rc": c_ * inv,
@@ -4293,6 +4484,21 @@ def main(argv=None) -> int:
                               np.asarray(classes)[lr["pair"] // n_k])
                     lr.insert(3, "partner",
                               np.asarray(classes)[lr["pair"] % n_k])
+                    lr.insert(4, "band",
+                              np.asarray(band_labels)[lr["band_index"]])
+                    locus_rows.append(lr.drop(columns=["pair",
+                                                       "band_index"]))
+                lr = locus_reassignment(
+                    ci_, type_code, np.zeros(idx.size, np.int64), band[idx],
+                    {"d": d_, "c": c_, "r": d_ * inv, "rc": c_ * inv,
+                     **{k: sgn_parts[k] for k in ("sd", "sc", "gd", "gc")}},
+                    len(edges) - 1, args.min_pairs, args.n_locus_perm,
+                    np.random.default_rng([args.seed, ci_ctx, si, 4051]))
+                if not lr.empty:
+                    lr.insert(0, "context", ctx)
+                    lr.insert(1, "system", name)
+                    lr.insert(2, "anchor", ALL_REGIONS)
+                    lr.insert(3, "partner", ALL_REGIONS)
                     lr.insert(4, "band",
                               np.asarray(band_labels)[lr["band_index"]])
                     locus_rows.append(lr.drop(columns=["pair",
@@ -4349,6 +4555,47 @@ def main(argv=None) -> int:
                         pcr["delta"].to_numpy(), oo_, oc_, fg_)
                     pcr["signed_sgn_control"] = _signed_sgn(
                         pcr["control"].to_numpy(), no2_, nc2_, fgn_)
+            ci_a, bi_a = np.nonzero(tot["n"] > 0)
+            if ci_a.size:
+                g_ = {k: v[ci_a, bi_a] for k, v in tot.items()}
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    s12m = sd[:, :, None] * sd[:, None, :]
+                    inv12 = np.where(s12m > 0, 1.0 / np.where(s12m > 0, s12m,
+                                                               1), 0.0)
+                    r_num = ((acc["xy"] - acc["xy1"])
+                             * inv12[..., None]).sum((1, 2))[ci_a, bi_a]
+                    rc_num = ((acc["xy2"] - acc["xy1"])
+                              * inv12[..., None]).sum((1, 2))[ci_a, bi_a]
+                    lev = marg[:, 1].sum(1) / marg[:, 0].sum(1)
+                    lsd = np.sqrt(np.maximum(marg[:, 2].sum(1)
+                                             / marg[:, 0].sum(1) - lev ** 2, 0))
+                    dlt = 2 * (g_["xy"] - g_["xy1"]) / g_["n"]
+                    ctl = 2 * (g_["xy2"] - g_["xy1"]) / g_["n"]
+                    percell_rows.append(pd.DataFrame({
+                        "context": ctx, "system": name,
+                        "cell": np.asarray(cells)[ci_a],
+                        "cell_type": types[ci_a], "anchor": ALL_REGIONS,
+                        "partner": ALL_REGIONS,
+                        "band": np.asarray(band_labels)[bi_a],
+                        "pairs": g_["n"],
+                        "enough_pairs": g_["n"] >= args.min_pairs,
+                        "C_obs": 2 * g_["xy"] / g_["n"],
+                        "C_null": 2 * g_["xy1"] / g_["n"],
+                        "delta": dlt, "control": ctl,
+                        "mu_anchor": lev[ci_a], "mu_partner": lev[ci_a],
+                        "sd_anchor": lsd[ci_a], "sd_partner": lsd[ci_a],
+                        "delta_r": r_num / g_["n"],
+                        "control_r": rc_num / g_["n"],
+                        "F": g_["oo"] / (g_["oo"] + g_["oc"]),
+                        "F_null": g_["no2"] / (g_["no2"] + g_["nc2"]),
+                        "F_ref": fg_c[ci_a],
+                        **{col_: S_sg[k_][ci_a, bi_a] / g_["n"]
+                           for col_, k_ in (
+                               ("signed", "ed"), ("signed_control", "ec"),
+                               ("signed_rel", "sd"),
+                               ("signed_rel_control", "sc"),
+                               ("signed_sgn", "gd"),
+                               ("signed_sgn_control", "gc"))}}))
             logger.info(f"{ctx} {name}: {ok.mean():.1%} of contacts "
                         f"annotated at both ends with a reshuffled partner")
         if ctx == hcg_ctx and "pmd" in systems and cell_cov is not None:
@@ -4368,7 +4615,8 @@ def main(argv=None) -> int:
             ct = cell_chromosome_test(
                 best_arrays[0], best_arrays[1], type_code, best_arrays[2],
                 args.n_locus_perm,
-                np.random.default_rng([args.seed, ci_ctx, 7331]))
+                np.random.default_rng([args.seed, ci_ctx, 7331]),
+                pair=best_arrays[3])
             ct.update({"context": ctx, "system": best_hot[1]})
             chrom_rows.append(ct)
             logger.info(f"{ctx} cell x chromosome ({best_hot[1]} null): "
