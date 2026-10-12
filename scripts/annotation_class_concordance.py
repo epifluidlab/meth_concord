@@ -6267,6 +6267,7 @@ def main(argv=None) -> int:
     if not cells_all:
         sys.exit(f"no cells of {args.samples} under {first}")
     sex_tab, sex_of = None, {}
+    chrx_on = args.chrx
     if args.chrx:
         cnt = Parallel(n_jobs=args.n_threads, prefer="threads")(
             delayed(_sex_counts)(Path(first) / f"{c}.posteriors.parquet")
@@ -6291,6 +6292,16 @@ def main(argv=None) -> int:
         sex_tab.to_csv(out / "cell_sex.tsv", sep="\t", index=False)
         logger.info("sex per cell type:\n" + pd.crosstab(
             sex_tab["cell_type"], sex_tab["sex"]).to_string())
+        if not (sex_tab["pairs_X"] > 0).any():
+            logger.warning(
+                "--chrx: no cell has a read pair on chrX -- its posteriors "
+                "were made without it (nome_hic_concordance drops chrX and "
+                "chrY unless given --exclude-chrom none).  Rerun its steps "
+                "2 and 4 with --exclude-chrom none into a new --output-dir, "
+                "its 03_mixture_model/em_fit_all.json copied in so the "
+                "autosomes' posteriors stay as they are, and point "
+                "--posteriors there.  chrX skipped.")
+            chrx_on = False
 
     ab_maps = None
     # One pass over every cell's read pairs: the A/B bins (with ab) and the
@@ -6396,7 +6407,7 @@ def main(argv=None) -> int:
                               args.min_distance, args.max_distance, exclude,
                               sysd, open_g if ctx == acc_ctx else None,
                               args.open_site_window, prof_bin,
-                              with_x=args.chrx)
+                              with_x=chrx_on)
         logger.info(f"{ctx}: reading {len(cells):,} cells")
         res_ = Parallel(n_jobs=args.n_threads, prefer="threads")(
             delayed(one)(i, c) for i, c in enumerate(cells))
@@ -6702,7 +6713,7 @@ def main(argv=None) -> int:
                                ("signed_sgn_control", "gc"))}}))
             logger.info(f"{ctx} {name}: {ok.mean():.1%} of contacts "
                         f"annotated at both ends with a reshuffled partner")
-        if args.chrx:
+        if chrx_on:
             # chrX against the autosomes: every contact, X ones included,
             # as one system of two classes
             xs = [r["x"] for r in res_]

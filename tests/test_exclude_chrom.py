@@ -34,6 +34,29 @@ def test_empty_and_none_are_noops():
         assert parse_exclude_chroms(v) == set(), v
 
 
+def test_none_clears_the_default_and_anything_before_it():
+    """argparse puts a CLI's default first and appends to it, so 'none' is
+    the one way to keep a contig the default drops."""
+    assert parse_exclude_chroms(["chrX,chrY", "none"]) == set()
+    assert parse_exclude_chroms(["chrX,chrY", "none,chrM"]) == {"M"}
+    assert parse_exclude_chroms(["chrX,chrY", "none", "chrM"]) == {"M"}
+    assert parse_exclude_chroms(["chrX,chrY", "chrM"]) == {"M", "X", "Y"}
+
+
+def test_none_through_argparse_keeps_the_sex_chromosomes():
+    import argparse
+    from nome_hic_concordance.utils import add_exclude_chrom_arg
+    p = argparse.ArgumentParser()
+    add_exclude_chrom_arg(p, default=["chrX,chrY"])
+
+    def ex(argv):
+        return parse_exclude_chroms(p.parse_args(argv).exclude_chrom)
+    assert ex([]) == {"X", "Y"}
+    assert ex(["--exclude-chrom", "chrM"]) == {"M", "X", "Y"}
+    assert ex(["--exclude-chrom", "none"]) == set()
+    assert ex([]) == {"X", "Y"}          # the default itself is untouched
+
+
 def test_naming_variants_are_interchangeable():
     """chrM / M / MT are one contig; chr1 / 1 are one chromosome."""
     for spelling in ("chrM", "M", "MT", "chrMT", "CHRM", " chrM "):

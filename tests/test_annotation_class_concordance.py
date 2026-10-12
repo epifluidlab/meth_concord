@@ -1467,6 +1467,21 @@ def test_chrx_concordance_in_females_only_and_nothing_else_changes(
                                       pd.read_csv(o1 / name, sep="\t"))
 
 
+def test_chrx_without_x_reads_says_so_and_skips(tmp_path, caplog):
+    """Posteriors made without chrX: sexes unknown, a warning saying how to
+    get chrX back, and no chrX tables."""
+    d = make_data(tmp_path, per=10, n_types=2)
+    o = tmp_path / "no_x"
+    with caplog.at_level("WARNING"):
+        acc.main(_contrast_args(d, o) + ["--chrx"])
+    assert "no cell has a read pair on chrX" in caplog.text
+    assert "--exclude-chrom none" in caplog.text
+    sx = pd.read_csv(o / "cell_sex.tsv", sep="\t")
+    assert (sx["sex_call"] == "unknown").all()
+    assert not (o / "chrx_concordance.tsv").exists()
+    assert (o / "summary.tsv").exists()
+
+
 def test_imprinted_domains_from_genes():
     genes = pd.DataFrame({
         "chrom": ["chr7", "chr7", "chr7", "chr7", "chr7", "chr11"],

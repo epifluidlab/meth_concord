@@ -76,7 +76,10 @@ def parse_exclude_chroms(values) -> set[str]:
     """``--exclude-chrom`` -> set of canonical keys.
 
     Accepts the flag repeated, comma-separated, or both:
-    ``--exclude-chrom chrM,chrX --exclude-chrom chrY``.
+    ``--exclude-chrom chrM,chrX --exclude-chrom chrY``.  'none' drops
+    everything before it -- a CLI's default included, which argparse puts
+    first and then appends to -- so ``--exclude-chrom none`` keeps every
+    contig and ``--exclude-chrom none,chrM`` drops chrM alone.
     """
     if not values:
         return set()
@@ -85,7 +88,10 @@ def parse_exclude_chroms(values) -> set[str]:
     out: set[str] = set()
     for v in values:
         for part in str(v).split(","):
-            if part.strip():
+            part = part.strip()
+            if part.lower() == "none":
+                out.clear()
+            elif part:
                 out.add(chrom_key(part))
     return out
 
@@ -157,7 +163,10 @@ def add_exclude_chrom_arg(parser, default=None) -> None:
              "Defaults to 'chrX,chrY' in nome_hic_concordance -- chrM is kept "
              "because it is not chromatinised and so is the enzyme-efficiency "
              "control (see scripts/chrm_regress.py); pass chrM explicitly to "
-             "drop it.  Downstream tools default to 'chrM,chrX,chrY'.")
+             "drop it.  Downstream tools default to 'chrM,chrX,chrY'.  A "
+             "value adds to the default; 'none' clears it (and anything "
+             "before it): '--exclude-chrom none' keeps chrX and chrY, "
+             "'--exclude-chrom none,chrM' drops chrM alone.")
 
 
 def report_excluded(excluded: set[str], present, kind: str = "contig"):
