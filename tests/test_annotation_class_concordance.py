@@ -1420,21 +1420,38 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
 
 
 def test_sex_called_from_x_and_y_coverage():
-    auto = {1: (9000, 20_000_000), 2: (9000, 20_000_000)}
     # 9000 pairs per 20 Mb autosome: two copies of X give as many per bp
-    counts = {"f": {**auto, 1001: (9000, 20_000_000)},
-              "m": {**auto, 1001: (4500, 20_000_000), 1002: (300, 9_000_000)},
-              "low": {1: (500, 20_000_000), 1001: (500, 20_000_000)},
-              "fy": {**auto, 1001: (8800, 20_000_000), 1002: (400, 9e6)}}
+    auto = {1: (9000, 20_000_000), 2: (9000, 20_000_000)}
+
+    def cell(x, y):
+        return {**auto, 1001: (x, 20_000_000), 1002: (y, 9_000_000)}
+    counts = {**{f"f{i}": cell(9000, 2) for i in range(4)},
+              "m1": cell(4500, 90), "m2": cell(4400, 100),
+              "fy": cell(8800, 60),          # two X and a Y: a doublet
+              "xloss": cell(4500, 2),        # one X, no Y: X lost
+              "low": {1: (500, 20_000_000), 1001: (500, 20_000_000)}}
     t = acc.call_sex(counts).set_index("cell")
-    assert t.loc["f", "sex_call"] == "female"
-    assert abs(t.loc["f", "x_dosage"] - 1) < 0.05
-    assert t.loc["m", "sex_call"] == "male"
-    assert abs(t.loc["m", "x_dosage"] - 0.5) < 0.05
+    assert (t.loc[[f"f{i}" for i in range(4)], "sex_call"] == "female").all()
+    assert abs(t.loc["f0", "x_dosage"] - 1) < 0.05
+    assert (t.loc[["m1", "m2"], "sex_call"] == "male").all()
+    assert abs(t.loc["m1", "x_dosage"] - 0.5) < 0.05
+    assert t.loc["fy", "sex_call"] == "unknown"
+    assert t.loc["xloss", "sex_call"] == "unknown"
     assert t.loc["low", "sex_call"] == "unknown"        # too few pairs
-    assert t.loc["fy", "sex_call"] == "unknown"         # two X and a Y
     assert list(acc._given_sex(["F", "male", "xx", "?"])) == [
         "female", "male", "female", "unknown"]
+
+
+def test_female_cells_with_mismapped_y_stay_female():
+    """A female line: Y pairs only from mismapping, as many in the cells
+    short of an X as in the rest -- those are not males."""
+    auto = {1: (9000, 20_000_000), 2: (9000, 20_000_000)}
+    counts = {f"f{i}": {**auto, 1001: (9000 - 50 * i, 20_000_000),
+                        1002: (2, 9_000_000)} for i in range(20)}
+    counts["xloss"] = {**auto, 1001: (4000, 20_000_000), 1002: (2, 9e6)}
+    t = acc.call_sex(counts).set_index("cell")
+    assert (t.drop("xloss")["sex_call"] == "female").all()
+    assert t.loc["xloss", "sex_call"] == "unknown"
 
 
 def test_chrx_concordance_in_females_only_and_nothing_else_changes(

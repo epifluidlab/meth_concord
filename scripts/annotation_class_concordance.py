@@ -3570,10 +3570,14 @@ def call_sex(counts: dict, min_pairs: int = 2000, x_female: float = 0.8,
     per bp of the autosomes, a chromosome's length the furthest position
     any cell reaches -- about 1 with two X, 0.5 with one.  Female at
     ``x_female`` or more, male at ``x_male`` or less, else unknown, and
-    unknown with fewer than ``min_pairs`` autosomal pairs.  A 'female' with
-    a quarter of the males' median share of pairs on Y -- or, without
-    males, ten times the females' median -- is unknown too: a male-female
-    doublet, or a male."""
+    unknown with fewer than ``min_pairs`` autosomal pairs.  Where the data
+    has Y, Y has the last word.  If the X calls' males carry clearly more
+    of their pairs on Y than the females (over five times the median), a
+    female above their geometric mean is unknown (a male-female doublet, or
+    a male) and so is a male below it (one X and no Y: an X lost in
+    culture, or a poor cell).  If they don't, the 'males' are female cells
+    short of an X -- unknown.  Without males, a female with ten times the
+    females' median share on Y is unknown (given ten females or more)."""
     X, Y = _chrom_code("X"), _chrom_code("Y")
     length: dict = {}
     for c in counts.values():
@@ -3600,10 +3604,18 @@ def call_sex(counts: dict, min_pairs: int = 2000, x_female: float = 0.8,
           "sex_call"] = "unknown"
     fem, mal = t["sex_call"] == "female", t["sex_call"] == "male"
     if t["pairs_Y"].sum() > 0 and fem.any():
-        y_cut = (0.25 * float(t.loc[mal, "y_share"].median()) if mal.any()
-                 else 10 * max(float(t.loc[fem, "y_share"].median()), 1e-5)
-                 if fem.sum() >= 10 else np.inf)
-        t.loc[fem & (t["y_share"] > y_cut), "sex_call"] = "unknown"
+        yf = max(float(t.loc[fem, "y_share"].median()), 1e-6)
+        if mal.any():
+            ym = float(t.loc[mal, "y_share"].median())
+            if ym > 5 * yf:
+                cut = np.sqrt(yf * ym)
+                t.loc[fem & (t["y_share"] > cut), "sex_call"] = "unknown"
+                t.loc[mal & (t["y_share"] < cut), "sex_call"] = "unknown"
+            else:
+                t.loc[mal, "sex_call"] = "unknown"
+        elif fem.sum() >= 10:
+            t.loc[fem & (t["y_share"] > 10 * max(yf, 1e-5)),
+                  "sex_call"] = "unknown"
     return t
 
 
