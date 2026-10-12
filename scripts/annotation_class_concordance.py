@@ -171,6 +171,21 @@ rescaled to the first's -- and what they are, with p against genome rotations
 (contrast_hotspots.tsv.gz, contrast_hotspot_enrichment.tsv,
 contrast_hotspots_<ctx>).
 
+ALLELIC STATES.  A contact's two ends lie on one copy of a chromosome, and
+its reshuffled partners come from either copy, so where the two copies differ
+-- an inactive X, an imprinted domain -- contacts are concordant beyond the
+null without any SNP.  --chrx: each cell's sex from its X and Y coverage
+(cell_sex.tsv, or --sex-column), and X-X against autosome-autosome
+concordance per cell type, sex and group (chrx_concordance.tsv,
+chrx_percell.tsv.gz, chrx_<ctx>); chrX enters nothing else, and in a male the
+one X is the reference with no second copy.  --imprinting: concordance
+inside imprinted domains (the gene annotation's imprinted genes merged, or
+--imprinting-bed) against windows matched in length, chromatin (the
+contacts' class pairs) and TSS count, per cell type and group, and each
+pair's difference -- neurons against glia where imprinting is neuron-specific
+(Ube3a, Grb10) (imprinting_domains.tsv, imprinting_concordance.tsv,
+imprinting_contrast.tsv, imprinting_windows.tsv, imprinting_<ctx>).
+
 VARIABLE AND STABLE LOCI.  Per 1 Mb bin, each cell type's concordance, and
 how much it varies between types beyond sampling (a heterogeneity test
 against the control): the most variable bins, the variable ones beyond each
@@ -803,7 +818,7 @@ def compartments_from_contacts(by_cell: list, cell_type: list, res: int,
 
 def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
                systems: dict, open_g=None, open_w: int = 200,
-               prof_bin: int = 0) -> dict:
+               prof_bin: int = 0, with_x: bool = False) -> dict:
     """One cell's contacts -- both ends called, min_d <= d <= max_d -- as
     genome coordinates, with every system's class at both ends, and per
     system x class the count, sum and sum of squares of ALL its called
@@ -811,8 +826,10 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
     included).  With ``open_g``, the sites methylated and the sites of its
     ends within ``open_w`` of an open site (the posterior instead when the
     file has no counts); with ``prof_bin``, its called ends' posterior sum
-    and count per bin of that size.  Integer work only, so threads run in
-    parallel."""
+    and count per bin of that size.  With ``with_x``, its chrX contacts
+    and the marginal of its X ends and of its autosomal ends, kept apart
+    ("x") so that nothing but the chrX analysis sees them.  Integer work
+    only, so threads run in parallel."""
     import pyarrow.parquet as pq
     cols = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
     has_k = {"k1", "k2"} <= set(pq.read_schema(str(path)).names)
@@ -889,6 +906,30 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
             np.bincount(k[ok], weights=e_p[ok], minlength=n_k),
             np.bincount(k[ok], weights=e_p[ok] ** 2, minlength=n_k)])
         out["cls"][name] = (lk.lookup_g(g_lo), lk.lookup_g(g_hi))
+    if with_x:
+        xl = (lut[ci] == _chrom_code("X"))
+        xb = lut[ci][xl] * STRIDE
+        q1 = df["pos1"].to_numpy(np.int64)[xl]
+        q2 = df["pos2"].to_numpy(np.int64)[xl]
+        r1 = df["posterior1"].to_numpy(np.float64, na_value=np.nan)[xl]
+        r2 = df["posterior2"].to_numpy(np.float64, na_value=np.nan)[xl]
+        j1 = (df["n1"].to_numpy()[xl] >= min_sites) & np.isfinite(r1)
+        j2 = (df["n2"].to_numpy()[xl] >= min_sites) & np.isfinite(r2)
+        xs = np.abs(q2 - q1)
+        xm = j1 & j2 & (xs >= min_d) & (xs <= max_d)
+        lf = q1 <= q2
+        h1, h2 = xb + q1, xb + q2
+        xe = np.concatenate([r1[j1], r2[j2]])
+        au = (e_g // STRIDE >= 1) & (e_g // STRIDE < 1000)
+        out["x"] = {"g_lo": np.where(lf, h1, h2)[xm],
+                    "g_hi": np.where(lf, h2, h1)[xm],
+                    "a": np.where(lf, r1, r2)[xm].astype(np.float32),
+                    "p": np.where(lf, r2, r1)[xm].astype(np.float32),
+                    # count, sum, sum of squares: autosomes, then X
+                    "marg": np.array([[au.sum(), xe.size],
+                                      [e_p[au].sum(), xe.sum()],
+                                      [(e_p[au] ** 2).sum(),
+                                       (xe ** 2).sum()]], float)}
     return out
 
 
@@ -3467,6 +3508,657 @@ def plot_hotspot_contrast(hc: pd.DataFrame, enr: pd.DataFrame, context: str,
         plt.close(fig)
 
 
+# ---------------------------------------------- chrX and imprinted domains --
+
+#: The chrX analysis' system: each end's chromosome, an autosome or X.
+CHROM_SYSTEM = "chrX"
+#: Imprinted genes whose imprinting differs between neurons and glia --
+#: Ube3a maternal in neurons and from both alleles in glia; Grb10 paternal
+#: from a neuron promoter, maternal elsewhere -- marked † in the figures.
+NEURON_IMPRINTED = ("Ube3a", "Grb10")
+
+
+class ChromosomeClasses:
+    """Autosomes against chrX as an annotation system: an end on a numbered
+    chromosome is 'autosomes', one on X 'chrX', any other -1.  A contact's
+    two ends share its chromosome -- and one copy of it -- so where the two
+    copies of X differ, one inactive, X-X contacts are concordant beyond
+    their reshuffled partners, which come from either copy."""
+
+    def __init__(self):
+        self.name = CHROM_SYSTEM
+        self.classes = ("autosomes", "chrX")
+        self._x = _chrom_code("X")
+
+    def lookup_g(self, g) -> np.ndarray:
+        code = np.asarray(g, np.int64) // STRIDE
+        out = np.full(code.size, -1, np.int8)
+        out[(code >= 1) & (code < 1000)] = 0
+        out[code == self._x] = 1
+        return out
+
+
+def _sex_counts(path) -> dict:
+    """One cell's read pairs per chromosome and the furthest position they
+    reach: {chromosome code: (pairs, max position)}."""
+    df, names, ci, lut = _categorical(path, ["chrom", "pos1", "pos2"])
+    code = lut[ci]
+    hi = np.maximum(df["pos1"].to_numpy(np.int64),
+                    df["pos2"].to_numpy(np.int64))
+    out = {}
+    for k in np.unique(code[code >= 0]):
+        m = code == k
+        out[int(k)] = (int(m.sum()), int(hi[m].max()))
+    return out
+
+
+def call_sex(counts: dict, min_pairs: int = 2000, x_female: float = 0.8,
+             x_male: float = 0.7) -> pd.DataFrame:
+    """Each cell's sex from its coverage (``counts``: {cell:
+    :func:`_sex_counts`}).  X dosage: its read pairs per bp of X over those
+    per bp of the autosomes, a chromosome's length the furthest position
+    any cell reaches -- about 1 with two X, 0.5 with one.  Female at
+    ``x_female`` or more, male at ``x_male`` or less, else unknown, and
+    unknown with fewer than ``min_pairs`` autosomal pairs.  A 'female' with
+    a quarter of the males' median share of pairs on Y -- or, without
+    males, ten times the females' median -- is unknown too: a male-female
+    doublet, or a male."""
+    X, Y = _chrom_code("X"), _chrom_code("Y")
+    length: dict = {}
+    for c in counts.values():
+        for k, (_, mx) in c.items():
+            length[k] = max(length.get(k, 0), mx)
+    auto = [k for k in length if 1 <= k < 1000]
+    L_a, L_x = sum(length[k] for k in auto), length.get(X, 0)
+    rows = []
+    for cell, c in counts.items():
+        n_a = sum(c.get(k, (0, 0))[0] for k in auto)
+        n_x, n_y = c.get(X, (0, 0))[0], c.get(Y, (0, 0))[0]
+        rows.append({"cell": cell, "pairs_autosomes": n_a, "pairs_X": n_x,
+                     "pairs_Y": n_y,
+                     "x_dosage": ((n_x / L_x) / (n_a / L_a)
+                                  if n_a and L_x and L_a else np.nan),
+                     "y_share": n_y / n_a if n_a else np.nan})
+    t = pd.DataFrame(rows)
+    if t.empty:
+        return t.assign(sex_call=pd.Series(dtype=str))
+    t["sex_call"] = np.where(
+        t["x_dosage"] >= x_female, "female",
+        np.where(t["x_dosage"] <= x_male, "male", "unknown"))
+    t.loc[(t["pairs_autosomes"] < min_pairs) | t["x_dosage"].isna(),
+          "sex_call"] = "unknown"
+    fem, mal = t["sex_call"] == "female", t["sex_call"] == "male"
+    if t["pairs_Y"].sum() > 0 and fem.any():
+        y_cut = (0.25 * float(t.loc[mal, "y_share"].median()) if mal.any()
+                 else 10 * max(float(t.loc[fem, "y_share"].median()), 1e-5)
+                 if fem.sum() >= 10 else np.inf)
+        t.loc[fem & (t["y_share"] > y_cut), "sex_call"] = "unknown"
+    return t
+
+
+def _given_sex(values) -> np.ndarray:
+    """A sample sheet's sex column as female / male / unknown."""
+    v = pd.Series(values).astype(str).str.strip().str.lower()
+    return np.where(v.isin(["f", "female", "xx", "woman"]), "female",
+                    np.where(v.isin(["m", "male", "xy", "man"]), "male",
+                             "unknown"))
+
+
+def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
+                          band_labels, n_boot: int, seed: int) -> list:
+    """Per group of cells (``groups``: {name: cell indices}): two class
+    pairs' pooled ΔC and Δr by band -- each cell's contacts pooled, as the
+    summary pools them -- and the second less the first, from the same
+    bootstrap draws of the group's cells, so the interval knows what the
+    two share."""
+    rng = np.random.default_rng(seed)
+    parts = []
+    for i, j in ((classes.index(pair_a[0]), classes.index(pair_a[1])),
+                 (classes.index(pair_b[0]), classes.index(pair_b[1]))):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            s12 = sd[:, i] * sd[:, j]
+            inv = np.where(s12 > 0, 1.0 / np.where(s12 > 0, s12, 1), 0.0)
+        dd = acc["xy"][:, i, j, :] - acc["xy1"][:, i, j, :]
+        parts.append({"n": acc["n"][:, i, j, :], "d": 2 * dd,
+                      "r": dd * inv[:, None],
+                      "c": 2 * (acc["xy2"][:, i, j, :]
+                                - acc["xy1"][:, i, j, :])})
+
+    def pooled(Wt, P, ix):
+        n = Wt @ P["n"][ix]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return {"delta": (Wt @ P["d"][ix]) / n,
+                    "delta_r": (Wt @ P["r"][ix]) / n,
+                    "control": (Wt @ P["c"][ix]) / n}, n
+    rows = []
+    for g, ix in groups.items():
+        ix = np.asarray(ix, np.int64)
+        if not ix.size:
+            continue
+        W = rng.multinomial(ix.size, np.full(ix.size, 1.0 / ix.size),
+                            size=n_boot).astype(float)
+        one = np.ones((1, ix.size))
+        (ea, na), (eb, nb_) = (pooled(one, P, ix) for P in parts)
+        ba, bb = (pooled(W, P, ix)[0] for P in parts)
+        for b, bl in enumerate(band_labels):
+            for st in ("delta", "delta_r"):
+                with np.errstate(invalid="ignore"):
+                    lo_a, hi_a = np.nanpercentile(ba[st][:, b], [2.5, 97.5])
+                    lo_b, hi_b = np.nanpercentile(bb[st][:, b], [2.5, 97.5])
+                    dif = bb[st][:, b] - ba[st][:, b]
+                    dlo, dhi = np.nanpercentile(dif, [2.5, 97.5])
+                rows.append({
+                    "group": g, "band": bl, "statistic": st,
+                    "cells": int(ix.size), "pairs_A": int(na[0, b]),
+                    "pairs_B": int(nb_[0, b]), "value_A": float(ea[st][0, b]),
+                    "lo_A": float(lo_a), "hi_A": float(hi_a),
+                    "value_B": float(eb[st][0, b]), "lo_B": float(lo_b),
+                    "hi_B": float(hi_b),
+                    "diff": float(eb[st][0, b] - ea[st][0, b]),
+                    "diff_lo": float(dlo), "diff_hi": float(dhi),
+                    "p_diff": _boot_p(dif),
+                    "control_diff": float(eb["control"][0, b]
+                                          - ea["control"][0, b])})
+    return rows
+
+
+def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
+                           edges, band_labels, dbins, position_bin: int,
+                           max_widen: int, n_boot: int, seed: int,
+                           n_threads: int = 1):
+    """chrX against the autosomes (:class:`ChromosomeClasses`), as one
+    system's class pairs: every contact's ends centred on its cell's mean
+    on autosomes or on X (``marg``: cells x (count, sum, sum of squares) x
+    (autosomes, X)), its partner reshuffled within ``strat`` -- the cell's
+    type, and sex when known, so an X donor never comes from the other
+    sex -- and per group of cells (:func:`class_pair_difference`) X-X less
+    autosome-autosome ΔC and Δr by band.  Returns (rows, per-cell rows of
+    every cell's own two values at all distances)."""
+    lk = ChromosomeClasses()
+    kx = lk.lookup_g(g_lo).astype(np.int64)
+    ky = lk.lookup_g(g_hi).astype(np.int64)
+    n_cells = marg.shape[0]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu = marg[:, 1] / marg[:, 0]
+        sd = np.sqrt(np.maximum(marg[:, 2] / marg[:, 0] - mu ** 2, 0))
+    a_c = np.where(kx >= 0, a - mu[cell, np.maximum(kx, 0)], np.nan)
+    p_c = np.where(ky >= 0, p - mu[cell, np.maximum(ky, 0)], np.nan)
+    dist = g_hi - g_lo
+    band = np.clip(np.searchsorted(edges, dist, side="right") - 1, 0,
+                   len(edges) - 2)
+    s_code, s_names = pd.factorize(np.asarray(strat))
+    ok, right, left, _ = reshuffle(
+        g_lo, g_hi, dist, cell, kx, ky, a_c, p_c, s_code[cell], 2, dbins,
+        position_bin, max_widen, seed=seed, names=list(s_names),
+        n_threads=n_threads)
+    idx = np.flatnonzero(ok)
+    x_, y_ = a_c[idx], p_c[idx]
+    w = {"xy": x_ * y_,
+         "xy1": 0.5 * (x_ * right[0, idx] + left[0, idx] * y_),
+         "xy2": 0.5 * (x_ * right[1, idx] + left[1, idx] * y_)}
+    acc = accumulate(cell[idx], np.minimum(kx, ky)[idx],
+                     np.maximum(kx, ky)[idx], band[idx],
+                     np.zeros(idx.size, np.int64), w, n_cells, 2,
+                     len(edges) - 1)
+    rows = class_pair_difference(acc, sd, groups, lk.classes,
+                                 ("autosomes", "autosomes"),
+                                 ("chrX", "chrX"), band_labels, n_boot, seed)
+    A_ = len(band_labels) - 1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pc = {"pairs_autosomes": acc["n"][:, 0, 0, A_],
+              "pairs_X": acc["n"][:, 1, 1, A_]}
+        for tag, k in (("autosomes", 0), ("X", 1)):
+            n = acc["n"][:, k, k, A_]
+            dd = acc["xy"][:, k, k, A_] - acc["xy1"][:, k, k, A_]
+            pc[f"delta_{tag}"] = 2 * dd / n
+            pc[f"delta_r_{tag}"] = dd / n / (sd[:, k] ** 2)
+    return rows, pd.DataFrame(pc)
+
+
+def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
+              context: str, path, q_cut: float = 0.05):
+    """a: ΔC by distance, autosomes (solid) and chrX (dashed), per group; b:
+    chrX less autosomes, all distances, per group (filled: q < q_cut); c:
+    each cell's own chrX less autosomes Δr; d: the cells' X dosage and the
+    sex called from it."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from nome_hic_concordance import figure_style
+    t = tab[(tab["context"] == context) & (tab["statistic"] == "delta")]
+    if t.empty:
+        return
+    bands = list(dict.fromkeys(t["band"]))
+    all_b = next((b for b in bands if str(b).startswith("all")), bands[-1])
+    bands = [b for b in bands if b != all_b]
+    # the curves: each sex when there are two, else each cell type
+    kind = ("sex" if (t["group_kind"] == "sex").any() else
+            "cell type" if t.loc[t["group_kind"] == "cell type",
+                                 "group"].nunique() <= 8 else "all")
+    curves = list(dict.fromkeys(t.loc[t["group_kind"] == kind, "group"]))
+    PP = 100
+    with plt.rc_context(figure_style.RC):
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN, 2.4))
+        gs = fig.add_gridspec(1, 4, width_ratios=[1.2, 1.1, 1.0, 1.0],
+                              wspace=0.75)
+        ax0, ax1, ax2, ax3 = (fig.add_subplot(gs[0, i]) for i in range(4))
+        xx = np.arange(len(bands))
+        for gi, g in enumerate(curves):
+            col = GROUP_PALETTE[gi % len(GROUP_PALETTE)]
+            r = t[(t["group"] == g) & (t["group_kind"] == kind)
+                  ].set_index("band").reindex(bands)
+            ax0.plot(xx, PP * r["autosomes"], "-o", color=col, ms=2.5,
+                     lw=0.8, label=f"{g}: autosomes")
+            ax0.plot(xx, PP * r["chrX"], "--s", color=col, ms=2.5, lw=0.8,
+                     label=f"{g}: chrX")
+        ax0.axhline(0, color="0.6", lw=0.4)
+        ax0.set_xticks(xx)
+        ax0.set_xticklabels(bands, rotation=40, ha="right", fontsize=5)
+        ax0.set_ylabel("ΔC, pp")
+        f = t[t["band"] == all_b].reset_index(drop=True)
+        yy = np.arange(len(f))
+        for i, r in f.iterrows():
+            q = r.get("q_diff", np.nan)
+            ax1.plot([PP * r["diff_lo"], PP * r["diff_hi"]], [i, i],
+                     color="0.2", lw=0.8)
+            ax1.plot([PP * r["diff"]], [i], "o", ms=3, mec="0.1",
+                     mfc="0.1" if np.isfinite(q) and q < q_cut else "white")
+        ax1.axvline(0, color="0.6", lw=0.4)
+        ax1.set_yticks(yy)
+        ax1.set_yticklabels([f"{g} ({n:,})" for g, n in
+                             zip(f["group"], f["cells"])], fontsize=5)
+        ax1.set_ylim(len(f) - 0.5, -0.5)
+        ax1.set_xlabel("chrX − autosomes, ΔC pp")
+        pc = pcell[pcell["context"] == context]
+        if not pc.empty:
+            by = "sex" if kind == "sex" else "cell_type"
+            for gi, (g, x) in enumerate(pc.groupby(by, sort=False)):
+                v = PP * (x["delta_r_X"] - x["delta_r_autosomes"])
+                v = v[np.isfinite(v)]
+                if v.size:
+                    ax2.hist(v, bins=30, histtype="step", lw=0.8,
+                             color=GROUP_PALETTE[gi % len(GROUP_PALETTE)],
+                             label=f"{g}: {np.mean(v > 0):.0%} > 0")
+            ax2.axvline(0, color="0.6", lw=0.4)
+            ax2.legend(fontsize=4.5, frameon=False, loc="upper left")
+        ax2.set_xlabel("per cell:\nchrX − autosomes, Δr pp")
+        if sex is not None and not sex.empty:
+            for s_, col in (("female", "#c51b7d"), ("male", "#2166ac"),
+                            ("unknown", "0.6")):
+                x = sex[sex["sex_call"] == s_]
+                if len(x):
+                    ax3.scatter(x["x_dosage"], np.log10(x["y_share"] + 1e-6),
+                                s=3, lw=0, color=col,
+                                label=f"{s_} ({len(x):,})")
+            ax3.legend(fontsize=4.5, frameon=False)
+        ax3.set_xlabel("X dosage\n(X / autosome coverage)")
+        ax3.set_ylabel("log10 share of pairs on Y")
+        for ax, lab in zip((ax0, ax1, ax2, ax3), "abcd"):
+            ax.set_title(lab, loc="left", fontweight="bold")
+        _suptitle_above(fig, f"{context}: chrX against the autosomes -- "
+                             f"contacts on one copy of X, partners "
+                             f"reshuffled from either")
+        from matplotlib.lines import Line2D
+        hd = [Line2D([], [], color=GROUP_PALETTE[gi % len(GROUP_PALETTE)],
+                     lw=0.8) for gi in range(len(curves))]
+        hd += [Line2D([], [], color="0.3", lw=0.8, ls="-", marker="o",
+                      ms=2.5),
+               Line2D([], [], color="0.3", lw=0.8, ls="--", marker="s",
+                      ms=2.5)]
+        _legend_below(fig, hd, [str(g) for g in curves]
+                      + ["autosomes (panel a)", "chrX (panel a)"],
+                      ncol=min(len(curves) + 2, 6))
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+def imprinted_domains(genes: pd.DataFrame, names=None,
+                      merge: int = 500_000, flank: int = 50_000,
+                      exclude=()) -> pd.DataFrame:
+    """Imprinted domains from a gene annotation: the genes named in
+    ``names`` (case-blind; IMPRINTED_GENES), within ``merge`` bp of each
+    other on a chromosome merged into one domain, ``flank`` bp added on
+    each side.  Each is named after its first and last imprinted gene."""
+    want = {x.lower() for x in (IMPRINTED_GENES if names is None
+                                else names)}
+    g = genes[genes["name"].astype(str).str.lower().isin(want)].copy()
+    g = g[~g["chrom"].map(_canon).isin(exclude)]
+    rows = []
+    for c, x in g.sort_values(["chrom", "start"]).groupby("chrom", sort=False):
+        st, en = x["start"].to_numpy(), x["end"].to_numpy()
+        nm = x["name"].astype(str).to_numpy()
+        new = np.r_[True, st[1:] > np.maximum.accumulate(en)[:-1] + merge]
+        for s_, e_ in zip(np.flatnonzero(new), np.r_[np.flatnonzero(new)[1:],
+                                                      st.size]):
+            gs = list(dict.fromkeys(nm[s_:e_]))
+            rows.append({"chrom": c, "start": max(int(st[s_:e_].min())
+                                                  - flank, 0),
+                         "end": int(en[s_:e_].max()) + flank,
+                         "name": gs[0] if len(gs) == 1 else
+                         f"{gs[0]}–{gs[-1]}",
+                         "genes": ",".join(gs)})
+    return pd.DataFrame(rows, columns=["chrom", "start", "end", "name",
+                                       "genes"])
+
+
+def read_domains(path) -> pd.DataFrame:
+    """A BED of domains: chrom, start, end, and a name (4th column; else
+    chrom:start-end)."""
+    df = pd.read_csv(path, sep="\t", header=None, comment="#",
+                     compression="infer", dtype={0: str})
+    nm = (df[3].astype(str) if df.shape[1] > 3 else
+          df[0].astype(str) + ":" + df[1].astype(str) + "-"
+          + df[2].astype(str))
+    return pd.DataFrame({"chrom": df[0].astype(str),
+                         "start": df[1].astype(int),
+                         "end": df[2].astype(int), "name": nm,
+                         "genes": nm})
+
+
+def _vs_windows(x, cv) -> dict:
+    """A domain's value against its matched windows' values ``cv``: their
+    mean and SD, z, a normal two-sided p from z -- the windows are too few
+    for an empirical p to pass a correction over domains -- and the
+    empirical one."""
+    from scipy.stats import norm
+    cv = cv[np.isfinite(cv)]
+    out = {"windows": int(cv.size), "windows_mean": np.nan,
+           "windows_sd": np.nan, "z": np.nan, "p": np.nan,
+           "p_empirical": np.nan}
+    if cv.size < 5 or not np.isfinite(x):
+        return out
+    m, s = float(cv.mean()), float(np.std(cv, ddof=1))
+    out.update({"windows_mean": m, "windows_sd": s,
+                "p_empirical": float(min(1.0, 2 * min(np.mean(cv >= x),
+                                                      np.mean(cv <= x))
+                                         + 1.0 / (cv.size + 1)))})
+    if s > 0:
+        out["z"] = (x - m) / s
+        out["p"] = float(2 * norm.sf(abs(out["z"])))
+    return out
+
+
+def domain_concordance(domains: pd.DataFrame, g_lo, g_hi, cell, d, c,
+                       n_cells: int, groups: dict, pairs=(),
+                       tss_g=None, pair=None, n_controls: int = 100,
+                       min_contacts: int = 30, n_boot: int = 200,
+                       seed: int = 0):
+    """Concordance inside each domain against matched windows elsewhere.
+
+    The contacts with both ends in a domain, from the per-contact parts of
+    ΔC (``d``) and its control (``c``) -- the hotspots' (:func:`locus_
+    hotspots`) -- pooled over each group's cells (``groups``: {name: cell
+    indices}) with a 95% bootstrap interval over the cells.  Against
+    ``n_controls`` windows of the domain's length, on the autosomes and
+    away from every domain, with ``min_contacts`` contacts, most like the
+    domain in the chromatin its contacts join -- the share of its contacts
+    in each class pair of the system (``pair``), L1 distance -- and in TSS
+    count (``tss_g``, genome coordinates; |log ratio|): the excess over the
+    windows' mean, z and p (:func:`_vs_windows`).  Also every domain pooled
+    against every window pooled ('all domains'), and per pair of groups
+    (A - B) the same against the windows' differences.  A contact's two
+    ends lie on one copy of the chromosome, so where the two parental
+    copies differ -- an imprinted domain -- its ends agree beyond
+    reshuffled partners, which come from either copy.  Returns (rows,
+    contrast rows, the windows)."""
+    rng = np.random.default_rng(seed)
+    o = np.argsort(g_lo, kind="stable")
+    gl, gh = np.asarray(g_lo, np.int64)[o], np.asarray(g_hi, np.int64)[o]
+    ce = np.asarray(cell, np.int64)[o]
+    dd, cc = np.asarray(d, float)[o], np.asarray(c, float)[o]
+    pr = np.asarray(pair, np.int64)[o] if pair is not None else None
+    n_pr = int(pr.max()) + 1 if pr is not None and pr.size else 1
+
+    def mix(ix):
+        """The share of these contacts in each class pair."""
+        if pr is None or not ix.size:
+            return np.zeros(n_pr)
+        return np.bincount(pr[ix], minlength=n_pr) / ix.size
+
+    def inside(s, e):
+        i0, i1 = np.searchsorted(gl, [s, e])
+        return i0 + np.flatnonzero(gh[i0:i1] < e)
+
+    def per_cell(ix):
+        return (np.bincount(ce[ix], weights=dd[ix], minlength=n_cells),
+                np.bincount(ce[ix], minlength=n_cells).astype(float),
+                np.bincount(ce[ix], weights=cc[ix], minlength=n_cells))
+    dm = domains.reset_index(drop=True)
+    code = _codes_of(dm["chrom"])
+    g0 = code * STRIDE + dm["start"].to_numpy(np.int64)
+    g1 = code * STRIDE + dm["end"].to_numpy(np.int64)
+    # where windows may fall: the autosomes' extent, away from every domain
+    ch = gl // STRIDE
+    keys = np.array([k for k in np.unique(ch) if 1 <= k < 1000], np.int64)
+    e0 = np.array([gl[ch == k].min() for k in keys], np.int64)
+    e1 = np.array([gh[ch == k].max() for k in keys], np.int64)
+    od = np.argsort(g0)
+    d0, d1 = g0[od], np.maximum.accumulate(g1[od])
+    tss = np.sort(np.asarray(tss_g, np.int64)) if tss_g is not None else None
+
+    def n_tss(s, e):
+        return (np.searchsorted(tss, e) - np.searchsorted(tss, s)
+                if tss is not None else np.zeros(np.size(s)))
+    S, N, T, owner, wins = [], [], [], [], []
+    for r in range(len(dm)):
+        here = inside(g0[r], g1[r])
+        for x, v in zip((S, N, T), per_cell(here)):
+            x.append(v)
+        owner.append(-1)
+        L = int(g1[r] - g0[r])
+        room = np.maximum(e1 - e0 - L, 0).astype(float)
+        if not keys.size or room.sum() <= 0:
+            continue
+        m = 30 * n_controls
+        ki = rng.choice(keys.size, m, p=room / room.sum())
+        st = e0[ki] + (rng.random(m) * room[ki]).astype(np.int64)
+        en = st + L
+        j = np.searchsorted(d0, en)
+        free = ~((j > 0) & (d1[np.maximum(j - 1, 0)] > st))
+        st, en = st[free], en[free]
+        cand = [inside(a_, b_) for a_, b_ in zip(st, en)]
+        good = np.flatnonzero(np.array([x.size for x in cand], int)
+                              >= min_contacts)
+        if not good.size:
+            continue
+        t_d = n_tss(g0[r:r + 1], g1[r:r + 1])[0]
+        t_w = n_tss(st[good], en[good])
+        m_d = mix(here)
+        gap = (np.abs(np.log1p(t_w) - np.log1p(t_d))
+               + np.array([np.abs(mix(cand[k]) - m_d).sum() for k in good]))
+        for k in good[np.lexsort((rng.random(good.size), gap))[:n_controls]]:
+            for x, v in zip((S, N, T), per_cell(cand[k])):
+                x.append(v)
+            owner.append(r)
+            wins.append({"domain": dm.at[r, "name"],
+                         "code": int(st[k] // STRIDE),
+                         "start": int(st[k] % STRIDE),
+                         "end": int(en[k] % STRIDE),
+                         "contacts": int(cand[k].size),
+                         "tss": int(n_tss(st[k:k + 1], en[k:k + 1])[0]),
+                         "class_mix_distance": float(
+                             np.abs(mix(cand[k]) - m_d).sum())})
+    S, N, T, owner = np.array(S), np.array(N), np.array(T), np.array(owner)
+    dom = np.flatnonzero(owner < 0)             # domain r -> its row
+    ctl = owner >= 0
+    rows, crows, vals = [], [], {}
+    for gname, ix in groups.items():
+        ix = np.asarray(ix, np.int64)
+        if not ix.size:
+            continue
+        W = rng.multinomial(ix.size, np.full(ix.size, 1.0 / ix.size),
+                            size=n_boot).astype(float)
+        Sd, Nd = S[dom][:, ix], N[dom][:, ix]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            v = S[:, ix].sum(1) / N[:, ix].sum(1)
+            vc = T[dom][:, ix].sum(1) / Nd.sum(1)
+            bd = (W @ Sd.T) / (W @ Nd.T)
+            b_dom = (W @ Sd.sum(0)) / (W @ Nd.sum(0))
+            b_win = (W @ S[ctl][:, ix].sum(0)) / (W @ N[ctl][:, ix].sum(0))
+        vals[gname] = (v, bd)
+        for r in range(len(dm)):
+            x = float(v[dom[r]])
+            vw = _vs_windows(x, v[owner == r])
+            with np.errstate(invalid="ignore"):
+                lo, hi = np.nanpercentile(bd[:, r], [2.5, 97.5])
+            rows.append({
+                "group": gname, "domain": dm.at[r, "name"],
+                "chrom": dm.at[r, "chrom"], "start": int(dm.at[r, "start"]),
+                "end": int(dm.at[r, "end"]), "genes": dm.at[r, "genes"],
+                "contacts": int(Nd[r].sum()), "cells": int((Nd[r] > 0).sum()),
+                "delta": x, "lo": float(lo), "hi": float(hi),
+                "control": float(vc[r]), **vw,
+                "excess": x - vw["windows_mean"],
+                "excess_lo": lo - vw["windows_mean"],
+                "excess_hi": hi - vw["windows_mean"]})
+        with np.errstate(invalid="ignore", divide="ignore"):
+            x = float(Sd.sum() / Nd.sum())
+            w_ = float(S[ctl][:, ix].sum() / N[ctl][:, ix].sum())
+            lo, hi = np.nanpercentile(b_dom, [2.5, 97.5])
+            elo, ehi = np.nanpercentile(b_dom - b_win, [2.5, 97.5])
+        rows.append({"group": gname, "domain": "all domains", "chrom": "",
+                     "start": -1, "end": -1, "genes": "",
+                     "contacts": int(Nd.sum()),
+                     "cells": int((Nd.sum(0) > 0).sum()), "delta": x,
+                     "lo": float(lo), "hi": float(hi), "control": np.nan,
+                     "windows": int(ctl.sum()), "windows_mean": w_,
+                     "windows_sd": np.nan, "z": np.nan,
+                     "p": _boot_p(b_dom - b_win), "p_empirical": np.nan,
+                     "excess": x - w_, "excess_lo": float(elo),
+                     "excess_hi": float(ehi)})
+    for a_, b_ in pairs:
+        if a_ not in vals or b_ not in vals:
+            continue
+        (va, bda), (vb, bdb) = vals[a_], vals[b_]
+        dv = va - vb
+        for r in range(len(dm)):
+            x = float(dv[dom[r]])
+            vw = _vs_windows(x, dv[owner == r])
+            with np.errstate(invalid="ignore"):
+                lo, hi = np.nanpercentile(bda[:, r] - bdb[:, r], [2.5, 97.5])
+            crows.append({
+                "group_A": a_, "group_B": b_, "domain": dm.at[r, "name"],
+                "chrom": dm.at[r, "chrom"], "start": int(dm.at[r, "start"]),
+                "end": int(dm.at[r, "end"]), "genes": dm.at[r, "genes"],
+                "diff": x, "lo": float(lo), "hi": float(hi), **vw,
+                "excess": x - vw["windows_mean"],
+                "excess_lo": lo - vw["windows_mean"],
+                "excess_hi": hi - vw["windows_mean"]})
+    return rows, crows, pd.DataFrame(wins)
+
+
+def plot_imprinting(tab: pd.DataFrame, ctab: pd.DataFrame, context: str,
+                    path, show_groups=(), q_cut: float = 0.05):
+    """a: per imprinted domain, ΔC of all cells (black) and of
+    ``show_groups``, with 95% intervals, against the matched windows (grey:
+    their mean ± SD; filled: q < q_cut); b: per pair of groups, the
+    domain's difference against the windows' differences.  † marks the
+    domains with neuron-specific imprinting (NEURON_IMPRINTED)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from nome_hic_concordance import figure_style
+    t = tab[tab["context"] == context]
+    if t.empty:
+        return
+    doms = (["all domains"] if (t["domain"] == "all domains").any() else []
+            ) + list(dict.fromkeys(t.loc[t["domain"] != "all domains",
+                                         "domain"]))
+    gen = t.drop_duplicates("domain").set_index("domain")["genes"]
+    neuro = {x.lower() for x in NEURON_IMPRINTED}
+
+    def label(dmn):
+        gs = {x.lower() for x in str(gen.get(dmn, "")).split(",")}
+        return dmn + (" †" if gs & neuro else "")
+    c_ = (ctab[ctab["context"] == context] if ctab is not None
+          and not ctab.empty else pd.DataFrame())
+    pairs = (list(dict.fromkeys(zip(c_["group_A"], c_["group_B"])))
+             if not c_.empty else [])
+    show = ["all cells"] + [g for g in show_groups if g != "all cells"
+                            and g in set(t["group"])]
+    ny = len(doms)
+    PP = 100
+    with plt.rc_context(figure_style.RC):
+        ncol = 1 + (1 if pairs else 0)
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN, 1.0 + 0.2 * ny))
+        gs = fig.add_gridspec(1, ncol, wspace=0.08)
+        ax0 = fig.add_subplot(gs[0, 0])
+        off = (np.arange(len(show)) - (len(show) - 1) / 2) * min(
+            0.6 / max(len(show) - 1, 1), 0.22)
+        hd, lb = [], []
+        for gi, g in enumerate(show):
+            col = "k" if g == "all cells" else GROUP_PALETTE[
+                (gi - 1) % len(GROUP_PALETTE)]
+            x = t[t["group"] == g].set_index("domain")
+            for i, dmn in enumerate(doms):
+                if dmn not in x.index:
+                    continue
+                r = x.loc[dmn]
+                if g == "all cells" and np.isfinite(r["windows_mean"]):
+                    m_, s_ = PP * r["windows_mean"], PP * r["windows_sd"]
+                    ax0.add_patch(plt.Rectangle(
+                        (m_ - s_, i - 0.4), 2 * s_ if np.isfinite(s_) else 0,
+                        0.8, color="0.88", lw=0, zorder=0))
+                    ax0.plot([m_, m_], [i - 0.4, i + 0.4], color="0.6",
+                             lw=0.6, zorder=1)
+                y = i + off[gi]
+                q = r.get("q", np.nan)
+                ax0.plot([PP * r["lo"], PP * r["hi"]], [y, y], color=col,
+                         lw=0.7)
+                ax0.plot([PP * r["delta"]], [y], "o", ms=2.8, mec=col,
+                         mfc=col if np.isfinite(q) and q < q_cut else "white")
+            n_ = int(t.loc[t["group"] == g, "cells"].max())
+            hd.append(Line2D([], [], color=col, marker="o", ms=2.8, lw=0.7))
+            lb.append(f"{g} ({n_:,} cells)")
+        hd.append(plt.Rectangle((0, 0), 1, 1, color="0.88"))
+        lb.append("matched windows, mean ± SD")
+        ax0.axvline(0, color="0.6", lw=0.4)
+        ax0.set_ylim(ny - 0.5, -0.5)
+        ax0.set_yticks(np.arange(ny))
+        ax0.set_yticklabels([label(x) for x in doms], fontsize=5.5)
+        ax0.set_xlabel("ΔC within the domain, pp")
+        ax0.set_title("a", loc="left", fontweight="bold")
+        if pairs:
+            ax1 = fig.add_subplot(gs[0, 1])
+            offp = (np.arange(len(pairs)) - (len(pairs) - 1) / 2) * min(
+                0.6 / max(len(pairs) - 1, 1), 0.22)
+            for pi, (ga, gb) in enumerate(pairs):
+                col = GROUP_PALETTE[pi % len(GROUP_PALETTE)]
+                x = c_[(c_["group_A"] == ga) & (c_["group_B"] == gb)
+                       ].set_index("domain")
+                for i, dmn in enumerate(doms):
+                    if dmn not in x.index:
+                        continue
+                    r = x.loc[dmn]
+                    y = i + offp[pi]
+                    if np.isfinite(r["windows_mean"]):
+                        m_, s_ = PP * r["windows_mean"], PP * r["windows_sd"]
+                        ax1.plot([m_ - s_, m_ + s_], [y, y], color="0.8",
+                                 lw=2.2, solid_capstyle="butt", zorder=0)
+                    q = r.get("q", np.nan)
+                    ax1.plot([PP * r["lo"], PP * r["hi"]], [y, y], color=col,
+                             lw=0.7)
+                    ax1.plot([PP * r["diff"]], [y], "o", ms=2.8, mec=col,
+                             mfc=col if np.isfinite(q) and q < q_cut
+                             else "white")
+                hd.append(Line2D([], [], color=col, marker="o", ms=2.8,
+                                 lw=0.7))
+                lb.append(f"{ga} − {gb} (grey: matched windows)")
+            ax1.axvline(0, color="0.6", lw=0.4)
+            ax1.set_ylim(ny - 0.5, -0.5)
+            ax1.set_yticks(np.arange(ny))
+            ax1.set_yticklabels([])
+            ax1.set_xlabel("difference, pp")
+            ax1.set_title("b", loc="left", fontweight="bold")
+        _suptitle_above(fig, f"{context}: concordance inside imprinted "
+                             f"domains (filled: q < {q_cut:g}; † neuron-"
+                             f"specific imprinting)")
+        _legend_below(fig, hd, lb, ncol=3)
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
 # ------------------------------------------- variable and stable loci --
 
 
@@ -5309,6 +6001,36 @@ def main(argv=None) -> int:
     ap.add_argument("--contrast-reference", default=None, metavar="NAME",
                     help="Compare every other --contrast-group against this "
                          "one only, instead of every pair.")
+    ap.add_argument("--chrx", action="store_true",
+                    help="chrX against the autosomes: each cell's sex from "
+                         "its X and Y coverage (cell_sex.tsv), and per cell "
+                         "type, sex and --contrast-group the concordance of "
+                         "X-X contacts less autosome-autosome ones "
+                         "(chrx_concordance.tsv, chrx_percell.tsv.gz, "
+                         "chrx_<ctx>).  chrX enters nothing else.")
+    ap.add_argument("--sex-column", default=None,
+                    help="--samples column with each cell's sex (female / "
+                         "male, F / M), used instead of the call from "
+                         "coverage.")
+    ap.add_argument("--imprinting", action="store_true",
+                    help="Concordance inside imprinted domains -- the "
+                         "imprinted genes of the gene annotation merged "
+                         "(--imprinting-merge), or --imprinting-bed -- "
+                         "against matched windows, per cell type and "
+                         "--contrast-group, and each pair's difference "
+                         "(imprinting_domains.tsv, imprinting_concordance"
+                         ".tsv, imprinting_contrast.tsv, imprinting_<ctx>).")
+    ap.add_argument("--imprinting-bed", default=None,
+                    help="BED of the domains (name in column 4) instead of "
+                         "the gene annotation's imprinted genes.")
+    ap.add_argument("--imprinting-merge", type=int, default=500_000,
+                    help="Imprinted genes this close form one domain.")
+    ap.add_argument("--imprinting-flank", type=int, default=50_000,
+                    help="Added to each side of a domain.")
+    ap.add_argument("--imprinting-windows", type=int, default=100,
+                    help="Matched windows per domain (100).")
+    ap.add_argument("--imprinting-min-contacts", type=int, default=30,
+                    help="Contacts a matched window needs (30).")
     ap.add_argument("--celltype-auc-stats", default="signed_rel",
                     help="Per-cell statistics whose power to predict cell "
                          "type, per region group, is tested (comma-separated "
@@ -5347,6 +6069,10 @@ def main(argv=None) -> int:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     exclude = {_canon(c) for c in args.exclude_chrom.split(",") if c.strip()}
+    if args.chrx and "X" not in exclude:
+        logger.info("--chrx: chrX is analysed against the autosomes only, "
+                    "and kept out of everything else")
+        exclude.add("X")
     want = [s.strip() for s in args.systems.split(",") if s.strip()]
     signed_figs = [t.strip() for t in args.signed_figures.split(",")
                    if t.strip()]
@@ -5422,7 +6148,7 @@ def main(argv=None) -> int:
     # Genes and CpG islands: the default open sites (CpG-island TSSs) and
     # the hotspot map's tracks.
     genes = cpg = None
-    if not (args.no_covariates and args.no_hotspots):
+    if not (args.no_covariates and args.no_hotspots) or args.imprinting:
         ga = enr._resolve(args.gene_annotation
                           or preset.get("gene_annotation"), cache,
                           "gene-annotation")
@@ -5444,6 +6170,29 @@ def main(argv=None) -> int:
         else:
             logger.info(f"labeling efficiency: GCH at {open_g.size:,} "
                         f"{open_label}")
+    imp_domains, tss_g = pd.DataFrame(), None
+    if args.imprinting:
+        if args.imprinting_bed:
+            imp_domains = read_domains(enr._resolve(
+                args.imprinting_bed, cache, "imprinting BED"))
+        elif genes is not None:
+            imp_domains = imprinted_domains(genes, merge=args.imprinting_merge,
+                                            flank=args.imprinting_flank,
+                                            exclude=exclude)
+        if imp_domains.empty:
+            logger.warning("imprinting: no domains -- needs --imprinting-"
+                           "bed, or a gene annotation (--gene-annotation or "
+                           "--genome) with imprinted genes; skipped")
+        else:
+            imp_domains.to_csv(out / "imprinting_domains.tsv", sep="\t",
+                               index=False)
+            logger.info(f"imprinting: {len(imp_domains)} domains: "
+                        + ", ".join(imp_domains["name"]))
+        if genes is not None:
+            tss_g = (_codes_of(genes["chrom"]) * STRIDE + np.where(
+                genes["strand"].to_numpy() == "-",
+                genes["end"].to_numpy(np.int64) - 1,
+                genes["start"].to_numpy(np.int64)))
     acc_ctx = next((c for c in contexts if c.upper() == "GCH"),
                    next((c for c in contexts if c.upper().startswith("GC")),
                         None))
@@ -5507,6 +6256,8 @@ def main(argv=None) -> int:
         group_batches = pd.DataFrame(rows_)
     contrast_rows, chot_rows, cenr_rows = [], [], []
     var_rows, var_en = [], []
+    chrx_rows, chrx_cells, imp_rows, imp_crows = [], [], [], []
+    imp_wins: list = []
 
     from joblib import Parallel, delayed
     first = next(iter(contexts.values()))
@@ -5515,6 +6266,31 @@ def main(argv=None) -> int:
     cells_all = [c for c in cells_all if c in samples.index]
     if not cells_all:
         sys.exit(f"no cells of {args.samples} under {first}")
+    sex_tab, sex_of = None, {}
+    if args.chrx:
+        cnt = Parallel(n_jobs=args.n_threads, prefer="threads")(
+            delayed(_sex_counts)(Path(first) / f"{c}.posteriors.parquet")
+            for c in cells_all)
+        sex_tab = call_sex(dict(zip(cells_all, cnt)))
+        sex_tab.insert(1, "cell_type", [str(samples.at[c, args.group_column])
+                                        for c in sex_tab["cell"]])
+        sex_tab["sex"] = sex_tab["sex_call"]
+        if args.sex_column:
+            if args.sex_column not in samples.columns:
+                sys.exit(f"--sex-column {args.sex_column!r} not in --samples")
+            sex_tab["sex_given"] = _given_sex(
+                samples.loc[sex_tab["cell"], args.sex_column].to_numpy())
+            both = (sex_tab["sex_given"] != "unknown") & (
+                sex_tab["sex_call"] != "unknown")
+            agree = int((both & (sex_tab["sex_given"]
+                                 == sex_tab["sex_call"])).sum())
+            logger.info(f"sex: --sex-column agrees with the coverage call "
+                        f"in {agree:,} of {int(both.sum()):,} cells")
+            sex_tab["sex"] = sex_tab["sex_given"]
+        sex_of = dict(zip(sex_tab["cell"], sex_tab["sex"]))
+        sex_tab.to_csv(out / "cell_sex.tsv", sep="\t", index=False)
+        logger.info("sex per cell type:\n" + pd.crosstab(
+            sex_tab["cell_type"], sex_tab["sex"]).to_string())
 
     ab_maps = None
     # One pass over every cell's read pairs: the A/B bins (with ab) and the
@@ -5619,7 +6395,8 @@ def main(argv=None) -> int:
             return _read_cell(Path(d) / f"{c}.posteriors.parquet", ms,
                               args.min_distance, args.max_distance, exclude,
                               sysd, open_g if ctx == acc_ctx else None,
-                              args.open_site_window, prof_bin)
+                              args.open_site_window, prof_bin,
+                              with_x=args.chrx)
         logger.info(f"{ctx}: reading {len(cells):,} cells")
         res_ = Parallel(n_jobs=args.n_threads, prefer="threads")(
             delayed(one)(i, c) for i, c in enumerate(cells))
@@ -5925,6 +6702,54 @@ def main(argv=None) -> int:
                                ("signed_sgn_control", "gc"))}}))
             logger.info(f"{ctx} {name}: {ok.mean():.1%} of contacts "
                         f"annotated at both ends with a reshuffled partner")
+        if args.chrx:
+            # chrX against the autosomes: every contact, X ones included,
+            # as one system of two classes
+            xs = [r["x"] for r in res_]
+            sx = np.array([sex_of.get(c_, "unknown") for c_ in cells])
+            grp_x = {"all cells": np.arange(len(cells))}
+            kind_x = {"all cells": "all"}
+            two_sexes = len({x for x in sx if x != "unknown"}) > 1
+            for kind, lab in (("cell type", types),
+                              ("sex", sx if two_sexes else None)):
+                for g_ in (dict.fromkeys(lab) if lab is not None else ()):
+                    if g_ not in grp_x and g_ != "unknown":
+                        grp_x[g_] = np.flatnonzero(lab == g_)
+                        kind_x[g_] = kind
+            for g_, ix_ in cgroups.items():
+                if g_ not in grp_x and ix_.size:
+                    grp_x[g_], kind_x[g_] = ix_, "contrast group"
+            rx, pcx = chromosome_concordance(
+                np.concatenate([cell] + [np.full(x["g_lo"].size, i, np.int64)
+                                         for i, x in enumerate(xs)]),
+                np.concatenate([g_lo] + [x["g_lo"] for x in xs]),
+                np.concatenate([g_hi] + [x["g_hi"] for x in xs]),
+                np.concatenate([a] + [x["a"].astype(float) for x in xs]),
+                np.concatenate([p] + [x["p"].astype(float) for x in xs]),
+                np.stack([x["marg"] for x in xs]),
+                np.array([f"{st_}|{sx_}" for st_, sx_ in zip(stratum, sx)]),
+                grp_x, edges, band_labels, dbins, args.position_bin,
+                args.max_widen, args.n_boot, args.seed + 6007 * ci_ctx,
+                args.n_threads)
+            for r_ in rx:
+                r_.update(context=ctx, group_kind=kind_x[r_["group"]])
+            chrx_rows += rx
+            pcx.insert(0, "context", ctx)
+            pcx.insert(1, "cell", cells)
+            pcx.insert(2, "cell_type", types)
+            pcx.insert(3, "sex", sx)
+            chrx_cells.append(pcx)
+            r0 = next((r_ for r_ in rx if r_["group"] == "all cells"
+                       and r_["statistic"] == "delta"
+                       and str(r_["band"]).startswith("all")), None)
+            if r0 is not None:
+                logger.info(f"{ctx} chrX: X-X {100 * r0['value_B']:.2f} pp "
+                            f"vs autosomes {100 * r0['value_A']:.2f} pp, "
+                            f"difference {100 * r0['diff']:+.2f} pp "
+                            f"[{100 * r0['diff_lo']:+.2f}, "
+                            f"{100 * r0['diff_hi']:+.2f}] "
+                            f"({r0['pairs_B']:,} X contacts)")
+            del xs
         if ctx == hcg_ctx and "pmd" in systems and cell_cov is not None:
             # HMD less PMD methylation: PMDs lose methylation with every
             # division, so their depth is a cell's division history
@@ -6046,6 +6871,46 @@ def main(argv=None) -> int:
                         f"{int(h_['above_scaled'].sum())} bins above that, "
                         f"{int(h_['below_scaled'].sum())} below "
                         f"(of {len(h_):,})")
+        if not imp_domains.empty and best_arrays is not None:
+            # imprinted domains: the hotspots' per-contact parts
+            grp_i = {"all cells": np.arange(len(cells))}
+            kind_i = {"all cells": "all"}
+            for g_ in dict.fromkeys(types):
+                if g_ not in grp_i:
+                    grp_i[g_], kind_i[g_] = np.flatnonzero(types == g_), \
+                        "cell type"
+            for g_, ix_ in cgroups.items():
+                if g_ not in grp_i and ix_.size:
+                    grp_i[g_], kind_i[g_] = ix_, "contrast group"
+            ir, icr, iw = domain_concordance(
+                imp_domains, best_arrays[0], best_arrays[4], best_arrays[1],
+                best_arrays[2], best_arrays[5], len(cells), grp_i,
+                pairs=cpairs_ctx, tss_g=tss_g, pair=best_arrays[3],
+                n_controls=args.imprinting_windows,
+                min_contacts=args.imprinting_min_contacts,
+                n_boot=args.n_boot, seed=args.seed + 3001 * ci_ctx)
+            for r_ in ir:
+                r_.update(context=ctx, system=best_hot[1],
+                          group_kind=kind_i[r_["group"]])
+            for r_ in icr:
+                r_.update(context=ctx, system=best_hot[1])
+            imp_rows += ir
+            imp_crows += icr
+            if not iw.empty:
+                iw.insert(0, "context", ctx)
+                iw.insert(1, "system", best_hot[1])
+                iw.insert(3, "chrom", iw["code"].map(chrom_names))
+                imp_wins.append(iw.drop(columns="code"))
+            r0 = next((r_ for r_ in ir if r_["group"] == "all cells"
+                       and r_["domain"] == "all domains"), None)
+            if r0 is not None:
+                logger.info(f"{ctx} imprinted domains ({best_hot[1]} null): "
+                            f"{100 * r0['delta']:.2f} pp vs matched windows "
+                            f"{100 * r0['windows_mean']:.2f} pp, excess "
+                            f"{100 * r0['excess']:+.2f} pp "
+                            f"[{100 * r0['excess_lo']:+.2f}, "
+                            f"{100 * r0['excess_hi']:+.2f}] "
+                            f"({r0['contacts']:,} contacts)")
         best_arrays = None
         del res_
 
@@ -6365,6 +7230,53 @@ def main(argv=None) -> int:
                                             f"{pair_tag(a_, b_)}."
                                             f"{args.plot_format}",
                                       fdr=args.hotspot_fdr, pair=(a_, b_))
+    # chrX against the autosomes
+    if chrx_rows:
+        cx = pd.DataFrame(chrx_rows).rename(columns={
+            "pairs_A": "pairs_autosomes", "pairs_B": "pairs_X",
+            "value_A": "autosomes", "lo_A": "autosomes_lo",
+            "hi_A": "autosomes_hi", "value_B": "chrX", "lo_B": "chrX_lo",
+            "hi_B": "chrX_hi"})
+        cx["q_diff"] = np.nan
+        for _, g in cx.groupby(["context", "statistic", "band"], sort=False):
+            cx.loc[g.index, "q_diff"] = fdr_bh(g["p_diff"].to_numpy())
+        lead = ["context", "group_kind", "group", "band", "statistic"]
+        cx = cx[lead + [c for c in cx.columns if c not in lead]]
+        cx.to_csv(out / "chrx_concordance.tsv", sep="\t", index=False)
+        pcx = pd.concat(chrx_cells, ignore_index=True)
+        pcx.to_csv(out / "chrx_percell.tsv.gz", sep="\t", index=False)
+        for ctx_ in contexts:
+            plot_chrx(cx, pcx, sex_tab, ctx_,
+                      out / f"chrx_{ctx_}.{args.plot_format}")
+    # concordance inside imprinted domains
+    if imp_rows:
+        it = pd.DataFrame(imp_rows)
+        it["q"] = np.nan
+        for _, g in it[it["domain"] != "all domains"].groupby(
+                ["context", "group"], sort=False):
+            it.loc[g.index, "q"] = fdr_bh(g["p"].to_numpy())
+        lead = ["context", "system", "group_kind", "group", "domain"]
+        it = it[lead + [c for c in it.columns if c not in lead]]
+        it.to_csv(out / "imprinting_concordance.tsv", sep="\t", index=False)
+        if imp_wins:
+            pd.concat(imp_wins, ignore_index=True).to_csv(
+                out / "imprinting_windows.tsv", sep="\t", index=False)
+        ic = pd.DataFrame(imp_crows)
+        if not ic.empty:
+            ic["q"] = np.nan
+            for _, g in ic.groupby(["context", "group_A", "group_B"],
+                                   sort=False):
+                ic.loc[g.index, "q"] = fdr_bh(g["p"].to_numpy())
+            lead = ["context", "system", "group_A", "group_B", "domain"]
+            ic = ic[lead + [c for c in ic.columns if c not in lead]]
+            ic.to_csv(out / "imprinting_contrast.tsv", sep="\t", index=False)
+        tnames = list(dict.fromkeys(it.loc[it["group_kind"] == "cell type",
+                                           "group"]))
+        show = contrast_names or (tnames if len(tnames) <= 6 else [])
+        for ctx_ in contexts:
+            plot_imprinting(it, ic, ctx_,
+                            out / f"imprinting_{ctx_}.{args.plot_format}",
+                            show_groups=show)
     # How well each region group's concordance predicts cell type.
     auc_stats = [x.strip() for x in args.celltype_auc_stats.split(",")
                  if x.strip() and x.strip() != "none"]

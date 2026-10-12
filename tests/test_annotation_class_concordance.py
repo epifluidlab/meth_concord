@@ -1370,6 +1370,211 @@ def test_rotation_p_keeps_the_bins_autocorrelation():
                            ) < 0.01
 
 
+# ------------------------------------------- chrX and imprinted domains --
+
+
+def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
+                   n_y=150, seed=5, xi=0.1, xa=0.6):
+    """chrX read pairs for every cell -- a female's twice a male's -- and
+    chrY short pairs for males.  A female's X contact lies on her inactive
+    X (accessibility ``xi``) or her active one (``xa``), both ends alike; a
+    male's on his one active X."""
+    rng = np.random.default_rng(seed)
+    s = pd.read_csv(Path(d) / "samples.tsv", sep="\t")
+    for cell, typ in zip(s["cell_name"], s["group"]):
+        f = Path(d) / "GCH" / f"{cell}.posteriors.parquet"
+        df = pd.read_parquet(f)
+        fem = typ in female_types
+        k = 2 if fem else 1
+        n, ns = n_x * k // 2, n_x_short * k // 2
+        a_pos = rng.integers(0, 17_000_000, n)
+        b_pos = a_pos + np.exp(rng.uniform(np.log(1_000), np.log(3_000_000),
+                                           n)).astype(np.int64)
+        lvl = np.where(fem & (rng.random(n) < 0.5), xi, xa)
+        pa = np.where(rng.random(n) < lvl, 0.9, 0.1)
+        pb = np.where(rng.random(n) < lvl, 0.9, 0.1)
+        s_pos = rng.integers(0, 19_000_000, ns)
+        s_end = s_pos + rng.integers(200, 800, ns)
+        sa = np.where(rng.random(ns) < xa, 0.9, 0.1)
+        sb = np.where(rng.random(ns) < xa, 0.9, 0.1)
+        add = [pd.DataFrame({"chrom": "chrX",
+                             "pos1": np.r_[a_pos, s_pos],
+                             "pos2": np.r_[b_pos, s_end],
+                             "posterior1": np.r_[pa, sa],
+                             "posterior2": np.r_[pb, sb]})]
+        if not fem:
+            y = rng.integers(0, 10_000_000, n_y)
+            add.append(pd.DataFrame({"chrom": "chrY", "pos1": y,
+                                     "pos2": y + 300, "posterior1": 0.1,
+                                     "posterior2": 0.1}))
+        x = pd.concat(add, ignore_index=True)
+        x["n1"] = np.int32(3)
+        x["n2"] = np.int32(3)
+        x["k1"] = np.round(x["posterior1"] * 3).astype(np.int32)
+        x["k2"] = np.round(x["posterior2"] * 3).astype(np.int32)
+        x["distance"] = (x["pos2"] - x["pos1"]).abs()
+        out = pd.concat([df, x[df.columns]], ignore_index=True)
+        out["chrom"] = out["chrom"].astype(str)
+        out.to_parquet(f)
+    return d
+
+
+def test_sex_called_from_x_and_y_coverage():
+    auto = {1: (9000, 20_000_000), 2: (9000, 20_000_000)}
+    # 9000 pairs per 20 Mb autosome: two copies of X give as many per bp
+    counts = {"f": {**auto, 1001: (9000, 20_000_000)},
+              "m": {**auto, 1001: (4500, 20_000_000), 1002: (300, 9_000_000)},
+              "low": {1: (500, 20_000_000), 1001: (500, 20_000_000)},
+              "fy": {**auto, 1001: (8800, 20_000_000), 1002: (400, 9e6)}}
+    t = acc.call_sex(counts).set_index("cell")
+    assert t.loc["f", "sex_call"] == "female"
+    assert abs(t.loc["f", "x_dosage"] - 1) < 0.05
+    assert t.loc["m", "sex_call"] == "male"
+    assert abs(t.loc["m", "x_dosage"] - 0.5) < 0.05
+    assert t.loc["low", "sex_call"] == "unknown"        # too few pairs
+    assert t.loc["fy", "sex_call"] == "unknown"         # two X and a Y
+    assert list(acc._given_sex(["F", "male", "xx", "?"])) == [
+        "female", "male", "female", "unknown"]
+
+
+def test_chrx_concordance_in_females_only_and_nothing_else_changes(
+        tmp_path):
+    """T0 cells female, with an inactive X; T1, T2 male.  X-X contacts are
+    concordant beyond the autosomes in females and not in males; sexes are
+    called from coverage; and --chrx changes no other output."""
+    d = make_data(tmp_path, per=20, n_types=3)
+    add_sex_chroms(d)
+    o0, o1 = tmp_path / "plain", tmp_path / "chrx"
+    acc.main(_contrast_args(d, o0))
+    acc.main(_contrast_args(d, o1) + ["--chrx"])
+    sx = pd.read_csv(o1 / "cell_sex.tsv", sep="\t")
+    want = np.where(sx["cell_type"] == "T0", "female", "male")
+    assert (sx["sex_call"].to_numpy() == want).all()
+    cx = pd.read_csv(o1 / "chrx_concordance.tsv", sep="\t")
+    a = cx[cx["band"].str.startswith("all") & (cx["statistic"] == "delta")
+           ].set_index("group")
+    assert a.loc["female", "diff"] > 0.03 and a.loc["female", "diff_lo"] > 0
+    assert a.loc["female", "q_diff"] < 0.05
+    assert abs(a.loc["male", "diff"]) < 0.02
+    assert a.loc["T0", "group_kind"] == "cell type"
+    assert a.loc["female", "pairs_X"] > 5000
+    pc = pd.read_csv(o1 / "chrx_percell.tsv.gz", sep="\t")
+    f = pc[pc["sex"] == "female"]
+    assert (f["delta_X"] - f["delta_autosomes"]).median() > 0.03
+    assert (o1 / "chrx_GCH.png").exists()
+    for name in ("summary.tsv", "percell.tsv.gz", "locus_hotspots.tsv.gz"):
+        pd.testing.assert_frame_equal(pd.read_csv(o0 / name, sep="\t"),
+                                      pd.read_csv(o1 / name, sep="\t"))
+
+
+def test_imprinted_domains_from_genes():
+    genes = pd.DataFrame({
+        "chrom": ["chr7", "chr7", "chr7", "chr7", "chr7", "chr11"],
+        "start": [59_200_000, 59_500_000, 60_000_000, 142_500_000,
+                  142_650_000, 12_000_000],
+        "end": [59_300_000, 59_600_000, 60_100_000, 142_510_000,
+                142_670_000, 12_100_000],
+        "name": ["Ube3a", "Atp10a", "Snrpn", "H19", "Igf2", "Grb10"],
+        "strand": "+"})
+    dm = acc.imprinted_domains(genes, merge=500_000, flank=50_000)
+    assert set(dm["name"]) == {"Grb10", "Ube3a", "Snrpn", "H19–Igf2"}
+    h = dm.set_index("name").loc["H19–Igf2"]
+    assert h["start"] == 142_450_000 and h["end"] == 142_720_000
+    dm2 = acc.imprinted_domains(genes, merge=1_000_000)
+    assert "Ube3a–Snrpn" in set(dm2["name"])
+    assert "Atp10a" not in ",".join(dm2["genes"])
+
+
+def _domain_data(seed=0, n_cells=40, per=3000):
+    """Contacts on chr1 and chr2 (30 Mb each); parts of ΔC with noise,
+    plus 0.1 inside D1 (chr1 10-10.5 Mb) in every cell and inside D2 (chr2
+    20-20.5 Mb) in cells 0-19 only."""
+    rng = np.random.default_rng(seed)
+    n = n_cells * per
+    cell = np.repeat(np.arange(n_cells), per)
+    code = rng.integers(1, 3, n)
+    lo = rng.integers(0, 29_000_000, n)
+    hi = np.minimum(lo + np.exp(rng.uniform(np.log(1e3), np.log(1e6), n)
+                                ).astype(np.int64), 30_000_000 - 1)
+    g_lo, g_hi = code * acc.STRIDE + lo, code * acc.STRIDE + hi
+    d = rng.normal(0, 0.05, n)
+    c = rng.normal(0, 0.05, n)
+    in1 = (code == 1) & (lo >= 10_000_000) & (hi < 10_500_000)
+    in2 = (code == 2) & (lo >= 20_000_000) & (hi < 20_500_000)
+    d = d + 0.1 * in1 + 0.1 * (in2 & (cell < 20))
+    dom = pd.DataFrame({"chrom": ["chr1", "chr2"],
+                        "start": [10_000_000, 20_000_000],
+                        "end": [10_500_000, 20_500_000],
+                        "name": ["D1", "D2"], "genes": ["G1", "Ube3a"]})
+    tss = np.r_[1 * acc.STRIDE + rng.integers(0, 30_000_000, 300),
+                2 * acc.STRIDE + rng.integers(0, 30_000_000, 300)]
+    return dom, g_lo, g_hi, cell, d, c, tss
+
+
+def test_domain_concordance_against_matched_windows():
+    dom, g_lo, g_hi, cell, d, c, tss = _domain_data()
+    groups = {"all cells": np.arange(40), "A": np.arange(20),
+              "B": np.arange(20, 40)}
+    rows, crows, wins = acc.domain_concordance(
+        dom, g_lo, g_hi, cell, d, c, 40, groups, pairs=[("A", "B")],
+        tss_g=tss, n_controls=60, min_contacts=30, n_boot=100, seed=1)
+    t = pd.DataFrame(rows).set_index(["group", "domain"])
+    assert t.loc[("all cells", "D1"), "excess"] > 0.07
+    assert t.loc[("all cells", "D1"), "z"] > 3
+    assert t.loc[("all cells", "D1"), "p"] < 0.01
+    assert t.loc[("all cells", "D1"), "windows"] == 60
+    assert abs(t.loc[("B", "D2"), "excess"]) < 0.03
+    assert t.loc[("all cells", "all domains"), "excess_lo"] > 0
+    ct = pd.DataFrame(crows).set_index("domain")
+    assert ct.loc["D2", "diff"] > 0.07 and ct.loc["D2", "z"] > 3
+    assert abs(ct.loc["D1", "z"]) < 3
+    assert ct.loc["D2", "lo"] > 0
+    assert (wins.groupby("domain").size() == 60).all()
+    assert (wins["contacts"] >= 30).all()
+
+
+def test_matched_windows_share_the_domains_chromatin():
+    """Contacts on chr1 below 15 Mb are class pair 1, all others 0: D1's
+    windows come from there, D2's from elsewhere."""
+    dom, g_lo, g_hi, cell, d, c, tss = _domain_data()
+    code, pos = g_lo // acc.STRIDE, g_lo % acc.STRIDE
+    pair = ((code == 1) & (pos < 15_000_000)).astype(np.int64)
+    _, _, wins = acc.domain_concordance(
+        dom, g_lo, g_hi, cell, d, c, 40, {"all cells": np.arange(40)},
+        pair=pair, n_controls=30, min_contacts=30, n_boot=50, seed=2)
+    w1 = wins[wins["domain"] == "D1"]
+    w2 = wins[wins["domain"] == "D2"]
+    assert ((w1["code"] == 1) & (w1["end"] <= 15_000_000)).all()
+    assert ((w2["code"] == 2) | (w2["start"] >= 15_000_000)).all()
+
+
+def test_imprinting_run_writes_its_tables(tmp_path):
+    d = make_data(tmp_path, per=15, n_types=2,
+                  coord=lambda t_, c: 0.8)
+    pd.DataFrame({"c": ["chr1", "chr1", "chr2"],
+                  "s": [100_000, 400_000, 4_300_000],
+                  "e": [150_000, 450_000, 4_350_000],
+                  "n": ["H19", "Igf2", "Grb10"], "sc": 0, "st": "+"}
+                 ).to_csv(d / "genes.bed", sep="\t", header=False,
+                          index=False)
+    o = tmp_path / "out_imp"
+    acc.main(_contrast_args(d, o, "T0=T0", "T1=T1") + [
+        "--imprinting", "--gene-annotation", str(d / "genes.bed"),
+        "--imprinting-windows", "20", "--imprinting-min-contacts", "5"])
+    dm = pd.read_csv(o / "imprinting_domains.tsv", sep="\t")
+    assert set(dm["name"]) == {"H19–Igf2", "Grb10"}
+    it = pd.read_csv(o / "imprinting_concordance.tsv", sep="\t")
+    assert {"all cells", "T0", "T1"} <= set(it["group"])
+    assert (it["domain"] == "all domains").any()
+    assert (it.loc[it["domain"] != "all domains", "contacts"] > 0).all()
+    ic = pd.read_csv(o / "imprinting_contrast.tsv", sep="\t")
+    assert set(zip(ic["group_A"], ic["group_B"])) == {("T0", "T1")}
+    w = pd.read_csv(o / "imprinting_windows.tsv", sep="\t")
+    assert set(w["domain"]) <= {"H19–Igf2", "Grb10"} and len(w) > 0
+    assert set(w["chrom"]) <= {"chr1", "chr2"}
+    assert (o / "imprinting_GCH.png").exists()
+
+
 # ------------------------------------------------ variable and stable loci --
 
 
