@@ -1586,6 +1586,98 @@ def test_matched_windows_share_the_domains_chromatin():
     assert ((w2["code"] == 2) | (w2["start"] >= 15_000_000)).all()
 
 
+def test_pcdh_domains_from_genes():
+    """The whole cluster and its alpha, beta, gamma parts; Pcdh9, a
+    non-clustered protocadherin, is not one of them."""
+    genes = pd.DataFrame({
+        "chrom": ["chr18"] * 7 + ["chr14"],
+        "start": [36_950_000, 37_000_000, 37_100_000, 37_300_000,
+                  37_350_000, 37_700_000, 37_900_000, 118_000_000],
+        "end": [36_960_000, 37_010_000, 37_110_000, 37_310_000,
+                37_360_000, 37_710_000, 37_910_000, 119_000_000],
+        "name": ["Pcdha1", "Pcdha2", "Pcdhac2", "Pcdhb1", "Pcdhb2",
+                 "Pcdhga1", "Pcdhgc5", "Pcdh9"], "strand": "+"})
+    dm = acc.pcdh_domains(genes, flank=50_000).set_index("name")
+    assert list(dm.index) == ["Pcdh cluster", "Pcdha", "Pcdhb", "Pcdhg"]
+    assert (dm.loc["Pcdh cluster", "start"],
+            dm.loc["Pcdh cluster", "end"]) == (36_900_000, 37_960_000)
+    assert (dm.loc["Pcdha", "start"], dm.loc["Pcdha", "end"]) == (
+        36_900_000, 37_160_000)
+    assert "Pcdh9" not in ",".join(dm["genes"])
+    assert (dm["chrom"] == "chr18").all()
+    assert acc.pcdh_domains(genes.iloc[[7]]).empty
+
+
+def test_domain_levels_per_group_and_pair():
+    # 4 cells x 2 domains x (ends, posterior sum)
+    lv = np.array([[[10, 8], [10, 2]], [[10, 8], [10, 2]],
+                   [[10, 2], [10, 2]], [[10, 2], [10, 2]]], float)
+    rows, crows = acc.domain_levels(lv, ["D1", "D2"],
+                                    {"A": [0, 1], "B": [2, 3]},
+                                    [("A", "B")], n_boot=50, seed=1)
+    t = pd.DataFrame(rows).set_index(["group", "domain"])
+    assert t.loc[("A", "D1"), "level"] == 0.8
+    assert t.loc[("B", "D1"), "level"] == 0.2
+    c = pd.DataFrame(crows).set_index("domain")
+    assert abs(c.loc["D1", "level_diff"] - 0.6) < 1e-9
+    assert c.loc["D2", "level_diff"] == 0
+
+
+def plant_region_concordance(d, types=("T0",), chrom="chr1",
+                             lo=200_000, hi=1_160_000, p=0.9, seed=7):
+    """In cells of ``types``, a contact with both ends in [lo, hi) copies
+    its first end's state into its second with probability ``p``."""
+    rng = np.random.default_rng(seed)
+    s = pd.read_csv(Path(d) / "samples.tsv", sep="\t")
+    for cell, typ in zip(s["cell_name"], s["group"]):
+        if typ not in types:
+            continue
+        f = Path(d) / "GCH" / f"{cell}.posteriors.parquet"
+        df = pd.read_parquet(f)
+        a = np.minimum(df["pos1"], df["pos2"])
+        b = np.maximum(df["pos1"], df["pos2"])
+        m = ((df["chrom"].astype(str) == chrom) & (a >= lo) & (b < hi)
+             & (b - a >= 1000) & (rng.random(len(df)) < p))
+        df.loc[m, "posterior2"] = df.loc[m, "posterior1"]
+        df.loc[m, "k2"] = df.loc[m, "k1"]
+        df["chrom"] = df["chrom"].astype(str)
+        df.to_parquet(f)
+
+
+def test_pcdh_neurons_against_glia(tmp_path):
+    """Concordance planted inside the protocadherin cluster in T0
+    ('neuron') cells only: neuron - glia is positive there, beyond the
+    matched windows, and each group's level in the cluster is reported."""
+    d = make_data(tmp_path, per=15, n_types=2)
+    plant_region_concordance(d)
+    pd.DataFrame({"c": "chr1",
+                  "s": [250_000, 300_000, 400_000, 600_000, 900_000,
+                        1_100_000],
+                  "e": [260_000, 310_000, 410_000, 610_000, 910_000,
+                        1_110_000],
+                  "n": ["Pcdha1", "Pcdha2", "Pcdhac2", "Pcdhb1", "Pcdhga1",
+                        "Pcdhgc5"], "sc": 0, "st": "+"}
+                 ).to_csv(d / "genes.bed", sep="\t", header=False,
+                          index=False)
+    o = tmp_path / "out_pcdh"
+    acc.main(_contrast_args(d, o, "neuron=T0", "glia=T1") + [
+        "--pcdh", "--gene-annotation", str(d / "genes.bed"),
+        "--imprinting-windows", "20", "--imprinting-min-contacts", "5"])
+    dm = pd.read_csv(o / "pcdh_domains.tsv", sep="\t")
+    assert list(dm["name"]) == ["Pcdh cluster", "Pcdha", "Pcdhb", "Pcdhg"]
+    ic = pd.read_csv(o / "pcdh_contrast.tsv", sep="\t").set_index("domain")
+    r = ic.loc["Pcdh cluster"]
+    assert (r["group_A"], r["group_B"]) == ("neuron", "glia")
+    assert r["diff"] > 0.05 and r["lo"] > 0 and r["excess"] > 0.05
+    assert r["z"] > 2 and np.isfinite(r["level_diff"])
+    it = pd.read_csv(o / "pcdh_concordance.tsv", sep="\t")
+    assert not (it["domain"] == "all domains").any()
+    c = it[(it["domain"] == "Pcdh cluster")].set_index("group")
+    assert c.loc["neuron", "excess"] > 0.05
+    assert 0 < c.loc["glia", "level"] < 1
+    assert (o / "pcdh_GCH.png").exists()
+
+
 def test_imprinting_run_writes_its_tables(tmp_path):
     d = make_data(tmp_path, per=15, n_types=2,
                   coord=lambda t_, c: 0.8)

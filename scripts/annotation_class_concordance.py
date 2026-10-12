@@ -184,7 +184,11 @@ inside imprinted domains (the gene annotation's imprinted genes merged, or
 contacts' class pairs) and TSS count, per cell type and group, and each
 pair's difference -- neurons against glia where imprinting is neuron-specific
 (Ube3a, Grb10) (imprinting_domains.tsv, imprinting_concordance.tsv,
-imprinting_contrast.tsv, imprinting_windows.tsv, imprinting_<ctx>).
+imprinting_contrast.tsv, imprinting_windows.tsv, imprinting_<ctx>).  --pcdh:
+the same for the clustered protocadherins -- the whole cluster and its alpha,
+beta and gamma parts; in a neuron each allele picks a few of their promoters,
+which loop to the HS5-1 enhancer -- with each group's accessibility or
+methylation level in each domain beside its concordance (pcdh_*).
 
 VARIABLE AND STABLE LOCI.  Per 1 Mb bin, each cell type's concordance, and
 how much it varies between types beyond sampling (a heterogeneity test
@@ -818,7 +822,7 @@ def compartments_from_contacts(by_cell: list, cell_type: list, res: int,
 
 def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
                systems: dict, open_g=None, open_w: int = 200,
-               prof_bin: int = 0, with_x: bool = False) -> dict:
+               prof_bin: int = 0, with_x: bool = False, loci=None) -> dict:
     """One cell's contacts -- both ends called, min_d <= d <= max_d -- as
     genome coordinates, with every system's class at both ends, and per
     system x class the count, sum and sum of squares of ALL its called
@@ -828,8 +832,9 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
     file has no counts); with ``prof_bin``, its called ends' posterior sum
     and count per bin of that size.  With ``with_x``, its chrX contacts
     and the marginal of its X ends and of its autosomal ends, kept apart
-    ("x") so that nothing but the chrX analysis sees them.  Integer work
-    only, so threads run in parallel."""
+    ("x") so that nothing but the chrX analysis sees them.  With ``loci``
+    (genome intervals, n x 2), the count and posterior sum of its called
+    ends in each.  Integer work only, so threads run in parallel."""
     import pyarrow.parquet as pq
     cols = ["chrom", "pos1", "pos2", "n1", "n2", "posterior1", "posterior2"]
     has_k = {"k1", "k2"} <= set(pq.read_schema(str(path)).names)
@@ -906,6 +911,12 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
             np.bincount(k[ok], weights=e_p[ok], minlength=n_k),
             np.bincount(k[ok], weights=e_p[ok] ** 2, minlength=n_k)])
         out["cls"][name] = (lk.lookup_g(g_lo), lk.lookup_g(g_hi))
+    if loci is not None:
+        lc = np.zeros((len(loci), 2))
+        for i, (l0, l1) in enumerate(loci):
+            m = (e_g >= l0) & (e_g < l1)
+            lc[i] = m.sum(), e_p[m].sum()
+        out["loci"] = lc
     if with_x:
         xl = (lut[ci] == _chrom_code("X"))
         xb = lut[ci][xl] * STRIDE
@@ -3841,6 +3852,80 @@ def imprinted_domains(genes: pd.DataFrame, names=None,
                                        "genes"])
 
 
+#: The clustered protocadherins' parts, by gene name (case-blind).
+PCDH_PARTS = {"Pcdha": r"^pcdha", "Pcdhb": r"^pcdhb", "Pcdhg": r"^pcdhg"}
+
+
+def pcdh_domains(genes: pd.DataFrame, flank: int = 50_000) -> pd.DataFrame:
+    """The clustered protocadherins: the whole cluster and its α, β and γ
+    parts (PCDH_PARTS: Pcdha*, Pcdhb*, Pcdhg*, or the human PCDHA* ...),
+    each the span of its genes on the chromosome most of them are on, with
+    ``flank`` bp on each side -- the α part's takes in the HS5-1 enhancer
+    just past it.  The non-clustered ones (Pcdh9, Pcdh17 ...) are not
+    matched."""
+    nm = genes["name"].astype(str).str.lower()
+    part = {k: genes[nm.str.match(rx)] for k, rx in PCDH_PARTS.items()}
+    every = pd.concat(part.values())
+    cols = ["chrom", "start", "end", "name", "genes"]
+    if every.empty:
+        return pd.DataFrame(columns=cols)
+    chrom = every["chrom"].value_counts().index[0]
+    rows = []
+    for k, g in [("Pcdh cluster", every)] + list(part.items()):
+        g = g[g["chrom"] == chrom].sort_values("start")
+        if g.empty:
+            continue
+        rows.append({"chrom": chrom,
+                     "start": max(int(g["start"].min()) - flank, 0),
+                     "end": int(g["end"].max()) + flank, "name": k,
+                     "genes": ",".join(dict.fromkeys(g["name"].astype(str)))})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def domain_levels(lv, names, groups: dict, pairs=(), n_boot: int = 200,
+                  seed: int = 0):
+    """Each domain's 1D level -- the mean posterior of the called ends in
+    it, every read pair's (``lv``: cells x domains x (count, sum)) -- per
+    group of cells with a 95% bootstrap interval over the cells, and per
+    pair of groups (A - B) the difference with its interval and bootstrap
+    p.  Concordance can differ between groups because the domain is more
+    open (or methylated) in one; this says whether it is.  Returns (rows,
+    pair rows)."""
+    rng = np.random.default_rng(seed)
+    rows, crows, boot = [], [], {}
+    for g, ix in groups.items():
+        ix = np.asarray(ix, np.int64)
+        if not ix.size:
+            continue
+        W = rng.multinomial(ix.size, np.full(ix.size, 1.0 / ix.size),
+                            size=n_boot).astype(float)
+        n_, s_ = lv[ix, :, 0], lv[ix, :, 1]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            v = s_.sum(0) / n_.sum(0)
+            b = (W @ s_) / (W @ n_)
+        boot[g] = (v, b)
+        for r, nm in enumerate(names):
+            with np.errstate(invalid="ignore"):
+                lo, hi = np.nanpercentile(b[:, r], [2.5, 97.5])
+            rows.append({"group": g, "domain": nm, "level": float(v[r]),
+                         "level_lo": float(lo), "level_hi": float(hi),
+                         "level_ends": int(n_[:, r].sum())})
+    for a_, b_ in pairs:
+        if a_ not in boot or b_ not in boot:
+            continue
+        (va, ba), (vb, bb) = boot[a_], boot[b_]
+        for r, nm in enumerate(names):
+            dif = ba[:, r] - bb[:, r]
+            with np.errstate(invalid="ignore"):
+                lo, hi = np.nanpercentile(dif, [2.5, 97.5])
+            crows.append({"group_A": a_, "group_B": b_, "domain": nm,
+                          "level_diff": float(va[r] - vb[r]),
+                          "level_diff_lo": float(lo),
+                          "level_diff_hi": float(hi),
+                          "level_p": _boot_p(dif)})
+    return rows, crows
+
+
 def read_domains(path) -> pd.DataFrame:
     """A BED of domains: chrom, start, end, and a name (4th column; else
     chrom:start-end)."""
@@ -3886,7 +3971,7 @@ def domain_concordance(domains: pd.DataFrame, g_lo, g_hi, cell, d, c,
                        n_cells: int, groups: dict, pairs=(),
                        tss_g=None, pair=None, n_controls: int = 100,
                        min_contacts: int = 30, n_boot: int = 200,
-                       seed: int = 0):
+                       seed: int = 0, pooled: bool = True):
     """Concordance inside each domain against matched windows elsewhere.
 
     The contacts with both ends in a domain, from the per-contact parts of
@@ -3899,8 +3984,9 @@ def domain_concordance(domains: pd.DataFrame, g_lo, g_hi, cell, d, c,
     in each class pair of the system (``pair``), L1 distance -- and in TSS
     count (``tss_g``, genome coordinates; |log ratio|): the excess over the
     windows' mean, z and p (:func:`_vs_windows`; a domain with fewer than
-    ``min_contacts`` contacts is not tested).  Also every domain pooled
-    against every window pooled ('all domains'), and per pair of groups
+    ``min_contacts`` contacts is not tested).  Also, unless not
+    ``pooled`` (domains that overlap), every domain pooled against every
+    window pooled ('all domains'), and per pair of groups
     (A - B) the same against the windows' differences.  A contact's two
     ends lie on one copy of the chromosome, so where the two parental
     copies differ -- an imprinted domain -- its ends agree beyond
@@ -4019,6 +4105,8 @@ def domain_concordance(domains: pd.DataFrame, g_lo, g_hi, cell, d, c,
                 "excess": x - vw["windows_mean"],
                 "excess_lo": lo - vw["windows_mean"],
                 "excess_hi": hi - vw["windows_mean"]})
+        if not pooled:
+            continue
         with np.errstate(invalid="ignore", divide="ignore"):
             x = float(Sd.sum() / Nd.sum())
             w_ = float(S[ctl][:, ix].sum() / N[ctl][:, ix].sum())
@@ -4058,13 +4146,17 @@ def domain_concordance(domains: pd.DataFrame, g_lo, g_hi, cell, d, c,
     return rows, crows, pd.DataFrame(wins)
 
 
-def plot_imprinting(tab: pd.DataFrame, ctab: pd.DataFrame, context: str,
-                    path, show_groups=(), q_cut: float = 0.05):
-    """a: per imprinted domain, ΔC of all cells (black) and of
-    ``show_groups``, with 95% intervals, against the matched windows (grey:
-    their mean ± SD; filled: q < q_cut); b: per pair of groups, the
-    domain's difference against the windows' differences.  † marks the
-    domains with neuron-specific imprinting (NEURON_IMPRINTED)."""
+def plot_domains(tab: pd.DataFrame, ctab: pd.DataFrame, context: str,
+                 path, what: str = "imprinted domains",
+                 mark_neuron: bool = True, show_groups=(),
+                 q_cut: float = 0.05):
+    """a: per domain, ΔC of all cells (black) and of ``show_groups``, with
+    95% intervals, against the matched windows (grey: their mean ± SD;
+    filled: q < q_cut); b: per pair of groups, the domain's difference
+    against the windows' differences; c, with levels in ``tab``: each
+    group's mean posterior in the domain (accessibility or methylation).
+    With ``mark_neuron``, † marks the domains with neuron-specific
+    imprinting (NEURON_IMPRINTED)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -4081,17 +4173,18 @@ def plot_imprinting(tab: pd.DataFrame, ctab: pd.DataFrame, context: str,
 
     def label(dmn):
         gs = {x.lower() for x in str(gen.get(dmn, "")).split(",")}
-        return dmn + (" †" if gs & neuro else "")
+        return dmn + (" †" if mark_neuron and gs & neuro else "")
     c_ = (ctab[ctab["context"] == context] if ctab is not None
           and not ctab.empty else pd.DataFrame())
     pairs = (list(dict.fromkeys(zip(c_["group_A"], c_["group_B"])))
              if not c_.empty else [])
     show = ["all cells"] + [g for g in show_groups if g != "all cells"
                             and g in set(t["group"])]
+    has_lv = "level" in t and t["level"].notna().any()
     ny = len(doms)
     PP = 100
     with plt.rc_context(figure_style.RC):
-        ncol = 1 + (1 if pairs else 0)
+        ncol = 1 + (1 if pairs else 0) + (1 if has_lv else 0)
         fig = plt.figure(figsize=(figure_style.FIG_W_IN, 1.0 + 0.2 * ny))
         gs = fig.add_gridspec(1, ncol, wspace=0.08)
         ax0 = fig.add_subplot(gs[0, 0])
@@ -4162,9 +4255,31 @@ def plot_imprinting(tab: pd.DataFrame, ctab: pd.DataFrame, context: str,
             ax1.set_yticklabels([])
             ax1.set_xlabel("difference, pp")
             ax1.set_title("b", loc="left", fontweight="bold")
-        _suptitle_above(fig, f"{context}: concordance inside imprinted "
-                             f"domains (filled: q < {q_cut:g}; † neuron-"
-                             f"specific imprinting)")
+        if has_lv:
+            ax2 = fig.add_subplot(gs[0, ncol - 1])
+            for gi, g in enumerate(show):
+                col = "k" if g == "all cells" else GROUP_PALETTE[
+                    (gi - 1) % len(GROUP_PALETTE)]
+                x = t[t["group"] == g].set_index("domain")
+                for i, dmn in enumerate(doms):
+                    if dmn not in x.index or not np.isfinite(
+                            x.loc[dmn, "level"]):
+                        continue
+                    r = x.loc[dmn]
+                    y = i + off[gi]
+                    ax2.plot([PP * r["level_lo"], PP * r["level_hi"]], [y, y],
+                             color=col, lw=0.7)
+                    ax2.plot([PP * r["level"]], [y], "s", ms=2.6, color=col)
+            ax2.set_ylim(ny - 0.5, -0.5)
+            ax2.set_yticks(np.arange(ny))
+            ax2.set_yticklabels([])
+            ax2.set_xlabel(f"{context} level in the domain, %")
+            ax2.set_title("b" if not pairs else "c", loc="left",
+                          fontweight="bold")
+        _suptitle_above(fig, f"{context}: concordance inside {what} "
+                             f"(filled: q < {q_cut:g}"
+                             + ("; † neuron-specific imprinting)"
+                                if mark_neuron else ")"))
         _legend_below(fig, hd, lb, ncol=3)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
@@ -6031,6 +6146,17 @@ def main(argv=None) -> int:
                          "--contrast-group, and each pair's difference "
                          "(imprinting_domains.tsv, imprinting_concordance"
                          ".tsv, imprinting_contrast.tsv, imprinting_<ctx>).")
+    ap.add_argument("--pcdh", action="store_true",
+                    help="Concordance inside the clustered protocadherins "
+                         "-- the whole cluster and its alpha, beta, gamma "
+                         "parts, from the gene annotation -- against "
+                         "matched windows, per cell type and --contrast-"
+                         "group (e.g. neuron=..., glia=...), each pair's "
+                         "difference, and each group's accessibility or "
+                         "methylation level there (pcdh_domains.tsv, "
+                         "pcdh_concordance.tsv, pcdh_contrast.tsv, "
+                         "pcdh_windows.tsv, pcdh_<ctx>).  The matched-window "
+                         "settings are the --imprinting-* ones.")
     ap.add_argument("--imprinting-bed", default=None,
                     help="BED of the domains (name in column 4) instead of "
                          "the gene annotation's imprinted genes.")
@@ -6159,7 +6285,8 @@ def main(argv=None) -> int:
     # Genes and CpG islands: the default open sites (CpG-island TSSs) and
     # the hotspot map's tracks.
     genes = cpg = None
-    if not (args.no_covariates and args.no_hotspots) or args.imprinting:
+    if not (args.no_covariates and args.no_hotspots) or args.imprinting \
+            or args.pcdh:
         ga = enr._resolve(args.gene_annotation
                           or preset.get("gene_annotation"), cache,
                           "gene-annotation")
@@ -6182,6 +6309,7 @@ def main(argv=None) -> int:
             logger.info(f"labeling efficiency: GCH at {open_g.size:,} "
                         f"{open_label}")
     imp_domains, tss_g = pd.DataFrame(), None
+    dsets: dict = {}               # {set name: its domains}
     if args.imprinting:
         if args.imprinting_bed:
             imp_domains = read_domains(enr._resolve(
@@ -6195,15 +6323,38 @@ def main(argv=None) -> int:
                            "bed, or a gene annotation (--gene-annotation or "
                            "--genome) with imprinted genes; skipped")
         else:
-            imp_domains.to_csv(out / "imprinting_domains.tsv", sep="\t",
-                               index=False)
-            logger.info(f"imprinting: {len(imp_domains)} domains: "
-                        + ", ".join(imp_domains["name"]))
-        if genes is not None:
-            tss_g = (_codes_of(genes["chrom"]) * STRIDE + np.where(
-                genes["strand"].to_numpy() == "-",
-                genes["end"].to_numpy(np.int64) - 1,
-                genes["start"].to_numpy(np.int64)))
+            dsets["imprinting"] = imp_domains
+    if args.pcdh:
+        pc_ = (pcdh_domains(genes, flank=args.imprinting_flank)
+               if genes is not None else pd.DataFrame())
+        if pc_.empty:
+            logger.warning("pcdh: no clustered protocadherin genes -- needs "
+                           "a gene annotation (--gene-annotation or "
+                           "--genome); skipped")
+        else:
+            dsets["pcdh"] = pc_
+    for nm_, dm_ in dsets.items():
+        dm_.to_csv(out / f"{nm_}_domains.tsv", sep="\t", index=False)
+        logger.info(f"{nm_}: {len(dm_)} domains: " + ", ".join(
+            f"{r_['name']} ({r_['chrom']}:{r_['start']:,}-{r_['end']:,})"
+            for _, r_ in dm_.iterrows()))
+    if dsets and genes is not None:
+        tss_g = (_codes_of(genes["chrom"]) * STRIDE + np.where(
+            genes["strand"].to_numpy() == "-",
+            genes["end"].to_numpy(np.int64) - 1,
+            genes["start"].to_numpy(np.int64)))
+    # every set's domains, for each cell's level in them
+    loci_g, loci_of = None, {}
+    if dsets:
+        parts_, at = [], 0
+        for nm_, dm_ in dsets.items():
+            cd_ = _codes_of(dm_["chrom"]) * STRIDE
+            parts_.append(np.column_stack(
+                [cd_ + dm_["start"].to_numpy(np.int64),
+                 cd_ + dm_["end"].to_numpy(np.int64)]))
+            loci_of[nm_] = slice(at, at + len(dm_))
+            at += len(dm_)
+        loci_g = np.concatenate(parts_)
     acc_ctx = next((c for c in contexts if c.upper() == "GCH"),
                    next((c for c in contexts if c.upper().startswith("GC")),
                         None))
@@ -6267,8 +6418,10 @@ def main(argv=None) -> int:
         group_batches = pd.DataFrame(rows_)
     contrast_rows, chot_rows, cenr_rows = [], [], []
     var_rows, var_en = [], []
-    chrx_rows, chrx_cells, imp_rows, imp_crows = [], [], [], []
-    imp_wins: list = []
+    chrx_rows, chrx_cells = [], []
+    dom_rows = {k: [] for k in dsets}
+    dom_crows = {k: [] for k in dsets}
+    dom_wins = {k: [] for k in dsets}
 
     from joblib import Parallel, delayed
     first = next(iter(contexts.values()))
@@ -6418,7 +6571,7 @@ def main(argv=None) -> int:
                               args.min_distance, args.max_distance, exclude,
                               sysd, open_g if ctx == acc_ctx else None,
                               args.open_site_window, prof_bin,
-                              with_x=chrx_on)
+                              with_x=chrx_on, loci=loci_g)
         logger.info(f"{ctx}: reading {len(cells):,} cells")
         res_ = Parallel(n_jobs=args.n_threads, prefer="threads")(
             delayed(one)(i, c) for i, c in enumerate(cells))
@@ -6893,8 +7046,9 @@ def main(argv=None) -> int:
                         f"{int(h_['above_scaled'].sum())} bins above that, "
                         f"{int(h_['below_scaled'].sum())} below "
                         f"(of {len(h_):,})")
-        if not imp_domains.empty and best_arrays is not None:
-            # imprinted domains: the hotspots' per-contact parts
+        if dsets and best_arrays is not None:
+            # imprinted domains, the protocadherins: the hotspots'
+            # per-contact parts inside each domain against matched windows
             grp_i = {"all cells": np.arange(len(cells))}
             kind_i = {"all cells": "all"}
             for g_ in dict.fromkeys(types):
@@ -6904,35 +7058,67 @@ def main(argv=None) -> int:
             for g_, ix_ in cgroups.items():
                 if g_ not in grp_i and ix_.size:
                     grp_i[g_], kind_i[g_] = ix_, "contrast group"
-            ir, icr, iw = domain_concordance(
-                imp_domains, best_arrays[0], best_arrays[4], best_arrays[1],
-                best_arrays[2], best_arrays[5], len(cells), grp_i,
-                pairs=cpairs_ctx, tss_g=tss_g, pair=best_arrays[3],
-                n_controls=args.imprinting_windows,
-                min_contacts=args.imprinting_min_contacts,
-                n_boot=args.n_boot, seed=args.seed + 3001 * ci_ctx)
-            for r_ in ir:
-                r_.update(context=ctx, system=best_hot[1],
-                          group_kind=kind_i[r_["group"]])
-            for r_ in icr:
-                r_.update(context=ctx, system=best_hot[1])
-            imp_rows += ir
-            imp_crows += icr
-            if not iw.empty:
-                iw.insert(0, "context", ctx)
-                iw.insert(1, "system", best_hot[1])
-                iw.insert(3, "chrom", iw["code"].map(chrom_names))
-                imp_wins.append(iw.drop(columns="code"))
-            r0 = next((r_ for r_ in ir if r_["group"] == "all cells"
-                       and r_["domain"] == "all domains"), None)
-            if r0 is not None:
-                logger.info(f"{ctx} imprinted domains ({best_hot[1]} null): "
-                            f"{100 * r0['delta']:.2f} pp vs matched windows "
-                            f"{100 * r0['windows_mean']:.2f} pp, excess "
-                            f"{100 * r0['excess']:+.2f} pp "
-                            f"[{100 * r0['excess_lo']:+.2f}, "
-                            f"{100 * r0['excess_hi']:+.2f}] "
-                            f"({r0['contacts']:,} contacts)")
+            lv_all = np.stack([r["loci"] for r in res_])
+            for si_, (nm_, dm_) in enumerate(dsets.items()):
+                ir, icr, iw = domain_concordance(
+                    dm_, best_arrays[0], best_arrays[4], best_arrays[1],
+                    best_arrays[2], best_arrays[5], len(cells), grp_i,
+                    pairs=cpairs_ctx, tss_g=tss_g, pair=best_arrays[3],
+                    n_controls=args.imprinting_windows,
+                    min_contacts=args.imprinting_min_contacts,
+                    n_boot=args.n_boot,
+                    seed=args.seed + 3001 * ci_ctx + 17 * si_,
+                    pooled=nm_ != "pcdh")
+                lr, lcr = domain_levels(
+                    lv_all[:, loci_of[nm_]], list(dm_["name"]), grp_i,
+                    cpairs_ctx, args.n_boot,
+                    args.seed + 3001 * ci_ctx + 17 * si_ + 5)
+                lvd = {(r_["group"], r_["domain"]): r_ for r_ in lr}
+                lcd = {(r_["group_A"], r_["group_B"], r_["domain"]): r_
+                       for r_ in lcr}
+                for r_ in ir:
+                    r_.update(context=ctx, system=best_hot[1],
+                              group_kind=kind_i[r_["group"]])
+                    x_ = lvd.get((r_["group"], r_["domain"]))
+                    if x_ is not None:
+                        r_.update({k: x_[k] for k in (
+                            "level", "level_lo", "level_hi", "level_ends")})
+                for r_ in icr:
+                    r_.update(context=ctx, system=best_hot[1])
+                    x_ = lcd.get((r_["group_A"], r_["group_B"],
+                                  r_["domain"]))
+                    if x_ is not None:
+                        r_.update({k: x_[k] for k in (
+                            "level_diff", "level_diff_lo", "level_diff_hi",
+                            "level_p")})
+                dom_rows[nm_] += ir
+                dom_crows[nm_] += icr
+                if not iw.empty:
+                    iw.insert(0, "context", ctx)
+                    iw.insert(1, "system", best_hot[1])
+                    iw.insert(3, "chrom", iw["code"].map(chrom_names))
+                    dom_wins[nm_].append(iw.drop(columns="code"))
+                head = "all domains" if nm_ != "pcdh" else "Pcdh cluster"
+                r0 = next((r_ for r_ in ir if r_["group"] == "all cells"
+                           and r_["domain"] == head), None)
+                if r0 is not None:
+                    logger.info(
+                        f"{ctx} {nm_} -- {head} ({best_hot[1]} null): "
+                        f"{100 * r0['delta']:.2f} pp vs matched windows "
+                        f"{100 * r0['windows_mean']:.2f} pp, excess "
+                        f"{100 * r0['excess']:+.2f} pp "
+                        f"[{100 * r0['excess_lo']:+.2f}, "
+                        f"{100 * r0['excess_hi']:+.2f}] "
+                        f"({r0['contacts']:,} contacts)")
+                for r_ in icr:
+                    if r_["domain"] == head:
+                        logger.info(
+                            f"{ctx} {nm_} -- {head}: {r_['group_A']} - "
+                            f"{r_['group_B']} {100 * r_['diff']:+.2f} pp "
+                            f"[{100 * r_['lo']:+.2f}, {100 * r_['hi']:+.2f}]"
+                            f" (matched windows "
+                            f"{100 * r_['windows_mean']:+.2f} pp); level "
+                            f"{100 * r_.get('level_diff', np.nan):+.2f} pp")
         best_arrays = None
         del res_
 
@@ -7270,20 +7456,24 @@ def main(argv=None) -> int:
         for ctx_ in contexts:
             plot_chrx(cx, pcx, sex_tab, ctx_,
                       out / f"chrx_{ctx_}.{args.plot_format}")
-    # concordance inside imprinted domains
-    if imp_rows:
-        it = pd.DataFrame(imp_rows)
+    # concordance inside each set of domains: imprinted, protocadherin
+    what_of = {"imprinting": "imprinted domains",
+               "pcdh": "the clustered protocadherins"}
+    for nm_ in dsets:
+        if not dom_rows[nm_]:
+            continue
+        it = pd.DataFrame(dom_rows[nm_])
         it["q"] = np.nan
         for _, g in it[it["domain"] != "all domains"].groupby(
                 ["context", "group"], sort=False):
             it.loc[g.index, "q"] = fdr_bh(g["p"].to_numpy())
         lead = ["context", "system", "group_kind", "group", "domain"]
         it = it[lead + [c for c in it.columns if c not in lead]]
-        it.to_csv(out / "imprinting_concordance.tsv", sep="\t", index=False)
-        if imp_wins:
-            pd.concat(imp_wins, ignore_index=True).to_csv(
-                out / "imprinting_windows.tsv", sep="\t", index=False)
-        ic = pd.DataFrame(imp_crows)
+        it.to_csv(out / f"{nm_}_concordance.tsv", sep="\t", index=False)
+        if dom_wins[nm_]:
+            pd.concat(dom_wins[nm_], ignore_index=True).to_csv(
+                out / f"{nm_}_windows.tsv", sep="\t", index=False)
+        ic = pd.DataFrame(dom_crows[nm_])
         if not ic.empty:
             ic["q"] = np.nan
             for _, g in ic.groupby(["context", "group_A", "group_B"],
@@ -7291,14 +7481,15 @@ def main(argv=None) -> int:
                 ic.loc[g.index, "q"] = fdr_bh(g["p"].to_numpy())
             lead = ["context", "system", "group_A", "group_B", "domain"]
             ic = ic[lead + [c for c in ic.columns if c not in lead]]
-            ic.to_csv(out / "imprinting_contrast.tsv", sep="\t", index=False)
+            ic.to_csv(out / f"{nm_}_contrast.tsv", sep="\t", index=False)
         tnames = list(dict.fromkeys(it.loc[it["group_kind"] == "cell type",
                                            "group"]))
         show = contrast_names or (tnames if len(tnames) <= 6 else [])
         for ctx_ in contexts:
-            plot_imprinting(it, ic, ctx_,
-                            out / f"imprinting_{ctx_}.{args.plot_format}",
-                            show_groups=show)
+            plot_domains(it, ic, ctx_,
+                         out / f"{nm_}_{ctx_}.{args.plot_format}",
+                         what=what_of.get(nm_, nm_),
+                         mark_neuron=nm_ == "imprinting", show_groups=show)
     # How well each region group's concordance predicts cell type.
     auc_stats = [x.strip() for x in args.celltype_auc_stats.split(",")
                  if x.strip() and x.strip() != "none"]
