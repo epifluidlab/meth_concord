@@ -3855,11 +3855,14 @@ def read_domains(path) -> pd.DataFrame:
                          "genes": nm})
 
 
-def _vs_windows(x, cv) -> dict:
+def _vs_windows(x, cv, se: float = 0.0, tested: bool = True) -> dict:
     """A domain's value against its matched windows' values ``cv``: their
-    mean and SD, z, a normal two-sided p from z -- the windows are too few
-    for an empirical p to pass a correction over domains -- and the
-    empirical one."""
+    mean and SD, and z over both the windows' spread and the domain's own
+    standard error ``se`` -- the windows have their minimum of contacts,
+    a sparse domain far fewer, so their spread alone understates its noise
+    -- with a normal two-sided p from z (the windows are too few for an
+    empirical p to pass a correction over domains) and the empirical one.
+    Not ``tested`` (too few contacts): no z or p."""
     from scipy.stats import norm
     cv = cv[np.isfinite(cv)]
     out = {"windows": int(cv.size), "windows_mean": np.nan,
@@ -3868,13 +3871,14 @@ def _vs_windows(x, cv) -> dict:
     if cv.size < 5 or not np.isfinite(x):
         return out
     m, s = float(cv.mean()), float(np.std(cv, ddof=1))
-    out.update({"windows_mean": m, "windows_sd": s,
-                "p_empirical": float(min(1.0, 2 * min(np.mean(cv >= x),
-                                                      np.mean(cv <= x))
-                                         + 1.0 / (cv.size + 1)))})
-    if s > 0:
-        out["z"] = (x - m) / s
+    out.update({"windows_mean": m, "windows_sd": s})
+    tot = float(np.sqrt(s ** 2 + (se if np.isfinite(se) else 0.0) ** 2))
+    if tested and tot > 0:
+        out["z"] = (x - m) / tot
         out["p"] = float(2 * norm.sf(abs(out["z"])))
+        out["p_empirical"] = float(min(1.0, 2 * min(np.mean(cv >= x),
+                                                    np.mean(cv <= x))
+                                       + 1.0 / (cv.size + 1)))
     return out
 
 
@@ -3894,7 +3898,8 @@ def domain_concordance(domains: pd.DataFrame, g_lo, g_hi, cell, d, c,
     domain in the chromatin its contacts join -- the share of its contacts
     in each class pair of the system (``pair``), L1 distance -- and in TSS
     count (``tss_g``, genome coordinates; |log ratio|): the excess over the
-    windows' mean, z and p (:func:`_vs_windows`).  Also every domain pooled
+    windows' mean, z and p (:func:`_vs_windows`; a domain with fewer than
+    ``min_contacts`` contacts is not tested).  Also every domain pooled
     against every window pooled ('all domains'), and per pair of groups
     (A - B) the same against the windows' differences.  A contact's two
     ends lie on one copy of the chromosome, so where the two parental
@@ -3995,10 +4000,13 @@ def domain_concordance(domains: pd.DataFrame, g_lo, g_hi, cell, d, c,
             bd = (W @ Sd.T) / (W @ Nd.T)
             b_dom = (W @ Sd.sum(0)) / (W @ Nd.sum(0))
             b_win = (W @ S[ctl][:, ix].sum(0)) / (W @ N[ctl][:, ix].sum(0))
-        vals[gname] = (v, bd)
+        vals[gname] = (v, bd, Nd.sum(1))
         for r in range(len(dm)):
             x = float(v[dom[r]])
-            vw = _vs_windows(x, v[owner == r])
+            with np.errstate(invalid="ignore"):
+                se_ = float(np.nanstd(bd[:, r], ddof=1))
+            vw = _vs_windows(x, v[owner == r], se_,
+                             Nd[r].sum() >= min_contacts)
             with np.errstate(invalid="ignore"):
                 lo, hi = np.nanpercentile(bd[:, r], [2.5, 97.5])
             rows.append({
@@ -4029,11 +4037,14 @@ def domain_concordance(domains: pd.DataFrame, g_lo, g_hi, cell, d, c,
     for a_, b_ in pairs:
         if a_ not in vals or b_ not in vals:
             continue
-        (va, bda), (vb, bdb) = vals[a_], vals[b_]
+        (va, bda, na_), (vb, bdb, nb_) = vals[a_], vals[b_]
         dv = va - vb
         for r in range(len(dm)):
             x = float(dv[dom[r]])
-            vw = _vs_windows(x, dv[owner == r])
+            with np.errstate(invalid="ignore"):
+                se_ = float(np.nanstd(bda[:, r] - bdb[:, r], ddof=1))
+            vw = _vs_windows(x, dv[owner == r], se_,
+                             min(na_[r], nb_[r]) >= min_contacts)
             with np.errstate(invalid="ignore"):
                 lo, hi = np.nanpercentile(bda[:, r] - bdb[:, r], [2.5, 97.5])
             crows.append({

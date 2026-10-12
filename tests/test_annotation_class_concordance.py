@@ -1548,6 +1548,29 @@ def test_domain_concordance_against_matched_windows():
     assert (wins["contacts"] >= 30).all()
 
 
+def test_a_sparse_domain_is_not_tested_and_its_noise_counts():
+    """The windows' spread alone would make a domain of a few contacts look
+    extreme: its own standard error enters z, and below the windows'
+    minimum of contacts it is not tested at all."""
+    rng = np.random.default_rng(3)
+    cv = rng.normal(0, 0.1, 100)
+    assert acc._vs_windows(1.0, cv)["z"] > 5
+    assert abs(acc._vs_windows(1.0, cv, se=1.0)["z"]) < 1.5
+    v = acc._vs_windows(1.0, cv, se=1.0, tested=False)
+    assert np.isnan(v["z"]) and np.isnan(v["p"]) and v["windows"] == 100
+    dom, g_lo, g_hi, cell, d, c, tss = _domain_data()
+    tiny = pd.DataFrame({"chrom": ["chr1"], "start": [25_000_000],
+                         "end": [25_020_000], "name": ["tiny"],
+                         "genes": ["T1"]})
+    rows, _, _ = acc.domain_concordance(
+        pd.concat([dom, tiny], ignore_index=True), g_lo, g_hi, cell, d, c,
+        40, {"all cells": np.arange(40)}, tss_g=tss, n_controls=30,
+        min_contacts=30, n_boot=50, seed=4)
+    t = pd.DataFrame(rows).set_index("domain")
+    assert t.loc["tiny", "contacts"] < 30 and np.isnan(t.loc["tiny", "z"])
+    assert t.loc["D1", "z"] > 3
+
+
 def test_matched_windows_share_the_domains_chromatin():
     """Contacts on chr1 below 15 Mb are class pair 1, all others 0: D1's
     windows come from there, D2's from elsewhere."""
