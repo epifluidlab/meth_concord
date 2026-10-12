@@ -26,6 +26,11 @@ their own.  Per cell and chromosome each haplotype's level
 islands, the same haplotype in every cell of a clonal line, either one in a
 polyclonal line.  Figures: allelic_<context>.pdf.
 
+--region NAME=BED adds each context again with only its sites inside the
+BED, as <context>_<NAME>: the inactive X is the more methylated at CpG
+islands but the less in gene bodies, so over all sites the two partly
+cancel, and HCG_island is the sharper call of which copy is silenced.
+
 The VCF holds the line's genotypes, heterozygous SNVs used; subset a
 multi-sample VCF first, e.g. ``bcftools view -s NA12878 -g het -v snps -m2
 -M2``.  For GM12878, the 1000 Genomes high-coverage release has NA12878
@@ -445,6 +450,11 @@ def main(argv=None) -> int:
                          "nome_hic_concordance takes them.")
     ap.add_argument("--context-bed-offset", type=int, default=0,
                     help="As nome_hic_concordance's (0).")
+    ap.add_argument("--region", action="append", default=None,
+                    metavar="NAME=BED",
+                    help="Also each context with only its sites inside this "
+                         "BED (chrom, start, end), as <context>_<NAME> -- "
+                         "e.g. island=cpgIslands.bed (repeatable).")
     ap.add_argument("--chroms", default=None,
                     help="Chromosomes to read (comma-separated; default: "
                          "every one in the VCFs).")
@@ -485,6 +495,23 @@ def main(argv=None) -> int:
     sites = _ref.load_context_from_bed(beds, chroms=want,
                                        n_threads=args.n_threads,
                                        c_offset=args.context_bed_offset)
+    for nm, path in _pairs(args.region).items():
+        reg = pd.read_csv(path, sep="\t", header=None, comment="#",
+                          usecols=[0, 1, 2], dtype={0: str})
+        for ctx in list(beds):
+            sub = {}
+            for c, a in sites[ctx].items():
+                r = reg[reg[0] == c].sort_values(1)
+                if r.empty:
+                    continue
+                st_, en_ = r[1].to_numpy(np.int64), r[2].to_numpy(np.int64)
+                i = np.searchsorted(st_, a["pos"], side="right") - 1
+                ok = (i >= 0) & (a["pos"] < en_[np.maximum(i, 0)])
+                sub[c] = a[ok]
+            sites[f"{ctx}_{nm}"] = sub
+            contexts.append(f"{ctx}_{nm}")
+            logger.info(f"{ctx}_{nm}: {sum(len(v) for v in sub.values()):,} "
+                        f"sites inside {path}")
     snp_rows, cell_rows = [], {}
     for g, tab in snps.items():
         cells = samples[samples[args.group_column].astype(str) == g]

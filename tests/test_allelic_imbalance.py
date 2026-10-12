@@ -172,10 +172,12 @@ def test_vcf_keeps_heterozygous_snvs_and_their_phase(tmp_path):
 def test_clonal_line_is_imbalanced_on_x_and_a_polyclonal_one_per_cell(
         tmp_path):
     d = make_data(tmp_path / "d")
+    (d / "half.bed").write_text("chrX\t0\t10000\n")
     o = tmp_path / "out"
     ai.main(["--samples", str(d / "samples.tsv"),
              "--vcf", f"GM={d / 'snps.vcf'}", "--vcf", f"IMR={d / 'snps.vcf'}",
              "--context-bed", f"HCG:{d / 'HCG.bed.gz'}", "--mates",
+             "--region", f"half={d / 'half.bed'}",
              "--min-reads", "3", "--n-threads", "2", "--plot-format", "png",
              "--output-dir", str(o)])
     snp = pd.read_csv(o / "allelic_snps.tsv", sep="\t")
@@ -189,7 +191,7 @@ def test_clonal_line_is_imbalanced_on_x_and_a_polyclonal_one_per_cell(
     assert (x.loc["IMR", "HCG_q"] < 0.05).mean() < 0.3
     assert a["HCG_alt_minus_ref"].abs().median() < 0.2
     ch = pd.read_csv(o / "allelic_chromosomes.tsv", sep="\t")
-    c = ch.set_index(["group", "chrom"])
+    c = ch[ch["context"] == "HCG"].set_index(["group", "chrom"])
     assert c.loc[("GM", "chrX"), "share_imbalanced"] > 0.8
     assert c.loc[("GM", "chr1"), "share_imbalanced"] < 0.2
     cells = pd.read_csv(o / "allelic_cells.tsv", sep="\t")
@@ -202,3 +204,9 @@ def test_clonal_line_is_imbalanced_on_x_and_a_polyclonal_one_per_cell(
     # the mates' sites count too: more sites than the SNP reads alone
     assert (cx["HCG_sites_hap1"] > 0).all()
     assert (o / "allelic_HCG.png").exists()
+    # the region's sites: a subset, with the same call
+    assert (cx["HCG_half_sites_hap1"] < cx["HCG_sites_hap1"]).all()
+    assert (cx["HCG_half_sites_hap1"] > 0).all()
+    assert (cx.filter(like="GM_", axis=0)["HCG_half_hap1_minus_hap2"]
+            < -0.5).all()
+    assert (o / "allelic_HCG_half.png").exists()
