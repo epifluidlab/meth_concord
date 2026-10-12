@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""SNP-based allelic imbalance in methylation and accessibility, per cell line.
+
+Every read that covers a heterozygous SNP is given the SNP's allele --
+bisulfite-aware: on a C->T read a T may be a T or an unmethylated C, on a
+G->A read an A may be an A or an unmethylated G, so a base that fits both
+alleles calls neither -- and its HCG / GCH sites are counted as the pipeline
+counts them (nome_hic_concordance.bam_parser: the conversion strand from the
+read's mismatches, the sites of that strand only), the SNP positions
+themselves left out.
+
+Per cell line (the samples' group) and SNP, pooled over the line's cells:
+each allele's methylation (HCG) and accessibility (GCH), alt less ref, and a
+Welch t-test over the reads' own levels (allelic_snps.tsv).  Per line and
+chromosome: the share of tested SNPs with imbalance and the median |alt -
+ref| (allelic_chromosomes.tsv) -- chrX against the autosomes.  A line whose
+cells all silence the same X (clonal: GM12878) is imbalanced on X pooled over
+cells; a line whose cells silence either X (polyclonal: IMR-90) cancels in
+the pool, though every cell has an inactive X.
+
+With phased SNPs (0|1, 1|0) each read also gets a haplotype, and with
+--mates its Hi-C mate too -- a cis contact keeps to one copy of its
+chromosome, so the mate's sites are on the read's haplotype without a SNP of
+their own.  Per cell and chromosome each haplotype's level
+(allelic_cells.tsv): on X the inactive copy is the more methylated at CpG
+islands, the same haplotype in every cell of a clonal line, either one in a
+polyclonal line.  Figures: allelic_<context>.pdf.
+
+The VCF holds the line's genotypes, heterozygous SNVs used; subset a
+multi-sample VCF first, e.g. ``bcftools view -s NA12878 -g het -v snps -m2
+-M2``.  For GM12878, the 1000 Genomes high-coverage release has NA12878
+phased by its trio.
+
+    python scripts/allelic_imbalance.py \\
+        --samples gm12878_imr90.samples.tsv \\
+        --vcf GM12878=NA12878.het.phased.vcf.gz --vcf IMR90=IMR90.het.vcf.gz \\
+        --context-bed GCH:GCH_motif.hg38.bed.gz,HCG:HCG_motif.hg38.bed.gz \\
+        --chroms chrX,chr7,chr11,chr15 --mates --n-threads 10 \\
+        --output-dir output/allelic_imbalance
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import logging
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from nome_hic_concordance import bam_parser as _bp  # noqa: E402
+from nome_hic_concordance import reference as _ref  # noqa: E402
+from nome_hic_concordance.utils import chrom_key, manifest_text  # noqa: E402
+
+logger = logging.getLogger("allelic_imbalance")
+
+#: The bases a read can show for each true base, by its conversion strand:
+#: on a C->T read an unmethylated C reads as T, on a G->A read an
+#: unmethylated G as A.
+_SHOWS = {"CT": {"A": "A", "C": "CT", "G": "G", "T": "T"},
+          "GA": {"A": "A", "C": "C", "G": "GA", "T": "T"}}
+
+
+def call_allele(base: str, ref: str, alt: str, strand: str) -> int:
+    """0 for the ref allele, 1 for alt, -1 when the base fits both or
+    neither under the read's conversion strand."""
+    s = _SHOWS.get(strand)
+    if s is None:
+        return -1
+    r, a = base in s.get(ref, ref), base in s.get(alt, alt)
+    if r and not a:
+        return 0
+    if a and not r:
+        return 1
+    return -1
+
+
+def read_het_snps(path, sample=None, chroms=None) -> pd.DataFrame:
+    """The heterozygous biallelic SNVs of one sample of a VCF (``sample``,
+    else the first): chrom, pos (0-based), ref, alt, and ref_hap -- the
+    haplotype carrying REF, 1 for 0|1 and 2 for 1|0, 0 when unphased."""
+    want = {chrom_key(c) for c in chroms} if chroms else None
+    opener = gzip.open if str(path).endswith(".gz") else open
+    rows, col = [], None
+    with opener(path, "rt") as fh:
+        for line in fh:
+            if line.startswith("##"):
+                continue
+            if line.startswith("#"):
+                head = line.rstrip("\n").split("\t")
+                col = 9 if sample is None else head.index(sample)
+                continue
+            c = line[:line.find("\t")]
+            if want is not None and chrom_key(c) not in want:
+                continue
+            f = line.rstrip("\n").split("\t")
+            ref, alt = f[3].upper(), f[4].upper()
+            if len(ref) != 1 or len(alt) != 1 or ref not in "ACGT" \
+                    or alt not in "ACGT" or col is None or len(f) <= col:
+                continue
+            fmt = f[8].split(":")
+            if "GT" not in fmt:
+                continue
+            gt = f[col].split(":")[fmt.index("GT")]
+            if gt in ("0|1", "1|0"):
+                hap = 1 if gt == "0|1" else 2
+            elif gt in ("0/1", "1/0"):
+                hap = 0
+            else:
+                continue
+            rows.append((c, int(f[1]) - 1, ref, alt, hap))
+    return pd.DataFrame(rows, columns=["chrom", "pos", "ref", "alt",
+                                       "ref_hap"])
+
+
+def _base_at(read, pos: int, pairs):
+    """The read's base and quality at reference ``pos``, or None; ``pairs``
+    is the read's ref -> query map when it has indels."""
+    if pairs is None:
+        qp = pos - read.reference_start + read.query_alignment_start
+    else:
+        qp = pairs.get(pos)
+    seq = read.query_sequence
+    if qp is None or seq is None or qp < 0 or qp >= len(seq):
+        return None
+    q = read.query_qualities
+    return seq[qp], (q[qp] if q is not None else 40)
+
+
+def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
+                 mapq_min: int, min_bq: int, mates: bool):
+    """One cell: per (chrom, SNP, allele) its reads and, per context, the
+    sites (k methylated of n) and the reads' own levels (count, sum, sum of
+    squares); per (chrom, haplotype, 'snp' | 'mate') the sites; with
+    ``mates``, the mates of the haplotype-tagged reads too.  ``snps``:
+    {chrom: (pos, ref, alt, ref_hap)}, ``sites``: {context: {chrom:
+    (positions, reference bases)}}."""
+    import pysam
+    pysam.set_verbosity(0)
+    nc = len(contexts)
+    by_snp: dict = {}
+    by_hap: dict = {}
+
+    def add_hap(chrom, hap, kind, kn):
+        v = by_hap.setdefault((chrom, hap, kind), np.zeros(2 * nc + 1))
+        v[0] += 1
+        v[1:] += kn
+
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for chrom, (sp, sref, salt, shap) in snps.items():
+            here = [sites[c].get(chrom) for c in contexts]
+            try:
+                reads = bam.fetch(chrom)
+            except ValueError:
+                continue
+            tagged: dict = {}
+            for read in reads:
+                if read.flag & _bp._SKIP_FLAGS or \
+                        read.mapping_quality < mapq_min:
+                    continue
+                s, e = read.reference_start, read.reference_end
+                i0, i1 = np.searchsorted(sp, [s, e])
+                if i0 >= i1:
+                    continue
+                strand = _bp._infer_conversion_strand(read)
+                if strand == "unknown":
+                    continue
+                pairs = (None if read.reference_length
+                         == read.query_alignment_length else
+                         {r: q for q, r in read.get_aligned_pairs(
+                             matches_only=True)})
+                calls = []
+                for j in range(i0, i1):
+                    b = _base_at(read, int(sp[j]), pairs)
+                    if b is None or b[1] < min_bq:
+                        continue
+                    al = call_allele(b[0], sref[j], salt[j], strand)
+                    if al >= 0:
+                        calls.append((j, al))
+                if not calls:
+                    continue
+                kn = np.zeros(2 * nc)
+                for ci, h in enumerate(here):
+                    if h is not None:
+                        kn[2 * ci:2 * ci + 2] = _bp._count_context_in_read(
+                            read, h[0], h[1], trim_ends)
+                for j, al in calls:
+                    v = by_snp.setdefault((chrom, int(sp[j]), al),
+                                          np.zeros(1 + 5 * nc))
+                    v[0] += 1
+                    for ci in range(nc):
+                        k_, n_ = kn[2 * ci], kn[2 * ci + 1]
+                        v[1 + 5 * ci:3 + 5 * ci] += (k_, n_)
+                        if n_ > 0:
+                            f = k_ / n_
+                            v[3 + 5 * ci:6 + 5 * ci] += (1, f, f * f)
+                haps = {(shap[j] if al == 0 else 3 - shap[j])
+                        for j, al in calls if shap[j]}
+                if len(haps) == 1:
+                    hap = haps.pop()
+                    add_hap(chrom, hap, "snp", kn)
+                    if mates and read.next_reference_name == chrom:
+                        tagged.setdefault(read.query_name, {})[
+                            read.is_read1] = hap
+            if not (mates and tagged):
+                continue
+            for read in bam.fetch(chrom):
+                t_ = tagged.get(read.query_name)
+                # the mate only, and only once: a pair whose two reads both
+                # carry a SNP is counted already
+                if t_ is None or len(t_) > 1 or read.is_read1 in t_ or \
+                        read.flag & _bp._SKIP_FLAGS or \
+                        read.mapping_quality < mapq_min:
+                    continue
+                kn = np.zeros(2 * nc)
+                for ci, h in enumerate(here):
+                    if h is not None:
+                        kn[2 * ci:2 * ci + 2] = _bp._count_context_in_read(
+                            read, h[0], h[1], trim_ends)
+                add_hap(chrom, next(iter(t_.values())), "mate", kn)
+    return by_snp, by_hap
+
+
+def _welch(n1, m1, v1, n2, m2, v2):
+    """Two-sided Welch t-test p from two groups' size, mean and variance."""
+    from scipy.stats import t as t_dist
+    with np.errstate(invalid="ignore", divide="ignore"):
+        se2 = v1 / n1 + v2 / n2
+        t = (m2 - m1) / np.sqrt(se2)
+        df = se2 ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2
+                         / (n2 - 1))
+        p = 2 * t_dist.sf(np.abs(t), df)
+    return np.where((n1 >= 2) & (n2 >= 2) & (se2 > 0), p, np.nan)
+
+
+def fdr_bh(p) -> np.ndarray:
+    """Benjamini-Hochberg q over the finite p-values; NaN stays NaN."""
+    p = np.asarray(p, float)
+    q = np.full(p.shape, np.nan)
+    ok = np.flatnonzero(np.isfinite(p))
+    if ok.size:
+        o = ok[np.argsort(p[ok])]
+        m = o.size
+        v = p[o] * m / np.arange(1, m + 1)
+        q[o] = np.minimum(np.minimum.accumulate(v[::-1])[::-1], 1.0)
+    return q
+
+
+def snp_table(agg: dict, cells: dict, snps: pd.DataFrame, contexts,
+              min_reads: int) -> pd.DataFrame:
+    """Per SNP: each allele's reads and cells, and per context its level
+    (sites pooled), alt less ref, and the Welch p over the reads' own
+    levels; with phase, hap1 less hap2 too.  ``agg``: {(chrom, pos,
+    allele): sums}; ``cells``: {(chrom, pos, allele): cells}."""
+    keys = sorted({(c, p) for c, p, _ in agg})
+    if not keys:
+        return pd.DataFrame()
+    nc = len(contexts)
+    z = np.zeros(1 + 5 * nc)
+    R = np.array([agg.get((c, p, 0), z) for c, p in keys])
+    A = np.array([agg.get((c, p, 1), z) for c, p in keys])
+    out = pd.DataFrame(keys, columns=["chrom", "pos"])
+    out = out.merge(snps.drop_duplicates(["chrom", "pos"]),
+                    on=["chrom", "pos"], how="left")
+    out["reads_ref"], out["reads_alt"] = R[:, 0], A[:, 0]
+    out["cells_ref"] = [cells.get((c, p, 0), 0) for c, p in keys]
+    out["cells_alt"] = [cells.get((c, p, 1), 0) for c, p in keys]
+    sign = np.where(out["ref_hap"] == 1, -1.0,
+                    np.where(out["ref_hap"] == 2, 1.0, np.nan))
+    for ci, ctx in enumerate(contexts):
+        b = 1 + 5 * ci
+        with np.errstate(invalid="ignore", divide="ignore"):
+            lr, la = R[:, b] / R[:, b + 1], A[:, b] / A[:, b + 1]
+            mr, ma = R[:, b + 3] / R[:, b + 2], A[:, b + 3] / A[:, b + 2]
+            vr = (R[:, b + 4] - R[:, b + 2] * mr ** 2) / (R[:, b + 2] - 1)
+            va = (A[:, b + 4] - A[:, b + 2] * ma ** 2) / (A[:, b + 2] - 1)
+        out[f"{ctx}_ref"], out[f"{ctx}_alt"] = lr, la
+        out[f"{ctx}_alt_minus_ref"] = la - lr
+        # hap1 less hap2: alt - ref when REF is on haplotype 2
+        out[f"{ctx}_hap1_minus_hap2"] = sign * (la - lr)
+        out[f"{ctx}_reads_ref"], out[f"{ctx}_reads_alt"] = R[:, b + 2], \
+            A[:, b + 2]
+        ok = (R[:, b + 2] >= min_reads) & (A[:, b + 2] >= min_reads)
+        out[f"{ctx}_p"] = np.where(ok, _welch(R[:, b + 2], mr, vr,
+                                              A[:, b + 2], ma, va), np.nan)
+        out[f"{ctx}_q"] = fdr_bh(out[f"{ctx}_p"].to_numpy())
+    return out
+
+
+def chromosome_table(snp: pd.DataFrame, contexts, q_cut: float = 0.05):
+    """Per chromosome and context: SNPs tested, the share imbalanced (q <
+    q_cut), the median |alt - ref|, and with phase the median hap1 - hap2
+    -- one sign on X in a clonal line."""
+    rows = []
+    for c, g in snp.groupby("chrom", sort=False):
+        for ctx in contexts:
+            t = g[g[f"{ctx}_p"].notna()]
+            rows.append({
+                "chrom": c, "is_X": chrom_key(c) == "X", "context": ctx,
+                "snps_tested": len(t),
+                "share_imbalanced": (float((t[f"{ctx}_q"] < q_cut).mean())
+                                     if len(t) else np.nan),
+                "median_abs_diff": (float(t[f"{ctx}_alt_minus_ref"].abs()
+                                          .median()) if len(t) else np.nan),
+                "median_hap1_minus_hap2": (
+                    float(t[f"{ctx}_hap1_minus_hap2"].median())
+                    if t[f"{ctx}_hap1_minus_hap2"].notna().any()
+                    else np.nan)})
+    return pd.DataFrame(rows)
+
+
+def cell_table(per_cell: dict, contexts) -> pd.DataFrame:
+    """Per cell and chromosome: each haplotype's level per context, SNP
+    reads and (with --mates) their mates pooled, and hap1 less hap2."""
+    rows = []
+    for (cell, group), agg in per_cell.items():
+        for chrom in sorted({k[0] for k in agg}):
+            r = {"cell": cell, "group": group, "chrom": chrom}
+            for hap in (1, 2):
+                v = sum((agg[k] for k in agg if k[0] == chrom and
+                         k[1] == hap), np.zeros(2 * len(contexts) + 1))
+                r[f"reads_hap{hap}"] = int(v[0])
+                for ci, ctx in enumerate(contexts):
+                    k_, n_ = v[1 + 2 * ci], v[2 + 2 * ci]
+                    r[f"{ctx}_sites_hap{hap}"] = int(n_)
+                    r[f"{ctx}_hap{hap}"] = k_ / n_ if n_ else np.nan
+            for ctx in contexts:
+                r[f"{ctx}_hap1_minus_hap2"] = (r[f"{ctx}_hap1"]
+                                               - r[f"{ctx}_hap2"])
+            rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def plot_allelic(snp: pd.DataFrame, cells: pd.DataFrame, context: str,
+                 path, q_cut: float = 0.05, min_sites: int = 20):
+    """a: per line, |alt - ref| per tested SNP on chrX and the autosomes
+    (the share with q < q_cut in the legend); b: per phased SNP on chrX,
+    hap1 - hap2 along the chromosome -- one sign throughout where every
+    cell silences the same X; c: per cell, chrX hap1 - hap2 (cells with
+    ``min_sites`` sites on each haplotype)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    if snp.empty or f"{context}_p" not in snp:
+        return
+    groups = list(dict.fromkeys(snp["group"]))
+    cols = ("#d6604d", "#4393c3", "#1b9e77", "#7570b3")
+    fig, axes = plt.subplots(1, 3, figsize=(7.1, 2.4),
+                             gridspec_kw={"wspace": 0.45})
+    ax0, ax1, ax2 = axes
+    ticks, labels, k = [], [], 0.0
+    for gi, g in enumerate(groups):
+        t = snp[(snp["group"] == g) & snp[f"{context}_p"].notna()]
+        isx = t["chrom"].map(chrom_key).eq("X")
+        for xi, m in enumerate((~isx, isx)):
+            v = 100 * t.loc[m, f"{context}_alt_minus_ref"].abs().dropna()
+            if len(v):
+                ax0.boxplot(v, positions=[k], widths=0.6, showfliers=False,
+                            patch_artist=True,
+                            boxprops={"facecolor": cols[gi % 4],
+                                      "alpha": 0.9 if xi else 0.35})
+                sh = float((t.loc[m, f"{context}_q"] < q_cut).mean())
+                ticks.append(k)
+                labels.append(f"{g}\n{'X' if xi else 'auto'} {sh:.0%}")
+            k += 1
+        k += 0.6
+    ax0.set_xticks(ticks)
+    ax0.set_xticklabels(labels, fontsize=4.5)
+    ax0.set_ylabel(f"|alt − ref| {context}, pp")
+    ax0.set_title(f"a  per SNP (share with q < {q_cut:g})", loc="left",
+                  fontsize=6)
+    for gi, g in enumerate(groups):
+        t = snp[(snp["group"] == g)
+                & snp["chrom"].map(chrom_key).eq("X")
+                & snp[f"{context}_p"].notna()
+                & snp[f"{context}_hap1_minus_hap2"].notna()]
+        if len(t):
+            sig = t[f"{context}_q"] < q_cut
+            ax1.scatter(t["pos"] / 1e6, 100 * t[f"{context}_hap1_minus_hap2"],
+                        s=np.where(sig, 5, 2), lw=0, color=cols[gi % 4],
+                        alpha=0.8, label=g)
+    ax1.axhline(0, color="0.6", lw=0.4)
+    ax1.set_xlabel("chrX, Mb")
+    ax1.set_ylabel(f"hap1 − hap2 {context}, pp")
+    ax1.set_title("b  phased SNPs on X", loc="left", fontsize=6)
+    if ax1.has_data():
+        ax1.legend(fontsize=5, frameon=False)
+    if cells is not None and not cells.empty:
+        x = cells[cells["chrom"].map(chrom_key).eq("X")
+                  & (cells[f"{context}_sites_hap1"] >= min_sites)
+                  & (cells[f"{context}_sites_hap2"] >= min_sites)]
+        for gi, g in enumerate(groups):
+            v = 100 * x.loc[x["group"] == g,
+                            f"{context}_hap1_minus_hap2"].dropna()
+            if len(v):
+                ax2.hist(v, bins=30, histtype="step", color=cols[gi % 4],
+                         label=f"{g} ({len(v)} cells; "
+                               f"{np.mean(v > 0):.0%} > 0)")
+        ax2.axvline(0, color="0.6", lw=0.4)
+        if ax2.has_data():
+            ax2.legend(fontsize=5, frameon=False)
+    ax2.set_xlabel("chrX hap1 − hap2 per cell, pp")
+    ax2.set_ylabel("cells")
+    ax2.set_title("c  which X, cell by cell", loc="left", fontsize=6)
+    fig.suptitle(f"{context}: allelic imbalance at heterozygous SNPs",
+                 fontsize=7, y=1.04)
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
+def _pairs(values) -> dict:
+    out = {}
+    for v in values or []:
+        for tok in str(v).split(","):
+            if tok.strip():
+                k, _, p = tok.strip().partition("=")
+                out[k.strip()] = p.strip()
+    return out
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--samples", required=True,
+                    help="Cell sheet (TSV) with the cell, its BAM and its "
+                         "line.")
+    ap.add_argument("--cell-column", default="cell_name")
+    ap.add_argument("--bam-column", default="bam_path")
+    ap.add_argument("--group-column", default="group")
+    ap.add_argument("--vcf", action="append", required=True,
+                    metavar="GROUP=VCF",
+                    help="A line's genotypes (repeatable; heterozygous SNVs "
+                         "used, phased or not).")
+    ap.add_argument("--vcf-sample", action="append", default=None,
+                    metavar="GROUP=NAME",
+                    help="The VCF column of the line (default: the first).")
+    ap.add_argument("--context-bed", required=True,
+                    help="CTX:PATH[,CTX:PATH] tabix-indexed site BEDs, as "
+                         "nome_hic_concordance takes them.")
+    ap.add_argument("--context-bed-offset", type=int, default=0,
+                    help="As nome_hic_concordance's (0).")
+    ap.add_argument("--chroms", default=None,
+                    help="Chromosomes to read (comma-separated; default: "
+                         "every one in the VCFs).")
+    ap.add_argument("--mates", action="store_true",
+                    help="Also count the cis Hi-C mates of haplotype-tagged "
+                         "reads (phased SNPs only); reads each chromosome "
+                         "twice.")
+    ap.add_argument("--trim-ends", type=int, default=5)
+    ap.add_argument("--mapq-min", type=int, default=30)
+    ap.add_argument("--min-base-quality", type=int, default=20)
+    ap.add_argument("--min-reads", type=int, default=3,
+                    help="Reads each allele needs for a SNP to be tested.")
+    ap.add_argument("--n-threads", type=int, default=4)
+    ap.add_argument("--plot-format", default="pdf")
+    ap.add_argument("--output-dir", required=True)
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    from joblib import Parallel, delayed
+
+    samples = pd.read_csv(manifest_text(args.samples), sep="\t", dtype=str)
+    vcfs, names = _pairs(args.vcf), _pairs(args.vcf_sample)
+    chroms = ([c.strip() for c in args.chroms.split(",") if c.strip()]
+              if args.chroms else None)
+    beds = {}
+    for tok in args.context_bed.split(","):
+        ctx, _, p = tok.strip().partition(":")
+        beds[ctx.strip().upper()] = p.strip()
+    contexts = list(beds)
+    snps = {}
+    for g, v in vcfs.items():
+        snps[g] = read_het_snps(v, names.get(g), chroms)
+        logger.info(f"{g}: {len(snps[g]):,} heterozygous SNVs "
+                    f"({int((snps[g]['ref_hap'] > 0).sum()):,} phased)")
+    want = sorted({c for t in snps.values() for c in t["chrom"]})
+    sites = _ref.load_context_from_bed(beds, chroms=want,
+                                       n_threads=args.n_threads,
+                                       c_offset=args.context_bed_offset)
+    snp_rows, cell_rows = [], {}
+    for g, tab in snps.items():
+        cells = samples[samples[args.group_column].astype(str) == g]
+        if cells.empty or tab.empty:
+            logger.warning(f"{g}: no cells or no SNPs; skipped")
+            continue
+        tab = tab.sort_values(["chrom", "pos"])
+        per = {c: (x["pos"].to_numpy(np.int64), x["ref"].to_numpy(),
+                   x["alt"].to_numpy(), x["ref_hap"].to_numpy(np.int64))
+               for c, x in tab.groupby("chrom", sort=False)}
+        # the SNPs' own positions are not sites: a C/T SNP would read as
+        # methylation
+        st = {}
+        for ctx in contexts:
+            st[ctx] = {}
+            for c, a in sites[ctx].items():
+                if c in per:
+                    keep = ~np.isin(a["pos"], per[c][0])
+                    st[ctx][c] = (a["pos"][keep], a["ref_base"][keep])
+        logger.info(f"{g}: {len(cells):,} cells")
+        res = Parallel(n_jobs=args.n_threads)(
+            delayed(cell_alleles)(b, per, st, contexts, args.trim_ends,
+                                  args.mapq_min, args.min_base_quality,
+                                  args.mates)
+            for b in cells[args.bam_column])
+        agg: dict = {}
+        ncell: dict = {}
+        for (cell, (by_snp, by_hap)) in zip(cells[args.cell_column], res):
+            for k, v in by_snp.items():
+                agg[k] = agg.get(k, 0) + v
+                ncell[k] = ncell.get(k, 0) + 1
+            cell_rows[(cell, g)] = by_hap
+        t = snp_table(agg, ncell, tab, contexts, args.min_reads)
+        if not t.empty:
+            t.insert(0, "group", g)
+            snp_rows.append(t)
+            for ctx in contexts:
+                x = t[t[f"{ctx}_p"].notna()]
+                isx = x["chrom"].map(chrom_key).eq("X")
+                imb = x[f"{ctx}_q"] < 0.05
+                logger.info(
+                    f"{g} {ctx}: {len(x):,} SNPs tested; imbalanced (q < "
+                    f"0.05) on X {float(imb[isx].mean()):.1%} of "
+                    f"{int(isx.sum()):,}, autosomes "
+                    f"{float(imb[~isx].mean()):.1%} of "
+                    f"{int((~isx).sum()):,}")
+    if not snp_rows:
+        sys.exit("no SNP covered by any read")
+    snp = pd.concat(snp_rows, ignore_index=True)
+    snp.to_csv(out / "allelic_snps.tsv", sep="\t", index=False)
+    chrom_tab = pd.concat([chromosome_table(x, contexts).assign(group=g)
+                           for g, x in snp.groupby("group", sort=False)],
+                          ignore_index=True)
+    chrom_tab.to_csv(out / "allelic_chromosomes.tsv", sep="\t", index=False)
+    cells = cell_table(cell_rows, contexts)
+    if not cells.empty:
+        cells.to_csv(out / "allelic_cells.tsv", sep="\t", index=False)
+    for ctx in contexts:
+        plot_allelic(snp, cells, ctx,
+                     out / f"allelic_{ctx}.{args.plot_format}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
