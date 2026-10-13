@@ -161,10 +161,12 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
                  mapq_min: int, min_bq: int, mates: bool, pairs_path=None):
     """One cell: per (chrom, SNP, allele) its reads and, per context, the
     sites (k methylated of n) and the reads' own levels (count, sum, sum of
-    squares); per (chrom, haplotype, 'snp' | 'mate') the sites; with
-    ``mates``, the mates of the haplotype-tagged reads too.  ``snps``:
-    {chrom: (pos, ref, alt, ref_hap)}, ``sites``: {context: {chrom:
-    (positions, reference bases)}}.
+    squares) -- as arrays: keys (:func:`snp_key`, sorted) and their sums
+    (float32), small enough to send back for every cell; per (chrom,
+    haplotype, 'snp' | 'mate') the sites; with ``mates``, the mates of the
+    haplotype-tagged reads too.  ``snps``: {chrom: (pos, ref, alt,
+    ref_hap)}, ``sites``: {context: {chrom: (positions, reference
+    bases)}}.
 
     With ``pairs_path``, the cis read pairs on one haplotype are written
     there: a pair whose reads both pass the pipeline's filters (flags,
@@ -298,7 +300,54 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
              "snp_reads": np.int8})
         t.to_parquet(pairs_path, index=False)
         counts.update(t.groupby(["chrom", "hap"]).size().to_dict())
-    return by_snp, by_hap, counts
+    ci_of = {c: i for i, c in enumerate(snps)}
+    keys = np.fromiter((snp_key(ci_of[c], p_, a_) for c, p_, a_ in by_snp),
+                       np.int64, len(by_snp))
+    vals = (np.array(list(by_snp.values()), np.float32) if by_snp
+            else np.zeros((0, 1 + 5 * nc), np.float32))
+    o = np.argsort(keys)
+    return keys[o], vals[o], by_hap, counts
+
+
+def snp_key(chrom_index: int, pos: int, allele: int) -> int:
+    """One int64 per (chromosome, position, allele): the chromosome's index
+    in the cell's SNP table, the 0-based position, the allele (0 REF)."""
+    return (int(chrom_index) << 33) | (int(pos) << 1) | int(allele)
+
+
+class SnpSums:
+    """Per (chromosome, SNP, allele) -- :func:`snp_key` -- the sums over
+    cells and, last, the cells: merged a few million rows at a time,
+    numpy only, so no cell's results are held longer than its merge."""
+
+    def __init__(self, width: int, flush_rows: int = 2_000_000):
+        self.keys = np.zeros(0, np.int64)
+        self.vals = np.zeros((0, width + 1))
+        self.flush_rows = flush_rows
+        self._pend: list = []
+        self._n = 0
+
+    def add(self, keys, vals):
+        if len(keys):
+            self._pend.append((keys, vals))
+            self._n += len(keys)
+        if self._n >= self.flush_rows:
+            self.flush()
+
+    def flush(self):
+        if not self._pend:
+            return
+        k = np.concatenate([self.keys] + [k_ for k_, _ in self._pend])
+        v = np.concatenate(
+            [self.vals] + [np.column_stack([v_.astype(np.float64),
+                                            np.ones(len(v_))])
+                           for _, v_ in self._pend])
+        self._pend, self._n = [], 0
+        o = np.argsort(k, kind="stable")
+        k, v = k[o], v[o]
+        start = np.flatnonzero(np.r_[True, k[1:] != k[:-1]])
+        self.keys = k[start]
+        self.vals = np.add.reduceat(v, start, axis=0)
 
 
 def _welch(n1, m1, v1, n2, m2, v2):
@@ -326,25 +375,31 @@ def fdr_bh(p) -> np.ndarray:
     return q
 
 
-def snp_table(agg: dict, cells: dict, snps: pd.DataFrame, contexts,
+def snp_table(sums: SnpSums, chroms, snps: pd.DataFrame, contexts,
               min_reads: int) -> pd.DataFrame:
     """Per SNP: each allele's reads and cells, and per context its level
     (sites pooled), alt less ref, and the Welch p over the reads' own
-    levels; with phase, hap1 less hap2 too.  ``agg``: {(chrom, pos,
-    allele): sums}; ``cells``: {(chrom, pos, allele): cells}."""
-    keys = sorted({(c, p) for c, p, _ in agg})
-    if not keys:
+    levels; with phase, hap1 less hap2 too.  ``sums``: merged, its keys'
+    chromosome indices into ``chroms``."""
+    sums.flush()
+    if not len(sums.keys):
         return pd.DataFrame()
-    nc = len(contexts)
-    z = np.zeros(1 + 5 * nc)
-    R = np.array([agg.get((c, p, 0), z) for c, p in keys])
-    A = np.array([agg.get((c, p, 1), z) for c, p in keys])
-    out = pd.DataFrame(keys, columns=["chrom", "pos"])
+    w = 1 + 5 * len(contexts)
+    site = sums.keys >> 1
+    us, inv = np.unique(site, return_inverse=True)
+    alt_ = (sums.keys & 1).astype(bool)
+    R, A = np.zeros((us.size, w)), np.zeros((us.size, w))
+    cr, ca = np.zeros(us.size, np.int64), np.zeros(us.size, np.int64)
+    R[inv[~alt_]] = sums.vals[~alt_, :w]
+    A[inv[alt_]] = sums.vals[alt_, :w]
+    cr[inv[~alt_]] = sums.vals[~alt_, w]
+    ca[inv[alt_]] = sums.vals[alt_, w]
+    out = pd.DataFrame({"chrom": np.asarray(list(chroms), object)[us >> 32],
+                        "pos": us & 0xFFFFFFFF})
     out = out.merge(snps.drop_duplicates(["chrom", "pos"]),
                     on=["chrom", "pos"], how="left")
     out["reads_ref"], out["reads_alt"] = R[:, 0], A[:, 0]
-    out["cells_ref"] = [cells.get((c, p, 0), 0) for c, p in keys]
-    out["cells_alt"] = [cells.get((c, p, 1), 0) for c, p in keys]
+    out["cells_ref"], out["cells_alt"] = cr, ca
     sign = np.where(out["ref_hap"] == 1, -1.0,
                     np.where(out["ref_hap"] == 2, 1.0, np.nan))
     for ci, ctx in enumerate(contexts):
@@ -488,6 +543,33 @@ def plot_allelic(snp: pd.DataFrame, cells: pd.DataFrame, context: str,
     plt.close(fig)
 
 
+#: joblib's ways of handing back each call as it finishes, tried in turn
+#: (1.4, 1.3); without either, the cells go in batches.
+IMAP_MODES = ("generator_unordered", "generator")
+
+
+def _imap(calls, n_jobs: int):
+    """Each of ``calls`` (joblib delayed) run on ``n_jobs`` processes,
+    handed back as it finishes -- never all held at once."""
+    from joblib import Parallel
+    for mode in IMAP_MODES:
+        try:
+            par = Parallel(n_jobs=n_jobs, return_as=mode)
+        except (TypeError, ValueError):
+            continue
+        yield from par(calls)
+        return
+    calls = list(calls)
+    step = 4 * max(int(n_jobs), 1)
+    with Parallel(n_jobs=n_jobs) as par:
+        for i in range(0, len(calls), step):
+            yield from par(calls[i:i + step])
+
+
+def _cell_task(cell, *args, **kw):
+    return cell, cell_alleles(*args, **kw)
+
+
 def _pairs(values) -> dict:
     out = {}
     for v in values or []:
@@ -550,7 +632,7 @@ def main(argv=None) -> int:
                         format="%(asctime)s %(levelname)s %(message)s")
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    from joblib import Parallel, delayed
+    from joblib import delayed
 
     samples = pd.read_csv(manifest_text(args.samples), sep="\t", dtype=str)
     vcfs, names = _pairs(args.vcf), _pairs(args.vcf_sample)
@@ -592,41 +674,52 @@ def main(argv=None) -> int:
     hp_dir = Path(args.haplotype_dir) if args.haplotype_dir else None
     if hp_dir is not None:
         hp_dir.mkdir(parents=True, exist_ok=True)
+    # each line's SNPs, the alleles as fixed-width strings: shared with the
+    # worker processes as they are, not copied for every cell
+    pers = {}
     for g, tab in snps.items():
+        tab = tab.sort_values(["chrom", "pos"])
+        pers[g] = (tab, {c: (x["pos"].to_numpy(np.int64),
+                             x["ref"].to_numpy(dtype="<U1"),
+                             x["alt"].to_numpy(dtype="<U1"),
+                             x["ref_hap"].to_numpy(np.int64))
+                         for c, x in tab.groupby("chrom", sort=False)})
+    # the SNPs' own positions are not sites -- a C/T SNP would read as
+    # methylation -- any line's, so that one copy of the sites serves all
+    drop: dict = {}
+    for _, per in pers.values():
+        for c, v in per.items():
+            drop.setdefault(c, []).append(v[0])
+    drop = {c: np.unique(np.concatenate(v)) for c, v in drop.items()}
+    st = {}
+    for ctx in contexts:
+        st[ctx] = {}
+        for c, a in sites[ctx].items():
+            if c in drop:
+                keep = ~np.isin(a["pos"], drop[c])
+                st[ctx][c] = (a["pos"][keep], a["ref_base"][keep])
+    del sites, drop
+    for g, (tab, per) in pers.items():
         cells = samples[samples[args.group_column].astype(str) == g]
         if cells.empty or tab.empty:
             logger.warning(f"{g}: no cells or no SNPs; skipped")
             continue
-        tab = tab.sort_values(["chrom", "pos"])
-        per = {c: (x["pos"].to_numpy(np.int64), x["ref"].to_numpy(),
-                   x["alt"].to_numpy(), x["ref_hap"].to_numpy(np.int64))
-               for c, x in tab.groupby("chrom", sort=False)}
-        # the SNPs' own positions are not sites: a C/T SNP would read as
-        # methylation
-        st = {}
-        for ctx in contexts:
-            st[ctx] = {}
-            for c, a in sites[ctx].items():
-                if c in per:
-                    keep = ~np.isin(a["pos"], per[c][0])
-                    st[ctx][c] = (a["pos"][keep], a["ref_base"][keep])
         logger.info(f"{g}: {len(cells):,} cells")
         if hp_dir is not None and not (tab["ref_hap"] > 0).any():
             logger.warning(f"{g}: no phased SNP, so no read pair gets a "
                            f"haplotype")
-        res = Parallel(n_jobs=args.n_threads)(
-            delayed(cell_alleles)(
-                b, per, st, contexts, args.trim_ends, args.mapq_min,
-                args.min_base_quality, args.mates,
-                None if hp_dir is None else hp_dir / f"{c}.haplotypes.parquet")
+        sums = SnpSums(1 + 5 * len(contexts))
+        calls = (delayed(_cell_task)(
+            c, b, per, st, contexts, args.trim_ends, args.mapq_min,
+            args.min_base_quality, args.mates,
+            None if hp_dir is None else hp_dir / f"{c}.haplotypes.parquet")
             for c, b in zip(cells[args.cell_column], cells[args.bam_column]))
-        agg: dict = {}
-        ncell: dict = {}
-        for (cell, (by_snp, by_hap, npair)) in zip(cells[args.cell_column],
-                                                   res):
-            for k, v in by_snp.items():
-                agg[k] = agg.get(k, 0) + v
-                ncell[k] = ncell.get(k, 0) + 1
+        for n_done, (cell, (sk, sv, by_hap, npair)) in enumerate(
+                _imap(calls, args.n_threads), 1):
+            sums.add(sk, sv)
+            del sk, sv
+            if n_done % 50 == 0 or n_done == len(cells):
+                logger.info(f"{g}: {n_done:,} of {len(cells):,} cells")
             cell_rows[(cell, g)] = by_hap
             for (c_, dl), (nb, nd) in npair.pop("phase", {}).items():
                 k_ = (g, "chrX" if chrom_key(c_) == "X" else "autosomes",
@@ -638,7 +731,8 @@ def main(argv=None) -> int:
                 pair_rows.append({"cell": cell, "group": g, "chrom": c_,
                                   "pairs_hap1": npair.get((c_, 1), 0),
                                   "pairs_hap2": npair.get((c_, 2), 0)})
-        t = snp_table(agg, ncell, tab, contexts, args.min_reads)
+        t = snp_table(sums, per, tab, contexts, args.min_reads)
+        del sums
         if not t.empty:
             t.insert(0, "group", g)
             snp_rows.append(t)

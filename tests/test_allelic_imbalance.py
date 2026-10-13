@@ -273,3 +273,46 @@ def test_read_pairs_get_their_haplotype_keyed_as_the_pipeline_keys_them(
         assert ph.loc[k, "distance"] == "1-100kb"
         assert ph.loc[k, "both_called"] == nb > 0
         assert ph.loc[k, "disagree"] == nd
+
+
+def test_snp_sums_merge_like_a_dict():
+    """Cells' sums merged a few rows at a time: the totals and the cells of
+    every key, as a plain dict would have them."""
+    rng = np.random.default_rng(3)
+    s = ai.SnpSums(4, flush_rows=7)
+    ref: dict = {}
+    for _ in range(12):
+        k = np.unique(rng.integers(0, 40, 9)).astype(np.int64)
+        v = rng.random((k.size, 4)).astype(np.float32)
+        s.add(k, v)
+        for k_, v_ in zip(k, v):
+            t = ref.setdefault(int(k_), np.zeros(5))
+            t[:4] += v_
+            t[4] += 1
+    s.flush()
+    assert list(s.keys) == sorted(ref)
+    np.testing.assert_allclose(s.vals, np.array([ref[k] for k in s.keys]),
+                               rtol=1e-6)
+
+
+def test_cells_in_batches_give_the_same_tables(tmp_path, monkeypatch):
+    """Without joblib's generators the cells go in batches: the same
+    tables."""
+    d = make_data(tmp_path / "d", n_cells=4, reads_per_hap=2)
+    outs = []
+    for modes in (ai.IMAP_MODES, ()):
+        monkeypatch.setattr(ai, "IMAP_MODES", modes)
+        o = tmp_path / f"out{len(modes)}"
+        ai.main(["--samples", str(d / "samples.tsv"),
+                 "--vcf", f"GM={d / 'snps.vcf'}",
+                 "--vcf", f"IMR={d / 'snps.vcf'}",
+                 "--context-bed", f"HCG:{d / 'HCG.bed.gz'}",
+                 "--min-reads", "1", "--n-threads", "2",
+                 "--plot-format", "png", "--output-dir", str(o)])
+        outs.append(o)
+    for name in ("allelic_snps.tsv", "allelic_cells.tsv"):
+        a, b = (pd.read_csv(o / name, sep="\t") for o in outs)
+        cols = list(a.columns[:3])
+        pd.testing.assert_frame_equal(
+            a.sort_values(cols).reset_index(drop=True),
+            b.sort_values(cols).reset_index(drop=True))
