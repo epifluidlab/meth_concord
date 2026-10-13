@@ -211,18 +211,22 @@ def test_fetch_gives_up_on_a_file_that_never_matches(tmp_path, monkeypatch):
 
 def _panel(panel: Path, body: dict):
     """A local copy of the panel's files: {chrom: [(pos, ref, alt,
-    filter, NA12878's GT)]}, HG00096 0|0 throughout."""
+    filter, NA12878's GT[, NA12891's, NA12892's])]} -- her parents '.'
+    when not given -- HG00096 0|0 throughout."""
     head = ["##fileformat=VCFv4.2",
             '##FILTER=<ID=PASS,Description="All filters passed">',
             '##FILTER=<ID=LowQ,Description="low">',
             '##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">']
     for c, rows in body.items():
         p = panel / ps.kgp_file(c)
-        lines = head + [f"##contig=<ID={c},length=1000>",
+        lines = head + [f"##contig=<ID={c},length=200000000>",
                         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\t"
-                        "FORMAT\tHG00096\tNA12878"]
-        lines += [f"{c}\t{p_}\t.\t{r_}\t{a_}\t.\t{f_}\t.\tGT\t0|0\t{g_}"
-                  for p_, r_, a_, f_, g_ in rows]
+                        "FORMAT\tHG00096\tNA12878\tNA12891\tNA12892"]
+        for r in rows:
+            p_, r_, a_, f_, g_ = r[:5]
+            dad, mom = r[5:7] if len(r) > 5 else (".", ".")
+            lines.append(f"{c}\t{p_}\t.\t{r_}\t{a_}\t.\t{f_}\t.\tGT\t0|0\t"
+                         f"{g_}\t{dad}\t{mom}")
         plain = p.with_name(p.name[:-3])
         plain.write_text("\n".join(lines) + "\n")
         pysam.tabix_compress(str(plain), str(p), force=True)
@@ -263,7 +267,7 @@ def test_1kgp_sample_from_a_local_panel(tmp_path):
     out = tmp_path / "NA12878.het.vcf.gz"
     args = ["1kgp", "--sample", "NA12878", "--chroms", "chr21,chrX",
             "--base-url", str(panel), "--work-dir", str(tmp_path / "w"),
-            "--n-jobs", "1", "--output", str(out)]
+            "--n-jobs", "1", "--output", str(out), "--trio", "none"]
     assert ps.main(args) == 0
     t = ai.read_het_snps(out)
     assert list(zip(t["chrom"], t["pos"], t["ref"], t["ref_hap"])) == [
@@ -273,3 +277,41 @@ def test_1kgp_sample_from_a_local_panel(tmp_path):
     (panel / ps.kgp_file("chr21")).unlink()
     assert ps.main(args) == 0
     assert len(ai.read_het_snps(out)) == 3
+
+
+def test_chrx_phased_by_transmission(tmp_path):
+    """NA12878's chrX by her parents, whatever the panel's own phase: hap1
+    her father's one X -- his allele outside the PARs -- hap2 her
+    mother's; in a PAR by the homozygous parent; a site neither parent
+    phases, or that breaks Mendel, left out.  The autosomes keep the
+    panel's phase.  A rerun phases chrX so beside autosomes done before."""
+    panel = tmp_path / "panel"
+    panel.mkdir()
+    _panel(panel, {
+        "chr21": [(100, "A", "G", "PASS", "1|0", "0|0", "1|1")],
+        "chrX": [(100_000, "A", "G", "PASS", "0|1", "0|1", "1|1"),
+                 (200_000, "C", "T", "PASS", "0|1", "0|1", "0|1"),
+                 (3_000_000, "G", "A", "PASS", "0|1", "1", "0|0"),
+                 (3_000_100, "T", "C", "PASS", "1|0", "0", "1|1"),
+                 (3_000_200, "C", "G", "PASS", "0|1", "0", "0|0")]})
+    out = tmp_path / "NA12878.het.vcf.gz"
+    base = ["1kgp", "--sample", "NA12878", "--chroms", "chr21,chrX",
+            "--base-url", str(panel), "--work-dir", str(tmp_path / "w"),
+            "--n-jobs", "1", "--output", str(out)]
+    assert ps.main(base + ["--trio", "none"]) == 0      # the panel's phase
+    t = ai.read_het_snps(out)
+    assert list(t.loc[t["chrom"] == "chrX", "ref_hap"]) == [1, 1, 1, 2, 1]
+    (panel / ps.kgp_file("chr21")).unlink()             # done: not read
+    assert ps.main(base) == 0                           # --trio auto
+    t = ai.read_het_snps(out)
+    assert list(zip(t["chrom"], t["pos"], t["ref_hap"])) == [
+        ("chr21", 99, 2),                               # the panel's 1|0
+        ("chrX", 99_999, 1), ("chrX", 2_999_999, 2), ("chrX", 3_000_099, 1)]
+    assert "transmission from NA12891" in pysam.VariantFile(
+        str(out)).header.__str__()
+    rows, _, n = ps.het_snvs_trio(panel / ps.kgp_file("chrX"), "NA12878",
+                                  "NA12891", "NA12892")
+    assert n["parents_heterozygous"] == 1 and n["against_mendel"] == 1
+    # the panel had the paternal allele on hap1 at 100 kb, not at 3 Mb
+    assert n["panel_switches"] == 1
+    assert n["panel_hap1_paternal"] == pytest.approx(1 / 3)

@@ -8,9 +8,13 @@ high-coverage phased panel on GRCh38 (Byrska-Bishop et al., Cell 2022).
 The panel holds all 3,202 samples, ~32 GB over chr1-22 and X: each
 chromosome is downloaded (resumable, md5 against the panel's manifest),
 the sample's SNVs kept, and the download removed.  Autosomes were phased
-with the pedigree (SHAPEIT2-duohmm), so a trio child's are phased by
-transmission; chrX statistically (Eagle2), without it -- allelic_imbalance's
-phase check (mates of a read pair on one haplotype) tells how well.
+with the pedigree (SHAPEIT2-duohmm), hap1 the paternal copy; chrX
+statistically (Eagle2), without it -- and for NA12878 that phase switches
+about three times per Mb, so a chromosome-wide haplotype is not one.  With
+--trio (by default the sample's parents in the panel, NA12891 and NA12892 for
+NA12878) chrX is phased by transmission instead: hap1 the father's allele --
+outside the PARs he has one X, which she inherits whole -- hap2 the
+mother's; sites the parents cannot phase, or that break Mendel, left out.
 
     python scripts/phased_snps.py 1kgp --sample NA12878 \\
         --output NA12878.het.vcf.gz --work-dir tmp_1kgp --n-jobs 4
@@ -58,6 +62,8 @@ KGP_URL = ("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/"
            "20220422_3202_phased_SNV_INDEL_SV")
 KGP_MANIFEST = "20220804_manifest.txt"
 KGP_CHROMS = [f"chr{i}" for i in range(1, 23)] + ["chrX"]
+#: Children of the panel's trios whose parents are in it: (father, mother).
+KGP_TRIOS = {"NA12878": ("NA12891", "NA12892")}
 SYRI_URL = "https://ndownloader.figshare.com/files/54155468"
 SYRI_NAME = "BJ_IMR90_syri_SNVs_indels.vcf.gz"
 SYRI_MD5 = "3ebadaa3d7495bac7f177b161cdd2b79"
@@ -199,7 +205,7 @@ def het_snvs(path, sample: str):
     pysam.set_verbosity(0)          # read front to back: no index needed
     vf = pysam.VariantFile(str(path))
     if sample not in vf.header.samples:
-        raise SystemExit(f"{sample} is not a sample of {path}")
+        raise ValueError(f"{sample} is not a sample of {path}")
     vf.subset_samples([sample])
     rows = []
     for rec in vf:
@@ -229,7 +235,72 @@ def het_snvs(path, sample: str):
     return rows, contigs
 
 
-def _kgp_chrom(chrom, sample, base, work: Path, md5: dict, keep: bool):
+def het_snvs_trio(path, sample: str, father: str, mother: str):
+    """The sample's heterozygous biallelic SNVs phased by transmission: hap1
+    the father's allele -- his genotype where he is homozygous or has one
+    copy (chrX outside the PARs), else the allele the homozygous mother did
+    not give -- hap2 the mother's.  Sites neither parent phases, or that
+    break Mendel, are left out, and a position with more than one record.
+    Returns (records, contigs, counts), the counts with how often the
+    panel's own phase put the paternal allele on hap1 and how often it
+    switched between neighbouring sites."""
+    import pysam
+    pysam.set_verbosity(0)
+    vf = pysam.VariantFile(str(path))
+    miss = [x for x in (sample, father, mother)
+            if x not in vf.header.samples]
+    if miss:
+        raise ValueError(f"{', '.join(miss)}: not a sample of {path}")
+    vf.subset_samples([sample, father, mother])
+    rows, agree = [], []
+    n = {"heterozygous": 0, "parents_heterozygous": 0, "against_mendel": 0}
+    for rec in vf:
+        if len(rec.alleles) != 2 or len(rec.ref) != 1 or \
+                len(rec.alts[0]) != 1:
+            continue
+        ref, alt = rec.ref.upper(), rec.alts[0].upper()
+        if ref not in "ACGT" or alt not in "ACGT":
+            continue
+        flt = list(rec.filter.keys())
+        if flt and flt != ["PASS"]:
+            continue
+        smp = rec.samples
+        k = smp[sample]["GT"]
+        if len(k) != 2 or None in k or k[0] == k[1]:
+            continue
+        n["heterozygous"] += 1
+        d = [a for a in smp[father]["GT"] if a is not None]
+        m = [a for a in smp[mother]["GT"] if a is not None]
+        if d and len(set(d)) == 1:
+            pat = d[0]
+        elif m and len(set(m)) == 1:
+            pat = 1 - m[0]
+        else:
+            n["parents_heterozygous"] += 1
+            continue
+        if (d and pat not in d) or (m and 1 - pat not in m):
+            n["against_mendel"] += 1
+            continue
+        if smp[sample].phased:
+            agree.append(k[0] == pat)
+        rows.append((rec.chrom, rec.pos, rec.id or ".", ref, alt,
+                     f"{pat}|{1 - pat}"))
+    seen: dict = {}
+    for r in rows:
+        seen[(r[0], r[1])] = seen.get((r[0], r[1]), 0) + 1
+    rows = [r for r in rows if seen[(r[0], r[1])] == 1]
+    contigs = {c: vf.header.contigs[c].length for c in {r[0] for r in rows}
+               if c in vf.header.contigs}
+    vf.close()
+    a = np.asarray(agree, bool)
+    n.update(phased=len(rows),
+             panel_hap1_paternal=float(a.mean()) if a.size else np.nan,
+             panel_switches=int((a[1:] != a[:-1]).sum()) if a.size else 0)
+    return rows, contigs, n
+
+
+def _kgp_chrom(chrom, sample, base, work: Path, md5: dict, keep: bool,
+               trio=None):
     """One chromosome: download, keep the sample's SNVs (``work``/
     <sample>.<chrom>.vcf.part: VCF lines; its length beside it), remove
     the download.  Returns None, or what went wrong -- so that one
@@ -238,15 +309,22 @@ def _kgp_chrom(chrom, sample, base, work: Path, md5: dict, keep: bool):
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
     try:
-        _kgp_chrom_(chrom, sample, base, work, md5, keep)
+        _kgp_chrom_(chrom, sample, base, work, md5, keep, trio)
     except Exception as e:                           # noqa: BLE001
         logger.error(f"  {chrom}: {e}")
         return f"{type(e).__name__}: {e}"
     return None
 
 
-def _kgp_chrom_(chrom, sample, base, work: Path, md5: dict, keep: bool):
-    done = work / f"{sample}.{chrom}.vcf.part"
+def kgp_part(work: Path, sample: str, chrom: str, trio) -> Path:
+    """A chromosome's finished SNVs in ``work``: phased by the panel, or by
+    transmission (``trio``) -- kept apart, so either reruns alone."""
+    return work / f"{sample}.{chrom}{'.trio' if trio else ''}.vcf.part"
+
+
+def _kgp_chrom_(chrom, sample, base, work: Path, md5: dict, keep: bool,
+                trio=None):
+    done = kgp_part(work, sample, chrom, trio)
     if done.exists():
         return
     name = kgp_file(chrom)
@@ -254,7 +332,18 @@ def _kgp_chrom_(chrom, sample, base, work: Path, md5: dict, keep: bool):
            else str(Path(base) / name))
     logger.info(f"  {chrom}: {src}")
     path = fetch(src, work / name, md5.get(name))
-    rows, contigs = het_snvs(path, sample)
+    if trio:
+        rows, contigs, n = het_snvs_trio(path, sample, *trio)
+        logger.info(
+            f"  {chrom}: phased by {trio[0]} and {trio[1]}: {n['phased']:,} "
+            f"of {n['heterozygous']:,} heterozygous SNVs "
+            f"({n['parents_heterozygous']:,} with both parents "
+            f"heterozygous, {n['against_mendel']:,} against Mendel, left "
+            f"out); the panel's phase had the paternal allele on hap1 at "
+            f"{n['panel_hap1_paternal']:.1%} of them and switched "
+            f"{n['panel_switches']:,} times")
+    else:
+        rows, contigs = het_snvs(path, sample)
     tmp = done.with_name(done.name + ".tmp")
     tmp.write_text(body(rows))
     (work / f"{sample}.{chrom}.length").write_text(
@@ -278,13 +367,28 @@ def run_kgp(args) -> int:
             f = line.split()
             if len(f) == 2:
                 md5[f[0]] = f[1]
+    if args.trio == "none":
+        trio = None
+    elif args.trio == "auto":
+        trio = KGP_TRIOS.get(args.sample)
+    else:
+        trio = tuple(x.strip() for x in args.trio.split(","))
+        if len(trio) != 2:
+            raise SystemExit("--trio FATHER,MOTHER")
+    by_trio = ({c.strip() for c in args.trio_chroms.split(",") if c.strip()}
+               if trio else set())
+    tri = {c: trio if c in by_trio else None for c in chroms}
+    if trio:
+        logger.info(f"{args.sample}: {', '.join(sorted(by_trio))} phased by "
+                    f"transmission from {trio[0]} (father) and {trio[1]} "
+                    f"(mother): hap1 paternal, hap2 maternal")
     todo = [c for c in chroms
-            if not (work / f"{args.sample}.{c}.vcf.part").exists()]
+            if not kgp_part(work, args.sample, c, tri[c]).exists()]
     logger.info(f"{args.sample}: {len(chroms)} chromosomes of "
                 f"{args.base_url}, {len(chroms) - len(todo)} done before")
     errs = Parallel(n_jobs=args.n_jobs)(
         delayed(_kgp_chrom)(c, args.sample, args.base_url, work, md5,
-                            args.keep_downloads) for c in todo)
+                            args.keep_downloads, tri[c]) for c in todo)
     bad = {c: e for c, e in zip(todo, errs) if e}
     if bad:
         logger.error("not finished: " + "; ".join(
@@ -292,13 +396,15 @@ def run_kgp(args) -> int:
             f"command again: the finished chromosomes in {work} are kept and "
             f"the partial downloads resume.")
         return 1
-    parts = [work / f"{args.sample}.{c}.vcf.part" for c in chroms]
+    parts = [kgp_part(work, args.sample, c, tri[c]) for c in chroms]
     contigs = {c: int((work / f"{args.sample}.{c}.length").read_text())
                for c in chroms}
     n = {c: sum(1 for _ in open(p_)) for c, p_ in zip(chroms, parts)}
+    how = (f"; {','.join(sorted(by_trio))} phased by transmission from "
+           f"{trio[0]} (hap1) and {trio[1]} (hap2)" if trio else "")
     out = write_vcf(parts, contigs, args.sample, args.output,
                     f"phased_snps.py 1kgp {args.base_url} sample "
-                    f"{args.sample}")
+                    f"{args.sample}{how}")
     logger.info(f"{out}: {sum(n.values()):,} phased heterozygous SNVs "
                 f"({n.get('chrX', 0):,} on chrX)")
     return 0
@@ -549,6 +655,15 @@ def main(argv=None) -> int:
     k.add_argument("--n-jobs", type=int, default=4,
                    help="Chromosomes at once (each downloads 0.4-2.5 GB).")
     k.add_argument("--keep-downloads", action="store_true")
+    k.add_argument("--trio", default="auto",
+                   help="FATHER,MOTHER to phase --trio-chroms by "
+                        "transmission; 'auto' (default): the sample's "
+                        "parents in the panel where known (NA12878: "
+                        "NA12891,NA12892); 'none': the panel's phase "
+                        "throughout.")
+    k.add_argument("--trio-chroms", default="chrX",
+                   help="Chromosomes phased by transmission (default chrX, "
+                        "the one the panel phased without the pedigree).")
     s = sub.add_parser("syri", help="A sample of the BJ / IMR-90 SyRI "
                                     "calls, CHM13 -> hg38.")
     s.add_argument("--fasta", required=True,

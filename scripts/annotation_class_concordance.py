@@ -7246,15 +7246,32 @@ def main(argv=None) -> int:
         logger.info("sex per cell type:\n" + pd.crosstab(
             sex_tab["cell_type"], sex_tab["sex"]).to_string())
         if not (sex_tab["pairs_X"] > 0).any():
-            logger.warning(
-                "--chrx: no cell has a read pair on chrX -- its posteriors "
-                "were made without it (nome_hic_concordance drops chrX and "
-                "chrY unless given --exclude-chrom none).  Rerun its steps "
-                "2 and 4 with --exclude-chrom none into a new --output-dir, "
-                "its 03_mixture_model/em_fit_all.json copied in so the "
-                "autosomes' posteriors stay as they are, and point "
-                "--posteriors there.  chrX skipped.")
-            chrx_on = False
+            # asked for and impossible: stop now, not hours later
+            sys.exit(
+                f"--chrx: no cell has a read pair on chrX in {first} "
+                f"({len(sex_tab):,} cells; cell_sex.tsv) -- these posteriors "
+                f"were made without it (nome_hic_concordance drops chrX and "
+                f"chrY unless given --exclude-chrom none).  Point "
+                f"--posteriors at ones made with chrX, or make them: rerun "
+                f"its steps 2 and 4 with --exclude-chrom none into a new "
+                f"--output-dir, its 03_mixture_model/em_fit_all.json copied "
+                f"in so the autosomes' posteriors stay as they are.  Or "
+                f"leave out --chrx (and --haplotypes).")
+    if args.haplotypes:
+        hd = Path(args.haplotypes)
+        have = [c for c in cells_all
+                if (hd / f"{c}.haplotypes.parquet").exists()]
+        if not have:
+            sys.exit(f"--haplotypes {hd}: no <cell>.haplotypes.parquet for "
+                     f"any of the {len(cells_all):,} cells (e.g. "
+                     f"{cells_all[0]}.haplotypes.parquet) -- the directory "
+                     f"allelic_imbalance.py --haplotype-dir wrote, from these "
+                     f"cells' BAMs, under the same cell names")
+        n_t = pd.Series([str(samples.at[c, args.group_column])
+                         for c in have]).value_counts()
+        logger.info(f"--haplotypes: read pairs on one haplotype for "
+                    f"{len(have):,} of {len(cells_all):,} cells ("
+                    + ", ".join(f"{k} {v:,}" for k, v in n_t.items()) + ")")
 
     ab_maps = None
     # One pass over every cell's read pairs: the A/B bins (with ab) and the

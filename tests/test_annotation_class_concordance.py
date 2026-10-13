@@ -1592,19 +1592,31 @@ def test_chrx_by_haplotype_moves_the_copies_difference_into_the_null(
     assert (o / "chrx_haplotypes_GCH.png").exists()
 
 
-def test_chrx_without_x_reads_says_so_and_skips(tmp_path, caplog):
-    """Posteriors made without chrX: sexes unknown, a warning saying how to
-    get chrX back, and no chrX tables."""
+def test_chrx_without_x_reads_stops_and_says_why(tmp_path):
+    """Posteriors made without chrX: --chrx stops before the long run,
+    saying how to get chrX back; the sexes it found (none) are written."""
     d = make_data(tmp_path, per=10, n_types=2)
     o = tmp_path / "no_x"
-    with caplog.at_level("WARNING"):
+    with pytest.raises(SystemExit) as e:
         acc.main(_contrast_args(d, o) + ["--chrx"])
-    assert "no cell has a read pair on chrX" in caplog.text
-    assert "--exclude-chrom none" in caplog.text
+    assert "no cell has a read pair on chrX" in str(e.value)
+    assert "--exclude-chrom none" in str(e.value)
     sx = pd.read_csv(o / "cell_sex.tsv", sep="\t")
     assert (sx["sex_call"] == "unknown").all()
-    assert not (o / "chrx_concordance.tsv").exists()
-    assert (o / "summary.tsv").exists()
+    assert not (o / "summary.tsv").exists()
+
+
+def test_haplotypes_without_files_for_the_cells_stop_early(tmp_path):
+    d = make_data(tmp_path, per=10, n_types=2)
+    add_sex_chroms(d)
+    for hd in (d / "missing", d / "elsewhere"):
+        if hd.name == "elsewhere":
+            hd.mkdir()
+            (hd / "another_cell.haplotypes.parquet").write_text("")
+        with pytest.raises(SystemExit, match="no <cell>.haplotypes.parquet"):
+            acc.main(_contrast_args(d, tmp_path / "o")
+                     + ["--chrx", "--haplotypes", str(hd)])
+    assert not (tmp_path / "o" / "summary.tsv").exists()
 
 
 def test_imprinted_domains_from_genes():
