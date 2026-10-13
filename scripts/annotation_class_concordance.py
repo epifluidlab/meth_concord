@@ -3685,22 +3685,44 @@ def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
     return rows
 
 
+#: The chrX analysis' comparisons, (test, reference): X against the
+#: autosomes, against the autosomes thinned to X's contacts per bp, and the
+#: thinning alone.
+CHRX_COMPARISONS = (("chrX", "autosomes"),
+                    ("chrX", "autosomes at X density"),
+                    ("autosomes at X density", "autosomes"))
+
+
 def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
                            edges, band_labels, dbins, position_bin: int,
                            max_widen: int, n_boot: int, seed: int,
-                           n_threads: int = 1):
+                           n_threads: int = 1, map_bin: int = 1_000_000,
+                           min_map_contacts: int = 100):
     """chrX against the autosomes (:class:`ChromosomeClasses`), as one
     system's class pairs: every contact's ends centred on its cell's mean
     on autosomes or on X (``marg``: cells x (count, sum, sum of squares) x
     (autosomes, X)), its partner reshuffled within ``strat`` -- the cell's
     type, and sex when known, so an X donor never comes from the other
     sex -- and per group of cells (:func:`class_pair_difference`) X-X less
-    autosome-autosome ΔC and Δr by band.  Returns (rows, per-cell rows of
-    every cell's own two values at all distances)."""
+    autosome-autosome ΔC and Δr by band.
+
+    A single X, or an X short of coverage, has fewer contacts per bp, so
+    its reshuffled partners come from a sparser pool -- a wider distance
+    window inside the same position bin.  So that this alone cannot pass
+    for an excess on X, the autosomes are also thinned at random to X's
+    contacts per bp in each stratum and reshuffled on their own
+    ('autosomes at X density'), and every comparison of CHRX_COMPARISONS
+    is reported ('comparison'; value_A the reference, value_B the test).
+    And X's map: ΔC per ``map_bin`` bin along X (bins with
+    ``min_map_contacts``), beside the autosomes' bins' median and
+    quartiles -- an excess even along X, or in places.  Returns (rows,
+    per-cell rows of every cell's own two values at all distances, the
+    map)."""
     lk = ChromosomeClasses()
     kx = lk.lookup_g(g_lo).astype(np.int64)
     ky = lk.lookup_g(g_hi).astype(np.int64)
     n_cells = marg.shape[0]
+    nb = len(edges) - 1
     with np.errstate(invalid="ignore", divide="ignore"):
         mu = marg[:, 1] / marg[:, 0]
         sd = np.sqrt(np.maximum(marg[:, 2] / marg[:, 0] - mu ** 2, 0))
@@ -3708,24 +3730,60 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     p_c = np.where(ky >= 0, p - mu[cell, np.maximum(ky, 0)], np.nan)
     dist = g_hi - g_lo
     band = np.clip(np.searchsorted(edges, dist, side="right") - 1, 0,
-                   len(edges) - 2)
+                   nb - 1)
     s_code, s_names = pd.factorize(np.asarray(strat))
-    ok, right, left, _ = reshuffle(
-        g_lo, g_hi, dist, cell, kx, ky, a_c, p_c, s_code[cell], 2, dbins,
-        position_bin, max_widen, seed=seed, names=list(s_names),
-        n_threads=n_threads)
-    idx = np.flatnonzero(ok)
-    x_, y_ = a_c[idx], p_c[idx]
-    w = {"xy": x_ * y_,
-         "xy1": 0.5 * (x_ * right[0, idx] + left[0, idx] * y_),
-         "xy2": 0.5 * (x_ * right[1, idx] + left[1, idx] * y_)}
-    acc = accumulate(cell[idx], np.minimum(kx, ky)[idx],
-                     np.maximum(kx, ky)[idx], band[idx],
-                     np.zeros(idx.size, np.int64), w, n_cells, 2,
-                     len(edges) - 1)
-    rows = class_pair_difference(acc, sd, groups, lk.classes,
-                                 ("autosomes", "autosomes"),
-                                 ("chrX", "chrX"), band_labels, n_boot, seed)
+
+    def run(sel, sd_seed):
+        """Reshuffle the contacts ``sel``; their accumulated sums, the
+        contacts with a donor and their parts of ΔC and of the control."""
+        ok, right, left, _ = reshuffle(
+            g_lo[sel], g_hi[sel], dist[sel], cell[sel], kx[sel], ky[sel],
+            a_c[sel], p_c[sel], s_code[cell[sel]], 2, dbins, position_bin,
+            max_widen, seed=sd_seed, names=list(s_names),
+            n_threads=n_threads)
+        i = np.flatnonzero(ok)
+        x_, y_ = a_c[sel][i], p_c[sel][i]
+        w = {"xy": x_ * y_,
+             "xy1": 0.5 * (x_ * right[0, i] + left[0, i] * y_),
+             "xy2": 0.5 * (x_ * right[1, i] + left[1, i] * y_)}
+        acc = accumulate(cell[sel][i], np.minimum(kx, ky)[sel][i],
+                         np.maximum(kx, ky)[sel][i], band[sel][i],
+                         np.zeros(i.size, np.int64), w, n_cells, 2, nb)
+        return acc, sel[i], 2 * (w["xy"] - w["xy1"]), 2 * (w["xy2"]
+                                                          - w["xy1"])
+    acc, used, d_, c_ = run(np.arange(g_lo.size), seed)
+    # the autosomes thinned to X's contacts per bp, per stratum
+    auto = (kx == 0) & (ky == 0)
+    isx = (kx == 1) & (ky == 1)
+    ch = g_lo // STRIDE
+    span = {int(k): int(g_hi[ch == k].max() - g_lo[ch == k].min())
+            for k in np.unique(ch)}
+    L_x = span.get(_chrom_code("X"), 0)
+    L_a = sum(v for k, v in span.items() if 1 <= k < 1000)
+    nx = np.bincount(s_code[cell[isx]], minlength=len(s_names))
+    na = np.bincount(s_code[cell[auto]], minlength=len(s_names))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        frac = np.nan_to_num(np.clip((nx / max(L_x, 1)) / (na / max(L_a, 1)),
+                                     0, 1))
+    rng = np.random.default_rng([seed, 7])
+    thin = np.flatnonzero(auto & (rng.random(g_lo.size)
+                                  < frac[s_code[cell]]))
+    acc_t = run(thin, seed + 1)[0]
+    classes3 = ("autosomes", "chrX", "autosomes at X density")
+    acc3 = {}
+    for k in ("n", "xy", "xy1", "xy2"):
+        z = np.zeros((n_cells, 3, 3, nb + 1))
+        z[:, :2, :2] = acc[k]
+        z[:, 2, 2] = acc_t[k][:, 0, 0]
+        acc3[k] = z
+    sd3 = np.column_stack([sd[:, 0], sd[:, 1], sd[:, 0]])
+    rows = []
+    for test, ref in CHRX_COMPARISONS:
+        for r_ in class_pair_difference(acc3, sd3, groups, classes3,
+                                        (ref, ref), (test, test),
+                                        band_labels, n_boot, seed):
+            r_["comparison"] = f"{test} − {ref}"
+            rows.append(r_)
     A_ = len(band_labels) - 1
     with np.errstate(invalid="ignore", divide="ignore"):
         pc = {"pairs_autosomes": acc["n"][:, 0, 0, A_],
@@ -3735,20 +3793,43 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
             dd = acc["xy"][:, k, k, A_] - acc["xy1"][:, k, k, A_]
             pc[f"delta_{tag}"] = 2 * dd / n
             pc[f"delta_r_{tag}"] = dd / n / (sd[:, k] ** 2)
-    return rows, pd.DataFrame(pc)
+    # X's map, beside the autosomes' bins
+    xm, am = isx[used], auto[used]
+
+    def bins(m, codes):
+        h = locus_hotspots(BinGrid(codes, 300_000_000, map_bin),
+                           g_lo[used][m], g_hi[used][m], cell[used][m],
+                           d_[m], c_[m], band[used][m], nb)
+        return h[(h["band_index"] == nb) & (h["contacts"]
+                                            >= min_map_contacts)]
+    hx = bins(xm, [_chrom_code("X")])
+    ha = bins(am, [k for k in span if 1 <= k < 1000])
+    q = (np.percentile(ha["delta"], [25, 50, 75]) if len(ha)
+         else np.full(3, np.nan))
+    xmap = hx[["start", "end", "contacts", "cells", "delta", "se",
+               "control"]].assign(autosome_bins_q25=q[0],
+                                  autosome_bins_median=q[1],
+                                  autosome_bins_q75=q[2],
+                                  autosome_bins=len(ha))
+    return rows, pd.DataFrame(pc), xmap.reset_index(drop=True)
 
 
 def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
-              context: str, path, q_cut: float = 0.05):
+              context: str, path, q_cut: float = 0.05, xmap=None):
     """a: ΔC by distance, autosomes (solid) and chrX (dashed), per group; b:
     chrX less autosomes, all distances, per group (filled: q < q_cut); c:
     each cell's own chrX less autosomes Δr; d: the cells' X dosage and the
-    sex called from it."""
+    sex called from it; e: every comparison of CHRX_COMPARISONS, all
+    distances -- X against the autosomes thinned to X's density, and the
+    thinning alone; f: X's 1 Mb bins against the autosomes' (grey: their
+    middle half, line: median)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
     from nome_hic_concordance import figure_style
-    t = tab[(tab["context"] == context) & (tab["statistic"] == "delta")]
+    ta = tab[(tab["context"] == context) & (tab["statistic"] == "delta")]
+    t = ta[ta["comparison"] == "chrX − autosomes"]
     if t.empty:
         return
     bands = list(dict.fromkeys(t["band"]))
@@ -3761,25 +3842,23 @@ def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
     curves = list(dict.fromkeys(t.loc[t["group_kind"] == kind, "group"]))
     PP = 100
     with plt.rc_context(figure_style.RC):
-        fig = plt.figure(figsize=(figure_style.FIG_W_IN, 2.4))
-        gs = fig.add_gridspec(1, 4, width_ratios=[1.2, 1.1, 1.0, 1.0],
-                              wspace=0.75)
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN, 5.0))
+        gs = fig.add_gridspec(2, 4, width_ratios=[1.2, 1.1, 1.0, 1.0],
+                              wspace=0.75, hspace=0.75)
         ax0, ax1, ax2, ax3 = (fig.add_subplot(gs[0, i]) for i in range(4))
         xx = np.arange(len(bands))
         for gi, g in enumerate(curves):
             col = GROUP_PALETTE[gi % len(GROUP_PALETTE)]
             r = t[(t["group"] == g) & (t["group_kind"] == kind)
                   ].set_index("band").reindex(bands)
-            ax0.plot(xx, PP * r["autosomes"], "-o", color=col, ms=2.5,
-                     lw=0.8, label=f"{g}: autosomes")
-            ax0.plot(xx, PP * r["chrX"], "--s", color=col, ms=2.5, lw=0.8,
-                     label=f"{g}: chrX")
+            ax0.plot(xx, PP * r["reference"], "-o", color=col, ms=2.5,
+                     lw=0.8)
+            ax0.plot(xx, PP * r["test"], "--s", color=col, ms=2.5, lw=0.8)
         ax0.axhline(0, color="0.6", lw=0.4)
         ax0.set_xticks(xx)
         ax0.set_xticklabels(bands, rotation=40, ha="right", fontsize=5)
         ax0.set_ylabel("ΔC, pp")
         f = t[t["band"] == all_b].reset_index(drop=True)
-        yy = np.arange(len(f))
         for i, r in f.iterrows():
             q = r.get("q_diff", np.nan)
             ax1.plot([PP * r["diff_lo"], PP * r["diff_hi"]], [i, i],
@@ -3787,7 +3866,7 @@ def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
             ax1.plot([PP * r["diff"]], [i], "o", ms=3, mec="0.1",
                      mfc="0.1" if np.isfinite(q) and q < q_cut else "white")
         ax1.axvline(0, color="0.6", lw=0.4)
-        ax1.set_yticks(yy)
+        ax1.set_yticks(np.arange(len(f)))
         ax1.set_yticklabels([f"{g} ({n:,})" for g, n in
                              zip(f["group"], f["cells"])], fontsize=5)
         ax1.set_ylim(len(f) - 0.5, -0.5)
@@ -3803,7 +3882,8 @@ def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
                              color=GROUP_PALETTE[gi % len(GROUP_PALETTE)],
                              label=f"{g}: {np.mean(v > 0):.0%} > 0")
             ax2.axvline(0, color="0.6", lw=0.4)
-            ax2.legend(fontsize=4.5, frameon=False, loc="upper left")
+            if ax2.has_data():
+                ax2.legend(fontsize=4.5, frameon=False, loc="upper left")
         ax2.set_xlabel("per cell:\nchrX − autosomes, Δr pp")
         if sex is not None and not sex.empty:
             for s_, col in (("female", "#c51b7d"), ("male", "#2166ac"),
@@ -3816,12 +3896,55 @@ def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
             ax3.legend(fontsize=4.5, frameon=False)
         ax3.set_xlabel("X dosage\n(X / autosome coverage)")
         ax3.set_ylabel("log10 share of pairs on Y")
-        for ax, lab in zip((ax0, ax1, ax2, ax3), "abcd"):
+        # e: the density control
+        ax4 = fig.add_subplot(gs[1, :2])
+        comps = list(dict.fromkeys(ta["comparison"]))
+        rows_ = ["all cells"] + [g for g in curves if g != "all cells"]
+        ccol = ("0.1", "#d6604d", "#4393c3", "#1b9e77")
+        off = (np.arange(len(comps)) - (len(comps) - 1) / 2) * 0.22
+        for ci, cmp_ in enumerate(comps):
+            x = ta[(ta["comparison"] == cmp_) & (ta["band"] == all_b)]
+            for i, g in enumerate(rows_):
+                r = x[x["group"] == g]
+                if r.empty:
+                    continue
+                r = r.iloc[0]
+                q = r.get("q_diff", np.nan)
+                y = i + off[ci]
+                ax4.plot([PP * r["diff_lo"], PP * r["diff_hi"]], [y, y],
+                         color=ccol[ci % 4], lw=0.8)
+                ax4.plot([PP * r["diff"]], [y], "o", ms=3, mec=ccol[ci % 4],
+                         mfc=ccol[ci % 4] if np.isfinite(q) and q < q_cut
+                         else "white")
+        ax4.axvline(0, color="0.6", lw=0.4)
+        ax4.set_yticks(np.arange(len(rows_)))
+        ax4.set_yticklabels(rows_, fontsize=5)
+        ax4.set_ylim(len(rows_) - 0.5, -0.5)
+        ax4.set_xlabel("difference, ΔC pp, all distances")
+        ax4.legend([Line2D([], [], color=ccol[ci % 4], marker="o", ms=3,
+                           lw=0.8) for ci in range(len(comps))], comps,
+                   fontsize=4.5, frameon=False, loc="upper center",
+                   bbox_to_anchor=(0.5, -0.3), ncol=1)
+        # f: X along its length
+        ax5 = fig.add_subplot(gs[1, 2:])
+        xm = (xmap[xmap["context"] == context] if xmap is not None
+              and not xmap.empty else pd.DataFrame())
+        if not xm.empty:
+            mid = (xm["start"] + xm["end"]) / 2e6
+            r0 = xm.iloc[0]
+            ax5.axhspan(PP * r0["autosome_bins_q25"],
+                        PP * r0["autosome_bins_q75"], color="0.88", lw=0)
+            ax5.axhline(PP * r0["autosome_bins_median"], color="0.5", lw=0.6)
+            ax5.errorbar(mid, PP * xm["delta"], yerr=PP * xm["se"], fmt="o",
+                         ms=2, lw=0.5, color="#c51b7d")
+        ax5.axhline(0, color="0.6", lw=0.4)
+        ax5.set_xlabel("chrX, Mb")
+        ax5.set_ylabel("ΔC per 1 Mb bin, pp")
+        for ax, lab in zip((ax0, ax1, ax2, ax3, ax4, ax5), "abcdef"):
             ax.set_title(lab, loc="left", fontweight="bold")
         _suptitle_above(fig, f"{context}: chrX against the autosomes -- "
                              f"contacts on one copy of X, partners "
                              f"reshuffled from either")
-        from matplotlib.lines import Line2D
         hd = [Line2D([], [], color=GROUP_PALETTE[gi % len(GROUP_PALETTE)],
                      lw=0.8) for gi in range(len(curves))]
         hd += [Line2D([], [], color="0.3", lw=0.8, ls="-", marker="o",
@@ -6430,7 +6553,7 @@ def main(argv=None) -> int:
         group_batches = pd.DataFrame(rows_)
     contrast_rows, chot_rows, cenr_rows = [], [], []
     var_rows, var_en = [], []
-    chrx_rows, chrx_cells = [], []
+    chrx_rows, chrx_cells, chrx_maps = [], [], []
     dom_rows = {k: [] for k in dsets}
     dom_crows = {k: [] for k in dsets}
     dom_wins = {k: [] for k in dsets}
@@ -6906,7 +7029,7 @@ def main(argv=None) -> int:
             for g_, ix_ in cgroups.items():
                 if g_ not in grp_x and ix_.size:
                     grp_x[g_], kind_x[g_] = ix_, "contrast group"
-            rx, pcx = chromosome_concordance(
+            rx, pcx, xmap = chromosome_concordance(
                 np.concatenate([cell] + [np.full(x["g_lo"].size, i, np.int64)
                                          for i, x in enumerate(xs)]),
                 np.concatenate([g_lo] + [x["g_lo"] for x in xs]),
@@ -6926,16 +7049,17 @@ def main(argv=None) -> int:
             pcx.insert(2, "cell_type", types)
             pcx.insert(3, "sex", sx)
             chrx_cells.append(pcx)
-            r0 = next((r_ for r_ in rx if r_["group"] == "all cells"
-                       and r_["statistic"] == "delta"
-                       and str(r_["band"]).startswith("all")), None)
-            if r0 is not None:
-                logger.info(f"{ctx} chrX: X-X {100 * r0['value_B']:.2f} pp "
-                            f"vs autosomes {100 * r0['value_A']:.2f} pp, "
-                            f"difference {100 * r0['diff']:+.2f} pp "
-                            f"[{100 * r0['diff_lo']:+.2f}, "
-                            f"{100 * r0['diff_hi']:+.2f}] "
-                            f"({r0['pairs_B']:,} X contacts)")
+            chrx_maps.append(xmap.assign(context=ctx))
+            for r0 in rx:
+                if r0["group"] == "all cells" and r0["statistic"] == \
+                        "delta" and str(r0["band"]).startswith("all"):
+                    logger.info(
+                        f"{ctx} {r0['comparison']}: "
+                        f"{100 * r0['value_B']:.2f} vs "
+                        f"{100 * r0['value_A']:.2f} pp, difference "
+                        f"{100 * r0['diff']:+.2f} pp "
+                        f"[{100 * r0['diff_lo']:+.2f}, "
+                        f"{100 * r0['diff_hi']:+.2f}]")
             del xs
         if ctx == hcg_ctx and "pmd" in systems and cell_cov is not None:
             # HMD less PMD methylation: PMDs lose methylation with every
@@ -7453,21 +7577,29 @@ def main(argv=None) -> int:
     # chrX against the autosomes
     if chrx_rows:
         cx = pd.DataFrame(chrx_rows).rename(columns={
-            "pairs_A": "pairs_autosomes", "pairs_B": "pairs_X",
-            "value_A": "autosomes", "lo_A": "autosomes_lo",
-            "hi_A": "autosomes_hi", "value_B": "chrX", "lo_B": "chrX_lo",
-            "hi_B": "chrX_hi"})
+            "pairs_A": "pairs_reference", "pairs_B": "pairs_test",
+            "value_A": "reference", "lo_A": "reference_lo",
+            "hi_A": "reference_hi", "value_B": "test", "lo_B": "test_lo",
+            "hi_B": "test_hi"})
         cx["q_diff"] = np.nan
-        for _, g in cx.groupby(["context", "statistic", "band"], sort=False):
+        for _, g in cx.groupby(["context", "comparison", "statistic", "band"],
+                               sort=False):
             cx.loc[g.index, "q_diff"] = fdr_bh(g["p_diff"].to_numpy())
-        lead = ["context", "group_kind", "group", "band", "statistic"]
+        lead = ["context", "comparison", "group_kind", "group", "band",
+                "statistic"]
         cx = cx[lead + [c for c in cx.columns if c not in lead]]
         cx.to_csv(out / "chrx_concordance.tsv", sep="\t", index=False)
         pcx = pd.concat(chrx_cells, ignore_index=True)
         pcx.to_csv(out / "chrx_percell.tsv.gz", sep="\t", index=False)
+        xm_ = (pd.concat(chrx_maps, ignore_index=True) if chrx_maps
+               else pd.DataFrame())
+        if not xm_.empty:
+            xm_ = xm_[["context"] + [c for c in xm_.columns
+                                     if c != "context"]]
+            xm_.to_csv(out / "chrx_map.tsv", sep="\t", index=False)
         for ctx_ in contexts:
             plot_chrx(cx, pcx, sex_tab, ctx_,
-                      out / f"chrx_{ctx_}.{args.plot_format}")
+                      out / f"chrx_{ctx_}.{args.plot_format}", xmap=xm_)
     # concordance inside each set of domains: imprinted, protocadherin
     what_of = {"imprinting": "imprinted domains",
                "pcdh": "the clustered protocadherins"}

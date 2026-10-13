@@ -1468,13 +1468,27 @@ def test_chrx_concordance_in_females_only_and_nothing_else_changes(
     want = np.where(sx["cell_type"] == "T0", "female", "male")
     assert (sx["sex_call"].to_numpy() == want).all()
     cx = pd.read_csv(o1 / "chrx_concordance.tsv", sep="\t")
-    a = cx[cx["band"].str.startswith("all") & (cx["statistic"] == "delta")
-           ].set_index("group")
+    al = cx[cx["band"].str.startswith("all") & (cx["statistic"] == "delta")]
+    a = al[al["comparison"] == "chrX − autosomes"].set_index("group")
     assert a.loc["female", "diff"] > 0.03 and a.loc["female", "diff_lo"] > 0
     assert a.loc["female", "q_diff"] < 0.05
     assert abs(a.loc["male", "diff"]) < 0.02
     assert a.loc["T0", "group_kind"] == "cell type"
-    assert a.loc["female", "pairs_X"] > 5000
+    assert a.loc["female", "pairs_test"] > 5000
+    # the density control: X against autosomes thinned to its density, and
+    # thinning alone, which here changes nothing
+    assert set(al["comparison"]) == {
+        "chrX − autosomes", "chrX − autosomes at X density",
+        "autosomes at X density − autosomes"}
+    th = al[al["comparison"] == "autosomes at X density − autosomes"
+            ].set_index("group")
+    assert abs(th.loc["all cells", "diff"]) < 0.02
+    xd = al[al["comparison"] == "chrX − autosomes at X density"
+            ].set_index("group")
+    assert xd.loc["female", "diff"] > 0.03
+    xm = pd.read_csv(o1 / "chrx_map.tsv", sep="\t")
+    assert len(xm) > 5 and (xm["autosome_bins"] > 10).all()
+    assert (xm["contacts"] >= 100).all()
     pc = pd.read_csv(o1 / "chrx_percell.tsv.gz", sep="\t")
     f = pc[pc["sex"] == "female"]
     assert (f["delta_X"] - f["delta_autosomes"]).median() > 0.03
