@@ -316,3 +316,88 @@ def test_cells_in_batches_give_the_same_tables(tmp_path, monkeypatch):
         pd.testing.assert_frame_equal(
             a.sort_values(cols).reset_index(drop=True),
             b.sort_values(cols).reset_index(drop=True))
+
+
+def _cpg_snp_data(out: Path, n_cells=4, reads=60, seed=1):
+    """chr1 with a CpG at 1000-1001 whose G is a SNP (G>A): on the A allele
+    the C is a CpA C, never methylated; every other HCG site is methylated
+    alike on both alleles (0.8)."""
+    rng = np.random.default_rng(seed)
+    out.mkdir(parents=True, exist_ok=True)
+    L, p = 6000, 1000
+    ref = list(rng.choice(list("ACGT"), L))
+    ref[p - 1:p + 2] = list("ACG")
+    ref = "".join(ref)
+    sites = {i for i in range(1, L - 1) if ref[i] == "C"
+             and ref[i + 1] == "G" and ref[i - 1] != "G"}
+    assert p in sites
+    with open(out / "HCG.bed", "w") as fh:
+        for i in sorted(sites):
+            fh.write(f"chr1\t{i}\t{i + 1}\t+\n")
+    pysam.tabix_index(str(out / "HCG.bed"), preset="bed", force=True)
+    (out / "snps.vcf").write_text(
+        "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\t"
+        f"INFO\tFORMAT\tS1\nchr1\t{p + 2}\t.\tG\tA\t.\tPASS\t.\tGT\t0|1\n")
+    header = {"HD": {"VN": "1.6", "SO": "coordinate"},
+              "SQ": [{"SN": "chr1", "LN": L}]}
+    rows = []
+    for ci in range(n_cells):
+        segs, n = [], 0
+        for allele in "GA" * reads:
+            s1 = p + 1 - int(rng.integers(10, READ - 10))
+            s2 = int(rng.integers(3000, L - READ - 1))
+            q1 = list(_bisulfite(ref[s1:s1 + READ], sites, s1, 0.8, rng))
+            q1[p + 1 - s1] = allele
+            if allele == "A":
+                q1[p - s1] = "T"            # the CpA C: unmethylated
+            q1 = "".join(q1)
+            q2 = _bisulfite(ref[s2:s2 + READ], sites, s2, 0.8, rng)
+            for seq, st, mst, first in ((q1, s1, s2, True),
+                                        (q2, s2, s1, False)):
+                seg = pysam.AlignedSegment()
+                seg.query_name = f"r{n}"
+                seg.query_sequence = seq
+                seg.flag = 0x1 | (0x40 if first else 0x80)
+                seg.reference_id = 0
+                seg.reference_start = st
+                seg.mapping_quality = 60
+                seg.cigarstring = f"{READ}M"
+                seg.next_reference_id = 0
+                seg.next_reference_start = mst
+                seg.template_length = mst - st
+                seg.query_qualities = pysam.qualitystring_to_array("I" * READ)
+                seg.set_tag("MD", _md(seq, ref[st:st + READ]))
+                segs.append(seg)
+            n += 1
+        segs.sort(key=lambda x: x.reference_start)
+        bam = out / f"c{ci}.bam"
+        with pysam.AlignmentFile(str(bam), "wb", header=header) as fh:
+            for seg in segs:
+                fh.write(seg)
+        pysam.index(str(bam))
+        rows.append((f"c{ci}", str(bam), "L"))
+    pd.DataFrame(rows, columns=["cell_name", "bam_path", "group"]).to_csv(
+        out / "samples.tsv", sep="\t", index=False)
+    return out
+
+
+@pytest.mark.parametrize("flank, artefact", [(0, True), (1, False)])
+def test_a_snp_beside_a_site_is_not_an_imbalance(tmp_path, monkeypatch,
+                                                flank, artefact):
+    """A SNP that turns a CpG into CpA leaves an unmethylated C on its ALT
+    allele: counted, that site alone makes the ALT reads look the less
+    methylated; left out (within 1 bp of the SNP), the alleles agree."""
+    d = _cpg_snp_data(tmp_path / "d")
+    monkeypatch.setattr(ai, "SNP_FLANK", flank)
+    o = tmp_path / "o"
+    ai.main(["--samples", str(d / "samples.tsv"),
+             "--vcf", f"L={d / 'snps.vcf'}",
+             "--context-bed", f"HCG:{d / 'HCG.bed.gz'}",
+             "--n-threads", "1", "--plot-format", "png",
+             "--output-dir", str(o)])
+    r = pd.read_csv(o / "allelic_snps.tsv", sep="\t").iloc[0]
+    assert r["reads_ref"] == r["reads_alt"] == 240
+    if artefact:
+        assert r["HCG_alt_minus_ref"] < -0.08 and r["HCG_p"] < 1e-4
+    else:
+        assert abs(r["HCG_alt_minus_ref"]) < 0.04 and r["HCG_p"] > 0.01

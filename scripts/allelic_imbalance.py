@@ -6,8 +6,11 @@ bisulfite-aware: on a C->T read a T may be a T or an unmethylated C, on a
 G->A read an A may be an A or an unmethylated G, so a base that fits both
 alleles calls neither -- and its HCG / GCH sites are counted as the pipeline
 counts them (nome_hic_concordance.bam_parser: the conversion strand from the
-read's mismatches, the sites of that strand only), the SNP positions
-themselves left out.
+read's mismatches, the sites of that strand only) -- but not the sites
+within SNP_FLANK bp of any SNP: at a site a C/T SNP reads as methylation,
+and beside one a SNP can take its context away -- a CpG made CpA on one
+allele leaves a C no methyltransferase marks, so that allele's reads look
+unmethylated there, an imbalance of the sequence, not of the chromatin.
 
 Per cell line (the samples' group) and SNP, pooled over the line's cells:
 each allele's methylation (HCG) and accessibility (GCH), alt less ref, and a
@@ -89,6 +92,9 @@ _SHOWS = {"CT": {"A": "A", "C": "CT", "G": "G", "T": "T"},
 PHASE_EDGES = (0, 1_000, 100_000, 1_000_000, 10_000_000)
 PHASE_LABELS = ("same read", "<1kb", "1-100kb", "0.1-1Mb", "1-10Mb",
                 ">10Mb")
+#: Sites this close to a SNP are not counted: the SNP can be the site, its
+#: CpG / GpC partner or its H.
+SNP_FLANK = 1
 
 
 def call_allele(base: str, ref: str, alt: str, strand: str) -> int:
@@ -518,7 +524,7 @@ def plot_allelic(snp: pd.DataFrame, cells: pd.DataFrame, context: str,
     ax1.set_xlabel("chrX, Mb")
     ax1.set_ylabel(f"hap1 − hap2 {context}, pp")
     ax1.set_title("b  phased SNPs on X", loc="left", fontsize=6)
-    if ax1.has_data():
+    if ax1.get_legend_handles_labels()[0]:
         ax1.legend(fontsize=5, frameon=False)
     if cells is not None and not cells.empty:
         x = cells[cells["chrom"].map(chrom_key).eq("X")
@@ -532,7 +538,7 @@ def plot_allelic(snp: pd.DataFrame, cells: pd.DataFrame, context: str,
                          label=f"{g} ({len(v)} cells; "
                                f"{np.mean(v > 0):.0%} > 0)")
         ax2.axvline(0, color="0.6", lw=0.4)
-        if ax2.has_data():
+        if ax2.get_legend_handles_labels()[0]:
             ax2.legend(fontsize=5, frameon=False)
     ax2.set_xlabel("chrX hap1 − hap2 per cell, pp")
     ax2.set_ylabel("cells")
@@ -684,20 +690,29 @@ def main(argv=None) -> int:
                              x["alt"].to_numpy(dtype="<U1"),
                              x["ref_hap"].to_numpy(np.int64))
                          for c, x in tab.groupby("chrom", sort=False)})
-    # the SNPs' own positions are not sites -- a C/T SNP would read as
-    # methylation -- any line's, so that one copy of the sites serves all
+    # no site within SNP_FLANK of a SNP -- a C/T SNP at a site reads as
+    # methylation, one beside it can change its context -- any line's
+    # SNPs, so that one copy of the sites serves all
     drop: dict = {}
     for _, per in pers.values():
         for c, v in per.items():
             drop.setdefault(c, []).append(v[0])
     drop = {c: np.unique(np.concatenate(v)) for c, v in drop.items()}
     st = {}
+    n_near = dict.fromkeys(contexts, 0)
     for ctx in contexts:
         st[ctx] = {}
         for c, a in sites[ctx].items():
             if c in drop:
-                keep = ~np.isin(a["pos"], drop[c])
-                st[ctx][c] = (a["pos"][keep], a["ref_base"][keep])
+                u, sp_ = drop[c], a["pos"]
+                i = np.searchsorted(u, sp_)
+                near = np.minimum(np.abs(sp_ - u[np.maximum(i - 1, 0)]),
+                                  np.abs(u[np.minimum(i, u.size - 1)] - sp_))
+                keep = near > SNP_FLANK
+                n_near[ctx] += int((~keep).sum())
+                st[ctx][c] = (sp_[keep], a["ref_base"][keep])
+    logger.info(f"sites within {SNP_FLANK} bp of a SNP, left out: "
+                + ", ".join(f"{k} {v:,}" for k, v in n_near.items()))
     del sites, drop
     for g, (tab, per) in pers.items():
         cells = samples[samples[args.group_column].astype(str) == g]
