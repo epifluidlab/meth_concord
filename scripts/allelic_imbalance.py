@@ -31,6 +31,13 @@ BED, as <context>_<NAME>: the inactive X is the more methylated at CpG
 islands but the less in gene bodies, so over all sites the two partly
 cancel, and HCG_island is the sharper call of which copy is silenced.
 
+--haplotype-dir DIR writes, per cell, every cis read pair a phased SNP puts
+on one haplotype ({cell}.haplotypes.parquet: chrom, pos1, pos2 -- each
+read's midpoint, as nome_hic_concordance keys a read pair -- hap, and the
+pair's reads with a SNP call), and per cell and chromosome how many
+(haplotype_pairs.tsv): annotation_class_concordance.py --chrx --haplotypes
+DIR reshuffles each contact's partners from its own copy of X.
+
 The VCF holds the line's genotypes, heterozygous SNVs used; subset a
 multi-sample VCF first, e.g. ``bcftools view -s NA12878 -g het -v snps -m2
 -M2``.  For GM12878, the 1000 Genomes high-coverage release has NA12878
@@ -139,18 +146,27 @@ def _base_at(read, pos: int, pairs):
 
 
 def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
-                 mapq_min: int, min_bq: int, mates: bool):
+                 mapq_min: int, min_bq: int, mates: bool, pairs_path=None):
     """One cell: per (chrom, SNP, allele) its reads and, per context, the
     sites (k methylated of n) and the reads' own levels (count, sum, sum of
     squares); per (chrom, haplotype, 'snp' | 'mate') the sites; with
     ``mates``, the mates of the haplotype-tagged reads too.  ``snps``:
     {chrom: (pos, ref, alt, ref_hap)}, ``sites``: {context: {chrom:
-    (positions, reference bases)}}."""
+    (positions, reference bases)}}.
+
+    With ``pairs_path``, the cis read pairs on one haplotype are written
+    there: a pair whose reads both pass the pipeline's filters (flags,
+    ``mapq_min``, the mate on the same chromosome), one of them at least
+    with phased SNP calls of one haplotype, none of the other haplotype --
+    keyed as nome_hic_concordance.bam_parser keys it, each read's midpoint
+    (pos1 the read starting first).  Also returns {(chrom, hap): pairs}."""
     import pysam
     pysam.set_verbosity(0)
     nc = len(contexts)
     by_snp: dict = {}
     by_hap: dict = {}
+    want = mates or pairs_path is not None
+    on_hap: list = []          # the pairs on one haplotype
 
     def add_hap(chrom, hap, kind, kn):
         v = by_hap.setdefault((chrom, hap, kind), np.zeros(2 * nc + 1))
@@ -165,6 +181,7 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
             except ValueError:
                 continue
             tagged: dict = {}
+            mixed: set = set()
             for read in reads:
                 if read.flag & _bp._SKIP_FLAGS or \
                         read.mapping_quality < mapq_min:
@@ -210,18 +227,26 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
                 if len(haps) == 1:
                     hap = haps.pop()
                     add_hap(chrom, hap, "snp", kn)
-                    if mates and read.next_reference_name == chrom:
+                    if want and read.next_reference_name == chrom:
                         tagged.setdefault(read.query_name, {})[
                             read.is_read1] = hap
-            if not (mates and tagged):
+                elif len(haps) > 1 and want:
+                    mixed.add(read.query_name)
+            if not (want and tagged):
                 continue
+            ends: dict = {}
             for read in bam.fetch(chrom):
                 t_ = tagged.get(read.query_name)
+                if t_ is None or read.flag & _bp._SKIP_FLAGS or \
+                        read.mapping_quality < mapq_min:
+                    continue
+                if pairs_path is not None and \
+                        read.next_reference_name == chrom:
+                    ends.setdefault(read.query_name, []).append(
+                        (read.reference_start, read.reference_end))
                 # the mate only, and only once: a pair whose two reads both
                 # carry a SNP is counted already
-                if t_ is None or len(t_) > 1 or read.is_read1 in t_ or \
-                        read.flag & _bp._SKIP_FLAGS or \
-                        read.mapping_quality < mapq_min:
+                if not mates or len(t_) > 1 or read.is_read1 in t_:
                     continue
                 kn = np.zeros(2 * nc)
                 for ci, h in enumerate(here):
@@ -229,7 +254,22 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
                         kn[2 * ci:2 * ci + 2] = _bp._count_context_in_read(
                             read, h[0], h[1], trim_ends)
                 add_hap(chrom, next(iter(t_.values())), "mate", kn)
-    return by_snp, by_hap
+            for qn, e in ends.items():
+                hs = set(tagged[qn].values())
+                if len(e) != 2 or len(hs) != 1 or qn in mixed:
+                    continue
+                (s1, e1), (s2, e2) = sorted(e)
+                on_hap.append((chrom, (s1 + e1) // 2, (s2 + e2) // 2,
+                               hs.pop(), len(tagged[qn])))
+    counts: dict = {}
+    if pairs_path is not None:
+        t = pd.DataFrame(on_hap, columns=["chrom", "pos1", "pos2", "hap",
+                                          "snp_reads"]).astype(
+            {"pos1": np.int64, "pos2": np.int64, "hap": np.int8,
+             "snp_reads": np.int8})
+        t.to_parquet(pairs_path, index=False)
+        counts = t.groupby(["chrom", "hap"]).size().to_dict()
+    return by_snp, by_hap, counts
 
 
 def _welch(n1, m1, v1, n2, m2, v2):
@@ -462,6 +502,12 @@ def main(argv=None) -> int:
                     help="Also count the cis Hi-C mates of haplotype-tagged "
                          "reads (phased SNPs only); reads each chromosome "
                          "twice.")
+    ap.add_argument("--haplotype-dir", default=None,
+                    help="Write each cell's read pairs on one haplotype "
+                         "({cell}.haplotypes.parquet; phased SNPs only) and "
+                         "their counts (haplotype_pairs.tsv), for "
+                         "annotation_class_concordance.py --chrx "
+                         "--haplotypes.")
     ap.add_argument("--trim-ends", type=int, default=5)
     ap.add_argument("--mapq-min", type=int, default=30)
     ap.add_argument("--min-base-quality", type=int, default=20)
@@ -512,7 +558,10 @@ def main(argv=None) -> int:
             contexts.append(f"{ctx}_{nm}")
             logger.info(f"{ctx}_{nm}: {sum(len(v) for v in sub.values()):,} "
                         f"sites inside {path}")
-    snp_rows, cell_rows = [], {}
+    snp_rows, cell_rows, pair_rows = [], {}, []
+    hp_dir = Path(args.haplotype_dir) if args.haplotype_dir else None
+    if hp_dir is not None:
+        hp_dir.mkdir(parents=True, exist_ok=True)
     for g, tab in snps.items():
         cells = samples[samples[args.group_column].astype(str) == g]
         if cells.empty or tab.empty:
@@ -532,18 +581,27 @@ def main(argv=None) -> int:
                     keep = ~np.isin(a["pos"], per[c][0])
                     st[ctx][c] = (a["pos"][keep], a["ref_base"][keep])
         logger.info(f"{g}: {len(cells):,} cells")
+        if hp_dir is not None and not (tab["ref_hap"] > 0).any():
+            logger.warning(f"{g}: no phased SNP, so no read pair gets a "
+                           f"haplotype")
         res = Parallel(n_jobs=args.n_threads)(
-            delayed(cell_alleles)(b, per, st, contexts, args.trim_ends,
-                                  args.mapq_min, args.min_base_quality,
-                                  args.mates)
-            for b in cells[args.bam_column])
+            delayed(cell_alleles)(
+                b, per, st, contexts, args.trim_ends, args.mapq_min,
+                args.min_base_quality, args.mates,
+                None if hp_dir is None else hp_dir / f"{c}.haplotypes.parquet")
+            for c, b in zip(cells[args.cell_column], cells[args.bam_column]))
         agg: dict = {}
         ncell: dict = {}
-        for (cell, (by_snp, by_hap)) in zip(cells[args.cell_column], res):
+        for (cell, (by_snp, by_hap, npair)) in zip(cells[args.cell_column],
+                                                   res):
             for k, v in by_snp.items():
                 agg[k] = agg.get(k, 0) + v
                 ncell[k] = ncell.get(k, 0) + 1
             cell_rows[(cell, g)] = by_hap
+            for c_ in sorted({k[0] for k in npair}):
+                pair_rows.append({"cell": cell, "group": g, "chrom": c_,
+                                  "pairs_hap1": npair.get((c_, 1), 0),
+                                  "pairs_hap2": npair.get((c_, 2), 0)})
         t = snp_table(agg, ncell, tab, contexts, args.min_reads)
         if not t.empty:
             t.insert(0, "group", g)
@@ -572,6 +630,18 @@ def main(argv=None) -> int:
     for ctx in contexts:
         plot_allelic(snp, cells, ctx,
                      out / f"allelic_{ctx}.{args.plot_format}")
+    if hp_dir is not None:
+        pt = pd.DataFrame(pair_rows, columns=["cell", "group", "chrom",
+                                              "pairs_hap1", "pairs_hap2"])
+        pt.to_csv(out / "haplotype_pairs.tsv", sep="\t", index=False)
+        if not pt.empty:
+            pt["n"] = pt["pairs_hap1"] + pt["pairs_hap2"]
+            pt["on"] = np.where(pt["chrom"].map(chrom_key).eq("X"), "chrX",
+                                "autosomes")
+            med = pt.groupby(["group", "on", "cell"])["n"].sum().groupby(
+                ["group", "on"]).median()
+            logger.info(f"read pairs on one haplotype per cell (median), "
+                        f"in {hp_dir}:\n" + med.to_string())
     return 0
 
 

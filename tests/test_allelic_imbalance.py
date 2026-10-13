@@ -88,6 +88,7 @@ def make_data(out: Path, n_cells=6, reads_per_hap=4, seed=0):
             name = f"{grp}_c{ci}"
             bam_path = out / f"{name}.bam"
             segs = []
+            truth = []      # each pair's two read midpoints and haplotype
             n = 0
             for c, i, r, a, gt in snps:
                 tid = 0 if c == "chr1" else 1
@@ -108,6 +109,8 @@ def make_data(out: Path, n_cells=6, reads_per_hap=4, seed=0):
                                         meth, rng)
                         qn = f"r{n}"
                         n += 1
+                        truth.append((c, s1 + READ // 2, s2 + READ // 2,
+                                      hap))
                         for seq, st, mst, first in ((q1, s1, s2, True),
                                                     (q2, s2, s1, False)):
                             seg = pysam.AlignedSegment()
@@ -131,6 +134,9 @@ def make_data(out: Path, n_cells=6, reads_per_hap=4, seed=0):
                 for seg in segs:
                     fh.write(seg)
             pysam.index(str(bam_path))
+            pd.DataFrame(truth, columns=["chrom", "pos1", "pos2", "hap"]
+                         ).to_csv(out / f"{name}.truth.tsv", sep="\t",
+                                  index=False)
             rows.append((name, str(bam_path), grp))
     pd.DataFrame(rows, columns=["cell_name", "bam_path", "group"]).to_csv(
         out / "samples.tsv", sep="\t", index=False)
@@ -210,3 +216,48 @@ def test_clonal_line_is_imbalanced_on_x_and_a_polyclonal_one_per_cell(
     assert (cx.filter(like="GM_", axis=0)["HCG_half_hap1_minus_hap2"]
             < -0.5).all()
     assert (o / "allelic_HCG_half.png").exists()
+
+
+def test_read_pairs_get_their_haplotype_keyed_as_the_pipeline_keys_them(
+        tmp_path):
+    """--haplotype-dir: every read pair with a phased SNP gets its
+    haplotype, keyed on its reads' midpoints exactly as the pipeline's
+    parser keys the pair -- so a posterior row finds it."""
+    d = make_data(tmp_path / "d", n_cells=2, reads_per_hap=2)
+    o = tmp_path / "out"
+    ai.main(["--samples", str(d / "samples.tsv"),
+             "--vcf", f"GM={d / 'snps.vcf'}",
+             "--context-bed", f"HCG:{d / 'HCG.bed.gz'}",
+             "--haplotype-dir", str(o / "haps"), "--min-reads", "1",
+             "--n-threads", "1", "--plot-format", "png",
+             "--output-dir", str(o)])
+    sites = ai._ref.load_context_from_bed({"HCG": str(d / "HCG.bed.gz")},
+                                          chroms=["chr1", "chrX"],
+                                          n_threads=1)
+    snps = ai.read_het_snps(d / "snps.vcf")
+    n_x = {}
+    for cell in ("GM_c0", "GM_c1"):
+        h = pd.read_parquet(o / "haps" / f"{cell}.haplotypes.parquet")
+        truth = pd.read_csv(d / f"{cell}.truth.tsv", sep="\t")
+        # a mate over another SNP shows its REF base: a pair whose mate
+        # thereby reads as the other haplotype is no call
+        mixed = [((snps["chrom"] == c) & (snps["pos"] >= p2 - READ // 2)
+                  & (snps["pos"] < p2 + READ // 2)
+                  & (snps["ref_hap"] != hp)).any()
+                 for c, p2, hp in zip(truth["chrom"], truth["pos2"],
+                                      truth["hap"])]
+        want = truth[~np.array(mixed)]
+        m = h.merge(want, on=["chrom", "pos1", "pos2"],
+                    suffixes=("", "_true"))
+        assert len(m) == len(h) == len(want) > 0.9 * len(truth)
+        assert (m["hap"] == m["hap_true"]).all()
+        assert set(h["chrom"]) == {"chr1", "chrX"}
+        rp = ai._bp.parse_cell_bam(str(d / f"{cell}.bam"), sites["HCG"])
+        keys = set(zip(rp["chrom"], rp["pos1"], rp["pos2"]))
+        assert set(zip(h["chrom"], h["pos1"], h["pos2"])) <= keys
+        n_x[cell] = want[want["chrom"] == "chrX"].groupby("hap").size()
+    pt = pd.read_csv(o / "haplotype_pairs.tsv", sep="\t")
+    x = pt[pt["chrom"] == "chrX"].set_index("cell")
+    for cell, n in n_x.items():
+        assert x.loc[cell, "pairs_hap1"] == n[1]
+        assert x.loc[cell, "pairs_hap2"] == n[2]

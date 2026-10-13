@@ -1374,12 +1374,19 @@ def test_rotation_p_keeps_the_bins_autocorrelation():
 
 
 def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
-                   n_y=150, seed=5, xi=0.1, xa=0.6):
+                   n_y=150, seed=5, xi=0.1, xa=0.6, haps=None, tag=0.6):
     """chrX read pairs for every cell -- a female's twice a male's -- and
     chrY short pairs for males.  A female's X contact lies on her inactive
     X (accessibility ``xi``) or her active one (``xa``), both ends alike; a
-    male's on his one active X."""
+    male's on his one active X.  With ``haps(type, cell)`` -- the haplotype
+    of a female's inactive X -- a share ``tag`` of her X contacts and of
+    every cell's autosomal ones (a random haplotype) is written to
+    haps/{cell}.haplotypes.parquet, as allelic_imbalance.py would; a
+    male's one X has no heterozygous SNP."""
     rng = np.random.default_rng(seed)
+    rng_h = np.random.default_rng([seed, 1])
+    if haps is not None:
+        (Path(d) / "haps").mkdir(exist_ok=True)
     s = pd.read_csv(Path(d) / "samples.tsv", sep="\t")
     for cell, typ in zip(s["cell_name"], s["group"]):
         f = Path(d) / "GCH" / f"{cell}.posteriors.parquet"
@@ -1390,7 +1397,8 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
         a_pos = rng.integers(0, 17_000_000, n)
         b_pos = a_pos + np.exp(rng.uniform(np.log(1_000), np.log(3_000_000),
                                            n)).astype(np.int64)
-        lvl = np.where(fem & (rng.random(n) < 0.5), xi, xa)
+        on_xi = fem & (rng.random(n) < 0.5)
+        lvl = np.where(on_xi, xi, xa)
         pa = np.where(rng.random(n) < lvl, 0.9, 0.1)
         pb = np.where(rng.random(n) < lvl, 0.9, 0.1)
         s_pos = rng.integers(0, 19_000_000, ns)
@@ -1407,6 +1415,20 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
             add.append(pd.DataFrame({"chrom": "chrY", "pos1": y,
                                      "pos2": y + 300, "posterior1": 0.1,
                                      "posterior2": 0.1}))
+        if haps is not None:
+            auto = df[~df["chrom"].isin(["chrX", "chrY"])]
+            ta = rng_h.random(len(auto)) < tag
+            tx = fem & (rng_h.random(n) < tag)
+            h_i = haps(typ, cell)
+            pd.DataFrame({
+                "chrom": np.r_[auto["chrom"].to_numpy()[ta],
+                               np.full(tx.sum(), "chrX")],
+                "pos1": np.r_[auto["pos1"].to_numpy()[ta], a_pos[tx]],
+                "pos2": np.r_[auto["pos2"].to_numpy()[ta], b_pos[tx]],
+                "hap": np.r_[rng_h.integers(1, 3, ta.sum()),
+                             np.where(on_xi, h_i, 3 - h_i)[tx]].astype(
+                    np.int8)}).to_parquet(
+                Path(d) / "haps" / f"{cell}.haplotypes.parquet")
         x = pd.concat(add, ignore_index=True)
         x["n1"] = np.int32(3)
         x["n2"] = np.int32(3)
@@ -1518,6 +1540,56 @@ def test_chrx_concordance_in_females_only_and_nothing_else_changes(
     for name in ("summary.tsv", "percell.tsv.gz", "locus_hotspots.tsv.gz"):
         pd.testing.assert_frame_equal(pd.read_csv(o0 / name, sep="\t"),
                                       pd.read_csv(o1 / name, sep="\t"))
+
+
+def test_chrx_by_haplotype_moves_the_copies_difference_into_the_null(
+        tmp_path):
+    """T0 female and clonal -- hap2 the inactive X in every cell -- T1
+    female and polyclonal (either haplotype), T2 male.  With partners from
+    the contact's own haplotype, T0's X excess moves into the null (the
+    copy part) and nothing is left beyond the autosomes; in T1 a partner
+    of the same haplotype is no closer, so the copy part is ~0 though the
+    excess is there; T0's hap2 is the less accessible, co-closed copy."""
+    d = make_data(tmp_path, per=20, n_types=3)
+    add_sex_chroms(d, female_types=("T0", "T1"),
+                   haps=lambda typ, c: (2 if typ == "T0" else
+                                        1 + int(c.split("_c")[1]) % 2))
+    o = tmp_path / "out"
+    acc.main(_contrast_args(d, o) + ["--chrx", "--haplotypes",
+                                     str(d / "haps")])
+    h = pd.read_csv(o / "chrx_haplotype_concordance.tsv", sep="\t")
+    al = h[h["band"].str.startswith("all")]
+
+    def row(cmp_, st, g):
+        r = al[(al["comparison"] == cmp_) & (al["statistic"] == st)
+               & (al["group"] == g)]
+        assert len(r) == 1, (cmp_, st, g)
+        return r.iloc[0]
+    cp = row(acc.HAP_COPY_PART, "delta", "T0")
+    assert cp["diff"] > 0.05 and cp["diff_lo"] > 0 and cp["q_diff"] < 0.05
+    assert row("chrX: either copy − same copy", "delta", "T0")["diff"] > 0.05
+    assert abs(row("autosomes: either copy − same copy", "delta",
+                   "T0")["diff"]) < 0.01
+    assert row("either copy: chrX − autosomes", "delta", "T0")["diff"] > 0.05
+    assert abs(row("same copy: chrX − autosomes", "delta",
+                   "T0")["diff"]) < 0.015
+    # polyclonal: the excess is there, a same-haplotype partner no closer
+    assert row("either copy: chrX − autosomes", "delta", "T1")["diff"] > 0.05
+    assert abs(row(acc.HAP_COPY_PART, "delta", "T1")["diff"]) < 0.015
+    # T0's hap2, the inactive copy: less accessible, co-closed
+    lv = row("chrX: hap2 − hap1", "level", "T0")
+    assert lv["diff"] < -0.3 and lv["diff_hi"] < 0
+    w = row("chrX: hap2 − hap1", "w", "T0")
+    assert w["test"] < 0 < w["reference"]
+    assert abs(row("autosomes: hap2 − hap1", "level", "T0")["diff"]) < 0.03
+    pc = pd.read_csv(o / "chrx_haplotype_percell.tsv.gz", sep="\t")
+    t0 = pc[pc["cell_type"] == "T0"]
+    assert ((t0["level_X_hap2"] - t0["level_X_hap1"]) < -0.2).all()
+    t1 = pc[pc["cell_type"] == "T1"]
+    dd = t1["level_X_hap2"] - t1["level_X_hap1"]
+    assert (dd < -0.2).sum() == 10 and (dd > 0.2).sum() == 10
+    assert (pc.loc[pc["cell_type"] == "T2", "pairs_X_hap1"] == 0).all()
+    assert (o / "chrx_haplotypes_GCH.png").exists()
 
 
 def test_chrx_without_x_reads_says_so_and_skips(tmp_path, caplog):
