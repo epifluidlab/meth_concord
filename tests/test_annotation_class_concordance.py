@@ -1374,7 +1374,8 @@ def test_rotation_p_keeps_the_bins_autocorrelation():
 
 
 def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
-                   n_y=150, seed=5, xi=0.1, xa=0.6, haps=None, tag=0.6):
+                   n_y=150, seed=5, xi=0.1, xa=0.6, haps=None, tag=0.6,
+                   par=None):
     """chrX read pairs for every cell -- a female's twice a male's -- and
     chrY short pairs for males.  A female's X contact lies on her inactive
     X (accessibility ``xi``) or her active one (``xa``), both ends alike; a
@@ -1382,7 +1383,9 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
     of a female's inactive X -- a share ``tag`` of her X contacts and of
     every cell's autosomal ones (a random haplotype) is written to
     haps/{cell}.haplotypes.parquet, as allelic_imbalance.py would; a
-    male's one X has no heterozygous SNP."""
+    male's one X has no heterozygous SNP.  ``par`` (start, end): a PAR1
+    that escapes -- a contact with both ends in it is at ``xa`` on either
+    copy."""
     rng = np.random.default_rng(seed)
     rng_h = np.random.default_rng([seed, 1])
     if haps is not None:
@@ -1399,6 +1402,8 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
                                            n)).astype(np.int64)
         on_xi = fem & (rng.random(n) < 0.5)
         lvl = np.where(on_xi, xi, xa)
+        if par is not None:
+            lvl = np.where((a_pos >= par[0]) & (b_pos < par[1]), xa, lvl)
         pa = np.where(rng.random(n) < lvl, 0.9, 0.1)
         pb = np.where(rng.random(n) < lvl, 0.9, 0.1)
         s_pos = rng.integers(0, 19_000_000, ns)
@@ -1590,6 +1595,29 @@ def test_chrx_by_haplotype_moves_the_copies_difference_into_the_null(
     assert (dd < -0.2).sum() == 10 and (dd > 0.2).sum() == 10
     assert (pc.loc[pc["cell_type"] == "T2", "pairs_X_hap1"] == 0).all()
     assert (o / "chrx_haplotypes_GCH.png").exists()
+
+
+def test_par1_escapes_so_its_contacts_show_no_excess(tmp_path):
+    """T0 female: her inactive X closed, but not in PAR1 (0-2 Mb here),
+    which escapes -- both copies alike.  The rest of X is concordant beyond
+    the autosomes and beyond PAR1; PAR1 is not beyond the autosomes."""
+    d = make_data(tmp_path, per=20, n_types=3)
+    add_sex_chroms(d, par=(0, 2_000_000))
+    o = tmp_path / "o"
+    acc.main(_contrast_args(d, o) + ["--chrx", "--chrx-par", "0-2000000"])
+    cx = pd.read_csv(o / "chrx_concordance.tsv", sep="\t")
+    al = cx[cx["band"].str.startswith("all") & (cx["statistic"] == "delta")]
+    by = {c: g.set_index("group") for c, g in al.groupby("comparison")}
+    assert {"chrX PAR1 − autosomes", "chrX − chrX PAR1"} <= set(by)
+    x = by["chrX − autosomes"].loc["female", "diff"]
+    assert x > 0.03
+    assert abs(by["chrX PAR1 − autosomes"].loc["female", "diff"]) < 0.4 * x
+    xp = by["chrX − chrX PAR1"].loc["female"]
+    assert xp["diff"] > 0.03 and xp["q_diff"] < 0.05
+    assert by["chrX PAR1 − autosomes"].loc["female", "pairs_test"] > 1000
+    pc = pd.read_csv(o / "chrx_percell.tsv.gz", sep="\t")
+    assert {"pairs_PAR1", "delta_PAR1", "w_PAR1"} <= set(pc.columns)
+    assert (o / "chrx_GCH.png").exists()
 
 
 def test_chrx_without_x_reads_stops_and_says_why(tmp_path):

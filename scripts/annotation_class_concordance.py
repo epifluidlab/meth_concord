@@ -180,7 +180,10 @@ concordance per cell type, sex and group (chrx_concordance.tsv,
 chrx_percell.tsv.gz, chrx_<ctx>), with its direction -- ΔC x w, ΔC x sign(w)
 and w, co-open or co-closed against the cell's genome (chrx_signed_<ctx>);
 chrX enters nothing else, and in a male the one X is the reference with no
-second copy.  --haplotypes (allelic_imbalance.py --haplotype-dir): the
+second copy.  With --genome hg38 / hg19 (or --chrx-par) PAR1 is a class of its
+own: it escapes X inactivation, a cell's two copies alike there, so the
+copies differing predicts no excess in PAR1 -- X against PAR1 is the test.
+--haplotypes (allelic_imbalance.py --haplotype-dir): the
 contacts a phased SNP puts on one copy, their partners reshuffled from the
 same haplotype or from a random half -- in a clonal line (GM12878) the part
 of X's excess that is its two copies differing moves into the null, and
@@ -858,7 +861,7 @@ def _hap_lookup(tab, g_lo, g_hi) -> np.ndarray:
 def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
                systems: dict, open_g=None, open_w: int = 200,
                prof_bin: int = 0, with_x: bool = False, loci=None,
-               haps=None) -> dict:
+               haps=None, x_par=None) -> dict:
     """One cell's contacts -- both ends called, min_d <= d <= max_d -- as
     genome coordinates, with every system's class at both ends, and per
     system x class the count, sum and sum of squares of ALL its called
@@ -868,7 +871,8 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
     file has no counts); with ``prof_bin``, its called ends' posterior sum
     and count per bin of that size.  With ``with_x``, its chrX contacts
     and the marginal of its X ends and of its autosomal ends, kept apart
-    ("x") so that nothing but the chrX analysis sees them.  With ``loci``
+    ("x") so that nothing but the chrX analysis sees them -- with ``x_par``
+    (PAR1's span) its PAR1 ends' marginal apart.  With ``loci``
     (genome intervals, n x 2), the count and posterior sum of its called
     ends in each.  With ``haps`` (its :func:`_hap_table` file), each
     contact's haplotype ("hap", and X's in "x"; 0 untagged).  Integer work
@@ -973,15 +977,21 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
         h1, h2 = xb + q1, xb + q2
         xe = np.concatenate([r1[j1], r2[j2]])
         au = (e_g // STRIDE >= 1) & (e_g // STRIDE < 1000)
+        if x_par is None:
+            parts = [e_p[au], xe]
+        else:
+            xp = np.concatenate([q1[j1], q2[j2]])
+            inp = (xp >= x_par[0]) & (xp < x_par[1])
+            parts = [e_p[au], xe[~inp], xe[inp]]
         out["x"] = {"g_lo": np.where(lf, h1, h2)[xm],
                     "g_hi": np.where(lf, h2, h1)[xm],
                     "a": np.where(lf, r1, r2)[xm].astype(np.float32),
                     "p": np.where(lf, r2, r1)[xm].astype(np.float32),
-                    # count, sum, sum of squares: autosomes, then X
-                    "marg": np.array([[au.sum(), xe.size],
-                                      [e_p[au].sum(), xe.sum()],
-                                      [(e_p[au] ** 2).sum(),
-                                       (xe ** 2).sum()]], float)}
+                    # count, sum, sum of squares: autosomes, X[, PAR1]
+                    "marg": np.array([[v.size for v in parts],
+                                      [v.sum() for v in parts],
+                                      [(v ** 2).sum() for v in parts]],
+                                     float)}
         if ht is not None:
             out["x"]["hap"] = _hap_lookup(ht, out["x"]["g_lo"],
                                           out["x"]["g_hi"])
@@ -3573,23 +3583,38 @@ CHROM_SYSTEM = "chrX"
 NEURON_IMPRINTED = ("Ube3a", "Grb10")
 
 
+#: PAR1 on chrX (0-based, half-open) per --genome.  It escapes X
+#: inactivation -- a cell's two copies are alike there -- unlike PAR2, two of
+#: whose four genes the inactive X silences.
+PAR1 = {"hg38": (10_000, 2_781_479), "hg19": (60_000, 2_699_520)}
+
+
 class ChromosomeClasses:
     """Autosomes against chrX as an annotation system: an end on a numbered
     chromosome is 'autosomes', one on X 'chrX', any other -1.  A contact's
     two ends share its chromosome -- and one copy of it -- so where the two
     copies of X differ, one inactive, X-X contacts are concordant beyond
-    their reshuffled partners, which come from either copy."""
+    their reshuffled partners, which come from either copy.  With ``par``
+    (PAR1's span on X) its ends are a class of their own, 'chrX PAR1': X's
+    one part where the two copies do not differ, the control."""
 
-    def __init__(self):
+    def __init__(self, par=None):
         self.name = CHROM_SYSTEM
-        self.classes = ("autosomes", "chrX")
+        self.par = tuple(par) if par else None
+        self.classes = ("autosomes", "chrX") + (("chrX PAR1",) if self.par
+                                                else ())
         self._x = _chrom_code("X")
 
     def lookup_g(self, g) -> np.ndarray:
-        code = np.asarray(g, np.int64) // STRIDE
+        g = np.asarray(g, np.int64)
+        code = g // STRIDE
         out = np.full(code.size, -1, np.int8)
         out[(code >= 1) & (code < 1000)] = 0
-        out[code == self._x] = 1
+        isx = code == self._x
+        out[isx] = 1
+        if self.par:
+            pos = g % STRIDE
+            out[isx & (pos >= self.par[0]) & (pos < self.par[1])] = 2
         return out
 
 
@@ -3768,13 +3793,17 @@ def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
 CHRX_COMPARISONS = (("chrX", "autosomes"),
                     ("chrX", "autosomes at X density"),
                     ("autosomes at X density", "autosomes"))
+#: ... and with PAR1 a class of its own: PAR1 against the autosomes, and X
+#: against PAR1 -- the excess where the copies differ, beyond where they
+#: do not.
+CHRX_PAR_COMPARISONS = (("chrX PAR1", "autosomes"), ("chrX", "chrX PAR1"))
 
 
 def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
                            edges, band_labels, dbins, position_bin: int,
                            max_widen: int, n_boot: int, seed: int,
                            n_threads: int = 1, map_bin: int = 1_000_000,
-                           min_map_contacts: int = 100):
+                           min_map_contacts: int = 100, par=None):
     """chrX against the autosomes (:class:`ChromosomeClasses`), as one
     system's class pairs: every contact's ends centred on its cell's mean
     on autosomes or on X (``marg``: cells x (count, sum, sum of squares) x
@@ -3797,10 +3826,17 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     co-closed, while the excess of the copies differing is ΔC's.
     And X's map: ΔC per ``map_bin`` bin along X (bins with
     ``min_map_contacts``), beside the autosomes' bins' median and
-    quartiles -- an excess even along X, or in places.  Returns (rows,
-    per-cell rows of every cell's own two values at all distances, the
+    quartiles -- an excess even along X, or in places.
+
+    With ``par`` (PAR1's span on X; ``marg`` then has a third class) PAR1
+    is a class of its own and 'chrX' the rest of X: PAR1 escapes X
+    inactivation, so where the excess is the two copies differing, PAR1
+    has none (CHRX_PAR_COMPARISONS); where it is anything else about X --
+    its mapping, its density, how it was read -- PAR1 has it too.  Returns
+    (rows, per-cell rows of every cell's own values at all distances, the
     map)."""
-    lk = ChromosomeClasses()
+    lk = ChromosomeClasses(par)
+    nk = len(lk.classes)
     kx = lk.lookup_g(g_lo).astype(np.int64)
     ky = lk.lookup_g(g_hi).astype(np.int64)
     n_cells = marg.shape[0]
@@ -3820,7 +3856,7 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
         contacts with a donor and their parts of ΔC and of the control."""
         ok, right, left, _ = reshuffle(
             g_lo[sel], g_hi[sel], dist[sel], cell[sel], kx[sel], ky[sel],
-            a_c[sel], p_c[sel], s_code[cell[sel]], 2, dbins, position_bin,
+            a_c[sel], p_c[sel], s_code[cell[sel]], nk, dbins, position_bin,
             max_widen, seed=sd_seed, names=list(s_names),
             n_threads=n_threads)
         i = np.flatnonzero(ok)
@@ -3842,13 +3878,13 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
                                       * (1 - pr))
         acc = accumulate(ci_, np.minimum(kx, ky)[sel][i],
                          np.maximum(kx, ky)[sel][i], band[sel][i],
-                         np.zeros(i.size, np.int64), w, n_cells, 2, nb)
+                         np.zeros(i.size, np.int64), w, n_cells, nk, nb)
         return acc, sel[i], 2 * (w["xy"] - w["xy1"]), 2 * (w["xy2"]
                                                           - w["xy1"])
     acc, used, d_, c_ = run(np.arange(g_lo.size), seed)
     # the autosomes thinned to X's contacts per bp, per stratum
     auto = (kx == 0) & (ky == 0)
-    isx = (kx == 1) & (ky == 1)
+    isx = (kx >= 1) & (ky >= 1)
     ch = g_lo // STRIDE
     span = {int(k): int(g_hi[ch == k].max() - g_lo[ch == k].min())
             for k in np.unique(ch)}
@@ -3863,29 +3899,33 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     thin = np.flatnonzero(auto & (rng.random(g_lo.size)
                                   < frac[s_code[cell]]))
     acc_t = run(thin, seed + 1)[0]
-    classes3 = ("autosomes", "chrX", "autosomes at X density")
+    classes3 = lk.classes + ("autosomes at X density",)
     acc3 = {}
     for k in ("n", "xy", "xy1", "xy2", "oo", "oc", "no2", "nc2"):
-        z = np.zeros((n_cells, 3, 3, nb + 1))
-        z[:, :2, :2] = acc[k]
-        z[:, 2, 2] = acc_t[k][:, 0, 0]
+        z = np.zeros((n_cells, nk + 1, nk + 1, nb + 1))
+        z[:, :nk, :nk] = acc[k]
+        z[:, nk, nk] = acc_t[k][:, 0, 0]
         acc3[k] = z
-    sd3 = np.column_stack([sd[:, 0], sd[:, 1], sd[:, 0]])
+    sd3 = np.column_stack([sd[:, j] for j in range(nk)] + [sd[:, 0]])
     rows = []
-    for test, ref in CHRX_COMPARISONS:
+    for test, ref in CHRX_COMPARISONS + (CHRX_PAR_COMPARISONS if par
+                                         else ()):
         for r_ in class_pair_difference(acc3, sd3, groups, classes3,
                                         (ref, ref), (test, test),
                                         band_labels, n_boot, seed,
-                                        ref=(0, 1)):
+                                        ref=tuple(range(nk))):
             r_["comparison"] = f"{test} − {ref}"
             rows.append(r_)
     A_ = len(band_labels) - 1
     with np.errstate(invalid="ignore", divide="ignore"):
         pc = {"pairs_autosomes": acc["n"][:, 0, 0, A_],
               "pairs_X": acc["n"][:, 1, 1, A_]}
-        go, gc = (acc["oo"][:, 0, 0, A_] + acc["oo"][:, 1, 1, A_],
-                  acc["oc"][:, 0, 0, A_] + acc["oc"][:, 1, 1, A_])
-        for tag, k in (("autosomes", 0), ("X", 1)):
+        go = sum(acc["oo"][:, j, j, A_] for j in range(nk))
+        gc = sum(acc["oc"][:, j, j, A_] for j in range(nk))
+        if par:
+            pc["pairs_PAR1"] = acc["n"][:, 2, 2, A_]
+        for tag, k in (("autosomes", 0), ("X", 1)) + ((("PAR1", 2),)
+                                                     if par else ()):
             n = acc["n"][:, k, k, A_]
             dd = acc["xy"][:, k, k, A_] - acc["xy1"][:, k, k, A_]
             pc[f"delta_{tag}"] = 2 * dd / n
@@ -4225,8 +4265,10 @@ def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
         ax4 = fig.add_subplot(gs[1, :2])
         comps = list(dict.fromkeys(ta["comparison"]))
         rows_ = ["all cells"] + [g for g in curves if g != "all cells"]
-        ccol = ("0.1", "#d6604d", "#4393c3", "#1b9e77")
-        off = (np.arange(len(comps)) - (len(comps) - 1) / 2) * 0.22
+        ccol = ("0.1", "#d6604d", "#4393c3", "#1b9e77", "#7570b3",
+                "#e6ab02")
+        off = (np.arange(len(comps)) - (len(comps) - 1) / 2) * (
+            0.66 / max(len(comps), 3))
         for ci, cmp_ in enumerate(comps):
             x = ta[(ta["comparison"] == cmp_) & (ta["band"] == all_b)]
             for i, g in enumerate(rows_):
@@ -4236,18 +4278,19 @@ def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
                 r = r.iloc[0]
                 q = r.get("q_diff", np.nan)
                 y = i + off[ci]
+                c6 = ccol[ci % len(ccol)]
                 ax4.plot([PP * r["diff_lo"], PP * r["diff_hi"]], [y, y],
-                         color=ccol[ci % 4], lw=0.8)
-                ax4.plot([PP * r["diff"]], [y], "o", ms=3, mec=ccol[ci % 4],
-                         mfc=ccol[ci % 4] if np.isfinite(q) and q < q_cut
+                         color=c6, lw=0.8)
+                ax4.plot([PP * r["diff"]], [y], "o", ms=3, mec=c6,
+                         mfc=c6 if np.isfinite(q) and q < q_cut
                          else "white")
         ax4.axvline(0, color="0.6", lw=0.4)
         ax4.set_yticks(np.arange(len(rows_)))
         ax4.set_yticklabels(rows_, fontsize=5)
         ax4.set_ylim(len(rows_) - 0.5, -0.5)
         ax4.set_xlabel("difference, ΔC pp, all distances")
-        ax4.legend([Line2D([], [], color=ccol[ci % 4], marker="o", ms=3,
-                           lw=0.8) for ci in range(len(comps))], comps,
+        ax4.legend([Line2D([], [], color=ccol[ci % len(ccol)], marker="o",
+                           ms=3, lw=0.8) for ci in range(len(comps))], comps,
                    fontsize=4.5, frameon=False, loc="upper center",
                    bbox_to_anchor=(0.5, -0.3), ncol=1)
         # f: X along its length
@@ -6908,6 +6951,13 @@ def main(argv=None) -> int:
                          "(chrx_concordance.tsv, chrx_percell.tsv.gz, "
                          "chrx_<ctx>, chrx_signed_<ctx>).  chrX enters "
                          "nothing else.")
+    ap.add_argument("--chrx-par", default="auto", metavar="auto|none|S-E",
+                    help="With --chrx: PAR1 (chrX S-E, 0-based) as a class "
+                         "of its own -- it escapes X inactivation, a "
+                         "control where a cell's two X copies do not differ "
+                         "(chrX PAR1 - autosomes; chrX - chrX PAR1).  "
+                         "'auto' (default): by --genome (hg38, hg19), else "
+                         "none.")
     ap.add_argument("--haplotypes", default=None, metavar="DIR",
                     help="With --chrx: each cell's read pairs on one "
                          "haplotype ({cell}.haplotypes.parquet, from "
@@ -6994,6 +7044,21 @@ def main(argv=None) -> int:
     exclude = {_canon(c) for c in args.exclude_chrom.split(",") if c.strip()}
     if args.haplotypes and not args.chrx:
         sys.exit("--haplotypes needs --chrx")
+    x_par = None
+    if args.chrx:
+        v_ = str(args.chrx_par).strip().lower().replace(",", "")
+        if v_ == "auto":
+            x_par = PAR1.get(str(args.genome)) if args.genome else None
+        elif v_ != "none":
+            a_, _, b_ = v_.partition("-")
+            if not (a_.isdigit() and b_.isdigit() and int(a_) < int(b_)):
+                sys.exit(f"--chrx-par {args.chrx_par!r}: auto, none or "
+                         f"START-END")
+            x_par = (int(a_), int(b_))
+        logger.info("--chrx: " + (f"PAR1 chrX:{x_par[0]:,}-{x_par[1]:,} a "
+                                  f"class of its own, the control"
+                                  if x_par else "no PAR1 class (--chrx-par "
+                                  "S-E, or --genome hg38 / hg19)"))
     if args.chrx and "X" not in exclude:
         logger.info("--chrx: chrX is analysed against the autosomes only, "
                     "and kept out of everything else")
@@ -7377,7 +7442,7 @@ def main(argv=None) -> int:
                               args.min_distance, args.max_distance, exclude,
                               sysd, open_g if ctx == acc_ctx else None,
                               args.open_site_window, prof_bin,
-                              with_x=chrx_on, loci=loci_g,
+                              with_x=chrx_on, loci=loci_g, x_par=x_par,
                               haps=(Path(args.haplotypes)
                                     / f"{c}.haplotypes.parquet"
                                     if args.haplotypes and chrx_on
@@ -7713,11 +7778,11 @@ def main(argv=None) -> int:
                    np.concatenate([p] + [x["p"].astype(float) for x in xs]))
             strat_x = np.array([f"{st_}|{sx_}" for st_, sx_ in
                                 zip(stratum, sx)])
+            mx = np.stack([x["marg"] for x in xs])
             rx, pcx, xmap = chromosome_concordance(
-                *xa_, np.stack([x["marg"] for x in xs]), strat_x,
-                grp_x, edges, band_labels, dbins, args.position_bin,
-                args.max_widen, args.n_boot, args.seed + 6007 * ci_ctx,
-                args.n_threads)
+                *xa_, mx, strat_x, grp_x, edges, band_labels, dbins,
+                args.position_bin, args.max_widen, args.n_boot,
+                args.seed + 6007 * ci_ctx, args.n_threads, par=x_par)
             for r_ in rx:
                 r_.update(context=ctx, group_kind=kind_x[r_["group"]])
             chrx_rows += rx
@@ -7734,8 +7799,12 @@ def main(argv=None) -> int:
                     + [x.get("hap", np.zeros(x["g_lo"].size, np.int8))
                        for x in xs])
                 if (hx > 0).any():
+                    # X whole, PAR1 with it: copies by haplotype here
+                    mh = mx[:, :, :2].copy()
+                    if mx.shape[2] > 2:
+                        mh[:, :, 1] += mx[:, :, 2]
                     rh, pch = haplotype_concordance(
-                        *xa_, hx, np.stack([x["marg"] for x in xs]),
+                        *xa_, hx, mh,
                         strat_x, grp_x, edges, band_labels, dbins,
                         args.position_bin, args.max_widen, args.n_boot,
                         args.seed + 6007 * ci_ctx + 3, args.n_threads)
@@ -7782,7 +7851,7 @@ def main(argv=None) -> int:
                         f"{k_ * r0['diff']:+.3f}{u_} "
                         f"[{k_ * r0['diff_lo']:+.3f}, "
                         f"{k_ * r0['diff_hi']:+.3f}]")
-            del xs, xa_
+            del xs, xa_, mx
         if ctx == hcg_ctx and "pmd" in systems and cell_cov is not None:
             # HMD less PMD methylation: PMDs lose methylation with every
             # division, so their depth is a cell's division history
