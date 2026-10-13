@@ -1493,6 +1493,28 @@ def test_chrx_concordance_in_females_only_and_nothing_else_changes(
     f = pc[pc["sex"] == "female"]
     assert (f["delta_X"] - f["delta_autosomes"]).median() > 0.03
     assert (o1 / "chrx_GCH.png").exists()
+    # signed: a female's X, half of it closed, is more co-closed than her
+    # genome; a male's one active X more co-open
+    al = cx[cx["band"].str.startswith("all")
+            & (cx["comparison"] == "chrX − autosomes")]
+    by = {st: g.set_index("group") for st, g in al.groupby("statistic")}
+    assert {"signed_rel", "signed_sgn", "w"} <= set(by)
+    w = by["w"]
+    assert w.loc["female", "test"] < 0 < w.loc["male", "test"]
+    assert w.loc["female", "diff_hi"] < 0 < w.loc["male", "diff_lo"]
+    assert by["signed_rel"].loc["female", "diff"] < -0.005
+    assert by["signed_sgn"].loc["female", "diff"] < -0.02
+    for st in ("signed_rel", "signed_sgn"):
+        for col in ("reference", "test"):
+            s_, d_ = by[st][col], by["delta"][col]
+            assert (s_.abs() <= d_.abs() + 1e-12).all()
+    np.testing.assert_allclose(by["signed_sgn"]["test"].abs(),
+                               by["delta"]["test"].abs())
+    m = pc[pc["sex"] == "male"]
+    assert (f["w_X"] - f["w_autosomes"]).median() < 0
+    assert (m["w_X"] - m["w_autosomes"]).median() > 0
+    np.testing.assert_allclose(f["signed_rel_X"], f["delta_X"] * f["w_X"])
+    assert (o1 / "chrx_signed_GCH.png").exists()
     for name in ("summary.tsv", "percell.tsv.gz", "locus_hotspots.tsv.gz"):
         pd.testing.assert_frame_equal(pd.read_csv(o0 / name, sep="\t"),
                                       pd.read_csv(o1 / name, sep="\t"))

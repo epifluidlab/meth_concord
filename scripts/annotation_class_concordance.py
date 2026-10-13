@@ -177,8 +177,10 @@ its reshuffled partners come from either copy, so where the two copies differ
 null without any SNP.  --chrx: each cell's sex from its X and Y coverage
 (cell_sex.tsv, or --sex-column), and X-X against autosome-autosome
 concordance per cell type, sex and group (chrx_concordance.tsv,
-chrx_percell.tsv.gz, chrx_<ctx>); chrX enters nothing else, and in a male the
-one X is the reference with no second copy.  --imprinting: concordance
+chrx_percell.tsv.gz, chrx_<ctx>), with its direction -- ΔC x w, ΔC x sign(w)
+and w, co-open or co-closed against the cell's genome (chrx_signed_<ctx>);
+chrX enters nothing else, and in a male the one X is the reference with no
+second copy.  --imprinting: concordance
 inside imprinted domains (the gene annotation's imprinted genes merged, or
 --imprinting-bed) against windows matched in length, chromatin (the
 contacts' class pairs) and TSS count, per cell type and group, and each
@@ -3628,13 +3630,22 @@ def _given_sex(values) -> np.ndarray:
 
 
 def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
-                          band_labels, n_boot: int, seed: int) -> list:
+                          band_labels, n_boot: int, seed: int,
+                          ref=None) -> list:
     """Per group of cells (``groups``: {name: cell indices}): two class
     pairs' pooled ΔC and Δr by band -- each cell's contacts pooled, as the
     summary pools them -- and the second less the first, from the same
     bootstrap draws of the group's cells, so the interval knows what the
-    two share."""
+    two share.  With co-open and co-closed mass in ``acc`` (oo, oc, no2,
+    nc2) and ``ref`` (the classes whose same-class pairs make the genome
+    reference), also ΔC x w and ΔC x sign(w), and w itself: the weight of
+    the pair's co-open share against the reference's, all distances
+    (:func:`_weight`) -- whether its concordance is co-open or co-closed;
+    its control the null's own weight, the direction its level and its
+    positions' shared state give without the cell's concordance."""
     rng = np.random.default_rng(seed)
+    A_ = len(band_labels) - 1
+    signed = ref is not None and "oo" in acc
     parts = []
     for i, j in ((classes.index(pair_a[0]), classes.index(pair_a[1])),
                  (classes.index(pair_b[0]), classes.index(pair_b[1]))):
@@ -3642,17 +3653,40 @@ def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
             s12 = sd[:, i] * sd[:, j]
             inv = np.where(s12 > 0, 1.0 / np.where(s12 > 0, s12, 1), 0.0)
         dd = acc["xy"][:, i, j, :] - acc["xy1"][:, i, j, :]
-        parts.append({"n": acc["n"][:, i, j, :], "d": 2 * dd,
-                      "r": dd * inv[:, None],
-                      "c": 2 * (acc["xy2"][:, i, j, :]
-                                - acc["xy1"][:, i, j, :])})
+        P = {"n": acc["n"][:, i, j, :], "d": 2 * dd,
+             "r": dd * inv[:, None],
+             "c": 2 * (acc["xy2"][:, i, j, :] - acc["xy1"][:, i, j, :])}
+        if signed:
+            P.update({k: acc[k][:, i, j, :] for k in ("oo", "oc", "no2",
+                                                      "nc2")})
+        parts.append(P)
+    G = ({k: sum(acc[k][:, r, r, A_] for r in ref)
+          for k in ("oo", "oc", "no2", "nc2")} if signed else None)
 
     def pooled(Wt, P, ix):
         n = Wt @ P["n"][ix]
         with np.errstate(invalid="ignore", divide="ignore"):
-            return {"delta": (Wt @ P["d"][ix]) / n,
-                    "delta_r": (Wt @ P["r"][ix]) / n,
-                    "control": (Wt @ P["c"][ix]) / n}, n
+            o = {"delta": (Wt @ P["d"][ix]) / n,
+                 "delta_r": (Wt @ P["r"][ix]) / n,
+                 "control": (Wt @ P["c"][ix]) / n}
+            if signed:
+                f = {k: Wt @ P[k][ix] for k in ("oo", "oc", "no2", "nc2")}
+                g = {k: Wt @ G[k][ix] for k in ("oo", "oc", "no2", "nc2")}
+                w = _weight(f["oo"] / (f["oo"] + f["oc"]),
+                            (g["oo"] / (g["oo"] + g["oc"]))[:, None])
+                wn = _weight(f["no2"] / (f["no2"] + f["nc2"]),
+                             (g["no2"] / (g["no2"] + g["nc2"]))[:, None])
+                o.update({"signed_rel": o["delta"] * w,
+                          "signed_sgn": o["delta"] * np.sign(w),
+                          "signed_rel_control": o["control"] * wn,
+                          "signed_sgn_control": o["control"] * np.sign(wn),
+                          "w": w, "w_control": wn})
+        return o, n
+    stats = ("delta", "delta_r") + (("signed_rel", "signed_sgn", "w")
+                                    if signed else ())
+    ctl = {"delta": "control", "delta_r": "control",
+           "signed_rel": "signed_rel_control",
+           "signed_sgn": "signed_sgn_control", "w": "w_control"}
     rows = []
     for g, ix in groups.items():
         ix = np.asarray(ix, np.int64)
@@ -3664,13 +3698,13 @@ def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
         (ea, na), (eb, nb_) = (pooled(one, P, ix) for P in parts)
         ba, bb = (pooled(W, P, ix)[0] for P in parts)
         for b, bl in enumerate(band_labels):
-            for st in ("delta", "delta_r"):
+            for st in stats:
                 with np.errstate(invalid="ignore"):
                     lo_a, hi_a = np.nanpercentile(ba[st][:, b], [2.5, 97.5])
                     lo_b, hi_b = np.nanpercentile(bb[st][:, b], [2.5, 97.5])
                     dif = bb[st][:, b] - ba[st][:, b]
                     dlo, dhi = np.nanpercentile(dif, [2.5, 97.5])
-                rows.append({
+                row = {
                     "group": g, "band": bl, "statistic": st,
                     "cells": int(ix.size), "pairs_A": int(na[0, b]),
                     "pairs_B": int(nb_[0, b]), "value_A": float(ea[st][0, b]),
@@ -3680,8 +3714,9 @@ def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
                     "diff": float(eb[st][0, b] - ea[st][0, b]),
                     "diff_lo": float(dlo), "diff_hi": float(dhi),
                     "p_diff": _boot_p(dif),
-                    "control_diff": float(eb["control"][0, b]
-                                          - ea["control"][0, b])})
+                    "control_diff": float(eb[ctl[st]][0, b]
+                                          - ea[ctl[st]][0, b])}
+                rows.append(row)
     return rows
 
 
@@ -3712,7 +3747,12 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     for an excess on X, the autosomes are also thinned at random to X's
     contacts per bp in each stratum and reshuffled on their own
     ('autosomes at X density'), and every comparison of CHRX_COMPARISONS
-    is reported ('comparison'; value_A the reference, value_B the test).
+    is reported ('comparison'; value_A the reference, value_B the test),
+    for ΔC, Δr, ΔC x w, ΔC x sign(w) and w: whether a class's concordance
+    is co-open or co-closed against the cell's genome (autosomes and X).
+    w reads the class's co-open share, so its level and its concordance
+    together: an inactive X's closed copy lowers X's level and turns it
+    co-closed, while the excess of the copies differing is ΔC's.
     And X's map: ΔC per ``map_bin`` bin along X (bins with
     ``min_map_contacts``), beside the autosomes' bins' median and
     quartiles -- an excess even along X, or in places.  Returns (rows,
@@ -3746,7 +3786,19 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
         w = {"xy": x_ * y_,
              "xy1": 0.5 * (x_ * right[0, i] + left[0, i] * y_),
              "xy2": 0.5 * (x_ * right[1, i] + left[1, i] * y_)}
-        acc = accumulate(cell[sel][i], np.minimum(kx, ky)[sel][i],
+        # co-open / co-closed mass, the donor put on the receiving cell's
+        # level in its class, as the main analysis does
+        ar, pr = a[sel][i], p[sel][i]
+        ci_ = cell[sel][i]
+        mu_l, mu_r = mu[ci_, kx[sel][i]], mu[ci_, ky[sel][i]]
+        w.update({"oo": ar * pr, "oc": (1 - ar) * (1 - pr)})
+        for dr in (0, 1):
+            qr = np.clip(right[dr, i] + mu_r, 0, 1)
+            ql = np.clip(left[dr, i] + mu_l, 0, 1)
+            w[f"no{dr + 1}"] = 0.5 * (ar * qr + ql * pr)
+            w[f"nc{dr + 1}"] = 0.5 * ((1 - ar) * (1 - qr) + (1 - ql)
+                                      * (1 - pr))
+        acc = accumulate(ci_, np.minimum(kx, ky)[sel][i],
                          np.maximum(kx, ky)[sel][i], band[sel][i],
                          np.zeros(i.size, np.int64), w, n_cells, 2, nb)
         return acc, sel[i], 2 * (w["xy"] - w["xy1"]), 2 * (w["xy2"]
@@ -3771,7 +3823,7 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     acc_t = run(thin, seed + 1)[0]
     classes3 = ("autosomes", "chrX", "autosomes at X density")
     acc3 = {}
-    for k in ("n", "xy", "xy1", "xy2"):
+    for k in ("n", "xy", "xy1", "xy2", "oo", "oc", "no2", "nc2"):
         z = np.zeros((n_cells, 3, 3, nb + 1))
         z[:, :2, :2] = acc[k]
         z[:, 2, 2] = acc_t[k][:, 0, 0]
@@ -3781,18 +3833,25 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     for test, ref in CHRX_COMPARISONS:
         for r_ in class_pair_difference(acc3, sd3, groups, classes3,
                                         (ref, ref), (test, test),
-                                        band_labels, n_boot, seed):
+                                        band_labels, n_boot, seed,
+                                        ref=(0, 1)):
             r_["comparison"] = f"{test} − {ref}"
             rows.append(r_)
     A_ = len(band_labels) - 1
     with np.errstate(invalid="ignore", divide="ignore"):
         pc = {"pairs_autosomes": acc["n"][:, 0, 0, A_],
               "pairs_X": acc["n"][:, 1, 1, A_]}
+        go, gc = (acc["oo"][:, 0, 0, A_] + acc["oo"][:, 1, 1, A_],
+                  acc["oc"][:, 0, 0, A_] + acc["oc"][:, 1, 1, A_])
         for tag, k in (("autosomes", 0), ("X", 1)):
             n = acc["n"][:, k, k, A_]
             dd = acc["xy"][:, k, k, A_] - acc["xy1"][:, k, k, A_]
             pc[f"delta_{tag}"] = 2 * dd / n
             pc[f"delta_r_{tag}"] = dd / n / (sd[:, k] ** 2)
+            oo_, oc_ = acc["oo"][:, k, k, A_], acc["oc"][:, k, k, A_]
+            w_ = _weight(oo_ / (oo_ + oc_), go / (go + gc))
+            pc[f"w_{tag}"] = w_
+            pc[f"signed_rel_{tag}"] = pc[f"delta_{tag}"] * w_
     # X's map, beside the autosomes' bins
     xm, am = isx[used], auto[used]
 
@@ -3953,6 +4012,150 @@ def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
                       ms=2.5)]
         _legend_below(fig, hd, [str(g) for g in curves]
                       + ["autosomes (panel a)", "chrX (panel a)"],
+                      ncol=min(len(curves) + 2, 6))
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+def plot_chrx_signed(tab: pd.DataFrame, pcell: pd.DataFrame, context: str,
+                     path, q_cut: float = 0.05):
+    """chrX against the autosomes with a direction.  a-c: ΔC x w,
+    ΔC x sign(w) and w by distance, autosomes (solid) and chrX (dashed),
+    per group; d: chrX less autosomes, all distances, ΔC beside its two
+    signed forms (filled: q < q_cut); e: w, chrX less autosomes, and the
+    null's (x) -- the direction X's level gives without the cell's own
+    concordance; f: each cell's own w, chrX less autosomes.  w > 0: more
+    co-open than the cell's genome, < 0 more co-closed (HCG: co-methylated
+    and co-unmethylated)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from nome_hic_concordance import figure_style
+    ta = tab[(tab["context"] == context)
+             & (tab["comparison"] == "chrX − autosomes")]
+    if not (ta["statistic"] == "signed_rel").any():
+        return
+    t0 = ta[ta["statistic"] == "delta"]
+    bands = list(dict.fromkeys(t0["band"]))
+    all_b = next((b for b in bands if str(b).startswith("all")), bands[-1])
+    bands = [b for b in bands if b != all_b]
+    kind = ("sex" if (t0["group_kind"] == "sex").any() else
+            "cell type" if t0.loc[t0["group_kind"] == "cell type",
+                                  "group"].nunique() <= 8 else "all")
+    curves = list(dict.fromkeys(t0.loc[t0["group_kind"] == kind, "group"]))
+    rows_ = ["all cells"] + [g for g in curves if g != "all cells"]
+    op, cl = (("co-methylated", "co-unmethylated") if "HCG" in
+              str(context).upper() else ("co-open", "co-closed"))
+    name = {"delta": "ΔC", "signed_sgn": "ΔC × sign(w)",
+            "signed_rel": "ΔC × w", "w": "w"}
+    with plt.rc_context(figure_style.RC):
+        fig = plt.figure(figsize=(figure_style.FIG_W_IN, 5.0))
+        gs = fig.add_gridspec(2, 3, wspace=0.55, hspace=0.75)
+        xx = np.arange(len(bands))
+        for col, st in enumerate(("signed_rel", "signed_sgn", "w")):
+            ax = fig.add_subplot(gs[0, col])
+            k = 1 if st == "w" else PP
+            t = ta[ta["statistic"] == st]
+            for gi, g in enumerate(curves):
+                c_ = GROUP_PALETTE[gi % len(GROUP_PALETTE)]
+                r = t[(t["group"] == g) & (t["group_kind"] == kind)
+                      ].set_index("band").reindex(bands)
+                ax.plot(xx, k * r["reference"], "-o", color=c_, ms=2.5,
+                        lw=0.8)
+                ax.plot(xx, k * r["test"], "--s", color=c_, ms=2.5, lw=0.8)
+            ax.axhline(0, color="0.6", lw=0.4)
+            ax.set_xticks(xx)
+            ax.set_xticklabels(bands, rotation=40, ha="right", fontsize=5)
+            ax.set_ylabel(f"{name[st]}{'' if st == 'w' else ', pp'}\n"
+                          f"+ {op}, − {cl}")
+            ax.set_title("abc"[col], loc="left", fontweight="bold")
+        # d: X less autosomes, all distances, for ΔC and its signed forms
+        ax = fig.add_subplot(gs[1, 0])
+        # greys and shapes: the groups' colours belong to a-c
+        sts = ("delta", "signed_sgn", "signed_rel")
+        ccol, mk = ("0.1", "0.4", "0.65"), ("o", "s", "D")
+        off = (np.arange(len(sts)) - (len(sts) - 1) / 2) * 0.22
+        for si, st in enumerate(sts):
+            x = ta[(ta["statistic"] == st) & (ta["band"] == all_b)]
+            for i, g in enumerate(rows_):
+                r = x[x["group"] == g]
+                if r.empty:
+                    continue
+                r = r.iloc[0]
+                q = r.get("q_diff", np.nan)
+                y = i + off[si]
+                ax.plot([PP * r["diff_lo"], PP * r["diff_hi"]], [y, y],
+                        color=ccol[si], lw=0.8)
+                ax.plot([PP * r["diff"]], [y], mk[si], ms=3, mec=ccol[si],
+                        mfc=ccol[si] if np.isfinite(q) and q < q_cut
+                        else "white")
+        ax.axvline(0, color="0.6", lw=0.4)
+        ax.set_yticks(np.arange(len(rows_)))
+        ax.set_yticklabels(rows_, fontsize=5)
+        ax.set_ylim(len(rows_) - 0.5, -0.5)
+        ax.set_xlabel("chrX − autosomes, pp\nall distances")
+        ax.legend([Line2D([], [], color=c_, marker=m_, ms=3, lw=0.8)
+                   for c_, m_ in zip(ccol, mk)], [name[st] for st in sts],
+                  fontsize=4.5,
+                  frameon=False, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.38), ncol=1)
+        ax.set_title("d", loc="left", fontweight="bold")
+        # e: the direction, and the null's
+        ax = fig.add_subplot(gs[1, 1])
+        x = ta[(ta["statistic"] == "w") & (ta["band"] == all_b)]
+        for i, g in enumerate(rows_):
+            r = x[x["group"] == g]
+            if r.empty:
+                continue
+            r = r.iloc[0]
+            q = r.get("q_diff", np.nan)
+            ax.plot([r["diff_lo"], r["diff_hi"]], [i, i], color="0.2",
+                    lw=0.8)
+            ax.plot([r["diff"]], [i], "o", ms=3, mec="0.1",
+                    mfc="0.1" if np.isfinite(q) and q < q_cut else "white")
+            ax.plot([r["control_diff"]], [i], "x", ms=3.5, color="0.5",
+                    mew=0.8)
+        ax.axvline(0, color="0.6", lw=0.4)
+        ax.set_yticks(np.arange(len(rows_)))
+        ax.set_yticklabels(rows_, fontsize=5)
+        ax.set_ylim(len(rows_) - 0.5, -0.5)
+        ax.set_xlabel(f"w, chrX − autosomes\n+ {op}, − {cl}")
+        ax.legend([Line2D([], [], color="0.1", marker="o", ms=3, lw=0.8),
+                   Line2D([], [], color="0.5", marker="x", ms=3.5,
+                          lw=0)],
+                  ["contacts", "reshuffled: the level alone"], fontsize=4.5,
+                  frameon=False, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.38), ncol=1)
+        ax.set_title("e", loc="left", fontweight="bold")
+        # f: per cell
+        ax = fig.add_subplot(gs[1, 2])
+        pc = pcell[pcell["context"] == context]
+        if not pc.empty and "w_X" in pc:
+            by = "sex" if kind == "sex" else "cell_type"
+            for gi, (g, x) in enumerate(pc.groupby(by, sort=False)):
+                v = (x["w_X"] - x["w_autosomes"]).to_numpy(float)
+                v = v[np.isfinite(v)]
+                if v.size:
+                    ax.hist(v, bins=30, histtype="step", lw=0.8,
+                            color=GROUP_PALETTE[gi % len(GROUP_PALETTE)],
+                            label=f"{g}: {np.mean(v < 0):.0%} < 0")
+            if ax.has_data():
+                ax.legend(fontsize=4.5, frameon=False, loc="upper left")
+        ax.axvline(0, color="0.6", lw=0.4)
+        ax.set_xlabel("per cell: w, chrX − autosomes")
+        ax.set_title("f", loc="left", fontweight="bold")
+        _suptitle_above(fig, f"{context}: chrX against the autosomes, "
+                             f"signed -- w: the co-open share against the "
+                             f"cell's genome")
+        hd = [Line2D([], [], color=GROUP_PALETTE[gi % len(GROUP_PALETTE)],
+                     lw=0.8) for gi in range(len(curves))]
+        hd += [Line2D([], [], color="0.3", lw=0.8, ls="-", marker="o",
+                      ms=2.5),
+               Line2D([], [], color="0.3", lw=0.8, ls="--", marker="s",
+                      ms=2.5)]
+        _legend_below(fig, hd, [str(g) for g in curves]
+                      + ["autosomes (a-c)", "chrX (a-c)"],
                       ncol=min(len(curves) + 2, 6))
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
@@ -6266,9 +6469,11 @@ def main(argv=None) -> int:
                     help="chrX against the autosomes: each cell's sex from "
                          "its X and Y coverage (cell_sex.tsv), and per cell "
                          "type, sex and --contrast-group the concordance of "
-                         "X-X contacts less autosome-autosome ones "
+                         "X-X contacts less autosome-autosome ones, and "
+                         "their direction (ΔC x w, ΔC x sign(w), w) "
                          "(chrx_concordance.tsv, chrx_percell.tsv.gz, "
-                         "chrx_<ctx>).  chrX enters nothing else.")
+                         "chrx_<ctx>, chrx_signed_<ctx>).  chrX enters "
+                         "nothing else.")
     ap.add_argument("--sex-column", default=None,
                     help="--samples column with each cell's sex (female / "
                          "male, F / M), used instead of the call from "
@@ -7051,15 +7256,17 @@ def main(argv=None) -> int:
             chrx_cells.append(pcx)
             chrx_maps.append(xmap.assign(context=ctx))
             for r0 in rx:
-                if r0["group"] == "all cells" and r0["statistic"] == \
-                        "delta" and str(r0["band"]).startswith("all"):
+                if r0["group"] == "all cells" and str(
+                        r0["band"]).startswith("all"):
+                    k_ = 1 if r0["statistic"] == "w" else 100
+                    u_ = "" if r0["statistic"] == "w" else " pp"
                     logger.info(
-                        f"{ctx} {r0['comparison']}: "
-                        f"{100 * r0['value_B']:.2f} vs "
-                        f"{100 * r0['value_A']:.2f} pp, difference "
-                        f"{100 * r0['diff']:+.2f} pp "
-                        f"[{100 * r0['diff_lo']:+.2f}, "
-                        f"{100 * r0['diff_hi']:+.2f}]")
+                        f"{ctx} {r0['comparison']}, {r0['statistic']}: "
+                        f"{k_ * r0['value_B']:.3f} vs "
+                        f"{k_ * r0['value_A']:.3f}{u_}, difference "
+                        f"{k_ * r0['diff']:+.3f}{u_} "
+                        f"[{k_ * r0['diff_lo']:+.3f}, "
+                        f"{k_ * r0['diff_hi']:+.3f}]")
             del xs
         if ctx == hcg_ctx and "pmd" in systems and cell_cov is not None:
             # HMD less PMD methylation: PMDs lose methylation with every
@@ -7600,6 +7807,8 @@ def main(argv=None) -> int:
         for ctx_ in contexts:
             plot_chrx(cx, pcx, sex_tab, ctx_,
                       out / f"chrx_{ctx_}.{args.plot_format}", xmap=xm_)
+            plot_chrx_signed(cx, pcx, ctx_,
+                             out / f"chrx_signed_{ctx_}.{args.plot_format}")
     # concordance inside each set of domains: imprinted, protocadherin
     what_of = {"imprinting": "imprinted domains",
                "pcdh": "the clustered protocadherins"}
