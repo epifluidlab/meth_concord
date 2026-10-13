@@ -236,16 +236,21 @@ def test_read_pairs_get_their_haplotype_keyed_as_the_pipeline_keys_them(
                                           n_threads=1)
     snps = ai.read_het_snps(d / "snps.vcf")
     n_x = {}
+    both = {"chrX": [0, 0], "autosomes": [0, 0]}
     for cell in ("GM_c0", "GM_c1"):
         h = pd.read_parquet(o / "haps" / f"{cell}.haplotypes.parquet")
         truth = pd.read_csv(d / f"{cell}.truth.tsv", sep="\t")
         # a mate over another SNP shows its REF base: a pair whose mate
         # thereby reads as the other haplotype is no call
-        mixed = [((snps["chrom"] == c) & (snps["pos"] >= p2 - READ // 2)
-                  & (snps["pos"] < p2 + READ // 2)
-                  & (snps["ref_hap"] != hp)).any()
-                 for c, p2, hp in zip(truth["chrom"], truth["pos2"],
-                                      truth["hap"])]
+        over = [snps[(snps["chrom"] == c) & (snps["pos"] >= p2 - READ // 2)
+                     & (snps["pos"] < p2 + READ // 2)]
+                for c, p2 in zip(truth["chrom"], truth["pos2"])]
+        mixed = [bool((o_["ref_hap"] != hp).any())
+                 for o_, hp in zip(over, truth["hap"])]
+        for c, o_, mx in zip(truth["chrom"], over, mixed):
+            k = "chrX" if c == "chrX" else "autosomes"
+            both[k][0] += len(o_) > 0
+            both[k][1] += mx
         want = truth[~np.array(mixed)]
         m = h.merge(want, on=["chrom", "pos1", "pos2"],
                     suffixes=("", "_true"))
@@ -261,3 +266,10 @@ def test_read_pairs_get_their_haplotype_keyed_as_the_pipeline_keys_them(
     for cell, n in n_x.items():
         assert x.loc[cell, "pairs_hap1"] == n[1]
         assert x.loc[cell, "pairs_hap2"] == n[2]
+    # the phase check: pairs whose mate also calls a SNP, 5-15 kb apart
+    ph = pd.read_csv(o / "phase_check.tsv", sep="\t").set_index(
+        "chromosomes")
+    for k, (nb, nd) in both.items():
+        assert ph.loc[k, "distance"] == "1-100kb"
+        assert ph.loc[k, "both_called"] == nb > 0
+        assert ph.loc[k, "disagree"] == nd

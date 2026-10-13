@@ -31,6 +31,13 @@ BED, as <context>_<NAME>: the inactive X is the more methylated at CpG
 islands but the less in gene bodies, so over all sites the two partly
 cancel, and HCG_island is the sharper call of which copy is silenced.
 
+Phase check (phase_check.tsv): where both reads of a cis pair -- or two
+SNPs on one read -- carry phased SNP calls, how often their haplotypes
+disagree, by the reads' distance, on chrX and the autosomes.  Allele-call
+errors and contacts between the two homologs give a floor; switch errors of
+the phasing a share that climbs with distance; a phase that means nothing,
+one half.
+
 --haplotype-dir DIR writes, per cell, every cis read pair a phased SNP puts
 on one haplotype ({cell}.haplotypes.parquet: chrom, pos1, pos2 -- each
 read's midpoint, as nome_hic_concordance keys a read pair -- hap, and the
@@ -38,14 +45,14 @@ pair's reads with a SNP call), and per cell and chromosome how many
 (haplotype_pairs.tsv): annotation_class_concordance.py --chrx --haplotypes
 DIR reshuffles each contact's partners from its own copy of X.
 
-The VCF holds the line's genotypes, heterozygous SNVs used; subset a
-multi-sample VCF first, e.g. ``bcftools view -s NA12878 -g het -v snps -m2
--M2``.  For GM12878, the 1000 Genomes high-coverage release has NA12878
-phased by its trio.
+The VCF holds the line's genotypes, heterozygous SNVs used.
+phased_snps.py makes phased ones on hg38: NA12878 from the 1000 Genomes
+high-coverage phased panel (1kgp), IMR-90 from its haplotype-resolved
+assemblies, lifted from T2T-CHM13 (syri).
 
     python scripts/allelic_imbalance.py \\
         --samples gm12878_imr90.samples.tsv \\
-        --vcf GM12878=NA12878.het.phased.vcf.gz --vcf IMR90=IMR90.het.vcf.gz \\
+        --vcf GM12878=NA12878.het.vcf.gz --vcf IMR90=IMR90.het.vcf.gz \\
         --context-bed GCH:GCH_motif.hg38.bed.gz,HCG:HCG_motif.hg38.bed.gz \\
         --chroms chrX,chr7,chr11,chr15 --mates --n-threads 10 \\
         --output-dir output/allelic_imbalance
@@ -77,6 +84,11 @@ logger = logging.getLogger("allelic_imbalance")
 #: unmethylated G as A.
 _SHOWS = {"CT": {"A": "A", "C": "CT", "G": "G", "T": "T"},
           "GA": {"A": "A", "C": "C", "G": "GA", "T": "T"}}
+#: The phase check's distance classes: two SNPs on one read, then the two
+#: reads of a pair by the distance between their starts.
+PHASE_EDGES = (0, 1_000, 100_000, 1_000_000, 10_000_000)
+PHASE_LABELS = ("same read", "<1kb", "1-100kb", "0.1-1Mb", "1-10Mb",
+                ">10Mb")
 
 
 def call_allele(base: str, ref: str, alt: str, strand: str) -> int:
@@ -159,7 +171,9 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
     ``mapq_min``, the mate on the same chromosome), one of them at least
     with phased SNP calls of one haplotype, none of the other haplotype --
     keyed as nome_hic_concordance.bam_parser keys it, each read's midpoint
-    (pos1 the read starting first).  Also returns {(chrom, hap): pairs}."""
+    (pos1 the read starting first).  Also returns {(chrom, hap): pairs},
+    and the phase check: {(chrom, distance class): [read pairs -- or reads
+    with two phased SNPs -- both called, of them disagreeing]}."""
     import pysam
     pysam.set_verbosity(0)
     nc = len(contexts)
@@ -167,6 +181,7 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
     by_hap: dict = {}
     want = mates or pairs_path is not None
     on_hap: list = []          # the pairs on one haplotype
+    phase: dict = {}
 
     def add_hap(chrom, hap, kind, kn):
         v = by_hap.setdefault((chrom, hap, kind), np.zeros(2 * nc + 1))
@@ -182,6 +197,7 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
                 continue
             tagged: dict = {}
             mixed: set = set()
+            span: dict = {}
             for read in reads:
                 if read.flag & _bp._SKIP_FLAGS or \
                         read.mapping_quality < mapq_min:
@@ -224,14 +240,27 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
                             v[3 + 5 * ci:6 + 5 * ci] += (1, f, f * f)
                 haps = {(shap[j] if al == 0 else 3 - shap[j])
                         for j, al in calls if shap[j]}
+                if sum(1 for j, _ in calls if shap[j]) > 1:
+                    v = phase.setdefault((chrom, PHASE_LABELS[0]), [0, 0])
+                    v[0] += 1
+                    v[1] += len(haps) > 1
                 if len(haps) == 1:
                     hap = haps.pop()
                     add_hap(chrom, hap, "snp", kn)
-                    if want and read.next_reference_name == chrom:
+                    if read.next_reference_name == chrom:
                         tagged.setdefault(read.query_name, {})[
                             read.is_read1] = hap
-                elif len(haps) > 1 and want:
+                        span[read.query_name] = abs(
+                            read.reference_start - read.next_reference_start)
+                elif len(haps) > 1:
                     mixed.add(read.query_name)
+            for qn, t_ in tagged.items():
+                if len(t_) == 2:
+                    k_ = (chrom, PHASE_LABELS[int(np.searchsorted(
+                        PHASE_EDGES, span[qn], side="right"))])
+                    v = phase.setdefault(k_, [0, 0])
+                    v[0] += 1
+                    v[1] += len(set(t_.values())) > 1
             if not (want and tagged):
                 continue
             ends: dict = {}
@@ -261,14 +290,14 @@ def cell_alleles(bam_path, snps: dict, sites: dict, contexts, trim_ends: int,
                 (s1, e1), (s2, e2) = sorted(e)
                 on_hap.append((chrom, (s1 + e1) // 2, (s2 + e2) // 2,
                                hs.pop(), len(tagged[qn])))
-    counts: dict = {}
+    counts: dict = {"phase": phase}
     if pairs_path is not None:
         t = pd.DataFrame(on_hap, columns=["chrom", "pos1", "pos2", "hap",
                                           "snp_reads"]).astype(
             {"pos1": np.int64, "pos2": np.int64, "hap": np.int8,
              "snp_reads": np.int8})
         t.to_parquet(pairs_path, index=False)
-        counts = t.groupby(["chrom", "hap"]).size().to_dict()
+        counts.update(t.groupby(["chrom", "hap"]).size().to_dict())
     return by_snp, by_hap, counts
 
 
@@ -559,6 +588,7 @@ def main(argv=None) -> int:
             logger.info(f"{ctx}_{nm}: {sum(len(v) for v in sub.values()):,} "
                         f"sites inside {path}")
     snp_rows, cell_rows, pair_rows = [], {}, []
+    phase_rows: dict = {}
     hp_dir = Path(args.haplotype_dir) if args.haplotype_dir else None
     if hp_dir is not None:
         hp_dir.mkdir(parents=True, exist_ok=True)
@@ -598,6 +628,12 @@ def main(argv=None) -> int:
                 agg[k] = agg.get(k, 0) + v
                 ncell[k] = ncell.get(k, 0) + 1
             cell_rows[(cell, g)] = by_hap
+            for (c_, dl), (nb, nd) in npair.pop("phase", {}).items():
+                k_ = (g, "chrX" if chrom_key(c_) == "X" else "autosomes",
+                      dl)
+                v = phase_rows.setdefault(k_, [0, 0])
+                v[0] += nb
+                v[1] += nd
             for c_ in sorted({k[0] for k in npair}):
                 pair_rows.append({"cell": cell, "group": g, "chrom": c_,
                                   "pairs_hap1": npair.get((c_, 1), 0),
@@ -630,6 +666,21 @@ def main(argv=None) -> int:
     for ctx in contexts:
         plot_allelic(snp, cells, ctx,
                      out / f"allelic_{ctx}.{args.plot_format}")
+    if phase_rows:
+        ph = pd.DataFrame([(g, c, dl, nb, nd) for (g, c, dl), (nb, nd)
+                           in phase_rows.items()],
+                          columns=["group", "chromosomes", "distance",
+                                   "both_called", "disagree"])
+        ph["distance"] = pd.Categorical(ph["distance"], PHASE_LABELS,
+                                        ordered=True)
+        ph = ph.sort_values(["group", "chromosomes", "distance"])
+        ph["share_disagree"] = ph["disagree"] / ph["both_called"]
+        ph.to_csv(out / "phase_check.tsv", sep="\t", index=False)
+        logger.info("phase check -- calls on one molecule that disagree on "
+                    "the haplotype (a floor of allele-call errors; switch "
+                    "errors climb with distance; no phase: 0.5):\n"
+                    + ph.to_string(index=False,
+                                   float_format=lambda v: f"{v:.3f}"))
     if hp_dir is not None:
         pt = pd.DataFrame(pair_rows, columns=["cell", "group", "chrom",
                                               "pairs_hap1", "pairs_hap2"])
