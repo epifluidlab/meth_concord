@@ -64,6 +64,8 @@ SYRI_MD5 = "3ebadaa3d7495bac7f177b161cdd2b79"
 CHAIN_URL = ("https://hgdownload.soe.ucsc.edu/goldenPath/hs1/liftOver/"
              "hs1ToHg38.over.chain.gz")
 _COMP = str.maketrans("ACGT", "TGCA")
+#: Seconds before the first retry of a download; doubled after each.
+RETRY_WAIT = 5
 
 
 def kgp_file(chrom: str) -> str:
@@ -73,11 +75,11 @@ def kgp_file(chrom: str) -> str:
             f"SNV_INDEL_SV_phased_panel{v}.vcf.gz")
 
 
-def fetch(url: str, dest: Path, md5: str | None = None, tries: int = 8,
+def fetch(url: str, dest: Path, md5: str | None = None, tries: int = 10,
           chunk: int = 1 << 22) -> Path:
-    """``url`` to ``dest``, streamed, resuming a partial download (HTTP
-    range) after a dropped connection, checked against ``md5``.  A local
-    path is used where it is."""
+    """``url`` to ``dest``, streamed and resumed where it stops (HTTP range),
+    checked against ``md5`` -- on a mismatch downloaded once more from the
+    start.  A local path is used where it is."""
     if not re.match(r"^(https?|ftp)://", str(url)):
         return Path(url)
     dest = Path(dest)
@@ -85,6 +87,31 @@ def fetch(url: str, dest: Path, md5: str | None = None, tries: int = 8,
         logger.info(f"  cached {dest.name}")
         return dest
     part = dest.with_name(dest.name + ".part")
+    for clean in range(2):
+        _download(url, part, tries, chunk)
+        if md5 is None or _md5(part) == md5:
+            part.replace(dest)
+            return dest
+        part.unlink()
+        logger.warning(f"  {dest.name}: md5 differs from {md5}"
+                       + ("; downloading it again" if not clean else ""))
+    raise RuntimeError(f"{dest.name}: md5 differs from {md5} twice")
+
+
+def _total(fh, have: int):
+    """A response's whole file size: Content-Range's total, else the bytes
+    held plus Content-Length; None when it says neither."""
+    cr = fh.headers.get("Content-Range") or ""
+    if "/" in cr and cr.rsplit("/", 1)[1].strip().isdigit():
+        return int(cr.rsplit("/", 1)[1])
+    cl = fh.headers.get("Content-Length")
+    return have + int(cl) if cl and cl.strip().isdigit() else None
+
+
+def _download(url: str, part: Path, tries: int, chunk: int):
+    """``url`` into ``part``, from the bytes ``part`` already holds.  A
+    connection that ends before the file does -- which urllib reports as
+    its end, not as an error -- is resumed like one that breaks."""
     for k in range(tries):
         have = part.stat().st_size if part.exists() else 0
         req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"}
@@ -93,31 +120,28 @@ def fetch(url: str, dest: Path, md5: str | None = None, tries: int = 8,
             with urllib.request.urlopen(req, timeout=300) as fh:
                 if have and fh.status != 206:      # the range was ignored
                     have = 0
+                total = _total(fh, have)
                 with open(part, "ab" if have else "wb") as out:
                     while True:
                         b = fh.read(chunk)
                         if not b:
                             break
                         out.write(b)
-            break
+            size = part.stat().st_size
+            if total is None or size >= total:
+                return
+            err: Exception = ConnectionError(
+                f"the connection ended at {size:,} of {total:,} bytes")
         except urllib.error.HTTPError as e:
             if e.code == 416 and have:              # nothing left to fetch
-                break
-            if k == tries - 1:
-                raise
-            logger.warning(f"  {dest.name}: {e}; resuming ({k + 1})")
-            time.sleep(min(60, 5 * 2 ** k))
+                return
+            err = e
         except Exception as e:                       # noqa: BLE001
-            if k == tries - 1:
-                raise
-            logger.warning(f"  {dest.name}: {e}; resuming ({k + 1})")
-            time.sleep(min(60, 5 * 2 ** k))
-    if md5 is not None and _md5(part) != md5:
-        part.unlink()
-        raise SystemExit(f"{dest.name}: md5 differs from {md5}; removed, "
-                         f"run again")
-    part.replace(dest)
-    return dest
+            err = e
+        if k == tries - 1:
+            raise RuntimeError(f"{part.name}: {err}; {tries} tries")
+        logger.warning(f"  {part.name}: {err}; resuming ({k + 1})")
+        time.sleep(min(120, RETRY_WAIT * 2 ** k))
 
 
 def _md5(path: Path) -> str:
@@ -208,13 +232,23 @@ def het_snvs(path, sample: str):
 def _kgp_chrom(chrom, sample, base, work: Path, md5: dict, keep: bool):
     """One chromosome: download, keep the sample's SNVs (``work``/
     <sample>.<chrom>.vcf.part: VCF lines; its length beside it), remove
-    the download.  Returns the SNVs, None when done before."""
+    the download.  Returns None, or what went wrong -- so that one
+    chromosome's failure leaves the others running."""
     if not logging.getLogger().handlers:        # a worker process
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        _kgp_chrom_(chrom, sample, base, work, md5, keep)
+    except Exception as e:                           # noqa: BLE001
+        logger.error(f"  {chrom}: {e}")
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def _kgp_chrom_(chrom, sample, base, work: Path, md5: dict, keep: bool):
     done = work / f"{sample}.{chrom}.vcf.part"
     if done.exists():
-        return None
+        return
     name = kgp_file(chrom)
     src = (f"{base}/{name}" if re.match(r"^(https?|ftp)://", str(base))
            else str(Path(base) / name))
@@ -229,7 +263,6 @@ def _kgp_chrom(chrom, sample, base, work: Path, md5: dict, keep: bool):
     if not keep and Path(path).parent == work:
         Path(path).unlink(missing_ok=True)
     logger.info(f"  {chrom}: {len(rows):,} heterozygous SNVs")
-    return len(rows)
 
 
 def run_kgp(args) -> int:
@@ -245,10 +278,20 @@ def run_kgp(args) -> int:
             f = line.split()
             if len(f) == 2:
                 md5[f[0]] = f[1]
-    logger.info(f"{args.sample}: {len(chroms)} chromosomes of {args.base_url}")
-    Parallel(n_jobs=args.n_jobs)(
+    todo = [c for c in chroms
+            if not (work / f"{args.sample}.{c}.vcf.part").exists()]
+    logger.info(f"{args.sample}: {len(chroms)} chromosomes of "
+                f"{args.base_url}, {len(chroms) - len(todo)} done before")
+    errs = Parallel(n_jobs=args.n_jobs)(
         delayed(_kgp_chrom)(c, args.sample, args.base_url, work, md5,
-                            args.keep_downloads) for c in chroms)
+                            args.keep_downloads) for c in todo)
+    bad = {c: e for c, e in zip(todo, errs) if e}
+    if bad:
+        logger.error("not finished: " + "; ".join(
+            f"{c} ({e})" for c, e in bad.items()) + f".  Run the same "
+            f"command again: the finished chromosomes in {work} are kept and "
+            f"the partial downloads resume.")
+        return 1
     parts = [work / f"{args.sample}.{c}.vcf.part" for c in chroms]
     contigs = {c: int((work / f"{args.sample}.{c}.length").read_text())
                for c in chroms}

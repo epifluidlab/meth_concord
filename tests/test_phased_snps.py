@@ -3,7 +3,10 @@ from SyRI calls of haplotype-resolved assemblies, lifted over a chain."""
 
 from __future__ import annotations
 
+import hashlib
+import http.server
 import importlib.util
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -136,23 +139,83 @@ def test_syri_end_to_end(tmp_path):
         (59, "A", "G", 2), (69, "C", "T", 1), (119, "C", "G", 1)]
 
 
-def test_1kgp_sample_from_a_local_panel(tmp_path):
-    panel = tmp_path / "panel"
-    panel.mkdir()
+def _serve(payload: bytes, plan: list):
+    """A local HTTP server of ``payload`` that honours ranges; its n-th
+    response does ``plan[n]``: 'short' -- a third of the body, then the
+    connection closes though Content-Length said more -- 'corrupt' (one
+    bit flipped), else all of it.  Returns it and the ranges' starts."""
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            start = int(rng.split("=")[1].split("-")[0]) if rng else 0
+            seen.append(start)
+            act = plan[len(seen) - 1] if len(seen) <= len(plan) else "ok"
+            if start >= len(payload):
+                self.send_response(416)
+                self.end_headers()
+                return
+            body = payload[start:]
+            self.send_response(206 if rng else 200)
+            if rng:
+                self.send_header("Content-Range", f"bytes {start}-"
+                                 f"{len(payload) - 1}/{len(payload)}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if act == "short":
+                self.wfile.write(body[:len(body) // 3])
+            elif act == "corrupt":
+                self.wfile.write(bytes([body[0] ^ 1]) + body[1:])
+            else:
+                self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+
+
+@pytest.mark.parametrize("plan, starts", [
+    (["short"], [0, 333_333]),          # resumed from where it stopped
+    (["corrupt"], [0, 0]),              # md5: downloaded again
+    (["short", "corrupt", "short"], [0, 333_333, 0, 333_333])])
+def test_fetch_resumes_and_checks(tmp_path, monkeypatch, plan, starts):
+    monkeypatch.setattr(ps, "RETRY_WAIT", 0)
+    payload = np.random.default_rng(0).bytes(1_000_000)
+    srv, seen = _serve(payload, plan)
+    try:
+        got = ps.fetch(f"http://127.0.0.1:{srv.server_address[1]}/f.gz",
+                       tmp_path / "f.gz", hashlib.md5(payload).hexdigest(),
+                       chunk=1 << 16)
+    finally:
+        srv.shutdown()
+    assert got.read_bytes() == payload and seen == starts
+    assert not (tmp_path / "f.gz.part").exists()
+
+
+def test_fetch_gives_up_on_a_file_that_never_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(ps, "RETRY_WAIT", 0)
+    payload = b"x" * 1000
+    srv, seen = _serve(payload, ["corrupt", "corrupt"])
+    try:
+        with pytest.raises(RuntimeError, match="md5 differs"):
+            ps.fetch(f"http://127.0.0.1:{srv.server_address[1]}/f.gz",
+                     tmp_path / "f.gz", hashlib.md5(payload).hexdigest())
+    finally:
+        srv.shutdown()
+    assert not (tmp_path / "f.gz").exists()
+
+
+def _panel(panel: Path, body: dict):
+    """A local copy of the panel's files: {chrom: [(pos, ref, alt,
+    filter, NA12878's GT)]}, HG00096 0|0 throughout."""
     head = ["##fileformat=VCFv4.2",
             '##FILTER=<ID=PASS,Description="All filters passed">',
             '##FILTER=<ID=LowQ,Description="low">',
             '##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">']
-    body = {
-        "chr21": [(100, "A", "G", "PASS", "0|1"),       # kept
-                  (200, "C", "T", "PASS", "0/1"),       # unphased
-                  (300, "G", "A", "PASS", "1|1"),       # homozygous
-                  (400, "AT", "A", "PASS", "1|0"),      # indel
-                  (500, "T", "C", "PASS", "1|0"),       # split multiallelic
-                  (500, "T", "G", "PASS", "0|1"),
-                  (600, "G", "C", "LowQ", "0|1"),       # filtered
-                  (700, "c", "t", ".", "1|0")],         # kept
-        "chrX": [(50, "A", "C", "PASS", "1|0")]}
     for c, rows in body.items():
         p = panel / ps.kgp_file(c)
         lines = head + [f"##contig=<ID={c},length=1000>",
@@ -164,6 +227,39 @@ def test_1kgp_sample_from_a_local_panel(tmp_path):
         plain.write_text("\n".join(lines) + "\n")
         pysam.tabix_compress(str(plain), str(p), force=True)
         plain.unlink()
+
+
+def test_one_chromosome_failing_leaves_the_others(tmp_path):
+    panel = tmp_path / "panel"
+    panel.mkdir()
+    _panel(panel, {"chr21": [(100, "A", "G", "PASS", "0|1")]})
+    out = tmp_path / "NA12878.het.vcf.gz"
+    args = ["1kgp", "--chroms", "chr21,chr22", "--base-url", str(panel),
+            "--work-dir", str(tmp_path / "w"), "--n-jobs", "1",
+            "--output", str(out)]
+    assert ps.main(args) == 1                       # chr22 is missing
+    assert (tmp_path / "w" / "NA12878.chr21.vcf.part").exists()
+    assert not out.exists()
+    _panel(panel, {"chr22": [(200, "C", "T", "PASS", "1|0")]})
+    (panel / ps.kgp_file("chr21")).unlink()         # done: not read again
+    assert ps.main(args) == 0
+    t = ai.read_het_snps(out)
+    assert list(zip(t["chrom"], t["pos"])) == [("chr21", 99), ("chr22", 199)]
+
+
+def test_1kgp_sample_from_a_local_panel(tmp_path):
+    panel = tmp_path / "panel"
+    panel.mkdir()
+    _panel(panel, {
+        "chr21": [(100, "A", "G", "PASS", "0|1"),       # kept
+                  (200, "C", "T", "PASS", "0/1"),       # unphased
+                  (300, "G", "A", "PASS", "1|1"),       # homozygous
+                  (400, "AT", "A", "PASS", "1|0"),      # indel
+                  (500, "T", "C", "PASS", "1|0"),       # split multiallelic
+                  (500, "T", "G", "PASS", "0|1"),
+                  (600, "G", "C", "LowQ", "0|1"),       # filtered
+                  (700, "c", "t", ".", "1|0")],         # kept
+        "chrX": [(50, "A", "C", "PASS", "1|0")]})
     out = tmp_path / "NA12878.het.vcf.gz"
     args = ["1kgp", "--sample", "NA12878", "--chroms", "chr21,chrX",
             "--base-url", str(panel), "--work-dir", str(tmp_path / "w"),
