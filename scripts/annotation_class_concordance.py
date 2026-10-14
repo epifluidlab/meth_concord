@@ -3904,7 +3904,9 @@ def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
         ba, bb = (pooled(W, P, ix)[0] for P in parts)
         for b, bl in enumerate(band_labels):
             for st in stats:
-                with np.errstate(invalid="ignore"):
+                with np.errstate(invalid="ignore"), \
+                        warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
                     lo_a, hi_a = np.nanpercentile(ba[st][:, b], [2.5, 97.5])
                     lo_b, hi_b = np.nanpercentile(bb[st][:, b], [2.5, 97.5])
                     dif = bb[st][:, b] - ba[st][:, b]
@@ -3972,8 +3974,11 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     none; where it is anything else about X -- its mapping, its density,
     how it was read -- they have it too.  Each control against the
     autosomes and X against each, and PAR1 and the escape genes together
-    ('chrX PAR1 + escape', the larger control).  Returns (rows, per-cell
-    rows of every cell's own values at all distances, the map)."""
+    ('chrX PAR1 + escape', the larger control); and the contacts with one
+    end in a control and the other in the rest of X ('... × chrX'), which
+    the copies differing cannot make concordant -- one end's copies are
+    alike.  Returns (rows, per-cell rows of every cell's own values at all
+    distances, the map)."""
     lk = classes if classes is not None else ChromosomeClasses()
     nk = len(lk.classes)
     kx = lk.lookup_g(g_lo).astype(np.int64)
@@ -4045,6 +4050,11 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
         ip, ie = lk.i_par, lk.i_esc
         named["chrX PAR1 + escape"] = [(ip, ip), (ie, ie),
                                        (min(ip, ie), max(ip, ie))]
+    # contacts between the controls and the rest of X: one end on a part
+    # whose copies differ, one on a part where they do not
+    ctl_k = [k for k in (lk.i_par, lk.i_esc) if k is not None]
+    if ctl_k:
+        named[f"{chrx_control_name(lk)} × chrX"] = [(1, k) for k in ctl_k]
     classes3 = tuple(named) + ("autosomes at X density",)
     m3 = len(classes3)
     acc3 = {}
@@ -4111,6 +4121,291 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
                                   autosome_bins_q75=q[2],
                                   autosome_bins=len(ha))
     return rows, pd.DataFrame(pc), xmap.reset_index(drop=True)
+
+
+def chrx_control_name(lk) -> str:
+    """The controls together, as the tables name them."""
+    if lk.i_par is not None and lk.i_esc is not None:
+        return "chrX PAR1 + escape"
+    return "chrX PAR1" if lk.i_par is not None else "chrX escape"
+
+
+#: The two contexts of the cross-context analysis, in their codes' order.
+CROSS_CONTEXTS = ("HCG", "GCH")
+
+
+def _read_cross(h_path, g_path, ms_h: int, ms_g: int, min_d: int,
+                max_d: int, lk, exclude=(), haps=None) -> dict:
+    """One cell's contacts with HCG called at one end and GCH at the other,
+    either way round -- both, when a contact has both at both ends -- the
+    two posterior files joined on the read pair's ends, as the pipeline
+    keys it: each end's value in its own context (``m_lo``/``m_hi``: 0 HCG,
+    1 GCH); the called ends' marginal per context and class of ``lk``
+    (count, sum, sum of squares x context x class); with ``haps`` each
+    contact's haplotype."""
+    nk = len(lk.classes)
+    marg = np.zeros((3, 2, nk))
+    tabs = []
+    for mi, (path, ms) in enumerate(((h_path, ms_h), (g_path, ms_g))):
+        df, names, ci, lut = _categorical(path, ["chrom", "pos1", "pos2",
+                                                 "n1", "n2", "posterior1",
+                                                 "posterior2"])
+        ok_l = np.array([_canon(c) not in exclude or _canon(c).upper() == "X"
+                         for c in names] + [False])
+        keep = ok_l[ci]
+        base = lut[ci][keep] * STRIDE
+        g1 = base + df["pos1"].to_numpy(np.int64)[keep]
+        g2 = base + df["pos2"].to_numpy(np.int64)[keep]
+        v1 = df["posterior1"].to_numpy(np.float64, na_value=np.nan)[keep]
+        v2 = df["posterior2"].to_numpy(np.float64, na_value=np.nan)[keep]
+        c1 = (df["n1"].to_numpy()[keep] >= ms) & np.isfinite(v1)
+        c2 = (df["n2"].to_numpy()[keep] >= ms) & np.isfinite(v2)
+        eg = np.concatenate([g1[c1], g2[c2]])
+        ev = np.concatenate([v1[c1], v2[c2]])
+        k = lk.lookup_g(eg).astype(np.int64)
+        m_ = k >= 0
+        marg[0, mi] = np.bincount(k[m_], minlength=nk)
+        marg[1, mi] = np.bincount(k[m_], weights=ev[m_], minlength=nk)
+        marg[2, mi] = np.bincount(k[m_], weights=ev[m_] ** 2, minlength=nk)
+        t = pd.DataFrame({"g1": g1, "g2": g2,
+                          f"a{mi}": np.where(c1, v1, np.nan),
+                          f"b{mi}": np.where(c2, v2, np.nan)})
+        tabs.append(t[~t.duplicated(["g1", "g2"], keep=False)])
+    t = tabs[0].merge(tabs[1], on=["g1", "g2"], how="inner")
+    g1, g2 = t["g1"].to_numpy(np.int64), t["g2"].to_numpy(np.int64)
+    sep = np.abs(g2 - g1)
+    inb = (sep >= min_d) & (sep <= max_d)
+    h1, h2 = t["a0"].to_numpy(), t["b0"].to_numpy()
+    a1, a2 = t["a1"].to_numpy(), t["b1"].to_numpy()
+    e1 = inb & np.isfinite(h1) & np.isfinite(a2)     # HCG at end 1
+    e2 = inb & np.isfinite(a1) & np.isfinite(h2)     # GCH at end 1
+    gA = np.concatenate([g1[e1], g1[e2]])
+    gB = np.concatenate([g2[e1], g2[e2]])
+    vA = np.concatenate([h1[e1], a1[e2]])
+    vB = np.concatenate([a2[e1], h2[e2]])
+    mA = np.concatenate([np.zeros(e1.sum(), np.int8),
+                         np.ones(e2.sum(), np.int8)])
+    sw = gA > gB
+    out = {"g_lo": np.where(sw, gB, gA), "g_hi": np.where(sw, gA, gB),
+           "v_lo": np.where(sw, vB, vA).astype(np.float32),
+           "v_hi": np.where(sw, vA, vB).astype(np.float32),
+           "m_lo": np.where(sw, 1 - mA, mA).astype(np.int8),
+           "m_hi": np.where(sw, mA, 1 - mA).astype(np.int8),
+           "marg": marg}
+    ht = _hap_table(haps)
+    out["hap"] = (_hap_lookup(ht, out["g_lo"], out["g_hi"]) if ht is not None
+                  else np.zeros(out["g_lo"].size, np.int8))
+    return out
+
+
+def cross_context_chrx(cell, g_lo, g_hi, v_lo, v_hi, m_lo, m_hi, hap, marg,
+                       strat, groups: dict, edges, band_labels, dbins,
+                       position_bin: int, max_widen: int, n_boot: int,
+                       seed: int, n_threads: int = 1, classes=None):
+    """HCG at one end of a contact, GCH at the other (:func:`_read_cross`):
+    a cell's methylation at one locus against its accessibility at the
+    other, beyond the same reshuffled.  Each end is centred on the cell's
+    mean in its own context and class (``marg``: cells x (count, sum, sum
+    of squares) x context (HCG, GCH) x class of ``classes``), and its
+    partner reshuffled from ends of its own context and class in other
+    cells of the stratum.  ΔC is negative where methylation at one end
+    goes with closed chromatin at the other.
+
+    Regions (analysis 'regions'): X against the autosomes; with the
+    controls (PAR1, escape genes), the controls -- both ends -- and the
+    contacts from a control to the rest of X, either way round: HCG in the
+    control and GCH in the rest of X, or GCH in the control.  The copies
+    differing makes a contact concordant across contexts only where both
+    of its ends' copies differ.
+
+    Haplotypes (analysis 'haplotypes', tagged contacts with both ends on
+    the autosomes or the rest of X): partners from the contact's own
+    haplotype or from a random half, as :func:`haplotype_concordance` --
+    the copy part of X's cross-context concordance.
+
+    Rows as :func:`haplotype_concordance`'s, ΔC and Δr, 'comparison'
+    prefixed 'HCG×GCH: '; and per cell its contacts and ΔC at all
+    distances."""
+    lk = classes if classes is not None else ChromosomeClasses()
+    nk = len(lk.classes)
+    nb = len(edges) - 1
+    n_cells = marg.shape[0]
+    k_lo = lk.lookup_g(g_lo).astype(np.int64)
+    k_hi = lk.lookup_g(g_hi).astype(np.int64)
+    kp = np.flatnonzero((k_lo >= 0) & (k_hi >= 0))
+    cell, g_lo, g_hi = cell[kp], g_lo[kp], g_hi[kp]
+    v_lo, v_hi = v_lo[kp].astype(float), v_hi[kp].astype(float)
+    m_lo, m_hi = m_lo[kp].astype(np.int64), m_hi[kp].astype(np.int64)
+    k_lo, k_hi = k_lo[kp], k_hi[kp]
+    hap = (np.asarray(hap)[kp].astype(np.int64) if hap is not None
+           else np.zeros(kp.size, np.int64))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu = marg[:, 1] / marg[:, 0]
+        sd = np.sqrt(np.maximum(marg[:, 2] / marg[:, 0] - mu ** 2, 0))
+    x = v_lo - mu[cell, m_lo, k_lo]
+    y = v_hi - mu[cell, m_hi, k_hi]
+    s2 = sd[cell, m_lo, k_lo] * sd[cell, m_hi, k_hi]
+    inv = np.where(s2 > 0, 1.0 / np.where(s2 > 0, s2, 1), 0.0)
+    dist = g_hi - g_lo
+    band = np.clip(np.searchsorted(edges, dist, side="right") - 1, 0,
+                   nb - 1)
+    s_code, s_names = pd.factorize(np.asarray(strat))
+
+    def run(sel, c_lo, c_hi, n_codes, sd_seed):
+        """Reshuffle the contacts ``sel`` with codes ``c_lo``/``c_hi`` (of
+        ``sel``): their accumulated sums."""
+        ok, right, left, _ = reshuffle(
+            g_lo[sel], g_hi[sel], dist[sel], cell[sel], c_lo, c_hi, x[sel],
+            y[sel], s_code[cell[sel]], n_codes, dbins, position_bin,
+            max_widen, seed=sd_seed, names=list(s_names),
+            n_threads=n_threads)
+        return ok, right, left
+
+    def weights(i, rr, ll):
+        xy = x[i] * y[i]
+        xy1 = 0.5 * (x[i] * rr[0] + ll[0] * y[i])
+        xy2 = 0.5 * (x[i] * rr[1] + ll[1] * y[i])
+        return {"d": 2 * (xy - xy1), "c": 2 * (xy2 - xy1),
+                "r": (xy - xy1) * inv[i]}
+    keys = ("n", "d", "c", "r")
+
+    def sums(acc_, prs):
+        return {k: sum(acc_[k][:, a_, b_, :] for a_, b_ in prs) for k in keys}
+
+    def pooled(P, Wt, ix):
+        n = Wt @ P["n"][ix]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return {"delta": (Wt @ P["d"][ix]) / n,
+                    "delta_r": (Wt @ P["r"][ix]) / n,
+                    "control": (Wt @ P["c"][ix]) / n}, n
+
+    def compare(S, comps, part, analysis, rng_b):
+        out = []
+        for g, ix in groups.items():
+            ix = np.asarray(ix, np.int64)
+            has = np.zeros(n_cells, bool)
+            for P in S.values():
+                has |= P["n"][:, nb] > 0
+            ix = ix[has[ix]]
+            if ix.size < 2:
+                continue
+            W = rng_b.multinomial(ix.size, np.full(ix.size, 1.0 / ix.size),
+                                  size=n_boot).astype(float)
+            one = np.ones((1, ix.size))
+            E = {v: pooled(P, one, ix) for v, P in S.items()}
+            B = {v: pooled(P, W, ix)[0] for v, P in S.items()}
+            for b, bl in enumerate(band_labels):
+                for nm, ra, te in comps:
+                    if not (E[ra][1][0, b] and E[te][1][0, b]):
+                        continue
+                    for st in ("delta", "delta_r"):
+                        r_ = _diff_row(
+                            g, bl, st, ix.size, E[ra][1][0, b],
+                            E[te][1][0, b], E[ra][0][st][0, b],
+                            E[te][0][st][0, b], B[ra][st][:, b],
+                            B[te][st][:, b], E[te][0]["control"][0, b]
+                            - E[ra][0]["control"][0, b])
+                        r_.update(comparison=f"HCG×GCH: {nm}",
+                                  analysis=analysis)
+                        out.append(r_)
+                if part is None:
+                    continue
+                ae, as_, xe, xs = part
+                if not (E[as_][1][0, b] and E[xs][1][0, b]):
+                    continue
+                for st in ("delta", "delta_r"):
+                    def dd(D, e, s_, k=st):
+                        return D[e][0][k][0, b] - D[s_][0][k][0, b]
+                    r_ = _diff_row(
+                        g, bl, st, ix.size, E[as_][1][0, b], E[xs][1][0, b],
+                        dd(E, ae, as_), dd(E, xe, xs),
+                        B[ae][st][:, b] - B[as_][st][:, b],
+                        B[xe][st][:, b] - B[xs][st][:, b],
+                        dd(E, xe, xs, "control") - dd(E, ae, as_, "control"))
+                    r_.update(comparison=f"HCG×GCH: {HAP_COPY_PART}",
+                              analysis=analysis)
+                    out.append(r_)
+        return out
+
+    # regions
+    def pr(k1, m1, k2, m2):
+        a_, b_ = 2 * k1 + m1, 2 * k2 + m2
+        return (min(a_, b_), max(a_, b_))
+    c_lo, c_hi = 2 * k_lo + m_lo, 2 * k_hi + m_hi
+    alls = np.arange(cell.size)
+    ok, right, left = run(alls, c_lo, c_hi, 2 * nk, seed)
+    i = np.flatnonzero(ok)
+    acc = accumulate(cell[i], np.minimum(c_lo, c_hi)[i],
+                     np.maximum(c_lo, c_hi)[i], band[i],
+                     np.zeros(i.size, np.int64),
+                     weights(i, right[:, i], left[:, i]), n_cells, 2 * nk, nb)
+    named = {"autosomes": [pr(0, 0, 0, 1)], "chrX": [pr(1, 0, 1, 1)]}
+    ctl = [k for k in (lk.i_par, lk.i_esc) if k is not None]
+    comps = [("chrX − autosomes", "autosomes", "chrX")]
+    if ctl:
+        cn = chrx_control_name(lk)
+        both = sorted({pr(a_, 0, b_, 1) for a_ in ctl for b_ in ctl})
+        named[cn] = both
+        named[f"HCG in {cn} × GCH in chrX"] = [pr(a_, 0, 1, 1) for a_ in ctl]
+        named[f"GCH in {cn} × HCG in chrX"] = [pr(a_, 1, 1, 0) for a_ in ctl]
+        for t_ in (cn, f"HCG in {cn} × GCH in chrX",
+                   f"GCH in {cn} × HCG in chrX"):
+            comps += [(f"{t_} − autosomes", "autosomes", t_),
+                      (f"chrX − {t_}", t_, "chrX")]
+    S = {v: sums(acc, prs) for v, prs in named.items()}
+    rows = compare(S, comps, None, "regions", np.random.default_rng(seed))
+    pc = {}
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for v, P in S.items():
+            tag = v.replace(" ", "_")
+            pc[f"pairs_{tag}"] = P["n"][:, nb]
+            pc[f"delta_{tag}"] = P["d"][:, nb] / P["n"][:, nb]
+    # haplotypes: the rest of X and the autosomes
+    hs = np.flatnonzero((hap > 0) & (k_lo == k_hi) & (k_lo <= 1))
+    if hs.size:
+        kk = k_lo[hs]
+        lab = hap[hs] - 1
+        grp = cell[hs] * 2 + kk
+        rng = np.random.default_rng([seed, 13])
+        pseudo = np.empty_like(lab)
+        pseudo[np.lexsort((rng.random(hs.size), grp))] = lab[
+            np.argsort(grp, kind="stable")]
+        draws = {}
+        for tag, lab_, sd_seed in (("either", pseudo, seed + 5),
+                                   ("same", lab, seed + 6)):
+            cl_ = 4 * kk + 2 * m_lo[hs] + lab_
+            ch_ = 4 * kk + 2 * m_hi[hs] + lab_
+            draws[tag] = run(hs, cl_, ch_, 8, sd_seed) + (cl_, ch_)
+        j = np.flatnonzero(draws["either"][0] & draws["same"][0])
+        ii = hs[j]
+        accs = {t_: accumulate(cell[ii], np.minimum(cl_, ch_)[j],
+                               np.maximum(cl_, ch_)[j], band[ii],
+                               np.zeros(j.size, np.int64),
+                               weights(ii, rr[:, j], ll[:, j]), n_cells, 8,
+                               nb)
+                for t_, (_, rr, ll, cl_, ch_) in draws.items()}
+
+        def pr4(k_, l_):            # a copy's HCG end and GCH end
+            return (4 * k_ + l_, 4 * k_ + 2 + l_)
+        hn = {"autosomes, either copy": ("either", [pr4(0, 0), pr4(0, 1)]),
+              "chrX, either copy": ("either", [pr4(1, 0), pr4(1, 1)]),
+              "autosomes, same copy": ("same", [pr4(0, 0), pr4(0, 1)]),
+              "chrX, same copy": ("same", [pr4(1, 0), pr4(1, 1)]),
+              "autosomes hap1": ("same", [pr4(0, 0)]),
+              "autosomes hap2": ("same", [pr4(0, 1)]),
+              "chrX hap1": ("same", [pr4(1, 0)]),
+              "chrX hap2": ("same", [pr4(1, 1)])}
+        SH = {v: sums(accs[r_], prs) for v, (r_, prs) in hn.items()}
+        rows += compare(SH, HAP_COMPARISONS,
+                        ("autosomes, either copy", "autosomes, same copy",
+                         "chrX, either copy", "chrX, same copy"),
+                        "haplotypes", np.random.default_rng(seed + 1))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            for v in ("chrX hap1", "chrX hap2"):
+                tag = v.replace(" ", "_")
+                pc[f"pairs_{tag}"] = SH[v]["n"][:, nb]
+                pc[f"delta_{tag}"] = SH[v]["d"][:, nb] / SH[v]["n"][:, nb]
+    return rows, pd.DataFrame(pc)
 
 
 #: Haplotype-resolved chrX, (comparison, reference, test): each contact's
@@ -4805,6 +5100,99 @@ def plot_chrx_haplotypes(tab: pd.DataFrame, pcell: pd.DataFrame,
                          "chrX hap1 (d, e)", "chrX hap2 (d, e)",
                          "autosomes (d, e)"],
                       ncol=min(len(groups) + 5, 4))
+        fig.savefig(path, bbox_inches="tight", dpi=300)
+        plt.close(fig)
+
+
+def plot_chrx_contexts(cx: pd.DataFrame, cc: pd.DataFrame, path, cn: str,
+                       hcg: str = "HCG", gch: str = "GCH",
+                       q_cut: float = 0.05):
+    """chrX by context pairing, all distances, each against the autosomes
+    (ΔC pp; filled: q < q_cut), per cell type: the rest of X, the controls
+    (``cn``: PAR1, escape genes), and contacts from a control to the rest of
+    X -- HCG-HCG and GCH-GCH (chrx_concordance), HCG×GCH (cross-context:
+    from a control, HCG in it or GCH in it); last, the cross-context copy
+    part (partners from either copy less from the contact's own, X less
+    autosomes)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from nome_hic_concordance import figure_style
+    allb = lambda t: t[t["band"].astype(str).str.startswith("all")
+                       & (t["statistic"] == "delta")]  # noqa: E731
+    a_ = allb(cx)
+    c_ = allb(cc) if cc is not None and not cc.empty else pd.DataFrame(
+        columns=["comparison", "group", "analysis"])
+    regions = (("rest of X", "chrX"), ("controls", cn),
+               ("control × rest of X", f"{cn} × chrX"))
+    marks = (("HCG–HCG", "0.1", "o"), ("GCH–GCH", "#4393c3", "s"),
+             ("HCG×GCH (control × X: HCG in the control)", "#d6604d", "D"),
+             ("GCH×HCG (control × X: GCH in the control)", "#e6ab02", "^"))
+    groups = list(dict.fromkeys(a_.loc[a_["group_kind"] == "cell type",
+                                       "group"])) or ["all cells"]
+
+    def get(t, comp, g, ctx=None):
+        r = t[(t["comparison"] == comp) & (t["group"] == g)]
+        if ctx is not None:
+            r = r[r["context"] == ctx]
+        return r.iloc[0] if len(r) else None
+    with plt.rc_context(figure_style.RC):
+        fig, axes = plt.subplots(1, len(groups) + 1, figsize=(
+            figure_style.FIG_W_IN, 2.6), gridspec_kw={"wspace": 0.35})
+        for ax, g in zip(axes, groups):
+            for ri, (lab, reg) in enumerate(regions):
+                vals = [get(a_, f"{reg} − autosomes", g, hcg),
+                        get(a_, f"{reg} − autosomes", g, gch)]
+                if reg.endswith("× chrX"):
+                    vals += [get(c_, f"HCG×GCH: {t_} in {cn} × {u_} in "
+                                     f"chrX − autosomes", g)
+                             for t_, u_ in (("HCG", "GCH"), ("GCH", "HCG"))]
+                else:
+                    vals += [get(c_, f"HCG×GCH: {reg} − autosomes", g),
+                             None]
+                for mi, (r, (_, col, mk)) in enumerate(zip(vals, marks)):
+                    if r is None:
+                        continue
+                    y = ri + (mi - 1.5) * 0.18
+                    q = r.get("q_diff", np.nan)
+                    ax.plot([PP * r["diff_lo"], PP * r["diff_hi"]], [y, y],
+                            color=col, lw=0.8)
+                    ax.plot([PP * r["diff"]], [y], mk, ms=3.5, mec=col,
+                            mfc=col if np.isfinite(q) and q < q_cut
+                            else "white")
+            ax.axvline(0, color="0.6", lw=0.4)
+            ax.set_yticks(range(len(regions)))
+            ax.set_yticklabels([r[0] for r in regions], fontsize=5)
+            ax.set_ylim(len(regions) - 0.5, -0.5)
+            ax.set_xlabel("against the autosomes, ΔC pp")
+            ax.set_title(str(g), fontsize=6)
+        ax = axes[-1]
+        hp = (c_[(c_["analysis"] == "haplotypes")
+                 & (c_["comparison"] == f"HCG×GCH: {HAP_COPY_PART}")]
+              if "analysis" in c_ else pd.DataFrame())
+        for i, g in enumerate(groups):
+            r = hp[hp["group"] == g]
+            if r.empty:
+                continue
+            r = r.iloc[0]
+            q = r.get("q_diff", np.nan)
+            ax.plot([PP * r["diff_lo"], PP * r["diff_hi"]], [i, i],
+                    color="#d6604d", lw=0.8)
+            ax.plot([PP * r["diff"]], [i], "D", ms=3.5, mec="#d6604d",
+                    mfc="#d6604d" if np.isfinite(q) and q < q_cut
+                    else "white")
+        ax.axvline(0, color="0.6", lw=0.4)
+        ax.set_yticks(range(len(groups)))
+        ax.set_yticklabels([str(g) for g in groups], fontsize=5)
+        ax.set_ylim(len(groups) - 0.5, -0.5)
+        ax.set_xlabel("HCG×GCH copy part,\nΔC pp, X − autosomes")
+        ax.set_title("haplotypes", fontsize=6)
+        _suptitle_above(fig, f"chrX by context pairing -- {cn} the "
+                             f"controls")
+        _legend_below(fig, [Line2D([], [], color=col, marker=mk, ms=3.5,
+                                   lw=0.8) for _, col, mk in marks],
+                      [m[0] for m in marks], ncol=2)
         fig.savefig(path, bbox_inches="tight", dpi=300)
         plt.close(fig)
 
@@ -7140,6 +7528,16 @@ def main(argv=None) -> int:
                          "(XIST left out), 10 kb flanks, by --genome (hg38, "
                          "hg19); or a BED of chrX intervals.  Contacts in "
                          "PAR1 or these leave --haplotypes' X.")
+    ap.add_argument("--chrx-cross", default="auto", choices=("auto", "none"),
+                    help="With --chrx and both an HCG and a GCH --posteriors: "
+                         "HCG at one end of a contact, GCH at the other -- "
+                         "methylation at one locus against accessibility at "
+                         "the other -- on X, the controls, contacts from a "
+                         "control to the rest of X either way round, and by "
+                         "haplotype with --haplotypes "
+                         "(chrx_cross_context.tsv, "
+                         "chrx_cross_context_percell.tsv.gz, "
+                         "chrx_contexts.<fmt>).  'none' skips it.")
     ap.add_argument("--haplotypes", default=None, metavar="DIR",
                     help="With --chrx: each cell's read pairs on one "
                          "haplotype ({cell}.haplotypes.parquet, from "
@@ -8259,6 +8657,75 @@ def main(argv=None) -> int:
         best_arrays = None
         del res_
 
+    # HCG at one end, GCH at the other, on X
+    cross_rows, cross_cells = [], None
+    if chrx_on and args.chrx_cross != "none" and acc_ctx and hcg_ctx \
+            and acc_ctx != hcg_ctx:
+        hd_, gd_ = Path(contexts[hcg_ctx]), Path(contexts[acc_ctx])
+        cells_c = [c for c in cells_all
+                   if (hd_ / f"{c}.posteriors.parquet").exists()
+                   and (gd_ / f"{c}.posteriors.parquet").exists()]
+        ms_h, ms_g = (_min_sites(args.min_sites, hcg_ctx),
+                      _min_sites(args.min_sites, acc_ctx))
+
+        def one_c(c):
+            return _read_cross(
+                hd_ / f"{c}.posteriors.parquet",
+                gd_ / f"{c}.posteriors.parquet", ms_h, ms_g,
+                args.min_distance, args.max_distance, x_classes, exclude,
+                haps=(Path(args.haplotypes) / f"{c}.haplotypes.parquet"
+                      if args.haplotypes else None))
+        logger.info(f"HCG×GCH: reading {len(cells_c):,} cells")
+        rc_ = Parallel(n_jobs=args.n_threads, prefer="threads")(
+            delayed(one_c)(c) for c in cells_c)
+        cat = {k: np.concatenate([r[k] for r in rc_])
+               for k in ("g_lo", "g_hi", "v_lo", "v_hi", "m_lo", "m_hi",
+                         "hap")}
+        cell_c = np.concatenate([np.full(r["g_lo"].size, i, np.int64)
+                                 for i, r in enumerate(rc_)])
+        types_c = np.array([str(samples.at[c, args.group_column])
+                            for c in cells_c])
+        sx_c = np.array([sex_of.get(c, "unknown") for c in cells_c])
+        strat_c = np.array(["|".join(str(samples.at[c, k])
+                                     for k in strat_cols) + f"|{x_}"
+                            for c, x_ in zip(cells_c, sx_c)])
+        grp_c = {"all cells": np.arange(len(cells_c))}
+        kind_c = {"all cells": "all"}
+        for kind, lab in (("cell type", types_c),
+                          ("sex", sx_c if len({x_ for x_ in sx_c
+                                               if x_ != "unknown"}) > 1
+                           else None)):
+            for g_ in (dict.fromkeys(lab) if lab is not None else ()):
+                if g_ not in grp_c and g_ != "unknown":
+                    grp_c[g_] = np.flatnonzero(lab == g_)
+                    kind_c[g_] = kind
+        for nm in contrast_names or ():
+            ix_ = np.flatnonzero([group_of.get(c) == nm for c in cells_c])
+            if nm not in grp_c and ix_.size:
+                grp_c[nm], kind_c[nm] = ix_, "contrast group"
+        logger.info(f"HCG×GCH: {cell_c.size:,} contacts with HCG at one end "
+                    f"and GCH at the other")
+        cross_rows, cross_cells = cross_context_chrx(
+            cell_c, cat["g_lo"], cat["g_hi"], cat["v_lo"], cat["v_hi"],
+            cat["m_lo"], cat["m_hi"], cat["hap"],
+            np.stack([r["marg"] for r in rc_]), strat_c, grp_c, edges,
+            band_labels, _ls.log_dbins(args.min_distance, args.max_distance,
+                                       args.bins_per_decade),
+            args.position_bin, args.max_widen, args.n_boot, args.seed + 7919,
+            args.n_threads, classes=x_classes)
+        for r_ in cross_rows:
+            r_["group_kind"] = kind_c[r_["group"]]
+        if not cross_cells.empty:
+            cross_cells.insert(0, "cell", cells_c)
+            cross_cells.insert(1, "cell_type", types_c)
+            cross_cells.insert(2, "sex", sx_c)
+        for r0 in cross_rows:
+            if r0["group"] == "all cells" and r0["statistic"] == "delta" \
+                    and str(r0["band"]).startswith("all"):
+                logger.info(f"{r0['comparison']}: {100 * r0['diff']:+.2f} pp "
+                            f"[{100 * r0['diff_lo']:+.2f}, "
+                            f"{100 * r0['diff_hi']:+.2f}]")
+        del rc_, cat, cell_c
     percell = (pd.concat(percell_rows, ignore_index=True) if percell_rows
                else pd.DataFrame())
     summary = pd.DataFrame(summary_rows)
@@ -8603,6 +9070,31 @@ def main(argv=None) -> int:
                       out / f"chrx_{ctx_}.{args.plot_format}", xmap=xm_)
             plot_chrx_signed(cx, pcx, ctx_,
                              out / f"chrx_signed_{ctx_}.{args.plot_format}")
+        cc_ = pd.DataFrame()
+        if cross_rows:
+            cc_ = pd.DataFrame(cross_rows).rename(columns={
+                "pairs_A": "pairs_reference", "pairs_B": "pairs_test",
+                "value_A": "reference", "lo_A": "reference_lo",
+                "hi_A": "reference_hi", "value_B": "test", "lo_B": "test_lo",
+                "hi_B": "test_hi"})
+            cc_["q_diff"] = np.nan
+            for _, g in cc_.groupby(["analysis", "comparison", "statistic",
+                                     "band"], sort=False):
+                cc_.loc[g.index, "q_diff"] = fdr_bh(g["p_diff"].to_numpy())
+            lead = ["analysis", "comparison", "group_kind", "group", "band",
+                    "statistic"]
+            cc_ = cc_[lead + [c for c in cc_.columns if c not in lead]]
+            cc_.to_csv(out / "chrx_cross_context.tsv", sep="\t",
+                       index=False)
+            cross_cells.to_csv(out / "chrx_cross_context_percell.tsv.gz",
+                               sep="\t", index=False)
+        if x_classes is not None and (x_classes.i_par is not None
+                                      or x_classes.i_esc is not None) \
+                and acc_ctx and hcg_ctx:
+            plot_chrx_contexts(cx, cc_, out / f"chrx_contexts."
+                                              f"{args.plot_format}",
+                               chrx_control_name(x_classes), hcg=hcg_ctx,
+                               gch=acc_ctx)
     if hap_rows:
         hx_ = pd.DataFrame(hap_rows).rename(columns={
             "pairs_A": "pairs_reference", "pairs_B": "pairs_test",

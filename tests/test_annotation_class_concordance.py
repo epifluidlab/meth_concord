@@ -1375,7 +1375,7 @@ def test_rotation_p_keeps_the_bins_autocorrelation():
 
 def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
                    n_y=150, seed=5, xi=0.1, xa=0.6, haps=None, tag=0.6,
-                   par=None, escape=()):
+                   par=None, escape=(), hcg=False, m_xi=0.8, m_xa=0.2):
     """chrX read pairs for every cell -- a female's twice a male's -- and
     chrY short pairs for males.  A female's X contact lies on her inactive
     X (accessibility ``xi``) or her active one (``xa``), both ends alike; a
@@ -1384,10 +1384,16 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
     every cell's autosomal ones (a random haplotype) is written to
     haps/{cell}.haplotypes.parquet, as allelic_imbalance.py would; a
     male's one X has no heterozygous SNP.  ``par`` (start, end), and each
-    of ``escape``: X that escapes -- a contact with both ends in it is at
-    ``xa`` on either copy."""
+    of ``escape``: X that escapes -- an end in it is at ``xa`` on either
+    copy.  With ``hcg``, HCG posteriors of the same read pairs too
+    (HCG/{cell}.posteriors.parquet): on her inactive X methylation at
+    ``m_xi``, on the active one and where X escapes ``m_xa``; elsewhere 0.5,
+    apart from accessibility."""
     rng = np.random.default_rng(seed)
     rng_h = np.random.default_rng([seed, 1])
+    rng_m = np.random.default_rng([seed, 2])
+    if hcg:
+        (Path(d) / "HCG").mkdir(exist_ok=True)
     if haps is not None:
         (Path(d) / "haps").mkdir(exist_ok=True)
     s = pd.read_csv(Path(d) / "samples.tsv", sep="\t")
@@ -1402,10 +1408,12 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
                                            n)).astype(np.int64)
         on_xi = fem & (rng.random(n) < 0.5)
         lvl = np.where(on_xi, xi, xa)
+        esc_a, esc_b = np.zeros(n, bool), np.zeros(n, bool)
         for s0, e0 in ([par] if par is not None else []) + list(escape):
-            lvl = np.where((a_pos >= s0) & (b_pos < e0), xa, lvl)
-        pa = np.where(rng.random(n) < lvl, 0.9, 0.1)
-        pb = np.where(rng.random(n) < lvl, 0.9, 0.1)
+            esc_a |= (a_pos >= s0) & (a_pos < e0)
+            esc_b |= (b_pos >= s0) & (b_pos < e0)
+        pa = np.where(rng.random(n) < np.where(esc_a, xa, lvl), 0.9, 0.1)
+        pb = np.where(rng.random(n) < np.where(esc_b, xa, lvl), 0.9, 0.1)
         s_pos = rng.integers(0, 19_000_000, ns)
         s_end = s_pos + rng.integers(200, 800, ns)
         sa = np.where(rng.random(ns) < xa, 0.9, 0.1)
@@ -1443,6 +1451,22 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
         out = pd.concat([df, x[df.columns]], ignore_index=True)
         out["chrom"] = out["chrom"].astype(str)
         out.to_parquet(f)
+        if hcg:
+            mlv = np.where(on_xi, m_xi, m_xa)
+            ma = np.where(rng_m.random(n) < np.where(esc_a, m_xa, mlv), 0.9,
+                          0.1)
+            mb = np.where(rng_m.random(n) < np.where(esc_b, m_xa, mlv), 0.9,
+                          0.1)
+            rest = len(out) - len(df) - n
+
+            def coin(k):
+                return np.where(rng_m.random(k) < 0.5, 0.9, 0.1)
+            h = out.copy()
+            h["posterior1"] = np.r_[coin(len(df)), ma, coin(rest)]
+            h["posterior2"] = np.r_[coin(len(df)), mb, coin(rest)]
+            h["k1"] = np.round(h["posterior1"] * 3).astype(np.int32)
+            h["k2"] = np.round(h["posterior2"] * 3).astype(np.int32)
+            h.to_parquet(Path(d) / "HCG" / f"{cell}.posteriors.parquet")
     return d
 
 
@@ -1665,6 +1689,52 @@ def test_escape_genes_join_par1_as_controls(tmp_path):
         al.loc["chrX PAR1 − autosomes", "pairs_test"]
     pc = pd.read_csv(o / "chrx_percell.tsv.gz", sep="\t")
     assert {"pairs_PAR1", "pairs_escape", "delta_escape"} <= set(pc.columns)
+
+
+def test_chrx_across_contexts_and_controls(tmp_path):
+    """T0 female, clonal (hap2 her inactive X): on it her X is closed (GCH)
+    and methylated (HCG), except in PAR1 (0-2 Mb) and an escape region
+    (8-10 Mb), alike on both copies.  HCG at one end, GCH at the other: the
+    rest of X anti-concordant beyond the autosomes; the controls, and the
+    contacts from a control to the rest of X, either way round, not.  Same
+    context, the control-to-X contacts not concordant either.  By
+    haplotype, partners from the contact's own copy take X's cross-context
+    anti-concordance away."""
+    d = make_data(tmp_path, per=20, n_types=3)
+    add_sex_chroms(d, par=(0, 2_000_000), escape=[(8_000_000, 10_000_000)],
+                   hcg=True, haps=lambda typ, c: 2)
+    (d / "escape.bed").write_text("chrX\t8000000\t10000000\n")
+    o = tmp_path / "o"
+    acc.main(_contrast_args(d, o)
+             + ["--posteriors", f"HCG={d / 'HCG'}", "--chrx",
+                "--chrx-par", "0-2000000", "--chrx-escape",
+                str(d / "escape.bed"), "--haplotypes", str(d / "haps")])
+    cc = pd.read_csv(o / "chrx_cross_context.tsv", sep="\t")
+    al = cc[cc["band"].str.startswith("all") & (cc["statistic"] == "delta")
+            & (cc["group"] == "female")]
+    reg = al[al["analysis"] == "regions"].set_index("comparison")
+    x = reg.loc["HCG×GCH: chrX − autosomes"]
+    assert x["diff"] < -0.04 and x["q_diff"] < 0.05
+    cn = "chrX PAR1 + escape"
+    for t in (cn, f"HCG in {cn} × GCH in chrX", f"GCH in {cn} × HCG in chrX"):
+        assert abs(reg.loc[f"HCG×GCH: {t} − autosomes", "diff"]) < \
+            0.4 * abs(x["diff"]), t
+        assert reg.loc[f"HCG×GCH: chrX − {t}", "diff"] < -0.03, t
+    hp = al[al["analysis"] == "haplotypes"].set_index("comparison")
+    assert hp.loc["HCG×GCH: chrX: either copy − same copy", "diff"] < -0.04
+    assert hp.loc[f"HCG×GCH: {acc.HAP_COPY_PART}", "diff"] < -0.04
+    cx = pd.read_csv(o / "chrx_concordance.tsv", sep="\t")
+    g = cx[cx["band"].str.startswith("all") & (cx["statistic"] == "delta")
+           & (cx["group"] == "female")]
+    for ctx in ("GCH", "HCG"):
+        c_ = g[g["context"] == ctx].set_index("comparison")
+        xs = c_.loc["chrX − autosomes", "diff"]
+        assert xs > 0.03, ctx
+        assert abs(c_.loc[f"{cn} × chrX − autosomes", "diff"]) < 0.4 * xs
+        assert c_.loc[f"chrX − {cn} × chrX", "diff"] > 0.03, ctx
+    pc = pd.read_csv(o / "chrx_cross_context_percell.tsv.gz", sep="\t")
+    assert {"pairs_chrX", "delta_chrX", "pairs_chrX_hap2"} <= set(pc.columns)
+    assert (o / "chrx_contexts.png").exists()
 
 
 def test_chrx_without_x_reads_stops_and_says_why(tmp_path):
