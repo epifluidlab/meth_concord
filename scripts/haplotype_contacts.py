@@ -16,8 +16,10 @@ Four measures, per line, set of chromosomes and copy, each with a 95%
 interval from resampling the cells, the copies' difference and, where it
 applies, that difference on X less on the autosomes (haplotype_contacts.tsv):
 
-  * P(s), the contacts' distances (haplotype_contacts_ps.tsv): the share
-    0.1-1 Mb apart (TAD scale), 1 Mb or more, and 10 Mb or more, of those
+  * P(s), the contacts' distances (haplotype_contacts_ps.tsv: per bin the
+    share of a copy's contacts and, as P(s) is drawn, that share per kb of
+    distance): the share 0.1-1 Mb apart (TAD scale), 1 Mb or more, and
+    10 Mb or more, of those
     --min-distance or more; and per distance, log2 of one copy's P(s) over
     the other's with its interval (haplotype_contacts_ps_ratio.tsv) -- the
     inactive X, folded into two megadomains, trades contacts within TADs
@@ -71,8 +73,8 @@ from nome_hic_concordance.xci import parse_elements, parse_par  # noqa: E402
 
 logger = logging.getLogger("haplotype_contacts")
 
-#: P(s) bins, log10 of the distance: from 1 kb, a quarter decade each.
-PS_EDGES = np.arange(3.0, 8.51, 0.25)
+#: P(s) bins, log10 of the distance: from 1 kb, a tenth of a decade each.
+PS_EDGES = np.round(np.arange(3.0, 8.55, 0.1), 2)
 #: P(s) is summarised by the share of contacts this far apart: (name,
 #: from, to -- None: no end).
 PS_CLASSES = (("0.1–1 Mb", 100_000, 1_000_000), ("≥ 1 Mb", 1_000_000, None),
@@ -430,19 +432,22 @@ def ps_ratio_table(a: dict, w, labels) -> pd.DataFrame:
 
 
 def ps_table(a: dict, labels) -> pd.DataFrame:
+    """Per set, copy and distance bin: the contacts, their share of the
+    copy's contacts, and that share per kb of distance -- P(s) as Hi-C
+    draws it (a share per log10 bin is s P(s), flat where P(s) ~ 1/s)."""
     ps = a["ps"].sum(0)
+    kb = (10 ** PS_EDGES[1:] - 10 ** PS_EDGES[:-1]) / 1e3
     rows = []
     for si, sname in enumerate(SETS):
         for k, lab in enumerate(labels):
             tot = ps[si, k].sum()
             for b in range(PS_EDGES.size - 1):
+                sh = ps[si, k, b] / tot if tot else np.nan
                 rows.append({"set": sname, "copy": lab,
                              "log10_lo": PS_EDGES[b],
                              "log10_hi": PS_EDGES[b + 1],
-                             "contacts": int(ps[si, k, b]),
-                             "density": (ps[si, k, b] / tot
-                                         / (PS_EDGES[b + 1] - PS_EDGES[b])
-                                         if tot else np.nan)})
+                             "contacts": int(ps[si, k, b]), "share": sh,
+                             "per_kb": sh / kb[b]})
     return pd.DataFrame(rows)
 
 
@@ -501,16 +506,17 @@ def plot_contacts(stats: pd.DataFrame, ps: pd.DataFrame, ratio: pd.DataFrame,
     (ax_a, ax_b), (ax_c, ax_d) = axes
     for sname, ls in (("chrX", "-"), ("autosomes", "--")):
         for k, lab in enumerate(labels):
-            t = ps[(ps["set"] == sname) & (ps["copy"] == lab)]
-            if t["contacts"].sum():
+            t = ps[(ps["set"] == sname) & (ps["copy"] == lab)
+                   & (ps["log10_lo"] >= 4) & (ps["contacts"] > 0)]
+            if len(t):
                 ax_a.plot(10 ** ((t["log10_lo"] + t["log10_hi"]) / 2),
-                          t["density"], ls, color=_COLS[k], lw=0.9,
+                          t["per_kb"], ls, color=_COLS[k], lw=0.9,
                           alpha=1 if sname == "chrX" else 0.5,
                           label=f"{sname} {lab}")
     ax_a.set_xscale("log")
     ax_a.set_yscale("log")
-    ax_a.set_xlabel("distance, bp", fontsize=6)
-    ax_a.set_ylabel("contacts per log10 distance (share)", fontsize=6)
+    ax_a.set_xlabel("genomic distance, bp", fontsize=6)
+    ax_a.set_ylabel("contact frequency (share per kb)", fontsize=6)
     st = stats.set_index(["measure", "set"])
     ttl = "a  P(s)"
     k_ = (f"P(s): share {PS_CLASSES[1][0]}", "chrX")
@@ -521,7 +527,7 @@ def plot_contacts(stats: pd.DataFrame, ps: pd.DataFrame, ratio: pd.DataFrame,
     ax_a.set_title(ttl, loc="left", fontsize=6.5)
     ax_a.legend(fontsize=5, frameon=False)
     for sname, col in (("chrX", _COLS[0]), ("autosomes", "0.45")):
-        t = ratio[(ratio["set"] == sname)
+        t = ratio[(ratio["set"] == sname) & (ratio["log10_lo"] >= 4)
                   & (ratio[[f"contacts_{lab}" for lab in labels]].min(axis=1)
                      >= 20)]
         if t.empty:
@@ -532,7 +538,7 @@ def plot_contacts(stats: pd.DataFrame, ps: pd.DataFrame, ratio: pd.DataFrame,
         ax_b.plot(x, t["log2_ratio"], color=col, lw=0.9, label=sname)
     ax_b.axhline(0, color="0.6", lw=0.4)
     ax_b.set_xscale("log")
-    ax_b.set_xlabel("distance, bp", fontsize=6)
+    ax_b.set_xlabel("genomic distance, bp", fontsize=6)
     ax_b.set_ylabel(f"log2 P(s) {labels[0]} / {labels[1]}", fontsize=6)
     ax_b.set_title("b  where the copies' contacts differ (95% interval)",
                    loc="left", fontsize=6.5)

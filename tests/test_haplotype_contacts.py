@@ -137,9 +137,16 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
     # from crossing their boundaries, the inactive X's do not; chr1 flat
     r = pd.read_csv(o / "haplotype_contacts_ps_ratio.tsv", sep="\t")
     r = r[r["group"] == "GM"].set_index(["set", "log10_lo"])
-    assert r.loc[("chrX", 5.75), "log2_ratio"] > 0.5
-    assert r.loc[("chrX", 5.75), "ci_lo"] > 0
-    assert np.isnan(r.loc[("chrX", 7.25), "log2_ratio"])    # none on Xa
+    assert r.loc[("chrX", 5.8), "log2_ratio"] > 0.5
+    assert r.loc[("chrX", 5.8), "ci_lo"] > 0
+    assert np.isnan(r.loc[("chrX", 7.2), "log2_ratio"])     # none on Xa
+    # P(s) as Hi-C draws it: a share of the contacts per kb, falling
+    ps = pd.read_csv(o / "haplotype_contacts_ps.tsv", sep="\t")
+    a = ps[(ps["group"] == "GM") & (ps["set"] == "autosomes")
+           & (ps["copy"] == "Xa")].set_index("log10_lo")
+    assert abs(a["share"].sum() - 1) < 1e-9
+    assert a.loc[4.0, "per_kb"] > 5 * a.loc[5.0, "per_kb"] > \
+        25 * a.loc[6.0, "per_kb"]
     assert abs(r.loc[("autosomes", 5.0), "log2_ratio"]) < 0.2
     assert r.loc[("autosomes", 5.0), "ci_lo"] < 0 < r.loc[("autosomes", 5.0),
                                                           "ci_hi"]
