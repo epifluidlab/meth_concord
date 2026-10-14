@@ -21,6 +21,7 @@ _SPEC = importlib.util.spec_from_file_location(
     / "annotation_class_concordance.py")
 acc = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(acc)
+xci = importlib.import_module("nome_hic_concordance.xci")
 
 DOM = 2_000_000
 CHROMS = {"chr1": 20_000_000, "chr2": 20_000_000}
@@ -1647,8 +1648,8 @@ def test_par1_escapes_so_its_contacts_show_no_excess(tmp_path):
 
 
 def test_escape_genes_outside_par1():
-    par = acc.PAR1["hg38"]
-    iv = acc.xci_escape_regions("hg38", par)
+    par = xci.PAR1["hg38"]
+    iv = xci.xci_escape_regions("hg38", par)
     assert len(iv) > 20 and (iv[1:, 0] > iv[:-1, 1]).all()  # disjoint
     assert iv[0, 0] == par[1]            # XG straddles PAR1's end: clipped
 
@@ -1658,7 +1659,7 @@ def test_escape_genes_outside_par1():
     assert inside(41_350_000)            # DDX3X
     assert not inside(73_830_000)        # XIST: left out
     assert 4e6 < (iv[:, 1] - iv[:, 0]).sum() < 7e6
-    assert acc.xci_escape_regions("mm10") is None
+    assert xci.xci_escape_regions("mm10") is None
     lk = acc.ChromosomeClasses(par, iv)
     x = acc._chrom_code("X") * acc.STRIDE
     assert list(lk.lookup_g([x + 1_000_000, x + 53_200_000,

@@ -51,7 +51,11 @@ def _bisulfite(ref_seq: str, sites: set, start: int, meth: float, rng):
     return "".join(out)
 
 
-def make_data(out: Path, n_cells=6, reads_per_hap=4, seed=0):
+def make_data(out: Path, n_cells=6, reads_per_hap=4, seed=0, parts=None):
+    """``parts``: {name: (first, last) chrX SNP index}: 'PAR1' and
+    'escape' alike on both copies, any other name an element of the
+    inactive X, reversed -- the active copy methylated; written as
+    par.txt, esc.bed and el.bed (the SNPs' span, 100 bp wider)."""
     rng = np.random.default_rng(seed)
     out.mkdir(parents=True, exist_ok=True)
     ref = {c: "".join(rng.choice(list("ACGT"), L)) for c in ("chr1", "chrX")}
@@ -71,6 +75,29 @@ def make_data(out: Path, n_cells=6, reads_per_hap=4, seed=0):
         cand = [i for i in range(500, L - 6000, 150) if ref[c][i] == "A"]
         for k, i in enumerate(cand[:20]):
             snps.append((c, i, "A", "T", "0|1" if k % 2 == 0 else "1|0"))
+    px = [i for c, i, *_ in snps if c == "chrX"]
+    span = {nm: (0 if nm == "PAR1" else px[a_] - 100, px[b_] + 100)
+            for nm, (a_, b_) in (parts or {}).items()}
+    if "PAR1" in span:
+        (out / "par.txt").write_text("%d-%d" % span["PAR1"])
+    (out / "esc.bed").write_text("".join(
+        f"chrX\t{a_}\t{b_}\n" for nm, (a_, b_) in span.items()
+        if nm == "escape"))
+    (out / "el.bed").write_text("".join(
+        f"chrX\t{a_}\t{b_}\t{nm}\n" for nm, (a_, b_) in span.items()
+        if nm not in ("PAR1", "escape")))
+
+    def meth_at(c, pos, hap, xi):
+        if c != "chrX":
+            return 0.5
+        on = hap == xi
+        for nm, (a_, b_) in span.items():
+            if a_ <= pos < b_:
+                if nm in ("PAR1", "escape"):
+                    return 0.5
+                on = not on
+        return 0.9 if on else 0.1
+
     vcf = out / "snps.vcf"
     with open(vcf, "w") as fh:
         fh.write("##fileformat=VCFv4.2\n")
@@ -96,17 +123,17 @@ def make_data(out: Path, n_cells=6, reads_per_hap=4, seed=0):
                     # the allele on this haplotype
                     allele = (r if gt[0] == "0" else a) if hap == 1 else \
                         (r if gt[2] == "0" else a)
-                    meth = (0.9 if hap == xi else 0.1) if c == "chrX" \
-                        else 0.5
                     for _ in range(reads_per_hap):
                         s1 = i - int(rng.integers(10, READ - 10))
                         s2 = int(rng.integers(i + 5000, L - READ - 1))
                         q1 = list(_bisulfite(ref[c][s1:s1 + READ], sites[c],
-                                             s1, meth, rng))
+                                             s1, meth_at(c, i, hap, xi),
+                                             rng))
                         q1[i - s1] = allele
                         q1 = "".join(q1)
                         q2 = _bisulfite(ref[c][s2:s2 + READ], sites[c], s2,
-                                        meth, rng)
+                                        meth_at(c, s2 + READ // 2, hap, xi),
+                                        rng)
                         qn = f"r{n}"
                         n += 1
                         truth.append((c, s1 + READ // 2, s2 + READ // 2,
@@ -201,7 +228,8 @@ def test_clonal_line_is_imbalanced_on_x_and_a_polyclonal_one_per_cell(
     assert c.loc[("GM", "chrX"), "share_imbalanced"] > 0.8
     assert c.loc[("GM", "chr1"), "share_imbalanced"] < 0.2
     cells = pd.read_csv(o / "allelic_cells.tsv", sep="\t")
-    cx = cells[cells["chrom"] == "chrX"].set_index("cell")
+    cx = cells[(cells["chrom"] == "chrX") & (cells["part"] == "all")
+               ].set_index("cell")
     assert (cx.filter(like="GM_", axis=0)["HCG_hap1_minus_hap2"]
             < -0.5).all()
     imr = cx.filter(like="IMR_", axis=0)["HCG_hap1_minus_hap2"]
@@ -401,3 +429,91 @@ def test_a_snp_beside_a_site_is_not_an_imbalance(tmp_path, monkeypatch,
         assert r["HCG_alt_minus_ref"] < -0.08 and r["HCG_p"] < 1e-4
     else:
         assert abs(r["HCG_alt_minus_ref"]) < 0.04 and r["HCG_p"] > 0.01
+
+
+def test_summary_gives_the_controls_and_the_elements_that_go_the_other_way(
+        tmp_path):
+    """allelic_summary.tsv: per line, context and set -- the rest of X, the
+    escape genes and PAR1 (alike on both copies), an element of the
+    inactive X (reversed), the autosomes -- the pooled difference and its
+    interval over cells; the clonal line's inactive X named by its
+    methylation, none in the polyclonal line.  allelic_exceptions.tsv: the
+    element's SNPs alone go against the rest of X, named by their gene.
+    --summary-only makes the same summary from the tables."""
+    d = make_data(tmp_path / "d", parts={"PAR1": (0, 3), "escape": (7, 10),
+                                         "XIST": (14, 17)})
+    (d / "genes.bed").write_text(
+        "chrX\t0\t100\tGENEA\nchrX\t%s\tXIST\n"
+        % "\t".join(open(d / "el.bed").read().split()[1:3]))
+    o = tmp_path / "out"
+    parts = ["--genome", "none", "--chrx-par", (d / "par.txt").read_text(),
+             "--chrx-escape", str(d / "esc.bed"),
+             "--xi-elements", str(d / "el.bed"), "--xi-context", "HCG",
+             "--genes", str(d / "genes.bed"), "--min-cell-sites", "5",
+             "--n-boot", "300", "--plot-format", "png", "--output-dir",
+             str(o)]
+    ai.main(["--samples", str(d / "samples.tsv"),
+             "--vcf", f"GM={d / 'snps.vcf'}", "--vcf", f"IMR={d / 'snps.vcf'}",
+             "--context-bed", f"HCG:{d / 'HCG.bed.gz'}", "--mates",
+             "--min-reads", "3", "--n-threads", "2"] + parts)
+    s = pd.read_csv(o / "allelic_summary.tsv", sep="\t")
+    st = s[s["kind"].eq("set") & s["context"].eq("HCG")].set_index(
+        ["group", "set"])
+    gm = st.loc["GM"]
+    assert {"autosomes", "chrX", "chrX rest", "chrX escape", "chrX PAR1",
+            "chrX XIST"} <= set(gm.index)
+    # GM: haplotype 2 is the inactive X, in every cell
+    assert (gm["xi_hap"] == 2).all() and gm["xi_cells_agree"].iloc[0] == 1
+    r = gm.loc["chrX rest"]
+    assert r["xi_minus_xa"] > 0.6 and r["xi_ci_lo"] > 0.4
+    assert r["share_cells_xi_lower"] == 0 and r["cells_tested"] == 6
+    for ctl in ("chrX escape", "chrX PAR1", "autosomes"):
+        assert abs(gm.loc[ctl, "xi_minus_xa"]) < 0.15, ctl
+    assert gm.loc["chrX XIST", "xi_minus_xa"] < -0.6
+    assert gm.loc["chrX XIST", "xi_ci_hi"] < -0.3
+    # IMR: either copy, cell by cell -- no line-wide call
+    imr = st.loc["IMR"]
+    assert (imr["xi_hap"] == 0).all() and imr["xi_minus_xa"].isna().all()
+    assert imr.loc["chrX rest", "share_cells_hap1_lower"] == 0.5
+    ct = s[s["kind"].eq("contrast") & s["context"].eq("HCG")
+           & s["group"].eq("GM")].set_index("set")
+    assert ct.loc["chrX rest − chrX escape", "xi_minus_xa"] > 0.5
+    assert ct.loc["chrX rest − chrX escape", "q"] < 0.05
+    assert ct.loc["chrX XIST − chrX rest", "xi_minus_xa"] < -1.0
+    e = pd.read_csv(o / "allelic_exceptions.tsv", sep="\t")
+    e = e[e["group"].eq("GM")]
+    assert len(e) == 1
+    # the gene there first, then the others within 10 kb
+    assert e["part"].iloc[0] == "XIST"
+    assert e["genes"].iloc[0] == "XIST,GENEA"
+    assert e["snps_against"].iloc[0] >= 2 and e["snps_with"].iloc[0] == 0
+    assert e["median_xi_minus_xa"].iloc[0] < -0.5
+    assert (o / "allelic_summary_GM.png").exists()
+    (o / "allelic_summary.tsv").rename(o / "first.tsv")
+    ai.main(["--summary-only"] + parts)
+    pd.testing.assert_frame_equal(
+        pd.read_csv(o / "allelic_summary.tsv", sep="\t"),
+        pd.read_csv(o / "first.tsv", sep="\t"), check_exact=False,
+        rtol=1e-9)
+
+
+def test_x_parts_and_their_options(tmp_path):
+    xci = ai.parse_par.__module__
+    import importlib
+    x = importlib.import_module(xci)
+    assert x.parse_par("auto", "hg38") == x.PAR1["hg38"]
+    assert x.parse_par("auto") is None and x.parse_par("none", "hg38") is None
+    assert x.parse_par("1,000-2,000") == (1000, 2000)
+    with pytest.raises(ValueError):
+        x.parse_par("2000-1000")
+    assert set(x.parse_elements("auto", "hg38")) == {"XIST", "FIRRE", "ICCE",
+                                                    "DXZ4"}
+    assert x.parse_elements("auto", "hg19") == {}
+    b = tmp_path / "el.bed"
+    b.write_text("chrX\t10\t20\tA\nchr1\t0\t5\tB\n")
+    assert x.parse_elements(str(b)) == {"A": (10, 20)}
+    esc = x.parse_escape("auto", "hg38", x.PAR1["hg38"])
+    el = x.parse_elements("auto", "hg38")
+    got = x.x_part([1_000_000, 53_200_000, 73_830_000, 131_700_000, 90_000_000],
+                   x.PAR1["hg38"], esc, el)
+    assert list(got) == ["PAR1", "escape", "XIST", "FIRRE", "rest"]
