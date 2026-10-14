@@ -1586,7 +1586,8 @@ def test_chrx_by_haplotype_moves_the_copies_difference_into_the_null(
                                         1 + int(c.split("_c")[1]) % 2))
     o = tmp_path / "out"
     acc.main(_contrast_args(d, o) + ["--chrx", "--chrx-par", "0-2000000",
-                                     "--haplotypes", str(d / "haps")])
+                                     "--haplotypes", str(d / "haps"),
+                                     "--chrx-track-bin", "GCH=2500000"])
     h = pd.read_csv(o / "chrx_haplotype_concordance.tsv", sep="\t")
     al = h[h["band"].str.startswith("all")]
 
@@ -2094,3 +2095,25 @@ def test_posteriors_that_are_not_there_say_why(tmp_path):
         a[i] = f"GCH={tmp_path / sub}"
         with pytest.raises(SystemExit, match=msg):
             acc.main(a)
+
+
+def test_track_bins_per_context():
+    """--chrx-track-bin: a size for all, per context, 'none'; 'auto' takes
+    the finest bin where a copy's median bin holds 100 contacts."""
+    assert acc.parse_track_bins("auto") == {None: -1}
+    assert acc.parse_track_bins("2500000") == {None: 2_500_000}
+    assert acc.parse_track_bins("hcg=10000000,GCH=auto") == {
+        None: -1, "HCG": 10_000_000, "GCH": -1}
+    assert acc.parse_track_bins("none") == {None: 0}
+    with pytest.raises(ValueError):
+        acc.parse_track_bins("HCG=-5")
+    rng = np.random.default_rng(0)
+    # 80,000 ends over 150 Mb (a contact is two): a copy's 1 Mb bin holds
+    # ~133 contacts -> 1 Mb
+    pos = rng.integers(0, 150_000_000, 80_000)
+    hap = rng.integers(0, 2, pos.size)
+    assert acc.track_bin_auto(pos, hap) == 1_000_000
+    # 16,000: ~67 at 2.5 Mb, ~133 at 5 Mb
+    assert acc.track_bin_auto(pos[:16_000], hap[:16_000]) == 5_000_000
+    # 1,200: ~40 even at 20 Mb -> the coarsest
+    assert acc.track_bin_auto(pos[:1_200], hap[:1_200]) == 20_000_000

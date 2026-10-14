@@ -824,9 +824,11 @@ def locus_tracks(lo, hi, cp, start: int, end: int, eig, x_name: str,
                                 allelic[f"{c}_reads_hap{h}"].to_numpy(float),
                                 edges)
             out[f"level_{c}"] = lv
-    # concordance: each copy's ΔC in its own bins
-    if conc is not None and len(conc):
-        for c, t in conc.groupby("context", sort=False):
+    # concordance: each copy's ΔC in its context's own bins -- every
+    # context of --track-contexts, empty where none was tagged
+    if conc is not None:
+        for c in contexts:
+            t = conc[conc["context"].astype(str).str.upper() == c.upper()]
             t = t[(t["bin_end"] > start) & (t["bin_start"] < end)]
             rows = {}
             for k in (0, 1):
@@ -850,6 +852,20 @@ def locus_table(tr: dict, contexts, labels) -> pd.DataFrame:
                 t[f"{c}_{lab}"] = tr[f"level_{c}"][k]
     if "eigen" in tr:
         t["compartment_bulk"] = tr["eigen"]
+    # each bin's ΔC: that of the context's track bin holding its middle
+    mid = (e[:-1] + e[1:]) // 2
+    for c in contexts:
+        if f"delta_{c}" not in tr:
+            continue
+        for k, lab in enumerate(labels):
+            r = tr[f"delta_{c}"][k]
+            v = np.full(mid.size, np.nan)
+            if len(r):
+                st_, en_ = r["bin_start"].to_numpy(), r["bin_end"].to_numpy()
+                i = np.searchsorted(st_, mid, "right") - 1
+                ok = (i >= 0) & (mid < en_[np.maximum(i, 0)])
+                v[ok] = r["delta"].to_numpy()[i[ok]]
+            t[f"{c}_dC_{lab}"] = v
     return t
 
 
@@ -888,8 +904,12 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
     for c in contexts:
         if f"level_{c}" in tr:
             lines.append((f"level_{c}", f"{c} level"))
-    for c in [k[6:] for k in tr if k.startswith("delta_")]:
-        lines.append((f"delta_{c}", f"{c}-{c}\nΔC"))
+    for c in contexts:
+        if f"delta_{c}" in tr:
+            r = pd.concat([tr[f"delta_{c}"][0], tr[f"delta_{c}"][1]])
+            w = (f", {(r['bin_end'] - r['bin_start']).iloc[0] / 1e6:g} Mb"
+                 if len(r) else "")
+            lines.append((f"delta_{c}", f"{c}-{c}\nΔC{w}"))
     hr = [3.2, 0.35, 3.2] + [1.0] * len(lines)
     fig = plt.figure(figsize=(7.2, 4.4 + 1.0 * len(lines)))
     gs = fig.add_gridspec(len(hr), 1, height_ratios=hr, hspace=0.18)
@@ -935,6 +955,10 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
             ax.bar(mid, np.where(e < 0, e, 0), width=tr["res"] / 1e6,
                    color="#3182bd", alpha=0.35, lw=0, label="bulk B")
         if key.startswith("delta_"):
+            if not (len(tr[key][0]) or len(tr[key][1])):
+                ax.text(0.5, 0.5, f"no {key[6:]} contact tagged on a copy "
+                                  f"here", transform=ax.transAxes,
+                        ha="center", va="center", fontsize=6, color="0.4")
             for k, lab in enumerate(labels):
                 t = tr[key][k]
                 if not len(t):
