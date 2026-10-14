@@ -817,7 +817,7 @@ def locus_tracks(lo, hi, cp, start: int, end: int, eig, x_name: str,
     # 1D: each copy's level per context, from the phased SNPs
     if allelic is not None and len(allelic):
         pos = allelic["pos"].to_numpy(np.int64)
-        for c in contexts:
+        for c in [c for c in contexts if f"{c}_hap1" in allelic]:
             lv = np.full((2, nb), np.nan)
             for k in (0, 1):
                 h = (xi_hap or 1) if k == 0 else 3 - (xi_hap or 1)
@@ -959,7 +959,8 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
             r = pd.concat([tr[f"delta_{c}"][0], tr[f"delta_{c}"][1]])
             w = (f"\n{(r['bin_end'] - r['bin_start']).max() / 1e6:g} Mb "
                  f"windows" if len(r) else "")
-            lines.append((f"delta_{c}", f"{c}-{c} ΔC{w}"))
+            lines.append((f"delta_{c}",
+                          f"{dict(CONC_CONTEXTS).get(c, c)} ΔC{w}"))
     hr = [3.2, 0.35, 3.2, 2.6] + [1.0] * len(lines)
     fig = plt.figure(figsize=(7.2, 6.2 + 1.0 * len(lines)))
     gs = fig.add_gridspec(len(hr), 1, height_ratios=hr, hspace=0.18)
@@ -1072,6 +1073,220 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
     plt.close(fig)
 
 
+#: The two six-panel figures' rows of concordance: (context in the tables,
+#: label).
+CONC_CONTEXTS = (("HCG", "HCG-HCG"), ("GCH", "GCH-GCH"),
+                 ("HCG×GCH", "HCG-GCH"))
+
+
+def _orient(t: pd.DataFrame, xi_hap: int, cols=("delta", "level")):
+    """hap1-hap2 rows as Xi less Xa (``xi_hap`` 2: negated, the interval
+    swapped)."""
+    if (xi_hap or 1) != 2 or t.empty:
+        return t
+    t = t.copy()
+    for c in cols:
+        if c in t:
+            lo, hi = t[f"{c}_lo"].copy(), t[f"{c}_hi"].copy()
+            t[c], t[f"{c}_lo"], t[f"{c}_hi"] = -t[c], -hi, -lo
+    return t
+
+
+def level_track(allelic: pd.DataFrame, ctx: str, xi_hap: int, start: int,
+                end: int, window: int, step: int, n_boot: int = 200,
+                seed: int = 0) -> pd.DataFrame:
+    """Along X, windows ``window`` wide slid ``step``: each copy's level of
+    ``ctx`` at the phased SNPs inside (weighted by their reads) and log2 of
+    Xi's over Xa's, with its 95% interval from resampling the SNPs."""
+    t = allelic.sort_values("pos")
+    pos = t["pos"].to_numpy(np.int64)
+    h0 = xi_hap or 1
+    l0 = t[f"{ctx}_hap{h0}"].to_numpy(float)
+    l1 = t[f"{ctx}_hap{3 - h0}"].to_numpy(float)
+    w0 = t[f"{ctx}_reads_hap{h0}"].to_numpy(float)
+    w1 = t[f"{ctx}_reads_hap{3 - h0}"].to_numpy(float)
+    ok = np.isfinite(l0) & np.isfinite(l1) & (w0 > 0) & (w1 > 0)
+    pos, l0, l1, w0, w1 = pos[ok], l0[ok], l1[ok], w0[ok], w1[ok]
+    rng = np.random.default_rng([seed, 31])
+    rows = []
+    for c in range(start + window // 2, end - window // 2 + 1, step):
+        a_, b_ = np.searchsorted(pos, [c - window // 2, c + window // 2])
+        m = b_ - a_
+        if m < 3:
+            continue
+        s_ = slice(a_, b_)
+        x0, x1 = (w0[s_] * l0[s_]).sum() / w0[s_].sum(), \
+            (w1[s_] * l1[s_]).sum() / w1[s_].sum()
+        W = rng.multinomial(m, np.full(m, 1.0 / m), size=n_boot)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            b0 = (W @ (w0[s_] * l0[s_])) / (W @ w0[s_])
+            b1 = (W @ (w1[s_] * l1[s_])) / (W @ w1[s_])
+            r = np.log2(b0 / b1)
+        r = r[np.isfinite(r)]
+        lo, hi = (np.percentile(r, [2.5, 97.5]) if r.size else
+                  (np.nan, np.nan))
+        rows.append({"center": c, "snps": int(m), "xi": x0, "xa": x1,
+                     "log2": np.log2(x0 / x1) if x0 > 0 and x1 > 0
+                     else np.nan, "lo": lo, "hi": hi})
+    return pd.DataFrame(rows)
+
+
+def _band(ax, x, y, lo, hi, col, label, lw=0.9, alpha=0.18):
+    ax.fill_between(x, lo, hi, color=col, alpha=alpha, lw=0)
+    ax.plot(x, y, color=col, lw=lw, label=label)
+
+
+def plot_by_distance(ratio: pd.DataFrame, dist: pd.DataFrame | None,
+                     labels, xi_hap: int, group: str, path):
+    """Against the contacts' distance, the copies compared, X (red) against
+    the autosomes' copies (grey), each with its 95% interval: a, log2 of
+    their P(s); b, c, log2 of the ends' HCG and GCH level; d-f, ΔC less ΔC,
+    HCG-HCG, GCH-GCH, HCG at one end and GCH at the other."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(3, 2, figsize=(7.2, 7.6),
+                             gridspec_kw={"hspace": 0.55, "wspace": 0.3})
+    ax = axes[0, 0]
+    for sname, col in (("chrX", _COLS[0]), ("autosomes", "0.45")):
+        t = ratio[(ratio["set"] == sname) & (ratio["log10_lo"] >= 4)
+                  & (ratio[[f"contacts_{lab}" for lab in labels]]
+                     .min(axis=1) >= 20)]
+        if len(t):
+            _band(ax, 10 ** ((t["log10_lo"] + t["log10_hi"]) / 2),
+                  t["log2_ratio"], t["ci_lo"], t["ci_hi"], col, sname)
+    ax.set_title(f"a  contacts, log2 P(s) {labels[0]} / {labels[1]}",
+                 loc="left", fontsize=6.5)
+    panels = [(axes[0, 1], "HCG", "level", "b  HCG level of the ends, log2"),
+              (axes[1, 0], "GCH", "level", "c  GCH level of the ends, log2"),
+              (axes[1, 1], "HCG", "delta", "d  HCG-HCG ΔC"),
+              (axes[2, 0], "GCH", "delta", "e  GCH-GCH ΔC"),
+              (axes[2, 1], "HCG×GCH", "delta", "f  HCG-GCH ΔC")]
+    for ax, ctx, col_, ttl in panels:
+        t = (dist[(dist["context"].astype(str) == ctx)
+                  & (dist["haplotype"] == "hap1-hap2")]
+             if dist is not None else pd.DataFrame())
+        t = _orient(t, xi_hap)
+        drew = False
+        for sname, col in (("chrX", _COLS[0]), ("autosomes", "0.45")):
+            u = t[t["set"] == sname].sort_values("dist_lo") if len(t) \
+                else t
+            u = u[u[col_].notna()] if len(u) else u
+            if len(u):
+                _band(ax, np.sqrt(u["dist_lo"] * u["dist_hi"]), u[col_],
+                      u[f"{col_}_lo"], u[f"{col_}_hi"], col, sname)
+                drew = True
+        if not drew:
+            ax.text(0.5, 0.5, "not in --concordance-distance",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=6, color="0.4")
+        what = (f"{labels[0]} / {labels[1]}" if col_ == "level"
+                else f"{labels[0]} − {labels[1]}")
+        ax.set_title(f"{ttl}, {what}", loc="left", fontsize=6.5)
+    # one distance axis for all six: P(s) and the concordance's ranges
+    xs = [10 ** float(ratio["log10_lo"].min()), 10 ** float(
+        ratio["log10_hi"].max())] if len(ratio) else [1e3, 3e8]
+    if dist is not None and len(dist):
+        xs = [min(xs[0], float(dist["dist_lo"].min())),
+              max(xs[1], float(dist["dist_hi"].max()))]
+    for ax in axes.ravel():
+        ax.set_xscale("log")
+        ax.set_xlim(max(xs[0], 1e3), xs[1])
+        ax.axhline(0, color="0.6", lw=0.4)
+        ax.set_xlabel("distance between the contact's ends, bp", fontsize=6)
+        ax.tick_params(labelsize=5.5)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=5, frameon=False)
+    fig.suptitle(f"{group}: {labels[0]} against {labels[1]} by distance "
+                 f"(95% intervals over cells)", fontsize=7, y=0.995)
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
+def plot_along_x(prof: pd.DataFrame, levels: dict, conc, labels,
+                 xi_hap: int, elements: dict, group: str, path,
+                 x_range=None):
+    """Along X, the copies compared: a, contacts crossing each position,
+    log2 observed over expected, each copy and their difference; b, c, log2
+    of the copies' HCG and GCH level at the phased SNPs (``levels``,
+    :func:`level_track`); d-f, each copy's ΔC and their difference,
+    HCG-HCG, GCH-GCH, HCG at one end and GCH at the other (``conc``,
+    chrx_haplotype_tracks); each with its 95% interval."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(3, 2, figsize=(7.2, 7.6),
+                             gridspec_kw={"hspace": 0.55, "wspace": 0.3})
+    ax = axes[0, 0]
+    if len(prof):
+        x = prof["pos"] / 1e6
+        for k, lab in enumerate(labels):
+            ax.plot(x, prof[f"log2_obs_exp_{lab}"], color=_COLS[k], lw=0.8,
+                    label=lab)
+        ax.plot(x, prof["difference"], color="black", lw=0.9,
+                label=f"{labels[0]} − {labels[1]}")
+    ax.set_title("a  contacts crossing each position, log2 obs/exp",
+                 loc="left", fontsize=6.5)
+    for ax, ctx, ttl in ((axes[0, 1], "HCG", "b  HCG level"),
+                         (axes[1, 0], "GCH", "c  GCH level")):
+        t = levels.get(ctx)
+        if t is not None and len(t):
+            _band(ax, t["center"] / 1e6, t["log2"], t["lo"], t["hi"],
+                  "black", f"log2 {labels[0]} / {labels[1]}")
+        else:
+            ax.text(0.5, 0.5, "no --allelic-snps", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=6, color="0.4")
+        ax.set_title(f"{ttl}, log2 {labels[0]} / {labels[1]} (phased SNPs)",
+                     loc="left", fontsize=6.5)
+    for ax, (ctx, nm), ttl in zip((axes[1, 1], axes[2, 0], axes[2, 1]),
+                                  CONC_CONTEXTS, ("d", "e", "f")):
+        t = (conc[conc["context"].astype(str) == ctx] if conc is not None
+             else pd.DataFrame())
+        drew = False
+        if len(t):
+            mid_ = (t["bin_start"] + t["bin_end"]) / 2
+            t = t.assign(center=t["center"].fillna(mid_) if "center" in t
+                         else mid_)
+            h0 = xi_hap or 1
+            for hp, col, lab, lw in ((f"hap{h0}", _COLS[0], labels[0], 0.7),
+                                     (f"hap{3 - h0}", _COLS[1], labels[1],
+                                      0.7),
+                                     ("hap1-hap2", "black",
+                                      f"{labels[0]} − {labels[1]}", 0.9)):
+                u = t[t["haplotype"] == hp].sort_values("center")
+                if hp == "hap1-hap2":
+                    u = _orient(u, xi_hap, cols=("delta",))
+                if len(u):
+                    _band(ax, u["center"] / 1e6, u["delta"], u["delta_lo"],
+                          u["delta_hi"], col, lab, lw=lw,
+                          alpha=0.12 if col != "black" else 0.2)
+                    drew = True
+            w = (t["bin_end"] - t["bin_start"]).max()
+            ax.set_title(f"{ttl}  {nm} ΔC ({w / 1e6:g} Mb windows)",
+                         loc="left", fontsize=6.5)
+        if not drew:
+            ax.text(0.5, 0.5, "not in --concordance-tracks",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=6, color="0.4")
+            ax.set_title(f"{ttl}  {nm} ΔC", loc="left", fontsize=6.5)
+    for ax in axes.ravel():
+        ax.axhline(0, color="0.6", lw=0.4)
+        if x_range:
+            ax.set_xlim(x_range[0] / 1e6, x_range[1] / 1e6)
+        for nm, (a_, b_) in elements.items():
+            ax.axvline((a_ + b_) / 2e6, color="0.5", lw=0.4, ls=":")
+            ax.text((a_ + b_) / 2e6, 1.0, nm, fontsize=4.5, ha="center",
+                    va="bottom", transform=ax.get_xaxis_transform())
+        ax.set_xlabel("chrX, Mb", fontsize=6)
+        ax.tick_params(labelsize=5.5)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=4.8, frameon=False, loc="lower left")
+    fig.suptitle(f"{group}: {labels[0]} against {labels[1]} along X "
+                 f"(95% intervals)", fontsize=7, y=0.995)
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
 def _pairs(values) -> dict:
     out = {}
     for v in values or []:
@@ -1166,6 +1381,15 @@ def main(argv=None) -> int:
                     help="annotation_class_concordance.py's "
                          "chrx_haplotype_tracks.tsv: each copy's ΔC along "
                          "the loci.")
+    ap.add_argument("--concordance-distance", default=None,
+                    help="annotation_class_concordance.py's "
+                         "chrx_haplotype_distance.tsv: each copy's ΔC and "
+                         "level by the contacts' distance "
+                         "(haplotype_by_distance_<line>).")
+    ap.add_argument("--level-window", type=int, default=2_000_000,
+                    help="haplotype_along_x_<line>: the windows of the "
+                         "phased SNPs' levels.")
+    ap.add_argument("--level-step", type=int, default=500_000)
     ap.add_argument("--map-smooth", type=float, default=1.0,
                     help="The loci's contact maps: Gaussian smoothing, in "
                          "bins (0: none).")
@@ -1243,7 +1467,12 @@ def main(argv=None) -> int:
                if loci and args.allelic_snps else None)
     conc = (pd.read_csv(args.concordance_tracks, sep="\t",
                         dtype={"group": str})
-            if loci and args.concordance_tracks else None)
+            if args.concordance_tracks else None)
+    cdist = (pd.read_csv(args.concordance_distance, sep="\t",
+                         dtype={"group": str})
+             if args.concordance_distance else None)
+    if args.allelic_snps and allelic is None:
+        allelic = read_allelic(args.allelic_snps, contexts)
     if geo.dxz4 is None:
         logger.warning("no DXZ4 among --xi-elements: no megadomain boundary")
     if not args.boundaries:
@@ -1311,6 +1540,30 @@ def main(argv=None) -> int:
                                          "copy2": labels[1]}),
                       ps, ratio, prof, bt, geo, elements, labels, g,
                       out / f"haplotype_contacts_{name}.{args.plot_format}")
+        # the copies compared by distance and along X: contacts, levels,
+        # concordance -- by haplotype only where the line has one inactive X
+        one_x = mode not in ("cells",)
+        xh = int(mode) if one_x and mode else 0
+        plot_by_distance(
+            ratio, (cdist[cdist["group"] == g] if one_x and cdist is not None
+                    else None), labels, xh, g,
+            out / f"haplotype_by_distance_{name}.{args.plot_format}")
+        lv_ = {}
+        if one_x and allelic is not None:
+            al_g = allelic[allelic["group"] == g]
+            for c_ in ("HCG", "GCH"):
+                if len(al_g) and f"{c_}_hap1" in al_g:
+                    lv_[c_] = level_track(al_g, c_, xh, geo.x_lo, x_len,
+                                          args.level_window, args.level_step,
+                                          seed=args.seed)
+                    lv_[c_].assign(group=g, context=c_).to_csv(
+                        out / f"haplotype_levels_{name}_{c_}.tsv", sep="\t",
+                        index=False)
+        plot_along_x(prof, lv_, (conc[conc["group"] == g] if one_x and conc
+                                 is not None else None),
+                     labels, xh, elements, g,
+                     out / f"haplotype_along_x_{name}.{args.plot_format}",
+                     x_range=(geo.x_lo, x_len))
         if loci and pooled:
             lo_ = np.concatenate([x[0] for x in pooled])
             hi_ = np.concatenate([x[1] for x in pooled])
@@ -1327,18 +1580,22 @@ def main(argv=None) -> int:
                             f"and ΔC per haplotype are not per copy, so the "
                             f"loci show the contacts only")
             for nm, a_, b_ in loci:
+                # HCG at one end, GCH at the other, where the tracks have it
+                cx_ = contexts + [c for c, _ in CONC_CONTEXTS
+                                  if c not in contexts and co_ is not None
+                                  and (co_["context"] == c).any()]
                 tr = locus_tracks(lo_, hi_, cp_, a_, b_, eig, x_name, al_,
-                                  co_, contexts,
+                                  co_, cx_,
                                   int(mode) if one and mode else 0,
                                   args.map_smooth)
                 ln = re.sub(r"[^A-Za-z0-9_.-]+", "_", nm)
-                locus_table(tr, contexts, labels).to_csv(
+                locus_table(tr, cx_, labels).to_csv(
                     out / f"haplotype_locus_{name}_{ln}.tsv", sep="\t",
                     index=False)
                 map_table(tr, labels).to_csv(
                     out / f"haplotype_locus_{name}_{ln}_map.tsv.gz",
                     sep="\t", index=False)
-                plot_locus(tr, nm, a_, b_, g, labels, contexts, elements,
+                plot_locus(tr, nm, a_, b_, g, labels, cx_, elements,
                            tads, escape,
                            out / f"haplotype_locus_{name}_{ln}."
                                  f"{args.plot_format}")

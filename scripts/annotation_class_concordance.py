@@ -4077,7 +4077,9 @@ def _read_cross(h_path, g_path, ms_h: int, ms_g: int, min_d: int,
 def cross_context_chrx(cell, g_lo, g_hi, v_lo, v_hi, m_lo, m_hi, hap, marg,
                        strat, groups: dict, edges, band_labels, dbins,
                        position_bin: int, max_widen: int, n_boot: int,
-                       seed: int, n_threads: int = 1, classes=None):
+                       seed: int, n_threads: int = 1, classes=None,
+                       track_bin: int = 0, track_step: int = 0,
+                       dist_step: float = 0):
     """HCG at one end of a contact, GCH at the other (:func:`_read_cross`):
     a cell's methylation at one locus against its accessibility at the
     other, beyond the same reshuffled.  Each end is centred on the cell's
@@ -4100,12 +4102,15 @@ def cross_context_chrx(cell, g_lo, g_hi, v_lo, v_hi, m_lo, m_hi, hap, marg,
     the copy part of X's cross-context concordance.
 
     Rows as :func:`haplotype_concordance`'s, ΔC and Δr, 'comparison'
-    prefixed 'HCG×GCH: '; and per cell its contacts and ΔC at all
-    distances."""
+    prefixed 'HCG×GCH: '; per cell its contacts and ΔC at all distances;
+    and, as :func:`haplotype_concordance`'s, each copy's ΔC along X and by
+    distance ({'tracks', 'distance'}; no level -- the ends are two
+    contexts)."""
     lk = classes if classes is not None else ChromosomeClasses()
     nk = len(lk.classes)
     nb = len(edges) - 1
     n_cells = marg.shape[0]
+    extra = {"tracks": pd.DataFrame(), "distance": pd.DataFrame()}
     k_lo = lk.lookup_g(g_lo).astype(np.int64)
     k_hi = lk.lookup_g(g_hi).astype(np.int64)
     kp = np.flatnonzero((k_lo >= 0) & (k_hi >= 0))
@@ -4281,7 +4286,20 @@ def cross_context_chrx(cell, g_lo, g_hi, v_lo, v_hi, m_lo, m_hi, hap, marg,
                 tag = v.replace(" ", "_")
                 pc[f"pairs_{tag}"] = SH[v]["n"][:, nb]
                 pc[f"delta_{tag}"] = SH[v]["d"][:, nb] / SH[v]["n"][:, nb]
-    return rows, pd.DataFrame(pc)
+        if track_bin or dist_step:
+            _, rr, ll, _, _ = draws["same"]
+            d_c = weights(ii, rr[:, j], ll[:, j])["d"]
+            nan_ = np.full(j.size, np.nan)
+            if track_bin:
+                extra["tracks"] = _haplotype_tracks(
+                    cell[ii], kk[j] == 1, lab[j], g_lo[ii], g_hi[ii], d_c,
+                    nan_, nan_, groups, n_cells, track_bin, n_boot, seed,
+                    track_step)
+            if dist_step:
+                extra["distance"] = _haplotype_by_distance(
+                    cell[ii], kk[j], lab[j], dist[ii], d_c, nan_, groups,
+                    n_cells, n_boot, seed, dist_step)
+    return rows, pd.DataFrame(pc), extra
 
 
 #: Haplotype-resolved chrX, (comparison, reference, test): each contact's
@@ -4333,7 +4351,8 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                           groups: dict, edges, band_labels, dbins,
                           position_bin: int, max_widen: int, n_boot: int,
                           seed: int, n_threads: int = 1, classes=None,
-                          track_bin: int = 0, track_step: int = 0):
+                          track_bin: int = 0, track_step: int = 0,
+                          dist_step: float = 0):
     """chrX against the autosomes on the contacts a phased SNP puts on one
     copy (``hap`` 1 or 2, 0 untagged; allelic_imbalance.py
     --haplotype-dir).  Ends centred on the cell's mean on autosomes or on X
@@ -4371,7 +4390,10 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
     level, and ΔC on X and the autosomes with each null; and with
     ``track_bin`` (a window, bp, or -1: :func:`track_bin_auto`; slid
     ``track_step``), along X (:func:`_haplotype_tracks`) per group, window
-    and haplotype, ΔC with partners from the same copy and the level."""
+    and haplotype, ΔC with partners from the same copy and the level; with
+    ``dist_step`` (log10 bp, -1 auto), the same by the contacts' distance
+    on X and the autosomes (:func:`_haplotype_by_distance`): {'tracks',
+    'distance'}."""
     lk = classes if classes is not None else ChromosomeClasses()
     kc = lk.lookup_g(g_lo).astype(np.int64)
     k2 = lk.lookup_g(g_hi).astype(np.int64)
@@ -4382,8 +4404,9 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
     sel = np.flatnonzero((hap > 0) & (kc >= 0) & (kc <= 1) & (k2 == kc))
     n_cells = marg.shape[0]
     nb = len(edges) - 1
+    extra = {"tracks": pd.DataFrame(), "distance": pd.DataFrame()}
     if not sel.size:
-        return [], pd.DataFrame(), pd.DataFrame()
+        return [], pd.DataFrame(), extra
     c_, k_ = cell[sel], kc[sel]
     h_ = hap[sel].astype(np.int64) - 1
     gl, gh, av, pv = g_lo[sel], g_hi[sel], a[sel], p[sel]
@@ -4507,13 +4530,17 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                                                       "control"))
                 r_["comparison"] = HAP_COPY_PART
                 rows.append(r_)
-    tracks = pd.DataFrame()
-    if track_bin:
+    if track_bin or dist_step:
         _, right, left, _ = draws["same"]
         d_ = 2 * (xi * yi - 0.5 * (xi * right[0, i] + left[0, i] * yi))
-        tracks = _haplotype_tracks(c_[i], k_[i] == 1, h_[i], gl[i], gh[i],
-                                   d_, ar, pr, groups, n_cells, track_bin,
-                                   n_boot, seed, track_step)
+        if track_bin:
+            extra["tracks"] = _haplotype_tracks(
+                c_[i], k_[i] == 1, h_[i], gl[i], gh[i], d_, ar, pr, groups,
+                n_cells, track_bin, n_boot, seed, track_step)
+        if dist_step:
+            extra["distance"] = _haplotype_by_distance(
+                c_[i], k_[i], h_[i], dist[i], d_, 0.5 * (ar + pr), groups,
+                n_cells, n_boot, seed, dist_step)
     pc = {}
     if lk.i_par is not None or lk.i_esc is not None:
         pc["pairs_X_controls_left_out"] = np.bincount(
@@ -4529,13 +4556,113 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                        ("autosomes, either copy", "autosomes_either"),
                        ("autosomes, same copy", "autosomes_same")):
             pc[f"delta_{tag}"] = S[v]["d"][:, nb] / S[v]["n"][:, nb]
-    return rows, pd.DataFrame(pc), tracks
+    return rows, pd.DataFrame(pc), extra
 
 
 #: The bins track_bin_auto chooses among, finest first, and the contacts a
 #: copy needs in a typical bin.
 TRACK_BINS = (1_000_000, 2_500_000, 5_000_000, 10_000_000, 20_000_000)
 TRACK_MIN_CONTACTS = 100
+
+
+#: The steps (log10 bp) of the copies' concordance by distance, the
+#: finest first.
+DIST_STEPS = (0.25, 0.5, 1.0)
+
+
+def dist_step_auto(dist, hap) -> float:
+    """The finest of DIST_STEPS where a copy's median distance bin holds
+    TRACK_MIN_CONTACTS contacts (``hap`` 0 or 1); else the coarsest."""
+    lg = np.log10(np.maximum(np.asarray(dist, float), 1))
+    for st in DIST_STEPS:
+        b = np.floor(lg / st).astype(np.int64)
+        w = np.bincount((b - b.min()) * 2 + hap) if b.size else []
+        if len(w) and np.median(w[w > 0]) >= TRACK_MIN_CONTACTS:
+            return st
+    return DIST_STEPS[-1]
+
+
+def _haplotype_by_distance(c_, kind, h_, dist, d_, lev, groups: dict,
+                           n_cells: int, n_boot: int, seed: int,
+                           step: float = -1) -> pd.DataFrame:
+    """Per group, set -- the autosomes (``kind`` 0), the rest of X (1) --
+    and bin of the contacts' distance (``step`` log10 bp; -1:
+    :func:`dist_step_auto` on X): each haplotype's ΔC (``d_``) and level
+    (``lev``, the ends' mean; NaN for none), and the haplotypes'
+    difference -- ΔC hap1 less hap2, the level as log2 hap1 over hap2 --
+    each with its 95% interval from resampling the cells: how the copies'
+    concordance and level change with the distance between the ends, the
+    autosomes' copies the control."""
+    dist = np.asarray(dist, float)
+    if not dist.size:
+        return pd.DataFrame()
+    onx = kind == 1
+    if step < 0:
+        step = (dist_step_auto(dist[onx], h_[onx]) if onx.any()
+                else DIST_STEPS[0])
+    lg = np.log10(np.maximum(dist, 1))
+    b0 = int(np.floor(lg.min() / step))
+    b = np.floor(lg / step).astype(np.int64) - b0
+    nbin = int(b.max()) + 1
+    shape = (n_cells, 2, nbin, 2)
+    N, D, L = (np.zeros(shape) for _ in range(3))
+    kk = np.asarray(kind, np.int64)
+    np.add.at(N, (c_, kk, b, h_), 1.0)
+    np.add.at(D, (c_, kk, b, h_), d_)
+    has_lev = bool(np.isfinite(lev).any())
+    np.add.at(L, (c_, kk, b, h_), np.nan_to_num(lev, nan=0.0))
+    rng = np.random.default_rng([seed, 29])
+    rows = []
+    for g, ix in groups.items():
+        ix = np.asarray(ix, np.int64)
+        if ix.size < 2 or not N[ix].sum():
+            continue
+        W = rng.multinomial(ix.size, np.full(ix.size, 1.0 / ix.size),
+                            size=n_boot).astype(float)
+        n_, d_s, l_ = N[ix].sum(0), D[ix].sum(0), L[ix].sum(0)
+        nb_, db_, lb_ = (np.tensordot(W, A[ix], axes=(1, 0))
+                         for A in (N, D, L))
+        with np.errstate(invalid="ignore", divide="ignore"), \
+                warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            est, boot = d_s / n_, db_ / nb_
+            lev_e, lev_b = l_ / n_, lb_ / nb_
+
+            def ci(a):
+                return np.nanpercentile(a, [2.5, 97.5], axis=0)
+            dlo, dhi = ci(boot)
+            llo, lhi = ci(lev_b)
+            ddlo, ddhi = ci(boot[..., 0] - boot[..., 1])
+            lr = np.log2(lev_e[..., 0] / lev_e[..., 1])
+            rlo, rhi = ci(np.log2(lev_b[..., 0] / lev_b[..., 1]))
+
+        def lv(v):
+            return float(v) if has_lev else np.nan
+        for si, sname in enumerate(("autosomes", "chrX")):
+            for k in range(nbin):
+                at = {"group": g, "set": sname,
+                      "dist_lo": 10 ** ((k + b0) * step),
+                      "dist_hi": 10 ** ((k + b0 + 1) * step)}
+                for h in (0, 1):
+                    if n_[si, k, h]:
+                        rows.append({**at, "haplotype": f"hap{h + 1}",
+                                     "contacts": float(n_[si, k, h]),
+                                     "delta": est[si, k, h],
+                                     "delta_lo": dlo[si, k, h],
+                                     "delta_hi": dhi[si, k, h],
+                                     "level": lv(lev_e[si, k, h]),
+                                     "level_lo": lv(llo[si, k, h]),
+                                     "level_hi": lv(lhi[si, k, h])})
+                if n_[si, k, 0] and n_[si, k, 1]:
+                    rows.append({**at, "haplotype": "hap1-hap2",
+                                 "contacts": float(n_[si, k].sum()),
+                                 "delta": est[si, k, 0] - est[si, k, 1],
+                                 "delta_lo": ddlo[si, k],
+                                 "delta_hi": ddhi[si, k],
+                                 "level": lv(lr[si, k]),
+                                 "level_lo": lv(rlo[si, k]),
+                                 "level_hi": lv(rhi[si, k])})
+    return pd.DataFrame(rows)
 
 
 def track_bin_auto(pos, hap) -> int:
@@ -4577,8 +4704,9 @@ def _haplotype_tracks(c_, on_x, h_, gl, gh, d_, ar, pr, groups: dict,
     (``d_``, each contact's 2(xy - xy1), partners from its own copy) and the
     level (the ends' mean posterior, ``ar`` the low end's, ``pr`` the high
     end's), each contact counted half at each end; per group the pooled
-    values, with ΔC's 95% interval from resampling the cells -- and the
-    haplotypes' difference ('hap1-hap2'), on the same resampled cells.  A
+    values, with 95% intervals from resampling the cells -- and the
+    haplotypes' difference ('hap1-hap2': ΔC hap1 less hap2, the level as
+    log2 hap1 over hap2), on the same resampled cells.  A
     window wide enough for the sparse HCG contacts, slid in small steps,
     still shows where along X the copies' concordance changes."""
     base = _chrom_code("X") * STRIDE
@@ -4623,14 +4751,20 @@ def _haplotype_tracks(c_, on_x, h_, gl, gh, d_, ar, pr, groups: dict,
         n_, d_s, l_ = N[ix].sum(0), D[ix].sum(0), L[ix].sum(0)
         nb_ = np.tensordot(W, N[ix], axes=(1, 0))
         db_ = np.tensordot(W, D[ix], axes=(1, 0))
+        lb_ = np.tensordot(W, L[ix], axes=(1, 0))
         with np.errstate(invalid="ignore", divide="ignore"), \
                 warnings.catch_warnings():
             # a window this group has no contact in: no interval
             warnings.simplefilter("ignore", RuntimeWarning)
             est, boot, lev = d_s / n_, db_ / nb_, l_ / n_
+            levb = lb_ / nb_
             lo, hi = np.nanpercentile(boot, [2.5, 97.5], axis=0)
             dlo, dhi = np.nanpercentile(boot[..., 0] - boot[..., 1],
                                         [2.5, 97.5], axis=0)
+            llo, lhi = np.nanpercentile(levb, [2.5, 97.5], axis=0)
+            rlo, rhi = np.nanpercentile(np.log2(levb[..., 0] / levb[..., 1]),
+                                        [2.5, 97.5], axis=0)
+            lr = np.log2(lev[:, 0] / lev[:, 1])
         for i in range(nfine):
             if s1[i] <= s0[i]:
                 continue
@@ -4641,13 +4775,16 @@ def _haplotype_tracks(c_, on_x, h_, gl, gh, d_, ar, pr, groups: dict,
                     rows.append({**at, "haplotype": f"hap{h + 1}",
                                  "contacts": float(n_[i, h]),
                                  "delta": est[i, h], "delta_lo": lo[i, h],
-                                 "delta_hi": hi[i, h], "level": lev[i, h]})
+                                 "delta_hi": hi[i, h], "level": lev[i, h],
+                                 "level_lo": llo[i, h],
+                                 "level_hi": lhi[i, h]})
             if n_[i, 0] and n_[i, 1]:
                 rows.append({**at, "haplotype": "hap1-hap2",
                              "contacts": float(n_[i].sum()),
                              "delta": est[i, 0] - est[i, 1],
                              "delta_lo": dlo[i], "delta_hi": dhi[i],
-                             "level": lev[i, 0] - lev[i, 1]})
+                             "level": lr[i], "level_lo": rlo[i],
+                             "level_hi": rhi[i]})
     return pd.DataFrame(rows)
 
 
@@ -7568,7 +7705,18 @@ def main(argv=None) -> int:
                          "narrowest of 1, 2.5, 5, 10, 20 Mb where a copy's "
                          "median window holds 100 contacts -- HCG's are far "
                          "sparser than GCH's; or a width, for all or per "
-                         "context (HCG=20000000).")
+                         "context (HCG=20000000; CROSS= for HCG at one end, "
+                         "GCH at the other).")
+    ap.add_argument("--chrx-distance-step", default="auto",
+                    metavar="auto|none|LOG10",
+                    help="With --haplotypes: each copy's ΔC and level by the "
+                         "contacts' distance, on X and the autosomes, and "
+                         "the copies' difference (chrx_haplotype_distance"
+                         ".tsv; for haplotype_contacts.py "
+                         "--concordance-distance), in bins this wide in "
+                         "log10 bp.  'auto': per context the finest of "
+                         "0.25, 0.5, 1 where a copy's median bin on X holds "
+                         "100 contacts.")
     ap.add_argument("--chrx-track-step", type=int, default=500_000,
                     help="The windows of --chrx-track-window slide this far "
                          "at a time (0: side by side): a wide window, small "
@@ -7650,6 +7798,15 @@ def main(argv=None) -> int:
         track_bins = parse_track_bins(args.chrx_track_bin)
     except ValueError as e:
         sys.exit(f"--chrx-track-bin {e}")
+    v_ = str(args.chrx_distance_step).strip().lower()
+    try:
+        dist_step = {"auto": -1.0, "none": 0.0}.get(v_)
+        dist_step = float(v_) if dist_step is None else dist_step
+        if dist_step < 0 and v_ != "auto":
+            raise ValueError
+    except ValueError:
+        sys.exit(f"--chrx-distance-step {args.chrx_distance_step!r}: auto, "
+                 f"none or a step in log10 bp (0.25)")
     if args.haplotypes and not args.chrx:
         sys.exit("--haplotypes needs --chrx")
     x_par = None
@@ -7886,7 +8043,7 @@ def main(argv=None) -> int:
     contrast_rows, chot_rows, cenr_rows = [], [], []
     var_rows, var_en = [], []
     chrx_rows, chrx_cells, chrx_maps = [], [], []
-    hap_rows, hap_cells, hap_tracks = [], [], []
+    hap_rows, hap_cells, hap_tracks, hap_dist = [], [], [], []
     dom_rows = {k: [] for k in dsets}
     dom_crows = {k: [] for k in dsets}
     dom_wins = {k: [] for k in dsets}
@@ -8428,7 +8585,7 @@ def main(argv=None) -> int:
                     + [x.get("hap", np.zeros(x["g_lo"].size, np.int8))
                        for x in xs])
                 if (hx > 0).any():
-                    rh, pch, trk = haplotype_concordance(
+                    rh, pch, ext = haplotype_concordance(
                         *xa_, hx, mx,
                         strat_x, grp_x, edges, band_labels, dbins,
                         args.position_bin, args.max_widen, args.n_boot,
@@ -8436,7 +8593,12 @@ def main(argv=None) -> int:
                         classes=x_classes,
                         track_bin=track_bins.get(ctx.upper(),
                                                  track_bins[None]),
-                        track_step=args.chrx_track_step)
+                        track_step=args.chrx_track_step,
+                        dist_step=dist_step)
+                    trk = ext["tracks"]
+                    if not ext["distance"].empty:
+                        ext["distance"].insert(0, "context", ctx)
+                        hap_dist.append(ext["distance"])
                     if not trk.empty:
                         trk.insert(0, "context", ctx)
                         hap_tracks.append(trk)
@@ -8735,14 +8897,22 @@ def main(argv=None) -> int:
                 grp_c[nm], kind_c[nm] = ix_, "contrast group"
         logger.info(f"HCG×GCH: {cell_c.size:,} contacts with HCG at one end "
                     f"and GCH at the other")
-        cross_rows, cross_cells = cross_context_chrx(
+        cross_rows, cross_cells, cross_ext = cross_context_chrx(
             cell_c, cat["g_lo"], cat["g_hi"], cat["v_lo"], cat["v_hi"],
             cat["m_lo"], cat["m_hi"], cat["hap"],
             np.stack([r["marg"] for r in rc_]), strat_c, grp_c, edges,
             band_labels, _ls.log_dbins(args.min_distance, args.max_distance,
                                        args.bins_per_decade),
             args.position_bin, args.max_widen, args.n_boot, args.seed + 7919,
-            args.n_threads, classes=x_classes)
+            args.n_threads, classes=x_classes,
+            track_bin=(track_bins.get("CROSS", track_bins[None])
+                       if args.haplotypes else 0),
+            track_step=args.chrx_track_step,
+            dist_step=dist_step if args.haplotypes else 0)
+        for k_, lst_ in (("tracks", hap_tracks), ("distance", hap_dist)):
+            if not cross_ext[k_].empty:
+                cross_ext[k_].insert(0, "context", "HCG×GCH")
+                lst_.append(cross_ext[k_])
         for r_ in cross_rows:
             r_["group_kind"] = kind_c[r_["group"]]
         if not cross_cells.empty:
@@ -9147,6 +9317,9 @@ def main(argv=None) -> int:
         if hap_tracks:
             pd.concat(hap_tracks, ignore_index=True).to_csv(
                 out / "chrx_haplotype_tracks.tsv", sep="\t", index=False)
+        if hap_dist:
+            pd.concat(hap_dist, ignore_index=True).to_csv(
+                out / "chrx_haplotype_distance.tsv", sep="\t", index=False)
         xi_of = _xi_haplotypes(hx_)
         if xi_of:
             logger.info("the inactive X (the less accessible haplotype): "

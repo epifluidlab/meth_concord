@@ -130,10 +130,40 @@ def make_data(out: Path, n_cells=40, n=600, seed=0):
         for h, v in (("hap1", 0.08), ("hap2", 0.02), ("hap1-hap2", 0.06)):
             tr.append(("HCG", "GM", a_, b_, (a_ + b_) / 2, h, 50.0, v,
                        v - 0.05, v + 0.05, 0.5))
+    for c in range(0, L + 1, 2_500_000):          # HCG at one end, GCH
+        a_, b_ = max(c - 5_000_000, 0), min(c + 5_000_000, L)
+        for h, v in (("hap1", -0.04), ("hap2", 0.0), ("hap1-hap2", -0.04)):
+            tr.append(("HCG×GCH", "GM", a_, b_, (a_ + b_) / 2, h, 50.0, v,
+                       v - 0.02, v + 0.02, np.nan))
     pd.DataFrame(tr, columns=["context", "group", "bin_start", "bin_end",
                               "center", "haplotype", "contacts", "delta",
                               "delta_lo", "delta_hi", "level"]).to_csv(
         out / "chrx_haplotype_tracks.tsv", sep="\t", index=False)
+    # by distance: GM's hap1 the more methylated, the less accessible, at
+    # every distance; its HCG-HCG ΔC the higher; the autosomes' copies alike
+    rows = []
+    for c, lv1, lv2, d1, d2 in (("HCG", 0.8, 0.3, 0.06, 0.02),
+                                ("GCH", 0.2, 0.5, 0.02, 0.02),
+                                ("HCG×GCH", np.nan, np.nan, -0.04, 0.0)):
+        for sname in ("chrX", "autosomes"):
+            x = sname == "chrX"
+            for e in np.arange(3.0, 7.0, 0.5):
+                at = (c, "GM", sname, 10 ** e, 10 ** (e + 0.5))
+                a1 = lv1 if x else 0.5
+                a2 = lv2 if x else 0.5
+                dd = (d1 - d2) if x else 0.0
+                rows += [at + ("hap1", 100.0, d1, d1 - 0.01, d1 + 0.01, a1,
+                               a1 - 0.01, a1 + 0.01),
+                         at + ("hap2", 100.0, d2, d2 - 0.01, d2 + 0.01, a2,
+                               a2 - 0.01, a2 + 0.01),
+                         at + ("hap1-hap2", 200.0, dd, dd - 0.01, dd + 0.01,
+                               np.log2(a1 / a2), np.log2(a1 / a2) - 0.1,
+                               np.log2(a1 / a2) + 0.1)]
+    pd.DataFrame(rows, columns=[
+        "context", "group", "set", "dist_lo", "dist_hi", "haplotype",
+        "contacts", "delta", "delta_lo", "delta_hi", "level", "level_lo",
+        "level_hi"]).to_csv(out / "chrx_haplotype_distance.tsv", sep="\t",
+                            index=False)
     return out
 
 
@@ -151,6 +181,8 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
              "DXZ4=chrX:15000000-35000000",
              "--allelic-snps", str(d / "allelic_snps.tsv"),
              "--concordance-tracks", str(d / "chrx_haplotype_tracks.tsv"),
+             "--concordance-distance",
+             str(d / "chrx_haplotype_distance.tsv"),
              "--n-boot", "200", "--plot-format", "png",
              "--output-dir", str(o)])
     s = pd.read_csv(o / "haplotype_contacts.tsv", sep="\t")
@@ -226,6 +258,15 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
                    ("GCH_dC_Xa", 0.01)):
         assert lt[col].notna().all() and np.allclose(lt[col], v), col
     assert lt["GCH_dC_Xi_minus_Xa"].isna().all()       # none given
+    assert np.allclose(lt["HCG×GCH_dC_Xi_minus_Xa"].dropna(), -0.04)
+    # the copies compared by distance and along X
+    for f in ("by_distance", "along_x"):
+        assert (o / f"haplotype_{f}_GM.png").exists()
+    lv = pd.read_csv(o / "haplotype_levels_GM_HCG.tsv", sep="\t")
+    assert np.allclose(lv["log2"], np.log2(0.8 / 0.3))
+    assert (lv["lo"] <= lv["log2"] + 1e-9).all()
+    lv = pd.read_csv(o / "haplotype_levels_GM_GCH.tsv", sep="\t")
+    assert np.allclose(lv["log2"], np.log2(0.2 / 0.5))
     # IMR's copies are its cells' own: no SNP levels per copy
     assert "HCG_Xi" not in pd.read_csv(o / "haplotype_locus_IMR_chrX.tsv",
                                        sep="\t")

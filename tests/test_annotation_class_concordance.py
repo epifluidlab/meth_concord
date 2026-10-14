@@ -1754,6 +1754,24 @@ def test_chrx_across_contexts_and_controls(tmp_path):
     pc = pd.read_csv(o / "chrx_cross_context_percell.tsv.gz", sep="\t")
     assert {"pairs_chrX", "delta_chrX", "pairs_chrX_hap2"} <= set(pc.columns)
     assert (o / "chrx_contexts.png").exists()
+    # by the contacts' distance, per copy: hap2, her inactive X, the less
+    # accessible and the more methylated at every distance (log2 hap1 over
+    # hap2); HCG at one end and GCH at the other has no one level
+    dt = pd.read_csv(o / "chrx_haplotype_distance.tsv", sep="\t")
+    assert {"GCH", "HCG", "HCG×GCH"} <= set(dt["context"])
+    f = dt[(dt["group"] == "female") & (dt["set"] == "chrX")
+           & (dt["haplotype"] == "hap1-hap2")]
+    assert (f.loc[f["context"] == "GCH", "level"] > 1).all()
+    assert (f.loc[f["context"] == "HCG", "level"] < -1).all()
+    assert f.loc[f["context"] == "HCG×GCH", "level"].isna().all()
+    assert f.loc[f["context"] == "HCG×GCH", "delta"].notna().all()
+    a = dt[(dt["group"] == "female") & (dt["set"] == "autosomes")
+           & (dt["haplotype"] == "hap1-hap2") & (dt["context"] == "GCH")]
+    assert len(a) and (a["level"].abs() < 0.3).all()
+    assert ((dt["dist_hi"] / dt["dist_lo"]).round(3).isin(
+        [round(10 ** s_, 3) for s_ in acc.DIST_STEPS])).all()
+    tr = pd.read_csv(o / "chrx_haplotype_tracks.tsv", sep="\t")
+    assert "HCG×GCH" in set(tr["context"])
 
 
 def test_chrx_without_x_reads_stops_and_says_why(tmp_path):
