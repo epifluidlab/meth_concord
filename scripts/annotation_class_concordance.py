@@ -4332,7 +4332,8 @@ def _diff_row(group, band, st, cells, na, nb_, ea, eb, ba, bb, ctl) -> dict:
 def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                           groups: dict, edges, band_labels, dbins,
                           position_bin: int, max_widen: int, n_boot: int,
-                          seed: int, n_threads: int = 1, classes=None):
+                          seed: int, n_threads: int = 1, classes=None,
+                          track_bin: int = 0):
     """chrX against the autosomes on the contacts a phased SNP puts on one
     copy (``hap`` 1 or 2, 0 untagged; allelic_imbalance.py
     --haplotype-dir).  Ends centred on the cell's mean on autosomes or on X
@@ -4366,8 +4367,10 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
     Rows per group (``groups``: {name: cell indices}; cells without a
     tagged contact left out), band, comparison -- HAP_COMPARISONS, and
     HAP_COPY_PART (value_A the autosomes' copy part, value_B X's) -- and
-    statistic; and per cell, at all distances, each haplotype's contacts
-    and level, and ΔC on X and the autosomes with each null."""
+    statistic; per cell, at all distances, each haplotype's contacts and
+    level, and ΔC on X and the autosomes with each null; and with
+    ``track_bin``, along X (:func:`_haplotype_tracks`) per group, bin and
+    haplotype, ΔC with partners from the same copy and the level."""
     lk = classes if classes is not None else ChromosomeClasses()
     kc = lk.lookup_g(g_lo).astype(np.int64)
     k2 = lk.lookup_g(g_hi).astype(np.int64)
@@ -4379,7 +4382,7 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
     n_cells = marg.shape[0]
     nb = len(edges) - 1
     if not sel.size:
-        return [], pd.DataFrame()
+        return [], pd.DataFrame(), pd.DataFrame()
     c_, k_ = cell[sel], kc[sel]
     h_ = hap[sel].astype(np.int64) - 1
     gl, gh, av, pv = g_lo[sel], g_hi[sel], a[sel], p[sel]
@@ -4503,6 +4506,13 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                                                       "control"))
                 r_["comparison"] = HAP_COPY_PART
                 rows.append(r_)
+    tracks = pd.DataFrame()
+    if track_bin:
+        _, right, left, _ = draws["same"]
+        d_ = 2 * (xi * yi - 0.5 * (xi * right[0, i] + left[0, i] * yi))
+        tracks = _haplotype_tracks(c_[i], k_[i] == 1, h_[i], gl[i], gh[i],
+                                   d_, ar, pr, groups, n_cells, track_bin,
+                                   n_boot, seed)
     pc = {}
     if lk.i_par is not None or lk.i_esc is not None:
         pc["pairs_X_controls_left_out"] = np.bincount(
@@ -4518,7 +4528,57 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                        ("autosomes, either copy", "autosomes_either"),
                        ("autosomes, same copy", "autosomes_same")):
             pc[f"delta_{tag}"] = S[v]["d"][:, nb] / S[v]["n"][:, nb]
-    return rows, pd.DataFrame(pc)
+    return rows, pd.DataFrame(pc), tracks
+
+
+def _haplotype_tracks(c_, on_x, h_, gl, gh, d_, ar, pr, groups: dict,
+                      n_cells: int, track_bin: int, n_boot: int,
+                      seed: int) -> pd.DataFrame:
+    """Along X, per ``track_bin`` bin and haplotype: ΔC (``d_``, each
+    contact's 2(xy - xy1), partners from its own copy) and the level (the
+    ends' mean posterior, ``ar`` the low end's, ``pr`` the high end's), each
+    contact counted half at each end's bin; per group the pooled values,
+    with ΔC's 95% interval from resampling the cells."""
+    base = _chrom_code("X") * STRIDE
+    pos = np.concatenate([gl[on_x], gh[on_x]]) - base
+    if not pos.size:
+        return pd.DataFrame()
+    b = pos // track_bin
+    nbin = int(b.max()) + 1
+    cc = np.concatenate([c_[on_x], c_[on_x]])
+    hh = np.concatenate([h_[on_x], h_[on_x]])
+    dd = np.concatenate([d_[on_x], d_[on_x]])
+    lv = np.concatenate([ar[on_x], pr[on_x]])
+    shape = (n_cells, nbin, 2)
+    N, D, L = (np.zeros(shape) for _ in range(3))
+    np.add.at(N, (cc, b, hh), 0.5)
+    np.add.at(D, (cc, b, hh), 0.5 * dd)
+    np.add.at(L, (cc, b, hh), 0.5 * lv)
+    rng = np.random.default_rng([seed, 23])
+    rows = []
+    for g, ix in groups.items():
+        ix = np.asarray(ix, np.int64)
+        if ix.size < 2 or not N[ix].sum():
+            continue
+        W = rng.multinomial(ix.size, np.full(ix.size, 1.0 / ix.size),
+                            size=n_boot).astype(float)
+        n_, d_s, l_ = N[ix].sum(0), D[ix].sum(0), L[ix].sum(0)
+        nb_ = np.tensordot(W, N[ix], axes=(1, 0))
+        db_ = np.tensordot(W, D[ix], axes=(1, 0))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            est, boot, lev = d_s / n_, db_ / nb_, l_ / n_
+            lo, hi = np.nanpercentile(boot, [2.5, 97.5], axis=0)
+        for k in range(nbin):
+            for h in (0, 1):
+                if not n_[k, h]:
+                    continue
+                rows.append({"group": g, "bin_start": k * track_bin,
+                             "bin_end": (k + 1) * track_bin,
+                             "haplotype": f"hap{h + 1}",
+                             "contacts": float(n_[k, h]),
+                             "delta": est[k, h], "delta_lo": lo[k, h],
+                             "delta_hi": hi[k, h], "level": lev[k, h]})
+    return pd.DataFrame(rows)
 
 
 def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
@@ -7426,6 +7486,13 @@ def main(argv=None) -> int:
                          "(chrx_haplotype_concordance.tsv, "
                          "chrx_haplotype_percell.tsv.gz, "
                          "chrx_haplotypes_<ctx>).")
+    ap.add_argument("--chrx-track-bin", type=int, default=2_500_000,
+                    help="With --haplotypes: along X, per bin of this size "
+                         "and haplotype, ΔC with partners from the same "
+                         "copy and the level, per group "
+                         "(chrx_haplotype_tracks.tsv; for "
+                         "haplotype_contacts.py --concordance-tracks); 0: "
+                         "none.")
     ap.add_argument("--sex-column", default=None,
                     help="--samples column with each cell's sex (female / "
                          "male, F / M), used instead of the call from "
@@ -7734,7 +7801,7 @@ def main(argv=None) -> int:
     contrast_rows, chot_rows, cenr_rows = [], [], []
     var_rows, var_en = [], []
     chrx_rows, chrx_cells, chrx_maps = [], [], []
-    hap_rows, hap_cells = [], []
+    hap_rows, hap_cells, hap_tracks = [], [], []
     dom_rows = {k: [] for k in dsets}
     dom_crows = {k: [] for k in dsets}
     dom_wins = {k: [] for k in dsets}
@@ -8276,12 +8343,15 @@ def main(argv=None) -> int:
                     + [x.get("hap", np.zeros(x["g_lo"].size, np.int8))
                        for x in xs])
                 if (hx > 0).any():
-                    rh, pch = haplotype_concordance(
+                    rh, pch, trk = haplotype_concordance(
                         *xa_, hx, mx,
                         strat_x, grp_x, edges, band_labels, dbins,
                         args.position_bin, args.max_widen, args.n_boot,
                         args.seed + 6007 * ci_ctx + 3, args.n_threads,
-                        classes=x_classes)
+                        classes=x_classes, track_bin=args.chrx_track_bin)
+                    if not trk.empty:
+                        trk.insert(0, "context", ctx)
+                        hap_tracks.append(trk)
                     for r_ in rh:
                         r_.update(context=ctx, group_kind=kind_x[r_["group"]])
                     hap_rows += rh
@@ -8980,6 +9050,9 @@ def main(argv=None) -> int:
                else pd.DataFrame())
         hpc.to_csv(out / "chrx_haplotype_percell.tsv.gz", sep="\t",
                    index=False)
+        if hap_tracks:
+            pd.concat(hap_tracks, ignore_index=True).to_csv(
+                out / "chrx_haplotype_tracks.tsv", sep="\t", index=False)
         xi_of = _xi_haplotypes(hx_)
         if xi_of:
             logger.info("the inactive X (the less accessible haplotype): "

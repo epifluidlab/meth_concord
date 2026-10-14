@@ -1622,6 +1622,16 @@ def test_chrx_by_haplotype_moves_the_copies_difference_into_the_null(
     # PAR1's tagged contacts are left out of X, not counted on a copy
     assert (t0["pairs_X_controls_left_out"] > 0).all()
     assert (o / "chrx_haplotypes_GCH.png").exists()
+    # along X, bin by bin: T0's hap2 the less accessible everywhere; a
+    # male's X has no SNP, so no track
+    tr = pd.read_csv(o / "chrx_haplotype_tracks.tsv", sep="\t")
+    g0 = tr[(tr["context"] == "GCH") & (tr["group"] == "T0")]
+    lv = g0.pivot(index="bin_start", columns="haplotype", values="level")
+    assert len(lv) >= 5 and ((lv["hap2"] - lv["hap1"]) < -0.2).all()
+    assert (lv.index.to_series().diff().dropna() == 2_500_000).all()
+    assert (g0["delta_lo"] <= g0["delta"]).mean() > 0.9
+    assert (g0["delta"] <= g0["delta_hi"]).mean() > 0.9
+    assert not tr["group"].isin(["T2", "male"]).any()
 
 
 def test_par1_escapes_so_its_contacts_show_no_excess(tmp_path):

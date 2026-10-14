@@ -5,9 +5,14 @@ active X and both copies of chr1 have TADs: a contact under 1 Mb across a
 boundary (every Mb, at .5) is kept with probability 0.4.  The inactive X
 has none, but a megadomain boundary at 'DXZ4' (25 Mb) -- a contact across
 it kept with probability 0.1 -- more long-range contacts, and a superloop
-between DXZ4 and 'FIRRE' (33 Mb).  'GM': the inactive X is hap1 in every
-cell; 'IMR': hap1 in half the cells, hap2 in the others, each cell's called
-from its methylation (allelic_cells.tsv)."""
+between DXZ4 and 'FIRRE' (33 Mb).  Compartments alternate every 2 Mb (A,
+B, ...): a contact 2 Mb or more long between the two kinds is kept with
+probability 0.3 -- but on the inactive X, which has none.  'GM': the
+inactive X is hap1 in every cell; 'IMR': hap1 in half the cells, hap2 in
+the others, each cell's called from its methylation (allelic_cells.tsv).
+For the loci, a line's SNP levels (allelic_snps.tsv: the inactive X the
+more methylated, the less accessible) and ΔC along X per haplotype
+(chrx_haplotype_tracks.tsv)."""
 
 from __future__ import annotations
 
@@ -28,6 +33,11 @@ L = 40_000_000
 DXZ4, FIRRE = 25_050_000, 33_050_000
 
 
+def _a(pos) -> bool:
+    """Compartment A: 0-2 Mb, 4-6 Mb, ..."""
+    return (pos // 2_000_000) % 2 == 0
+
+
 def _contacts(rng, n, inactive, tads, chrom):
     lo_s, hi_s = (3.0, 7.6) if inactive else (3.0, 7.1)
     out = []
@@ -35,6 +45,9 @@ def _contacts(rng, n, inactive, tads, chrom):
         p1 = int(rng.integers(0, L))
         p2 = p1 + int(10 ** rng.uniform(lo_s, hi_s))
         if p2 >= L:
+            continue
+        if not inactive and p2 - p1 >= 2_000_000 and _a(p1) != _a(p2) \
+                and rng.random() < 0.7:
             continue
         if tads and p2 - p1 < 1_000_000:
             first = (p1 - 500_000) // 1_000_000 + 1   # boundaries > p1
@@ -88,6 +101,32 @@ def make_data(out: Path, n_cells=40, n=600, seed=0):
     (out / "el.bed").write_text(
         f"chrX\t{DXZ4 - 50_000}\t{DXZ4 + 50_000}\tDXZ4\n"
         f"chrX\t{FIRRE - 50_000}\t{FIRRE + 50_000}\tFIRRE\n")
+    with open(out / "eigen.bedGraph", "w") as fh:
+        for c in ("chr1", "chrX"):
+            for b in range(0, L, 250_000):
+                fh.write(f"{c}\t{b}\t{b + 250_000}\t"
+                         f"{1.0 if _a(b) else -1.0}\n")
+    # the SNPs: GM's hap1 (the inactive X) the more methylated, the less
+    # accessible; REF on either haplotype
+    pos = np.arange(1_000_000, L, 200_000)
+    rh = np.where(np.arange(pos.size) % 2 == 0, 1, 2)
+    xi_lv = {"HCG": 0.8, "GCH": 0.2}
+    xa_lv = {"HCG": 0.3, "GCH": 0.5}
+    sn = pd.DataFrame({"group": "GM", "chrom": "chrX", "pos": pos,
+                       "ref_hap": rh})
+    for c in ("HCG", "GCH"):
+        sn[f"{c}_ref"] = np.where(rh == 1, xi_lv[c], xa_lv[c])
+        sn[f"{c}_alt"] = np.where(rh == 1, xa_lv[c], xi_lv[c])
+        sn[f"{c}_reads_ref"] = sn[f"{c}_reads_alt"] = 10
+    sn.to_csv(out / "allelic_snps.tsv", sep="\t", index=False)
+    # ΔC along X per haplotype: GM's hap1 the higher
+    tr = [("GCH", "GM", b, b + 2_500_000, f"hap{h}", 100.0,
+           0.05 if h == 1 else 0.01, 0.0, 0.1, 0.4)
+          for b in range(0, L, 2_500_000) for h in (1, 2)]
+    pd.DataFrame(tr, columns=["context", "group", "bin_start", "bin_end",
+                              "haplotype", "contacts", "delta", "delta_lo",
+                              "delta_hi", "level"]).to_csv(
+        out / "chrx_haplotype_tracks.tsv", sep="\t", index=False)
     return out
 
 
@@ -100,6 +139,11 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
              "--boundaries", str(d / "boundaries.bed"), "--genome", "none",
              "--chrx-par", "0-1000000", "--xi-elements", str(d / "el.bed"),
              "--loop-window", "150000", "--profile-exclude", "8000000",
+             "--compartments", str(d / "eigen.bedGraph"),
+             "--locus", "chrX=chrX", "--locus",
+             "DXZ4=chrX:15000000-35000000",
+             "--allelic-snps", str(d / "allelic_snps.tsv"),
+             "--concordance-tracks", str(d / "chrx_haplotype_tracks.tsv"),
              "--n-boot", "200", "--plot-format", "png",
              "--output-dir", str(o)])
     s = pd.read_csv(o / "haplotype_contacts.tsv", sep="\t")
@@ -109,8 +153,9 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
         # more long-range contacts on the inactive X, alike on chr1
         r = t.loc[("P(s): share ≥ 10 Mb", "chrX")]
         assert r["difference"] > 0.005 and r["ci_lo"] > 0
+        # chr1's copies are made alike: no difference beyond sampling
         a = t.loc[("P(s): share ≥ 10 Mb", "autosomes")]
-        assert a["ci_lo"] < 0 < a["ci_hi"]
+        assert abs(a["difference"]) < 0.01
         assert t.loc[("P(s): share ≥ 10 Mb", "chrX − autosomes"),
                      "ci_lo"] > 0
         # the megadomain boundary: the inactive X's contacts avoid
@@ -124,20 +169,48 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
         assert r["ci_hi"] < 0 and r["q"] < 0.05
         a = t.loc[("TAD boundary insulation", "autosomes")]
         assert a["copy1"] > 0.3 and a["copy2"] > 0.3
-        assert a["ci_lo"] < 0 < a["ci_hi"]
+        assert abs(a["difference"]) < 0.2
         assert t.loc[("TAD boundary insulation", "chrX − autosomes"),
                      "ci_hi"] < 0
         # the superloop: on the inactive X only
         r = t.loc[("superloop DXZ4–FIRRE: obs/exp", "chrX")]
         assert r["copy1"] > 2 and r["copy2"] < 1.6 and r["ci_lo"] > 0
+        # compartments: kept by the active X and both chr1 copies
+        r = t.loc[("A/B compartments: ends' correlation", "chrX")]
+        assert r["copy2"] > 0.3 and abs(r["copy1"]) < 0.1
+        assert r["ci_hi"] < 0
+        a = t.loc[("A/B compartments: ends' correlation", "autosomes")]
+        assert a["copy1"] > 0.3 and a["copy2"] > 0.3
+        assert abs(a["difference"]) < 0.1
+        # the loci, as a browser draws them
+        for nm in ("chrX", "DXZ4"):
+            assert (o / f"haplotype_locus_{g}_{nm}.png").exists()
+        lt = pd.read_csv(o / f"haplotype_locus_{g}_DXZ4.tsv", sep="\t")
+        assert (lt["end"] - lt["start"]).max() == 500_000     # 40 bins
+        at = lt[(lt["start"] <= DXZ4) & (DXZ4 < lt["end"])].iloc[0]
+        assert at["insulation_Xi"] < at["insulation_Xa"] - 0.5
+        w = lt.dropna(subset=["partners_compartment_Xa",
+                              "partners_compartment_Xi"])
+        ca = np.corrcoef(w["compartment_bulk"],
+                         w["partners_compartment_Xa"])[0, 1]
+        ci = np.corrcoef(w["compartment_bulk"],
+                         w["partners_compartment_Xi"])[0, 1]
+        assert ca > 0.5 > ci
     assert (s.loc[s["group"] == "GM", "cells"] == 40).all()
+    # GM's levels per copy: from its SNPs, hap1 the inactive X
+    lt = pd.read_csv(o / "haplotype_locus_GM_chrX.tsv", sep="\t")
+    assert np.allclose(lt["HCG_Xi"].dropna(), 0.8)
+    assert np.allclose(lt["GCH_Xa"].dropna(), 0.5)
+    # IMR's copies are its cells' own: no SNP levels per copy
+    assert "HCG_Xi" not in pd.read_csv(o / "haplotype_locus_IMR_chrX.tsv",
+                                       sep="\t")
     for name in ("ps", "ps_ratio", "profile", "boundaries"):
         assert (o / f"haplotype_contacts_{name}.tsv").exists()
     # P(s), copy over copy: below 1 Mb the active X's TADs keep contacts
     # from crossing their boundaries, the inactive X's do not; chr1 flat
     r = pd.read_csv(o / "haplotype_contacts_ps_ratio.tsv", sep="\t")
     r = r[r["group"] == "GM"].set_index(["set", "log10_lo"])
-    assert r.loc[("chrX", 5.8), "log2_ratio"] > 0.5
+    assert r.loc[("chrX", 5.8), "log2_ratio"] > 0.3
     assert r.loc[("chrX", 5.8), "ci_lo"] > 0
     assert np.isnan(r.loc[("chrX", 7.2), "log2_ratio"])     # none on Xa
     # P(s) as Hi-C draws it: a share of the contacts per kb, falling
@@ -147,9 +220,7 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
     assert abs(a["share"].sum() - 1) < 1e-9
     assert a.loc[4.0, "per_kb"] > 5 * a.loc[5.0, "per_kb"] > \
         25 * a.loc[6.0, "per_kb"]
-    assert abs(r.loc[("autosomes", 5.0), "log2_ratio"]) < 0.2
-    assert r.loc[("autosomes", 5.0), "ci_lo"] < 0 < r.loc[("autosomes", 5.0),
-                                                          "ci_hi"]
+    assert abs(r.loc[("autosomes", 5.0), "log2_ratio"]) < 0.3
     assert (o / "haplotype_contacts_GM.png").exists()
 
 

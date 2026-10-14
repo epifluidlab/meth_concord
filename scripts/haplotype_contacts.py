@@ -41,15 +41,35 @@ applies, that difference on X less on the autosomes (haplotype_contacts.tsv):
     linking the same windows slid together along X -- a handful of contacts
     each at single-cell depth, so in the table only.
 
+With --compartments (a bulk compartment track, positive A), a fifth: the
+correlation of the track at a long-range contact's two ends -- A with A, B
+with B -- per copy: the inactive X's compartments are attenuated.
+
 Contacts with an end in PAR1 -- both copies active there -- are not X's;
 those within PAR1 are a control set of P(s).  Figures:
 haplotype_contacts_<line>.<fmt>.
+
+Loci (--locus; default all of X and DXZ4 +/- 10 Mb), drawn as a genome
+browser would, the two copies against each other
+(haplotype_locus_<line>_<locus>.<fmt>, and their tracks in .tsv): each
+copy's contact map, at the finest resolution giving the locus at most 64
+bins (single-cell depth: megabases, not TADs), the bulk TADs (--tads)
+between them; per copy, insulation, the compartment of its long-range
+partners against the bulk track, the level per context of its phased SNPs
+(--allelic-snps, allelic_imbalance.py's allelic_snps.tsv) and its ΔC
+(--concordance-tracks, annotation_class_concordance.py's
+chrx_haplotype_tracks.tsv) -- the last two for a line with one inactive X
+(--xi GROUP=1|2), whose haplotypes are its copies.
 
     python scripts/haplotype_contacts.py \\
         --haplotypes output/haplotypes --samples samples.tsv \\
         --group-column cell_type --xi GM12878=1 \\
         --xi IMR90=cells --xi-cells allelic_imbalance/allelic_cells.tsv \\
         --boundaries gm12878_tad_boundaries_ctcf.hg38.bed \\
+        --tads gm12878_tad_boundaries.hg38.bed \\
+        --compartments gm12878_compartments.hg38.bedGraph \\
+        --allelic-snps allelic_imbalance/allelic_snps.tsv \\
+        --concordance-tracks concordance/chrx_haplotype_tracks.tsv \\
         --output-dir output/haplotype_contacts
 """
 
@@ -69,7 +89,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from nome_hic_concordance.utils import chrom_key, manifest_text  # noqa: E402
-from nome_hic_concordance.xci import parse_elements, parse_par  # noqa: E402
+from nome_hic_concordance.xci import (  # noqa: E402
+    parse_elements, parse_escape, parse_par)
 
 logger = logging.getLogger("haplotype_contacts")
 
@@ -86,6 +107,38 @@ BOUNDARY_OFFSETS = np.arange(-1_000_000, 1_000_001, 100_000)
 #: Without --profile-window, the crossing profile keeps this far from
 #: either end of X (outside PAR1), where few contacts cross.
 PROFILE_MARGIN = 5_000_000
+#: Contacts this far apart or more show which compartments they join.
+COMPARTMENT_MIN_DISTANCE = 2_000_000
+
+
+class Eigen:
+    """A compartment track (bedGraph: chrom, start, end, value; positive A):
+    its value at any position, NaN where it has none."""
+
+    def __init__(self, path):
+        t = pd.read_csv(path, sep="\t", header=None, comment="#",
+                        usecols=[0, 1, 2, 3], dtype={0: str})
+        t = t[~t[0].str.startswith(("track", "browser"))]
+        self.by = {}
+        for c, g in t.groupby(0, sort=False):
+            g = g.sort_values(1)
+            self.by[chrom_key(c)] = (g[1].to_numpy(np.int64),
+                                     g[2].to_numpy(np.int64),
+                                     g[3].to_numpy(float))
+
+    def at(self, chrom, pos) -> np.ndarray:
+        pos = np.asarray(pos, np.int64)
+        out = np.full(pos.shape, np.nan)
+        key = pd.Series(np.asarray(chrom)).map(chrom_key).to_numpy()
+        for c in np.unique(key):
+            if c not in self.by:
+                continue
+            st, en, v = self.by[c]
+            m = key == c
+            i = np.searchsorted(st, pos[m], "right") - 1
+            ok = (i >= 0) & (pos[m] < en[np.maximum(i, 0)])
+            out[np.flatnonzero(m)[ok]] = v[i[ok]]
+        return out
 
 
 class Geometry:
@@ -94,8 +147,9 @@ class Geometry:
     slides."""
 
     def __init__(self, x_len: int, par, elements: dict, boundaries: dict,
-                 args):
+                 args, eigen: Eigen | None = None):
         self.par = par
+        self.eig = eigen
         self.min_d = int(args.min_distance)
         self.x_lo = int(par[1]) if par else 0
         self.x_hi = int(x_len)
@@ -221,7 +275,8 @@ def cell_counts(t: pd.DataFrame, xi_hap: int, geo: Geometry) -> dict:
            "prof_o": np.zeros((2, geo.grid.size)),
            "prof_e": np.zeros((2, geo.grid.size)),
            "bnd_n": np.zeros((2, 2, BOUNDARY_OFFSETS.size)),
-           "bnd_c": np.zeros((2, 2, BOUNDARY_OFFSETS.size))}
+           "bnd_c": np.zeros((2, 2, BOUNDARY_OFFSETS.size)),
+           "comp": np.zeros((2, 2, 4))}
     for i, (_, _, _, sh) in enumerate(geo.loops):
         out[f"loop{i}"] = np.zeros((2, sh.size))
     if t is None or t.empty:
@@ -281,6 +336,22 @@ def cell_counts(t: pd.DataFrame, xi_hap: int, geo: Geometry) -> dict:
                     mk = copy[mc] == k
                     out["bnd_n"][si, k, oi] += n_[mk].sum()
                     out["bnd_c"][si, k, oi] += c_[mk].sum()
+    # compartments: the track at a long-range contact's two ends -- each
+    # order once, so x and y have one mean: n, sum x, sum x^2, sum xy
+    if geo.eig is not None:
+        for si, want in enumerate((0, 2)):
+            m = (s_ == want) & (d >= COMPARTMENT_MIN_DISTANCE)
+            if not m.any():
+                continue
+            e1 = geo.eig.at(chrom[m], lo[m])
+            e2 = geo.eig.at(chrom[m], hi[m])
+            ok = np.isfinite(e1) & np.isfinite(e2)
+            for k in (0, 1):
+                mk = ok & (copy[m] == k)
+                out["comp"][si, k] += (2 * mk.sum(),
+                                       (e1[mk] + e2[mk]).sum(),
+                                       (e1[mk] ** 2 + e2[mk] ** 2).sum(),
+                                       2 * (e1[mk] * e2[mk]).sum())
     # superloops: the windows slid along X together
     for i, (_, a_, b_, sh) in enumerate(geo.loops):
         m = (s_ == 0) & (np.abs(d - (b_ - a_)) < 2 * geo.r)
@@ -314,6 +385,13 @@ def contact_stats(a: dict, geo: Geometry) -> list:
         if geo.dxz4 is not None:
             out.append(("crossing DXZ4: log2 obs/exp", "chrX", np.log2(
                 a["prof_o"][..., geo.dxz4] / a["prof_e"][..., geo.dxz4])))
+        if geo.eig is not None:
+            for si, sname in enumerate(("chrX", "autosomes")):
+                c = a["comp"][..., si, :, :]
+                n_, mu = c[..., 0], c[..., 1] / c[..., 0]
+                out.append(("A/B compartments: ends' correlation", sname,
+                            (c[..., 3] / n_ - mu ** 2)
+                            / (c[..., 2] / n_ - mu ** 2)))
         flank = np.abs(BOUNDARY_OFFSETS) >= geo.flank
         zero = int(np.flatnonzero(BOUNDARY_OFFSETS == 0)[0])
         for si, sname in enumerate(("chrX", "autosomes")):
@@ -588,6 +666,324 @@ def plot_contacts(stats: pd.DataFrame, ps: pd.DataFrame, ratio: pd.DataFrame,
     plt.close(fig)
 
 
+#: A locus's map resolution: the finest of these giving it at most
+#: MAP_BINS bins.
+MAP_RESOLUTIONS = (50_000, 100_000, 200_000, 250_000, 500_000, 1_000_000,
+                   2_000_000, 2_500_000, 5_000_000, 10_000_000)
+MAP_BINS = 64
+
+
+def parse_loci(values, elements: dict, x_name: str, x_lo: int, x_len: int):
+    """--locus NAME=CHROM:START-END (or NAME=CHROM, all of it): [(name,
+    start, end)] on X.  By default all of X outside PAR1 and DXZ4 +/- 10
+    Mb; 'none': no locus."""
+    if values and any(str(v).strip().lower() == "none" for v in values):
+        return []
+    out = []
+    for v in values or []:
+        nm, _, reg = str(v).partition("=")
+        c, _, se = reg.replace(",", "").partition(":")
+        if chrom_key(c) != "X":
+            raise ValueError(f"--locus {v}: on chrX only")
+        if se:
+            a_, _, b_ = se.partition("-")
+            if not (a_.isdigit() and b_.isdigit() and int(a_) < int(b_)):
+                raise ValueError(f"--locus {v}: NAME=chrX:START-END")
+            out.append((nm.strip(), int(a_), min(int(b_), x_len)))
+        else:
+            out.append((nm.strip(), x_lo, x_len))
+    if values:
+        return out
+    out = [(x_name, x_lo, x_len)]
+    if "DXZ4" in elements:
+        mid = sum(elements["DXZ4"]) // 2
+        out.append(("DXZ4", max(mid - 10_000_000, x_lo),
+                    min(mid + 10_000_000, x_len)))
+    return out
+
+
+def x_contacts(t: pd.DataFrame, xi_hap: int, geo: Geometry):
+    """A cell's contacts on X outside PAR1 (1 kb or more apart): low end,
+    high end and copy (0 the haplotype ``xi_hap``, as
+    :func:`cell_counts`)."""
+    if t is None or t.empty:
+        return (np.zeros(0, np.int64),) * 2 + (np.zeros(0, np.int8),)
+    m = t["chrom"].map(chrom_key).eq("X").to_numpy()
+    lo, hi = t["lo"].to_numpy(np.int64)[m], t["hi"].to_numpy(np.int64)[m]
+    ok = (hi - lo) >= 10 ** PS_EDGES[0]
+    if geo.par:
+        ok &= ~((lo >= geo.par[0]) & (lo < geo.par[1]))
+        ok &= ~((hi >= geo.par[0]) & (hi < geo.par[1]))
+    cp = np.where(t["hap"].to_numpy()[m] == (xi_hap or 1), 0, 1)
+    return lo[ok], hi[ok], cp[ok].astype(np.int8)
+
+
+def read_allelic(path, contexts) -> pd.DataFrame:
+    """allelic_imbalance.py's allelic_snps.tsv on X, phased SNPs only: per
+    line and SNP each haplotype's level per context and its reads."""
+    head = pd.read_csv(path, sep="\t", nrows=0).columns
+    need = ["group", "chrom", "pos", "ref_hap"]
+    for c in contexts:
+        need += [f"{c}_ref", f"{c}_alt", f"{c}_reads_ref", f"{c}_reads_alt"]
+    miss = [c for c in need if c not in head]
+    if miss:
+        sys.exit(f"--allelic-snps {path}: no {', '.join(miss)} "
+                 f"(--track-contexts)")
+    parts = []
+    for ch in pd.read_csv(path, sep="\t", usecols=need, chunksize=500_000,
+                          dtype={"group": str, "chrom": str}):
+        ch = ch[ch["chrom"].map(chrom_key).eq("X")
+                & ch["ref_hap"].isin([1, 2])]
+        if len(ch):
+            parts.append(ch)
+    t = pd.concat(parts, ignore_index=True) if parts else \
+        pd.DataFrame(columns=need)
+    out = t[["group", "chrom", "pos"]].copy()
+    r1 = t["ref_hap"].eq(1).to_numpy()
+    for c in contexts:
+        for h, (mine, other) in ((1, ("ref", "alt")), (2, ("alt", "ref"))):
+            out[f"{c}_hap{h}"] = np.where(r1, t[f"{c}_{mine}"],
+                                          t[f"{c}_{other}"])
+            out[f"{c}_reads_hap{h}"] = np.where(
+                r1, t[f"{c}_reads_{mine}"], t[f"{c}_reads_{other}"])
+    return out
+
+
+def _binned(pos, val, w, edges) -> np.ndarray:
+    """``val`` weighted by ``w``, averaged per bin of ``edges``."""
+    ok = np.isfinite(val) & np.isfinite(w) & (w > 0) & (pos >= edges[0]) \
+        & (pos < edges[-1])
+    b = np.searchsorted(edges, pos[ok], "right") - 1
+    n = np.bincount(b, w[ok], edges.size - 1)
+    s_ = np.bincount(b, w[ok] * val[ok], edges.size - 1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(n > 0, s_ / n, np.nan)
+
+
+def locus_tracks(lo, hi, cp, start: int, end: int, eig, x_name: str,
+                 allelic, conc, contexts, xi_hap: int, smooth: float):
+    """One locus's tracks per copy (0, 1): the contact map -- the copy's
+    share of its X contacts per pair of bins, smoothed -- insulation (log2
+    contacts crossing over those expected within 4 bins), the mean
+    compartment signal of the bins' long-range partners, and, per context,
+    the level (allelic_snps) and ΔC (chrx_haplotype_tracks) of each copy."""
+    from scipy.ndimage import gaussian_filter
+    width = end - start
+    res = next((r for r in MAP_RESOLUTIONS if width / r <= MAP_BINS),
+               MAP_RESOLUTIONS[-1])
+    edges = np.arange(start, end + res, res, dtype=np.int64)
+    edges[-1] = min(edges[-1], end)
+    nb = edges.size - 1
+    mid = (edges[:-1] + edges[1:]) // 2
+    tot = np.array([(cp == k).sum() for k in (0, 1)], float)
+    inside = (lo >= start) & (hi < end)
+    maps = np.zeros((2, nb, nb))
+    for k in (0, 1):
+        m = inside & (cp == k)
+        i = np.searchsorted(edges, lo[m], "right") - 1
+        j = np.searchsorted(edges, hi[m], "right") - 1
+        np.add.at(maps[k], (i, j), 1)
+        maps[k] = maps[k] + maps[k].T - np.diag(np.diag(maps[k]))
+        if smooth > 0:
+            maps[k] = gaussian_filter(maps[k], smooth)
+        maps[k] /= max(tot[k], 1)
+    out = {"res": res, "edges": edges, "maps": maps, "tot": tot}
+    # insulation within 4 bins, from contacts a bin or more apart
+    from types import SimpleNamespace
+    g_ = SimpleNamespace(grid=mid, w=4 * res, x_lo=start, x_hi=end)
+    ins = np.full((2, nb), np.nan)
+    for k in (0, 1):
+        m = (cp == k) & ((hi - lo) >= res) & ((hi - lo) < 8 * res) \
+            & (hi > start) & (lo < end)
+        if m.any():
+            o_, e_ = _crossing(lo[m], hi[m], g_)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ins[k] = np.log2(o_.sum(0) / e_.sum(0))
+    out["insulation"] = ins
+    # compartments: the bulk signal per bin, and each copy's partners'
+    if eig is not None:
+        out["eigen"] = _binned(mid, eig.at(np.full(nb, x_name), mid),
+                               np.ones(nb), edges)
+        part = np.full((2, nb), np.nan)
+        far = (hi - lo) >= COMPARTMENT_MIN_DISTANCE
+        for k in (0, 1):
+            m = far & (cp == k)
+            pos = np.concatenate([lo[m], hi[m]])
+            oth = np.concatenate([hi[m], lo[m]])
+            part[k] = _binned(pos, eig.at(np.full(pos.size, x_name), oth),
+                              np.ones(pos.size), edges)
+        out["partners"] = part
+    # 1D: each copy's level per context, from the phased SNPs
+    if allelic is not None and len(allelic):
+        pos = allelic["pos"].to_numpy(np.int64)
+        for c in contexts:
+            lv = np.full((2, nb), np.nan)
+            for k in (0, 1):
+                h = (xi_hap or 1) if k == 0 else 3 - (xi_hap or 1)
+                lv[k] = _binned(pos, allelic[f"{c}_hap{h}"].to_numpy(float),
+                                allelic[f"{c}_reads_hap{h}"].to_numpy(float),
+                                edges)
+            out[f"level_{c}"] = lv
+    # concordance: each copy's ΔC in its own bins
+    if conc is not None and len(conc):
+        for c, t in conc.groupby("context", sort=False):
+            t = t[(t["bin_end"] > start) & (t["bin_start"] < end)]
+            rows = {}
+            for k in (0, 1):
+                h = (xi_hap or 1) if k == 0 else 3 - (xi_hap or 1)
+                rows[k] = t[t["haplotype"] == f"hap{h}"].sort_values(
+                    "bin_start")
+            out[f"delta_{c}"] = rows
+    return out
+
+
+def locus_table(tr: dict, contexts, labels) -> pd.DataFrame:
+    """A locus's binned tracks, per copy."""
+    e = tr["edges"]
+    t = pd.DataFrame({"start": e[:-1], "end": e[1:]})
+    for k, lab in enumerate(labels):
+        t[f"insulation_{lab}"] = tr["insulation"][k]
+        if "partners" in tr:
+            t[f"partners_compartment_{lab}"] = tr["partners"][k]
+        for c in contexts:
+            if f"level_{c}" in tr:
+                t[f"{c}_{lab}"] = tr[f"level_{c}"][k]
+    if "eigen" in tr:
+        t["compartment_bulk"] = tr["eigen"]
+    return t
+
+
+def _triangle(ax, m, edges, up: bool, vmin, vmax, depth: float):
+    """A contact map as a triangle along the genome, up or down, to
+    ``depth`` of the distance (bp) between the bins."""
+    x_, y_ = np.meshgrid(edges, edges)
+    xs, ys = (x_ + y_) / 2e6, (x_ - y_) / 2e6
+    if not up:
+        ys = -ys
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lm = np.log10(m)
+    lm = np.ma.masked_where(np.tril(np.ones(m.shape, bool), -1)
+                            | ~np.isfinite(lm), lm)
+    qm = ax.pcolormesh(xs, ys, lm, cmap="YlOrRd", vmin=vmin, vmax=vmax,
+                       shading="flat", rasterized=True)
+    ax.set_ylim((0, depth / 2e6) if up else (-depth / 2e6, 0))
+    ax.set_yticks([])
+    for sp in ("left", "right", "top", "bottom"):
+        ax.spines[sp].set_visible(False)
+    return qm
+
+
+def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
+               labels, contexts, elements: dict, tads, escape, path):
+    """The two copies along one locus, as a genome browser shows them: each
+    copy's contact map (copy 1 up, copy 2 down), the bulk TADs between them,
+    and per copy insulation, compartments (the bulk signal; each copy's
+    long-range partners'), each context's level and ΔC."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    lines = [("insulation", "insulation\nlog2 obs/exp")]
+    if "partners" in tr:
+        lines.append(("partners", "A/B\ncompartment"))
+    for c in contexts:
+        if f"level_{c}" in tr:
+            lines.append((f"level_{c}", f"{c} level"))
+    for c in [k[6:] for k in tr if k.startswith("delta_")]:
+        lines.append((f"delta_{c}", f"{c}-{c}\nΔC"))
+    hr = [3.2, 0.35, 3.2] + [1.0] * len(lines)
+    fig = plt.figure(figsize=(7.2, 4.4 + 1.0 * len(lines)))
+    gs = fig.add_gridspec(len(hr), 1, height_ratios=hr, hspace=0.18)
+    lo_mb, hi_mb = start / 1e6, end / 1e6
+    pos = tr["maps"][tr["maps"] > 0]
+    vmax = np.log10(np.percentile(pos, 99.5)) if pos.size else 0
+    vmin = vmax - 2.5
+    depth = 0.5 * (end - start)
+    ax_up = fig.add_subplot(gs[0])
+    qm = _triangle(ax_up, tr["maps"][0], tr["edges"], True, vmin, vmax,
+                   depth)
+    ax_up.set_ylabel(labels[0], rotation=0, ha="right", va="center",
+                     fontsize=7)
+    ax_up.set_title(f"{group} {name}: chrX {lo_mb:.1f}-{hi_mb:.1f} Mb, "
+                    f"{tr['res'] / 1e3:g} kb bins ({int(tr['tot'][0]):,} / "
+                    f"{int(tr['tot'][1]):,} contacts on X)", fontsize=7,
+                    loc="left")
+    ax_t = fig.add_subplot(gs[1])
+    if tads is not None:
+        b = np.sort(tads[(tads >= start) & (tads < end)])
+        for i, (a_, b_) in enumerate(zip(b[:-1], b[1:])):
+            ax_t.plot([a_ / 1e6, b_ / 1e6], [i % 2, i % 2], color="#3182bd",
+                      lw=2.2, solid_capstyle="butt")
+    ax_t.set_ylim(-0.8, 1.8)
+    ax_t.set_yticks([])
+    ax_t.set_ylabel("TADs", rotation=0, ha="right", va="center", fontsize=6)
+    ax_dn = fig.add_subplot(gs[2])
+    _triangle(ax_dn, tr["maps"][1], tr["edges"], False, vmin, vmax, depth)
+    ax_dn.set_ylabel(labels[1], rotation=0, ha="right", va="center",
+                     fontsize=7)
+    cb = fig.colorbar(qm, ax=[ax_up, ax_dn], fraction=0.015, pad=0.01)
+    cb.set_label("log10 share of the copy's contacts", fontsize=5.5)
+    cb.ax.tick_params(labelsize=5)
+    mid = (tr["edges"][:-1] + tr["edges"][1:]) / 2e6
+    axes = []
+    for r, (key, ylab) in enumerate(lines):
+        ax = fig.add_subplot(gs[3 + r], sharex=axes[0] if axes else None)
+        axes.append(ax)
+        if key == "partners":
+            e = tr["eigen"]
+            ax.bar(mid, np.where(e > 0, e, 0), width=tr["res"] / 1e6,
+                   color="#e6550d", alpha=0.35, lw=0, label="bulk A")
+            ax.bar(mid, np.where(e < 0, e, 0), width=tr["res"] / 1e6,
+                   color="#3182bd", alpha=0.35, lw=0, label="bulk B")
+        if key.startswith("delta_"):
+            for k, lab in enumerate(labels):
+                t = tr[key][k]
+                if not len(t):
+                    continue
+                x = np.r_[t["bin_start"].to_numpy(), t["bin_end"].iloc[-1]]
+                ax.fill_between(x / 1e6, np.r_[t["delta_lo"],
+                                               t["delta_lo"].iloc[-1]],
+                                np.r_[t["delta_hi"], t["delta_hi"].iloc[-1]],
+                                step="post", color=_COLS[k], alpha=0.15,
+                                lw=0)
+                ax.step(x / 1e6, np.r_[t["delta"], t["delta"].iloc[-1]],
+                        where="post", color=_COLS[k], lw=0.9, label=lab)
+            ax.axhline(0, color="0.6", lw=0.4)
+        else:
+            v = tr[key]
+            for k, lab in enumerate(labels):
+                ax.plot(mid, v[k], color=_COLS[k], lw=0.9, marker="o",
+                        ms=1.5, label=lab)
+            if key == "insulation":
+                ax.axhline(0, color="0.6", lw=0.4)
+        ax.set_ylabel(ylab, fontsize=6)
+        ax.tick_params(labelsize=5.5)
+        if r == 0:
+            ax.legend(fontsize=5, frameon=False, ncol=2, loc="upper right")
+        if key == "partners":
+            ax.legend(fontsize=5, frameon=False, ncol=4, loc="upper right")
+    for ax in [ax_up, ax_t, ax_dn] + axes:
+        ax.set_xlim(lo_mb, hi_mb)
+        for nm, (a_, b_) in elements.items():
+            if a_ < end and b_ > start:
+                ax.axvline((a_ + b_) / 2e6, color="0.3", lw=0.5, ls=":")
+        if escape is not None and ax in axes:
+            for a_, b_ in escape:
+                if a_ < end and b_ > start:
+                    ax.axvspan(a_ / 1e6, b_ / 1e6, color="#fdae6b",
+                               alpha=0.15, lw=0)
+    for nm, (a_, b_) in elements.items():
+        if a_ < end and b_ > start:
+            ax_up.text((a_ + b_) / 2e6, 1.0, nm, fontsize=5.5, ha="center",
+                       va="bottom", transform=ax_up.get_xaxis_transform())
+    for ax in [ax_up, ax_t, ax_dn] + axes[:-1]:
+        plt.setp(ax.get_xticklabels(), visible=False)
+        ax.tick_params(axis="x", length=0)
+    if axes:
+        axes[-1].set_xlabel("chrX, Mb", fontsize=6.5)
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
 def _pairs(values) -> dict:
     out = {}
     for v in values or []:
@@ -655,6 +1051,36 @@ def main(argv=None) -> int:
     ap.add_argument("--loop-exclude", type=int, default=2_000_000,
                     help="Slides this close to none are not the "
                          "superloops' background.")
+    ap.add_argument("--compartments", default=None,
+                    help="A bulk compartment track (bedGraph; positive A), "
+                         "e.g. GM12878's eigenvector: the correlation of a "
+                         "long-range contact's two ends per copy, and the "
+                         "loci's compartment track.")
+    ap.add_argument("--locus", action="append", default=None,
+                    metavar="NAME=chrX:START-END",
+                    help="A locus to draw as a genome browser would, the "
+                         "two copies against each other "
+                         "(haplotype_locus_<line>_<name>; repeatable).  "
+                         "Default: all of X and DXZ4 +/- 10 Mb; 'none'.")
+    ap.add_argument("--tads", default=None,
+                    help="BED of the TAD boundaries the loci show (default: "
+                         "--boundaries).")
+    ap.add_argument("--chrx-escape", default="auto",
+                    metavar="auto|none|BED",
+                    help="The escape genes, shaded in the loci's tracks.")
+    ap.add_argument("--allelic-snps", default=None,
+                    help="allelic_imbalance.py's allelic_snps.tsv: each "
+                         "copy's level per --track-contexts along the "
+                         "loci.")
+    ap.add_argument("--track-contexts", default="HCG,GCH",
+                    help="The contexts of --allelic-snps to draw.")
+    ap.add_argument("--concordance-tracks", default=None,
+                    help="annotation_class_concordance.py's "
+                         "chrx_haplotype_tracks.tsv: each copy's ΔC along "
+                         "the loci.")
+    ap.add_argument("--map-smooth", type=float, default=1.0,
+                    help="The loci's contact maps: Gaussian smoothing, in "
+                         "bins (0: none).")
     ap.add_argument("--n-boot", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--plot-format", default="pdf")
@@ -688,7 +1114,7 @@ def main(argv=None) -> int:
                             args.min_cell_sites)
                 if "cells" in xi.values() else {})
     data: dict = {}
-    x_len = 0
+    x_len, x_name = 0, "chrX"
     for g in groups:
         cs = samples.loc[samples[args.group_column] == g, args.cell_column]
         got = {}
@@ -696,9 +1122,10 @@ def main(argv=None) -> int:
             t = read_pairs(hdir / f"{c}.haplotypes.parquet")
             if t is not None:
                 got[c] = t
-                xx = t.loc[t["chrom"].map(chrom_key).eq("X"), "hi"]
-                if len(xx):
-                    x_len = max(x_len, int(xx.max()) + 1)
+                onx = t["chrom"].map(chrom_key).eq("X")
+                if onx.any():
+                    x_len = max(x_len, int(t.loc[onx, "hi"].max()) + 1)
+                    x_name = str(t.loc[onx, "chrom"].iloc[0])
         if not got:
             logger.warning(f"{g}: none of its {len(cs)} cells has "
                            f"{hdir}/<cell>.haplotypes.parquet; skipped")
@@ -710,7 +1137,25 @@ def main(argv=None) -> int:
         sys.exit(f"no cell of --samples has a file in {hdir} (written by "
                  f"allelic_imbalance.py --haplotype-dir)")
     bnd = read_boundaries(args.boundaries) if args.boundaries else {}
-    geo = Geometry(x_len, par, elements, bnd, args)
+    eig = Eigen(args.compartments) if args.compartments else None
+    geo = Geometry(x_len, par, elements, bnd, args, eigen=eig)
+    try:
+        loci = parse_loci(args.locus, elements, x_name, geo.x_lo, x_len)
+    except ValueError as e:
+        ap.error(str(e))
+    tads = None
+    tad_path = args.tads or args.boundaries
+    if loci and tad_path:
+        tb = read_boundaries(tad_path)
+        tads = next((v for c, v in tb.items() if chrom_key(c) == "X"), None)
+    escape = parse_escape(args.chrx_escape, genome, par) if loci else None
+    contexts = [c.strip() for c in args.track_contexts.split(",")
+                if c.strip()]
+    allelic = (read_allelic(args.allelic_snps, contexts)
+               if loci and args.allelic_snps else None)
+    conc = (pd.read_csv(args.concordance_tracks, sep="\t",
+                        dtype={"group": str})
+            if loci and args.concordance_tracks else None)
     if geo.dxz4 is None:
         logger.warning("no DXZ4 among --xi-elements: no megadomain boundary")
     if not args.boundaries:
@@ -720,7 +1165,7 @@ def main(argv=None) -> int:
     for g, got in data.items():
         mode = xi.get(g)
         labels = ("Xi", "Xa") if mode else ("hap1", "hap2")
-        counts = []
+        counts, pooled = [], []
         n_drop = 0
         for c, t in got.items():
             if mode == "cells":
@@ -731,6 +1176,8 @@ def main(argv=None) -> int:
             else:
                 h = int(mode) if mode else 0
             counts.append(cell_counts(t, h, geo))
+            if loci:
+                pooled.append(x_contacts(t, h, geo))
         if mode == "cells":
             logger.info(f"{g}: each cell's inactive X from {args.xi_cells} "
                         f"({args.xi_context}); {n_drop} cells without a call "
@@ -776,6 +1223,34 @@ def main(argv=None) -> int:
                                          "copy2": labels[1]}),
                       ps, ratio, prof, bt, geo, elements, labels, g,
                       out / f"haplotype_contacts_{name}.{args.plot_format}")
+        if loci and pooled:
+            lo_ = np.concatenate([x[0] for x in pooled])
+            hi_ = np.concatenate([x[1] for x in pooled])
+            cp_ = np.concatenate([x[2] for x in pooled])
+            # a polyclonal line's haplotypes are not its copies: the
+            # SNPs' and the concordance's tracks are by haplotype
+            one = mode not in ("cells",)
+            al_ = (allelic[allelic["group"] == g] if one and allelic
+                   is not None else None)
+            co_ = (conc[conc["group"] == g] if one and conc is not None
+                   else None)
+            if not one and (allelic is not None or conc is not None):
+                logger.info(f"{g}: each cell's own inactive X -- the levels "
+                            f"and ΔC per haplotype are not per copy, so the "
+                            f"loci show the contacts only")
+            for nm, a_, b_ in loci:
+                tr = locus_tracks(lo_, hi_, cp_, a_, b_, eig, x_name, al_,
+                                  co_, contexts,
+                                  int(mode) if one and mode else 0,
+                                  args.map_smooth)
+                ln = re.sub(r"[^A-Za-z0-9_.-]+", "_", nm)
+                locus_table(tr, contexts, labels).to_csv(
+                    out / f"haplotype_locus_{name}_{ln}.tsv", sep="\t",
+                    index=False)
+                plot_locus(tr, nm, a_, b_, g, labels, contexts, elements,
+                           tads, escape,
+                           out / f"haplotype_locus_{name}_{ln}."
+                                 f"{args.plot_format}")
     if not all_stats:
         sys.exit("no cell left to analyse")
     stats = pd.concat(all_stats, ignore_index=True)
