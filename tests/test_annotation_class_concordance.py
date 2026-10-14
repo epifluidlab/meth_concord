@@ -1375,7 +1375,7 @@ def test_rotation_p_keeps_the_bins_autocorrelation():
 
 def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
                    n_y=150, seed=5, xi=0.1, xa=0.6, haps=None, tag=0.6,
-                   par=None):
+                   par=None, escape=()):
     """chrX read pairs for every cell -- a female's twice a male's -- and
     chrY short pairs for males.  A female's X contact lies on her inactive
     X (accessibility ``xi``) or her active one (``xa``), both ends alike; a
@@ -1383,9 +1383,9 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
     of a female's inactive X -- a share ``tag`` of her X contacts and of
     every cell's autosomal ones (a random haplotype) is written to
     haps/{cell}.haplotypes.parquet, as allelic_imbalance.py would; a
-    male's one X has no heterozygous SNP.  ``par`` (start, end): a PAR1
-    that escapes -- a contact with both ends in it is at ``xa`` on either
-    copy."""
+    male's one X has no heterozygous SNP.  ``par`` (start, end), and each
+    of ``escape``: X that escapes -- a contact with both ends in it is at
+    ``xa`` on either copy."""
     rng = np.random.default_rng(seed)
     rng_h = np.random.default_rng([seed, 1])
     if haps is not None:
@@ -1402,8 +1402,8 @@ def add_sex_chroms(d, female_types=("T0",), n_x=1100, n_x_short=700,
                                            n)).astype(np.int64)
         on_xi = fem & (rng.random(n) < 0.5)
         lvl = np.where(on_xi, xi, xa)
-        if par is not None:
-            lvl = np.where((a_pos >= par[0]) & (b_pos < par[1]), xa, lvl)
+        for s0, e0 in ([par] if par is not None else []) + list(escape):
+            lvl = np.where((a_pos >= s0) & (b_pos < e0), xa, lvl)
         pa = np.where(rng.random(n) < lvl, 0.9, 0.1)
         pb = np.where(rng.random(n) < lvl, 0.9, 0.1)
         s_pos = rng.integers(0, 19_000_000, ns)
@@ -1556,12 +1556,12 @@ def test_chrx_by_haplotype_moves_the_copies_difference_into_the_null(
     of the same haplotype is no closer, so the copy part is ~0 though the
     excess is there; T0's hap2 is the less accessible, co-closed copy."""
     d = make_data(tmp_path, per=20, n_types=3)
-    add_sex_chroms(d, female_types=("T0", "T1"),
+    add_sex_chroms(d, female_types=("T0", "T1"), par=(0, 2_000_000),
                    haps=lambda typ, c: (2 if typ == "T0" else
                                         1 + int(c.split("_c")[1]) % 2))
     o = tmp_path / "out"
-    acc.main(_contrast_args(d, o) + ["--chrx", "--haplotypes",
-                                     str(d / "haps")])
+    acc.main(_contrast_args(d, o) + ["--chrx", "--chrx-par", "0-2000000",
+                                     "--haplotypes", str(d / "haps")])
     h = pd.read_csv(o / "chrx_haplotype_concordance.tsv", sep="\t")
     al = h[h["band"].str.startswith("all")]
 
@@ -1594,6 +1594,8 @@ def test_chrx_by_haplotype_moves_the_copies_difference_into_the_null(
     dd = t1["level_X_hap2"] - t1["level_X_hap1"]
     assert (dd < -0.2).sum() == 10 and (dd > 0.2).sum() == 10
     assert (pc.loc[pc["cell_type"] == "T2", "pairs_X_hap1"] == 0).all()
+    # PAR1's tagged contacts are left out of X, not counted on a copy
+    assert (t0["pairs_X_controls_left_out"] > 0).all()
     assert (o / "chrx_haplotypes_GCH.png").exists()
 
 
@@ -1618,6 +1620,51 @@ def test_par1_escapes_so_its_contacts_show_no_excess(tmp_path):
     pc = pd.read_csv(o / "chrx_percell.tsv.gz", sep="\t")
     assert {"pairs_PAR1", "delta_PAR1", "w_PAR1"} <= set(pc.columns)
     assert (o / "chrx_GCH.png").exists()
+
+
+def test_escape_genes_outside_par1():
+    par = acc.PAR1["hg38"]
+    iv = acc.xci_escape_regions("hg38", par)
+    assert len(iv) > 20 and (iv[1:, 0] > iv[:-1, 1]).all()  # disjoint
+    assert iv[0, 0] == par[1]            # XG straddles PAR1's end: clipped
+
+    def inside(p):
+        return bool(((iv[:, 0] <= p) & (p < iv[:, 1])).any())
+    assert inside(53_200_000)            # KDM5C
+    assert inside(41_350_000)            # DDX3X
+    assert not inside(73_830_000)        # XIST: left out
+    assert 4e6 < (iv[:, 1] - iv[:, 0]).sum() < 7e6
+    assert acc.xci_escape_regions("mm10") is None
+    lk = acc.ChromosomeClasses(par, iv)
+    x = acc._chrom_code("X") * acc.STRIDE
+    assert list(lk.lookup_g([x + 1_000_000, x + 53_200_000,
+                             x + 73_830_000, 5 * acc.STRIDE])) == [
+        lk.i_par, lk.i_esc, 1, 0]
+
+
+def test_escape_genes_join_par1_as_controls(tmp_path):
+    """T0 female: her inactive X closed except in PAR1 (0-2 Mb) and an
+    escape region (8-10 Mb) -- both copies alike there.  Each control, and
+    the two together, show no excess; the rest of X shows it beyond each."""
+    d = make_data(tmp_path, per=20, n_types=3)
+    add_sex_chroms(d, par=(0, 2_000_000), escape=[(8_000_000, 10_000_000)])
+    (d / "escape.bed").write_text("chrX\t8000000\t10000000\n"
+                                  "chr1\t0\t1000000\n")
+    o = tmp_path / "o"
+    acc.main(_contrast_args(d, o) + ["--chrx", "--chrx-par", "0-2000000",
+                                     "--chrx-escape", str(d / "escape.bed")])
+    cx = pd.read_csv(o / "chrx_concordance.tsv", sep="\t")
+    al = cx[cx["band"].str.startswith("all") & (cx["statistic"] == "delta")
+            & (cx["group"] == "female")].set_index("comparison")
+    x = al.loc["chrX − autosomes", "diff"]
+    assert x > 0.03
+    for ctl in ("chrX PAR1", "chrX escape", "chrX PAR1 + escape"):
+        assert abs(al.loc[f"{ctl} − autosomes", "diff"]) < 0.4 * x, ctl
+        assert al.loc[f"chrX − {ctl}", "diff"] > 0.03, ctl
+    assert al.loc["chrX PAR1 + escape − autosomes", "pairs_test"] > \
+        al.loc["chrX PAR1 − autosomes", "pairs_test"]
+    pc = pd.read_csv(o / "chrx_percell.tsv.gz", sep="\t")
+    assert {"pairs_PAR1", "pairs_escape", "delta_escape"} <= set(pc.columns)
 
 
 def test_chrx_without_x_reads_stops_and_says_why(tmp_path):
@@ -1946,3 +1993,23 @@ def test_variability_beyond_each_types_overall_level():
     assert not plain & {7, 17, 27, 37}               # the scale's bins
     assert all(x % 2 == 0 for x in plain)
     assert scaled == {7, 17, 27, 37}
+
+
+def test_posteriors_that_are_not_there_say_why(tmp_path):
+    """A --posteriors directory missing, empty, or of other cells: each
+    stops at once, saying which."""
+    import shutil
+    d = make_data(tmp_path, per=5, n_types=2)
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "other").mkdir()
+    shutil.copy(next((d / "GCH").glob("*.posteriors.parquet")),
+                tmp_path / "other" / "cellZ.posteriors.parquet")
+    args = _contrast_args(d, tmp_path / "o")
+    i = args.index("--posteriors") + 1
+    for sub, msg in (("nope", "no such directory"),
+                     ("empty", r"no \*\.posteriors\.parquet"),
+                     ("other", "none of its 1 cells")):
+        a = list(args)
+        a[i] = f"GCH={tmp_path / sub}"
+        with pytest.raises(SystemExit, match=msg):
+            acc.main(a)

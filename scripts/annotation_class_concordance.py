@@ -861,7 +861,7 @@ def _hap_lookup(tab, g_lo, g_hi) -> np.ndarray:
 def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
                systems: dict, open_g=None, open_w: int = 200,
                prof_bin: int = 0, with_x: bool = False, loci=None,
-               haps=None, x_par=None) -> dict:
+               haps=None, x_classes=None) -> dict:
     """One cell's contacts -- both ends called, min_d <= d <= max_d -- as
     genome coordinates, with every system's class at both ends, and per
     system x class the count, sum and sum of squares of ALL its called
@@ -871,8 +871,9 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
     file has no counts); with ``prof_bin``, its called ends' posterior sum
     and count per bin of that size.  With ``with_x``, its chrX contacts
     and the marginal of its X ends and of its autosomal ends, kept apart
-    ("x") so that nothing but the chrX analysis sees them -- with ``x_par``
-    (PAR1's span) its PAR1 ends' marginal apart.  With ``loci``
+    ("x") so that nothing but the chrX analysis sees them -- with
+    ``x_classes`` (:class:`ChromosomeClasses`) the marginal of each of its
+    X classes apart.  With ``loci``
     (genome intervals, n x 2), the count and posterior sum of its called
     ends in each.  With ``haps`` (its :func:`_hap_table` file), each
     contact's haplotype ("hap", and X's in "x"; 0 untagged).  Integer work
@@ -977,17 +978,18 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
         h1, h2 = xb + q1, xb + q2
         xe = np.concatenate([r1[j1], r2[j2]])
         au = (e_g // STRIDE >= 1) & (e_g // STRIDE < 1000)
-        if x_par is None:
+        if x_classes is None:
             parts = [e_p[au], xe]
         else:
-            xp = np.concatenate([q1[j1], q2[j2]])
-            inp = (xp >= x_par[0]) & (xp < x_par[1])
-            parts = [e_p[au], xe[~inp], xe[inp]]
+            kk = x_classes.lookup_g(np.concatenate([xb[j1] + q1[j1],
+                                                    xb[j2] + q2[j2]]))
+            parts = [e_p[au]] + [xe[kk == k] for k in
+                                 range(1, len(x_classes.classes))]
         out["x"] = {"g_lo": np.where(lf, h1, h2)[xm],
                     "g_hi": np.where(lf, h2, h1)[xm],
                     "a": np.where(lf, r1, r2)[xm].astype(np.float32),
                     "p": np.where(lf, r2, r1)[xm].astype(np.float32),
-                    # count, sum, sum of squares: autosomes, X[, PAR1]
+                    # count, sum, sum of squares: autosomes, X's classes
                     "marg": np.array([[v.size for v in parts],
                                       [v.sum() for v in parts],
                                       [(v ** 2).sum() for v in parts]],
@@ -3587,6 +3589,126 @@ NEURON_IMPRINTED = ("Ube3a", "Grb10")
 #: inactivation -- a cell's two copies are alike there -- unlike PAR2, two of
 #: whose four genes the inactive X silences.
 PAR1 = {"hg38": (10_000, 2_781_479), "hg19": (60_000, 2_699_520)}
+#: Genes outside the PARs that escape X inactivation: Tukiainen et al. 2017
+#: (Nature 550:244), Suppl. Table 13, reported XCI status 'Escape' -- the
+#: consensus of earlier studies -- XIST left out: expressed from the inactive
+#: X alone, it is where the two copies differ most.  (Ensembl ID, name as
+#: published, hg19 start, end, hg38 start, end), 0-based half-open: hg19 as
+#: published (GENCODE v19), hg38 lifted with UCSC's hg19ToHg38 chain (every
+#: gene to chrX, its length kept).
+XCI_ESCAPE = (
+    ("ENSG00000124343", "XG", 2670090, 2734539, 2752049, 2816498),
+    ("ENSG00000056998", "GYG2", 2746828, 2800859, 2828787, 2882818),
+    ("ENSG00000006756", "ARSD", 2822010, 2847392, 2903969, 2929351),
+    ("ENSG00000157399", "ARSE", 2852698, 2886286, 2934657, 2968245),
+    ("ENSG00000205667", "ARSH", 2924653, 2951612, 3006612, 3033571),
+    ("ENSG00000062096", "ARSF", 2959511, 3030767, 3041470, 3112726),
+    ("ENSG00000101825", "MXRA5", 3226605, 3264682, 3308564, 3346641),
+    ("ENSG00000183943", "PRKX", 3522410, 3631649, 3604369, 3713608),
+    ("ENSG00000205664", "RP11-706O15.1", 3735568, 3761898, 3817527, 3843857),
+    ("ENSG00000130021", "HDHD1", 6966960, 7066231, 7048919, 7148190),
+    ("ENSG00000101846", "STS", 7137496, 7272851, 7219455, 7354810),
+    ("ENSG00000006757", "PNPLA4", 7866287, 7895780, 7898246, 7927739),
+    ("ENSG00000011201", "KAL1", 8496914, 8700227, 8528873, 8732186),
+    ("ENSG00000005302", "MSL3", 11776277, 11793870, 11758158, 11775751),
+    ("ENSG00000187268", "FAM9C", 13053736, 13062801, 13035617, 13044682),
+    ("ENSG00000235385", "GS1-600G8.5", 13284166, 13321571, 13266047, 13303452),
+    ("ENSG00000176896", "TCEANC", 13671224, 13700083, 13653105, 13681964),
+    ("ENSG00000123595", "RAB9A", 13707243, 13728625, 13689124, 13710506),
+    ("ENSG00000196459", "TRAPPC2", 13730362, 13752754, 13712243, 13734635),
+    ("ENSG00000046651", "OFD1", 13752831, 13787480, 13734712, 13769361),
+    ("ENSG00000046653", "GPM6B", 13789149, 13956757, 13771030, 13938638),
+    ("ENSG00000046647", "GEMIN8", 14026397, 14048012, 14008278, 14029893),
+    ("ENSG00000130234", "ACE2", 15579155, 15620271, 15561032, 15602148),
+    ("ENSG00000147003", "TMEM27", 15645440, 15683154, 15627317, 15665031),
+    ("ENSG00000169239", "CA5B", 15706952, 15805747, 15688829, 15787624),
+    ("ENSG00000169249", "ZRSR2", 15808594, 15841383, 15790471, 15823260),
+    ("ENSG00000182287", "AP1S2", 15843928, 15873054, 15825805, 15854931),
+    ("ENSG00000169895", "SYAP1", 16737754, 16783459, 16719631, 16765336),
+    ("ENSG00000086712", "TXLNG", 16804549, 16862642, 16786426, 16844519),
+    ("ENSG00000173674", "EIF1AX", 20142635, 20159962, 20124517, 20141844),
+    ("ENSG00000130741", "EIF2S3", 24072832, 24096088, 24054715, 24077971),
+    ("ENSG00000005889", "ZFX", 24167289, 24234372, 24149172, 24216255),
+    ("ENSG00000169297", "NR0B1", 30322322, 30327715, 30304205, 30309598),
+    ("ENSG00000165164", "CXorf22", 35937850, 36008269, 35919733, 35990152),
+    ("ENSG00000185753", "CXorf38", 40488284, 40506819, 40629032, 40647567),
+    ("ENSG00000180182", "MED14", 40507557, 40595110, 40648305, 40735858),
+    ("ENSG00000124486", "USP9X", 40944887, 41095832, 41085634, 41236579),
+    ("ENSG00000215301", "DDX3X", 41192650, 41223725, 41333397, 41364472),
+    ("ENSG00000189221", "MAOA", 43515466, 43606068, 43656218, 43746821),
+    ("ENSG00000069509", "FUNDC1", 44382884, 44402247, 44523638, 44543001),
+    ("ENSG00000147050", "KDM6A", 44732756, 44971847, 44873510, 45112602),
+    ("ENSG00000270069", "RP6-99M1.2", 45604638, 45629677, 45745210, 45770274),
+    ("ENSG00000130985", "UBA1", 47050259, 47074527, 47190860, 47215128),
+    ("ENSG00000102225", "CDK16", 47077258, 47089396, 47217859, 47229997),
+    ("ENSG00000126012", "KDM5C", 53220502, 53254604, 53191320, 53225422),
+    ("ENSG00000124313", "IQSEC2", 53262057, 53350522, 53232875, 53321324),
+    ("ENSG00000072501", "SMC1A", 53401069, 53449677, 53374148, 53422728),
+    ("ENSG00000158423", "RIBC1", 53449638, 53458059, 53422689, 53431111),
+    ("ENSG00000198034", "RPS4X", 71475528, 71497150, 72255678, 72277300),
+    ("ENSG00000225470", "JPX", 73164158, 73290243, 73944323, 74070408),
+    ("ENSG00000186310", "NAP1L3", 92925928, 92928567, 93670929, 93673568),
+    ("ENSG00000165194", "PCDH19", 99546641, 99665271, 100291643, 100410273),
+    ("ENSG00000102362", "SYTL4", 99929487, 99987110, 100674490, 100732123),
+    ("ENSG00000007952", "NOX1", 100098312, 100129334, 100843323, 100874345),
+    ("ENSG00000102387", "TAF7L", 100523240, 100548059, 101268252, 101293071),
+    ("ENSG00000080572", "PIH1D3", 106449861, 106487473, 107206631, 107244243),
+    ("ENSG00000187823", "ZCCHC16", 111697726, 111700473, 112454498, 112457245),
+    ("ENSG00000147246", "HTR2C", 113818550, 114144624, 114584077, 114910061),
+    ("ENSG00000183631", "CXorf64", 125953746, 125955769, 126819763, 126821786),
+    ("ENSG00000171004", "HS6ST2", 131760043, 132095423, 132626015, 132961395),
+    ("ENSG00000156920", "GPR112", 135383121, 135519215, 136300962, 136437056),
+    ("ENSG00000102243", "VGLL1", 135614310, 135638966, 136532151, 136556807),
+    ("ENSG00000165509", "MAGEC3", 140926101, 140985618, 141838315, 141897832),
+    ("ENSG00000198753", "PLXNB3", 153029650, 153044801, 153764195, 153779346),
+    ("ENSG00000102032", "RENBP", 153200715, 153210232, 153935262, 153944780),
+    ("ENSG00000073009", "IKBKG", 153769413, 153796782, 154541198, 154568551))
+
+
+def xci_escape_regions(genome, par=None, flank: int = 10_000):
+    """XCI_ESCAPE's genes on ``genome`` (hg38, hg19; else None), each
+    ``flank`` bp wider, merged and kept outside PAR1 (``par``): sorted,
+    disjoint (start, end) rows on chrX."""
+    col = {"hg38": (4, 5), "hg19": (2, 3)}.get(str(genome))
+    if col is None:
+        return None
+    iv = np.array([(r[col[0]] - flank, r[col[1]] + flank)
+                   for r in XCI_ESCAPE], np.int64)
+    return _clip_merge(iv, par)
+
+
+def read_escape_bed(path, par=None):
+    """A BED's chrX intervals (chrom, start, end), merged and kept outside
+    PAR1 (``par``)."""
+    b = pd.read_csv(path, sep="\t", header=None, comment="#",
+                    usecols=[0, 1, 2], dtype={0: str})
+    b = b[b[0].map(_canon).str.upper() == "X"]
+    return _clip_merge(b[[1, 2]].to_numpy(np.int64), par)
+
+
+def _clip_merge(iv, par=None):
+    iv = np.asarray(iv, np.int64).reshape(-1, 2)
+    iv = iv[np.argsort(iv[:, 0], kind="stable")]
+    out: list = []
+    for a_, b_ in iv:
+        a_ = max(int(a_), 0)
+        if out and a_ <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], int(b_))
+        else:
+            out.append([a_, int(b_)])
+    if par:
+        kept = []
+        for a_, b_ in out:
+            # the parts outside PAR1
+            if b_ <= par[0] or a_ >= par[1]:
+                kept.append([a_, b_])
+            else:
+                if a_ < par[0]:
+                    kept.append([a_, par[0]])
+                if b_ > par[1]:
+                    kept.append([par[1], b_])
+        out = kept
+    return np.array(out, np.int64).reshape(-1, 2)
 
 
 class ChromosomeClasses:
@@ -3594,15 +3716,27 @@ class ChromosomeClasses:
     chromosome is 'autosomes', one on X 'chrX', any other -1.  A contact's
     two ends share its chromosome -- and one copy of it -- so where the two
     copies of X differ, one inactive, X-X contacts are concordant beyond
-    their reshuffled partners, which come from either copy.  With ``par``
-    (PAR1's span on X) its ends are a class of their own, 'chrX PAR1': X's
-    one part where the two copies do not differ, the control."""
+    their reshuffled partners, which come from either copy.
 
-    def __init__(self, par=None):
+    X's parts where the two copies do not differ, the controls, are
+    classes of their own: with ``par`` (PAR1's span) 'chrX PAR1', with
+    ``escape`` (disjoint, sorted intervals outside PAR1: genes that escape
+    X inactivation) 'chrX escape'; 'chrX' is then the rest of X."""
+
+    def __init__(self, par=None, escape=None):
         self.name = CHROM_SYSTEM
         self.par = tuple(par) if par else None
-        self.classes = ("autosomes", "chrX") + (("chrX PAR1",) if self.par
-                                                else ())
+        self.escape = (np.asarray(escape, np.int64).reshape(-1, 2)
+                       if escape is not None and len(escape) else None)
+        cl = ["autosomes", "chrX"]
+        self.i_par = self.i_esc = None
+        if self.par:
+            self.i_par = len(cl)
+            cl.append("chrX PAR1")
+        if self.escape is not None:
+            self.i_esc = len(cl)
+            cl.append("chrX escape")
+        self.classes = tuple(cl)
         self._x = _chrom_code("X")
 
     def lookup_g(self, g) -> np.ndarray:
@@ -3612,9 +3746,13 @@ class ChromosomeClasses:
         out[(code >= 1) & (code < 1000)] = 0
         isx = code == self._x
         out[isx] = 1
+        pos = g % STRIDE
+        if self.escape is not None:
+            st, en = self.escape[:, 0], self.escape[:, 1]
+            i = np.searchsorted(st, pos, side="right") - 1
+            out[isx & (i >= 0) & (pos < en[np.maximum(i, 0)])] = self.i_esc
         if self.par:
-            pos = g % STRIDE
-            out[isx & (pos >= self.par[0]) & (pos < self.par[1])] = 2
+            out[isx & (pos >= self.par[0]) & (pos < self.par[1])] = self.i_par
         return out
 
 
@@ -3793,17 +3931,16 @@ def class_pair_difference(acc, sd, groups: dict, classes, pair_a, pair_b,
 CHRX_COMPARISONS = (("chrX", "autosomes"),
                     ("chrX", "autosomes at X density"),
                     ("autosomes at X density", "autosomes"))
-#: ... and with PAR1 a class of its own: PAR1 against the autosomes, and X
-#: against PAR1 -- the excess where the copies differ, beyond where they
-#: do not.
-CHRX_PAR_COMPARISONS = (("chrX PAR1", "autosomes"), ("chrX", "chrX PAR1"))
+#: ... and for each control -- PAR1, the escape genes, the two together --
+#: (control, autosomes) and (chrX, control): the excess where the copies
+#: differ, beyond where they do not.
 
 
 def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
                            edges, band_labels, dbins, position_bin: int,
                            max_widen: int, n_boot: int, seed: int,
                            n_threads: int = 1, map_bin: int = 1_000_000,
-                           min_map_contacts: int = 100, par=None):
+                           min_map_contacts: int = 100, classes=None):
     """chrX against the autosomes (:class:`ChromosomeClasses`), as one
     system's class pairs: every contact's ends centred on its cell's mean
     on autosomes or on X (``marg``: cells x (count, sum, sum of squares) x
@@ -3828,14 +3965,16 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     ``min_map_contacts``), beside the autosomes' bins' median and
     quartiles -- an excess even along X, or in places.
 
-    With ``par`` (PAR1's span on X; ``marg`` then has a third class) PAR1
-    is a class of its own and 'chrX' the rest of X: PAR1 escapes X
-    inactivation, so where the excess is the two copies differing, PAR1
-    has none (CHRX_PAR_COMPARISONS); where it is anything else about X --
-    its mapping, its density, how it was read -- PAR1 has it too.  Returns
-    (rows, per-cell rows of every cell's own values at all distances, the
-    map)."""
-    lk = ChromosomeClasses(par)
+    With ``classes`` (:class:`ChromosomeClasses`; ``marg`` a column per
+    class) PAR1 and the genes that escape X inactivation are classes of
+    their own, and 'chrX' the rest of X: the two copies do not differ
+    there, so where the excess is the copies differing, the controls have
+    none; where it is anything else about X -- its mapping, its density,
+    how it was read -- they have it too.  Each control against the
+    autosomes and X against each, and PAR1 and the escape genes together
+    ('chrX PAR1 + escape', the larger control).  Returns (rows, per-cell
+    rows of every cell's own values at all distances, the map)."""
+    lk = classes if classes is not None else ChromosomeClasses()
     nk = len(lk.classes)
     kx = lk.lookup_g(g_lo).astype(np.int64)
     ky = lk.lookup_g(g_hi).astype(np.int64)
@@ -3899,17 +4038,34 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
     thin = np.flatnonzero(auto & (rng.random(g_lo.size)
                                   < frac[s_code[cell]]))
     acc_t = run(thin, seed + 1)[0]
-    classes3 = lk.classes + ("autosomes at X density",)
+    # the classes compared, each its class pairs of acc: every class, and
+    # PAR1 and the escape genes together
+    named = {c: [(j, j)] for j, c in enumerate(lk.classes)}
+    if lk.i_par is not None and lk.i_esc is not None:
+        ip, ie = lk.i_par, lk.i_esc
+        named["chrX PAR1 + escape"] = [(ip, ip), (ie, ie),
+                                       (min(ip, ie), max(ip, ie))]
+    classes3 = tuple(named) + ("autosomes at X density",)
+    m3 = len(classes3)
     acc3 = {}
     for k in ("n", "xy", "xy1", "xy2", "oo", "oc", "no2", "nc2"):
-        z = np.zeros((n_cells, nk + 1, nk + 1, nb + 1))
-        z[:, :nk, :nk] = acc[k]
-        z[:, nk, nk] = acc_t[k][:, 0, 0]
+        z = np.zeros((n_cells, m3, m3, nb + 1))
+        for j, prs in enumerate(named.values()):
+            z[:, j, j] = sum(acc[k][:, a_, b_] for a_, b_ in prs)
+        z[:, m3 - 1, m3 - 1] = acc_t[k][:, 0, 0]
         acc3[k] = z
-    sd3 = np.column_stack([sd[:, j] for j in range(nk)] + [sd[:, 0]])
+
+    def pooled_sd(ks):
+        c_, s_, q_ = (sum(marg[:, t, i] for i in ks) for t in range(3))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return np.sqrt(np.maximum(q_ / c_ - (s_ / c_) ** 2, 0))
+    sd3 = np.column_stack([pooled_sd(sorted({i for pr in prs for i in pr}))
+                           for prs in named.values()] + [sd[:, 0]])
+    comps = list(CHRX_COMPARISONS)
+    for ctl in [c for c in named if c not in ("autosomes", "chrX")]:
+        comps += [(ctl, "autosomes"), ("chrX", ctl)]
     rows = []
-    for test, ref in CHRX_COMPARISONS + (CHRX_PAR_COMPARISONS if par
-                                         else ()):
+    for test, ref in comps:
         for r_ in class_pair_difference(acc3, sd3, groups, classes3,
                                         (ref, ref), (test, test),
                                         band_labels, n_boot, seed,
@@ -3922,10 +4078,12 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
               "pairs_X": acc["n"][:, 1, 1, A_]}
         go = sum(acc["oo"][:, j, j, A_] for j in range(nk))
         gc = sum(acc["oc"][:, j, j, A_] for j in range(nk))
-        if par:
-            pc["pairs_PAR1"] = acc["n"][:, 2, 2, A_]
-        for tag, k in (("autosomes", 0), ("X", 1)) + ((("PAR1", 2),)
-                                                     if par else ()):
+        tags = [("autosomes", 0), ("X", 1)]
+        for tag, k in (("PAR1", lk.i_par), ("escape", lk.i_esc)):
+            if k is not None:
+                tags.append((tag, k))
+                pc[f"pairs_{tag}"] = acc["n"][:, k, k, A_]
+        for tag, k in tags:
             n = acc["n"][:, k, k, A_]
             dd = acc["xy"][:, k, k, A_] - acc["xy1"][:, k, k, A_]
             pc[f"delta_{tag}"] = 2 * dd / n
@@ -4003,7 +4161,7 @@ def _diff_row(group, band, st, cells, na, nb_, ea, eb, ba, bb, ctl) -> dict:
 def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                           groups: dict, edges, band_labels, dbins,
                           position_bin: int, max_widen: int, n_boot: int,
-                          seed: int, n_threads: int = 1):
+                          seed: int, n_threads: int = 1, classes=None):
     """chrX against the autosomes on the contacts a phased SNP puts on one
     copy (``hap`` 1 or 2, 0 untagged; allelic_imbalance.py
     --haplotype-dir).  Ends centred on the cell's mean on autosomes or on X
@@ -4028,15 +4186,25 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
     direction w (its co-open share against the cell's tagged contacts, all
     distances): the inactive copy the less accessible, and co-closed.
 
+    With ``classes`` (:class:`ChromosomeClasses`) X is its rest: a contact
+    with an end in PAR1 or an escape gene is left out -- its two copies do
+    not differ, and PAR1, rich in SNPs, would be over-represented among the
+    tagged contacts -- and X is centred on the rest of X's mean (``marg``'s
+    first two classes).
+
     Rows per group (``groups``: {name: cell indices}; cells without a
     tagged contact left out), band, comparison -- HAP_COMPARISONS, and
     HAP_COPY_PART (value_A the autosomes' copy part, value_B X's) -- and
     statistic; and per cell, at all distances, each haplotype's contacts
     and level, and ΔC on X and the autosomes with each null."""
-    lk = ChromosomeClasses()
+    lk = classes if classes is not None else ChromosomeClasses()
     kc = lk.lookup_g(g_lo).astype(np.int64)
+    k2 = lk.lookup_g(g_hi).astype(np.int64)
     hap = np.asarray(hap)
-    sel = np.flatnonzero((hap > 0) & (kc >= 0))
+    marg = np.asarray(marg)[:, :, :2]            # autosomes, the rest of X
+    # PAR1 and the escape genes: their copies do not differ
+    left_out = (hap > 0) & ((kc >= 2) | (k2 >= 2))
+    sel = np.flatnonzero((hap > 0) & (kc >= 0) & (kc <= 1) & (k2 == kc))
     n_cells = marg.shape[0]
     nb = len(edges) - 1
     if not sel.size:
@@ -4165,6 +4333,9 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                 r_["comparison"] = HAP_COPY_PART
                 rows.append(r_)
     pc = {}
+    if lk.i_par is not None or lk.i_esc is not None:
+        pc["pairs_X_controls_left_out"] = np.bincount(
+            cell[left_out], minlength=n_cells)
     with np.errstate(invalid="ignore", divide="ignore"):
         for v, tag in (("chrX hap1", "X_hap1"), ("chrX hap2", "X_hap2"),
                        ("autosomes hap1", "autosomes_hap1"),
@@ -4266,7 +4437,7 @@ def plot_chrx(tab: pd.DataFrame, pcell: pd.DataFrame, sex: pd.DataFrame,
         comps = list(dict.fromkeys(ta["comparison"]))
         rows_ = ["all cells"] + [g for g in curves if g != "all cells"]
         ccol = ("0.1", "#d6604d", "#4393c3", "#1b9e77", "#7570b3",
-                "#e6ab02")
+                "#e6ab02", "#a6761d", "#e7298a", "#66a61e", "#666666")
         off = (np.arange(len(comps)) - (len(comps) - 1) / 2) * (
             0.66 / max(len(comps), 3))
         for ci, cmp_ in enumerate(comps):
@@ -6958,6 +7129,17 @@ def main(argv=None) -> int:
                          "(chrX PAR1 - autosomes; chrX - chrX PAR1).  "
                          "'auto' (default): by --genome (hg38, hg19), else "
                          "none.")
+    ap.add_argument("--chrx-escape", default="auto",
+                    metavar="auto|none|BED",
+                    help="With --chrx: genes that escape X inactivation, "
+                         "outside PAR1, as a class of their own -- another "
+                         "control where the two copies do not differ "
+                         "(chrX escape - autosomes; chrX - chrX escape; and "
+                         "with PAR1, 'chrX PAR1 + escape').  'auto' "
+                         "(default): Tukiainen et al. 2017's escape genes "
+                         "(XIST left out), 10 kb flanks, by --genome (hg38, "
+                         "hg19); or a BED of chrX intervals.  Contacts in "
+                         "PAR1 or these leave --haplotypes' X.")
     ap.add_argument("--haplotypes", default=None, metavar="DIR",
                     help="With --chrx: each cell's read pairs on one "
                          "haplotype ({cell}.haplotypes.parquet, from "
@@ -7056,9 +7238,25 @@ def main(argv=None) -> int:
                          f"START-END")
             x_par = (int(a_), int(b_))
         logger.info("--chrx: " + (f"PAR1 chrX:{x_par[0]:,}-{x_par[1]:,} a "
-                                  f"class of its own, the control"
+                                  f"class of its own, a control"
                                   if x_par else "no PAR1 class (--chrx-par "
                                   "S-E, or --genome hg38 / hg19)"))
+    x_esc = None
+    if args.chrx:
+        v_ = str(args.chrx_escape).strip()
+        if v_.lower() == "auto":
+            x_esc = (xci_escape_regions(args.genome, x_par) if args.genome
+                     else None)
+        elif v_.lower() != "none":
+            x_esc = read_escape_bed(v_, x_par)
+        logger.info(
+            "--chrx: " + (f"genes that escape X inactivation, outside PAR1, a "
+                          f"class of their own: {len(x_esc)} regions, "
+                          f"{(x_esc[:, 1] - x_esc[:, 0]).sum() / 1e6:.2f} Mb"
+                          if x_esc is not None and len(x_esc) else
+                          "no escape-gene class (--chrx-escape BED, or "
+                          "--genome hg38 / hg19)"))
+    x_classes = ChromosomeClasses(x_par, x_esc) if args.chrx else None
     if args.chrx and "X" not in exclude:
         logger.info("--chrx: chrX is analysed against the autosomes only, "
                     "and kept out of everything else")
@@ -7278,12 +7476,25 @@ def main(argv=None) -> int:
     dom_wins = {k: [] for k in dsets}
 
     from joblib import Parallel, delayed
+    # every --posteriors directory: there, with posteriors, of these cells
+    for ctx_, d_ in contexts.items():
+        dp = Path(d_)
+        if not dp.is_dir():
+            sys.exit(f"--posteriors {ctx_}={d_}: no such directory")
+        names = sorted(f.name[: -len(".posteriors.parquet")]
+                       for f in dp.glob("*.posteriors.parquet"))
+        if not names:
+            sys.exit(f"--posteriors {ctx_}={d_}: no *.posteriors.parquet "
+                     f"in it")
+        if not any(c in samples.index for c in names):
+            sys.exit(f"--posteriors {ctx_}={d_}: none of its {len(names):,} "
+                     f"cells is in {args.samples} -- files named e.g. "
+                     f"{names[:3]}, the sheet's --cell-column "
+                     f"{args.cell_column!r} e.g. {list(samples.index[:3])}")
     first = next(iter(contexts.values()))
     cells_all = sorted(f.name[: -len(".posteriors.parquet")]
                        for f in Path(first).glob("*.posteriors.parquet"))
     cells_all = [c for c in cells_all if c in samples.index]
-    if not cells_all:
-        sys.exit(f"no cells of {args.samples} under {first}")
     sex_tab, sex_of = None, {}
     chrx_on = args.chrx
     if args.chrx:
@@ -7442,7 +7653,8 @@ def main(argv=None) -> int:
                               args.min_distance, args.max_distance, exclude,
                               sysd, open_g if ctx == acc_ctx else None,
                               args.open_site_window, prof_bin,
-                              with_x=chrx_on, loci=loci_g, x_par=x_par,
+                              with_x=chrx_on, loci=loci_g,
+                              x_classes=x_classes,
                               haps=(Path(args.haplotypes)
                                     / f"{c}.haplotypes.parquet"
                                     if args.haplotypes and chrx_on
@@ -7782,7 +7994,8 @@ def main(argv=None) -> int:
             rx, pcx, xmap = chromosome_concordance(
                 *xa_, mx, strat_x, grp_x, edges, band_labels, dbins,
                 args.position_bin, args.max_widen, args.n_boot,
-                args.seed + 6007 * ci_ctx, args.n_threads, par=x_par)
+                args.seed + 6007 * ci_ctx, args.n_threads,
+                classes=x_classes)
             for r_ in rx:
                 r_.update(context=ctx, group_kind=kind_x[r_["group"]])
             chrx_rows += rx
@@ -7799,15 +8012,12 @@ def main(argv=None) -> int:
                     + [x.get("hap", np.zeros(x["g_lo"].size, np.int8))
                        for x in xs])
                 if (hx > 0).any():
-                    # X whole, PAR1 with it: copies by haplotype here
-                    mh = mx[:, :, :2].copy()
-                    if mx.shape[2] > 2:
-                        mh[:, :, 1] += mx[:, :, 2]
                     rh, pch = haplotype_concordance(
-                        *xa_, hx, mh,
+                        *xa_, hx, mx,
                         strat_x, grp_x, edges, band_labels, dbins,
                         args.position_bin, args.max_widen, args.n_boot,
-                        args.seed + 6007 * ci_ctx + 3, args.n_threads)
+                        args.seed + 6007 * ci_ctx + 3, args.n_threads,
+                        classes=x_classes)
                     for r_ in rh:
                         r_.update(context=ctx, group_kind=kind_x[r_["group"]])
                     hap_rows += rh
