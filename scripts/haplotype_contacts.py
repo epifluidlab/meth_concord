@@ -787,7 +787,8 @@ def locus_tracks(lo, hi, cp, start: int, end: int, eig, x_name: str,
         if smooth > 0:
             maps[k] = gaussian_filter(maps[k], smooth)
         maps[k] /= max(tot[k], 1)
-    out = {"res": res, "edges": edges, "maps": maps, "tot": tot}
+    out = {"res": res, "edges": edges, "maps": maps, "tot": tot,
+           "ratio": oe_ratio(maps)}
     # insulation within 4 bins, from contacts a bin or more apart
     from types import SimpleNamespace
     g_ = SimpleNamespace(grid=mid, w=4 * res, x_lo=start, x_hi=end)
@@ -849,6 +850,37 @@ def locus_tracks(lo, hi, cp, start: int, end: int, eig, x_name: str,
     return out
 
 
+def oe_ratio(maps) -> np.ndarray:
+    """log2 of copy 0's contacts over copy 1's, each first over its own
+    mean at that distance in the locus -- where the two fold differently
+    apart from how fast their contacts fall with distance (P(s))."""
+    n = maps.shape[1]
+    oe = np.full(maps.shape, np.nan)
+    for k in (0, 1):
+        for off in range(n):
+            i = np.arange(n - off)
+            v = maps[k][i, i + off]
+            mu = v.mean()
+            if mu > 0:
+                oe[k][i, i + off] = v / mu
+                oe[k][i + off, i] = v / mu
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.log2(oe[0] / oe[1])
+    return np.where(np.isfinite(r), r, np.nan)
+
+
+def map_table(tr: dict, labels) -> pd.DataFrame:
+    """A locus's maps, pixel by pixel (the upper triangle): each copy's
+    share of its contacts, smoothed, and log2 of the copies' observed over
+    expected."""
+    e = tr["edges"]
+    i, j = np.triu_indices(e.size - 1)
+    return pd.DataFrame({"start_1": e[i], "start_2": e[j],
+                         labels[0]: tr["maps"][0][i, j],
+                         labels[1]: tr["maps"][1][i, j],
+                         "log2_oe_ratio": tr["ratio"][i, j]})
+
+
 def locus_table(tr: dict, contexts, labels) -> pd.DataFrame:
     """A locus's binned tracks, per copy."""
     e = tr["edges"]
@@ -883,18 +915,20 @@ def locus_table(tr: dict, contexts, labels) -> pd.DataFrame:
     return t
 
 
-def _triangle(ax, m, edges, up: bool, vmin, vmax, depth: float):
+def _triangle(ax, m, edges, up: bool, vmin, vmax, depth: float,
+              log: bool = True, cmap: str = "YlOrRd"):
     """A contact map as a triangle along the genome, up or down, to
-    ``depth`` of the distance (bp) between the bins."""
+    ``depth`` of the distance (bp) between the bins; log10 of ``m``, or
+    ``m`` itself."""
     x_, y_ = np.meshgrid(edges, edges)
     xs, ys = (x_ + y_) / 2e6, (x_ - y_) / 2e6
     if not up:
         ys = -ys
     with np.errstate(divide="ignore", invalid="ignore"):
-        lm = np.log10(m)
+        lm = np.log10(m) if log else np.asarray(m, float)
     lm = np.ma.masked_where(np.tril(np.ones(m.shape, bool), -1)
                             | ~np.isfinite(lm), lm)
-    qm = ax.pcolormesh(xs, ys, lm, cmap="YlOrRd", vmin=vmin, vmax=vmax,
+    qm = ax.pcolormesh(xs, ys, lm, cmap=cmap, vmin=vmin, vmax=vmax,
                        shading="flat", rasterized=True)
     ax.set_ylim((0, depth / 2e6) if up else (-depth / 2e6, 0))
     ax.set_yticks([])
@@ -907,6 +941,8 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
                labels, contexts, elements: dict, tads, escape, path):
     """The two copies along one locus, as a genome browser shows them: each
     copy's contact map (copy 1 up, copy 2 down), the bulk TADs between them,
+    log2 of copy 1's over copy 2's, each as observed over expected at its
+    distance (red: copy 1's the more; blue: copy 2's),
     and per copy insulation, compartments (the bulk signal; each copy's
     long-range partners'), each context's level and ΔC."""
     import matplotlib
@@ -924,8 +960,8 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
             w = (f"\n{(r['bin_end'] - r['bin_start']).max() / 1e6:g} Mb "
                  f"windows" if len(r) else "")
             lines.append((f"delta_{c}", f"{c}-{c} ΔC{w}"))
-    hr = [3.2, 0.35, 3.2] + [1.0] * len(lines)
-    fig = plt.figure(figsize=(7.2, 4.4 + 1.0 * len(lines)))
+    hr = [3.2, 0.35, 3.2, 2.6] + [1.0] * len(lines)
+    fig = plt.figure(figsize=(7.2, 6.2 + 1.0 * len(lines)))
     gs = fig.add_gridspec(len(hr), 1, height_ratios=hr, hspace=0.18)
     lo_mb, hi_mb = start / 1e6, end / 1e6
     pos = tr["maps"][tr["maps"] > 0]
@@ -957,10 +993,20 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
     cb = fig.colorbar(qm, ax=[ax_up, ax_dn], fraction=0.015, pad=0.01)
     cb.set_label("log10 share of the copy's contacts", fontsize=5.5)
     cb.ax.tick_params(labelsize=5)
+    # where the copies fold differently, their P(s) aside
+    ax_r = fig.add_subplot(gs[3])
+    qr = _triangle(ax_r, tr["ratio"], tr["edges"], True, -1, 1, depth,
+                   log=False, cmap="RdBu_r")
+    ax_r.set_ylabel(f"{labels[0]} / {labels[1]}", rotation=0, ha="right",
+                    va="center", fontsize=7)
+    cr = fig.colorbar(qr, ax=ax_r, fraction=0.015, pad=0.01)
+    cr.set_label("log2 obs/exp,\n" + f"{labels[0]} over {labels[1]}",
+                 fontsize=5.5)
+    cr.ax.tick_params(labelsize=5)
     mid = (tr["edges"][:-1] + tr["edges"][1:]) / 2e6
     axes = []
     for r, (key, ylab) in enumerate(lines):
-        ax = fig.add_subplot(gs[3 + r], sharex=axes[0] if axes else None)
+        ax = fig.add_subplot(gs[4 + r], sharex=axes[0] if axes else None)
         axes.append(ax)
         if key == "partners":
             e = tr["eigen"]
@@ -1003,7 +1049,7 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
             ax.legend(fontsize=5, frameon=False, ncol=2, loc="upper right")
         if key == "partners":
             ax.legend(fontsize=5, frameon=False, ncol=4, loc="upper right")
-    for ax in [ax_up, ax_t, ax_dn] + axes:
+    for ax in [ax_up, ax_t, ax_dn, ax_r] + axes:
         ax.set_xlim(lo_mb, hi_mb)
         for nm, (a_, b_) in elements.items():
             if a_ < end and b_ > start:
@@ -1017,7 +1063,7 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
         if a_ < end and b_ > start:
             ax_up.text((a_ + b_) / 2e6, 1.0, nm, fontsize=5.5, ha="center",
                        va="bottom", transform=ax_up.get_xaxis_transform())
-    for ax in [ax_up, ax_t, ax_dn] + axes[:-1]:
+    for ax in [ax_up, ax_t, ax_dn, ax_r] + axes[:-1]:
         plt.setp(ax.get_xticklabels(), visible=False)
         ax.tick_params(axis="x", length=0)
     if axes:
@@ -1289,6 +1335,9 @@ def main(argv=None) -> int:
                 locus_table(tr, contexts, labels).to_csv(
                     out / f"haplotype_locus_{name}_{ln}.tsv", sep="\t",
                     index=False)
+                map_table(tr, labels).to_csv(
+                    out / f"haplotype_locus_{name}_{ln}_map.tsv.gz",
+                    sep="\t", index=False)
                 plot_locus(tr, nm, a_, b_, g, labels, contexts, elements,
                            tads, escape,
                            out / f"haplotype_locus_{name}_{ln}."

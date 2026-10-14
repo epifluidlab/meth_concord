@@ -196,6 +196,17 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
         assert (lt["end"] - lt["start"]).max() == 500_000     # 40 bins
         at = lt[(lt["start"] <= DXZ4) & (DXZ4 < lt["end"])].iloc[0]
         assert at["insulation_Xi"] < at["insulation_Xa"] - 0.5
+        # Xi over Xa, P(s) aside: the inactive X's contacts across DXZ4
+        # the fewer, those on one side of it the more
+        mp = pd.read_csv(o / f"haplotype_locus_{g}_DXZ4_map.tsv.gz",
+                         sep="\t")
+        far = (mp["start_2"] - mp["start_1"]) >= 3_000_000
+        across = far & (mp["start_1"] + 500_000 <= DXZ4) & \
+            (DXZ4 < mp["start_2"])
+        side = far & ((mp["start_2"] + 500_000 <= DXZ4)
+                      | (mp["start_1"] > DXZ4))
+        assert mp.loc[across, "log2_oe_ratio"].median() < -1
+        assert mp.loc[side, "log2_oe_ratio"].median() > 0.2
         w = lt.dropna(subset=["partners_compartment_Xa",
                               "partners_compartment_Xi"])
         ca = np.corrcoef(w["compartment_bulk"],
