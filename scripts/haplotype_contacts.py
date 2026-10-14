@@ -824,17 +824,27 @@ def locus_tracks(lo, hi, cp, start: int, end: int, eig, x_name: str,
                                 allelic[f"{c}_reads_hap{h}"].to_numpy(float),
                                 edges)
             out[f"level_{c}"] = lv
-    # concordance: each copy's ΔC in its context's own bins -- every
-    # context of --track-contexts, empty where none was tagged
+    # concordance: each copy's ΔC in its context's own windows, and copy
+    # 0's less copy 1's -- every context of --track-contexts, empty where
+    # none was tagged
     if conc is not None:
         for c in contexts:
             t = conc[conc["context"].astype(str).str.upper() == c.upper()]
+            mid_ = (t["bin_start"] + t["bin_end"]) / 2
+            t = t.assign(center=t["center"].fillna(mid_) if "center" in t
+                         else mid_)
+            # every window over the locus: the lines run to its edges
             t = t[(t["bin_end"] > start) & (t["bin_start"] < end)]
             rows = {}
             for k in (0, 1):
                 h = (xi_hap or 1) if k == 0 else 3 - (xi_hap or 1)
                 rows[k] = t[t["haplotype"] == f"hap{h}"].sort_values(
-                    "bin_start")
+                    "center")
+            d = t[t["haplotype"] == "hap1-hap2"].sort_values("center")
+            if (xi_hap or 1) == 2 and len(d):
+                d = d.assign(delta=-d["delta"], delta_lo=-d["delta_hi"],
+                             delta_hi=-d["delta_lo"])
+            rows["diff"] = d
             out[f"delta_{c}"] = rows
     return out
 
@@ -852,18 +862,22 @@ def locus_table(tr: dict, contexts, labels) -> pd.DataFrame:
                 t[f"{c}_{lab}"] = tr[f"level_{c}"][k]
     if "eigen" in tr:
         t["compartment_bulk"] = tr["eigen"]
-    # each bin's ΔC: that of the context's track bin holding its middle
+    # each bin's ΔC: that of the context's window centred nearest its
+    # middle, holding it
     mid = (e[:-1] + e[1:]) // 2
     for c in contexts:
         if f"delta_{c}" not in tr:
             continue
-        for k, lab in enumerate(labels):
+        for k, lab in ((0, labels[0]), (1, labels[1]),
+                       ("diff", f"{labels[0]}_minus_{labels[1]}")):
             r = tr[f"delta_{c}"][k]
             v = np.full(mid.size, np.nan)
             if len(r):
-                st_, en_ = r["bin_start"].to_numpy(), r["bin_end"].to_numpy()
-                i = np.searchsorted(st_, mid, "right") - 1
-                ok = (i >= 0) & (mid < en_[np.maximum(i, 0)])
+                holds = (r["bin_start"].to_numpy()[None, :] <= mid[:, None]) \
+                    & (mid[:, None] < r["bin_end"].to_numpy()[None, :])
+                dist = np.where(holds, np.abs(r["center"].to_numpy()[None, :]
+                                              - mid[:, None]), np.inf)
+                i, ok = dist.argmin(1), holds.any(1)
                 v[ok] = r["delta"].to_numpy()[i[ok]]
             t[f"{c}_dC_{lab}"] = v
     return t
@@ -907,9 +921,9 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
     for c in contexts:
         if f"delta_{c}" in tr:
             r = pd.concat([tr[f"delta_{c}"][0], tr[f"delta_{c}"][1]])
-            w = (f", {(r['bin_end'] - r['bin_start']).iloc[0] / 1e6:g} Mb"
-                 if len(r) else "")
-            lines.append((f"delta_{c}", f"{c}-{c}\nΔC{w}"))
+            w = (f"\n{(r['bin_end'] - r['bin_start']).max() / 1e6:g} Mb "
+                 f"windows" if len(r) else "")
+            lines.append((f"delta_{c}", f"{c}-{c} ΔC{w}"))
     hr = [3.2, 0.35, 3.2] + [1.0] * len(lines)
     fig = plt.figure(figsize=(7.2, 4.4 + 1.0 * len(lines)))
     gs = fig.add_gridspec(len(hr), 1, height_ratios=hr, hspace=0.18)
@@ -959,19 +973,23 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
                 ax.text(0.5, 0.5, f"no {key[6:]} contact tagged on a copy "
                                   f"here", transform=ax.transAxes,
                         ha="center", va="center", fontsize=6, color="0.4")
-            for k, lab in enumerate(labels):
+            # each copy's, and copy 0's less copy 1's (black), at the
+            # windows' centres, each with its 95% interval
+            for k, lab, col, lw in ((0, labels[0], _COLS[0], 0.8),
+                                    (1, labels[1], _COLS[1], 0.8),
+                                    ("diff", f"{labels[0]} − {labels[1]}",
+                                     "black", 1.0)):
                 t = tr[key][k]
                 if not len(t):
                     continue
-                x = np.r_[t["bin_start"].to_numpy(), t["bin_end"].iloc[-1]]
-                ax.fill_between(x / 1e6, np.r_[t["delta_lo"],
-                                               t["delta_lo"].iloc[-1]],
-                                np.r_[t["delta_hi"], t["delta_hi"].iloc[-1]],
-                                step="post", color=_COLS[k], alpha=0.15,
-                                lw=0)
-                ax.step(x / 1e6, np.r_[t["delta"], t["delta"].iloc[-1]],
-                        where="post", color=_COLS[k], lw=0.9, label=lab)
+                x = t["center"].to_numpy() / 1e6
+                ax.fill_between(x, t["delta_lo"], t["delta_hi"], color=col,
+                                alpha=0.12 if k != "diff" else 0.18, lw=0)
+                ax.plot(x, t["delta"], color=col, lw=lw, label=lab)
             ax.axhline(0, color="0.6", lw=0.4)
+            if key == next(k_ for k_, _ in lines if k_.startswith("delta_")):
+                ax.legend(fontsize=5, frameon=False, ncol=3,
+                          loc="upper right")
         else:
             v = tr[key]
             for k, lab in enumerate(labels):

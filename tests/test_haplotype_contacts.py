@@ -119,16 +119,20 @@ def make_data(out: Path, n_cells=40, n=600, seed=0):
         sn[f"{c}_alt"] = np.where(rh == 1, xa_lv[c], xi_lv[c])
         sn[f"{c}_reads_ref"] = sn[f"{c}_reads_alt"] = 10
     sn.to_csv(out / "allelic_snps.tsv", sep="\t", index=False)
-    # ΔC along X per haplotype: GM's hap1 the higher; HCG's sparser
-    # contacts in coarser bins
-    tr = [(c, "GM", b, b + w, f"hap{h}", 100.0, (hi if h == 1 else lo_),
-           0.0, 0.1, 0.4)
-          for c, w, hi, lo_ in (("GCH", 2_500_000, 0.05, 0.01),
-                                ("HCG", 10_000_000, 0.08, 0.02))
-          for b in range(0, L, w) for h in (1, 2)]
+    # ΔC along X per haplotype: GM's hap1 the higher; GCH side by side in
+    # 2.5 Mb bins, HCG's sparser contacts in 10 Mb windows slid 2.5 Mb, with
+    # the haplotypes' difference
+    tr = [("GCH", "GM", b, b + 2_500_000, np.nan, f"hap{h}", 100.0,
+           0.05 if h == 1 else 0.01, 0.0, 0.1, 0.4)
+          for b in range(0, L, 2_500_000) for h in (1, 2)]
+    for c in range(0, L + 1, 2_500_000):
+        a_, b_ = max(c - 5_000_000, 0), min(c + 5_000_000, L)
+        for h, v in (("hap1", 0.08), ("hap2", 0.02), ("hap1-hap2", 0.06)):
+            tr.append(("HCG", "GM", a_, b_, (a_ + b_) / 2, h, 50.0, v,
+                       v - 0.05, v + 0.05, 0.5))
     pd.DataFrame(tr, columns=["context", "group", "bin_start", "bin_end",
-                              "haplotype", "contacts", "delta", "delta_lo",
-                              "delta_hi", "level"]).to_csv(
+                              "center", "haplotype", "contacts", "delta",
+                              "delta_lo", "delta_hi", "level"]).to_csv(
         out / "chrx_haplotype_tracks.tsv", sep="\t", index=False)
     return out
 
@@ -204,10 +208,13 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
     lt = pd.read_csv(o / "haplotype_locus_GM_chrX.tsv", sep="\t")
     assert np.allclose(lt["HCG_Xi"].dropna(), 0.8)
     assert np.allclose(lt["GCH_Xa"].dropna(), 0.5)
-    # and its ΔC per copy, HCG-HCG and GCH-GCH, each in its own bins
+    # and its ΔC per copy, HCG-HCG and GCH-GCH, each in its own windows,
+    # and HCG's Xi less Xa
     for col, v in (("HCG_dC_Xi", 0.08), ("HCG_dC_Xa", 0.02),
-                   ("GCH_dC_Xi", 0.05), ("GCH_dC_Xa", 0.01)):
+                   ("HCG_dC_Xi_minus_Xa", 0.06), ("GCH_dC_Xi", 0.05),
+                   ("GCH_dC_Xa", 0.01)):
         assert lt[col].notna().all() and np.allclose(lt[col], v), col
+    assert lt["GCH_dC_Xi_minus_Xa"].isna().all()       # none given
     # IMR's copies are its cells' own: no SNP levels per copy
     assert "HCG_Xi" not in pd.read_csv(o / "haplotype_locus_IMR_chrX.tsv",
                                        sep="\t")

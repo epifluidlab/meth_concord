@@ -4333,7 +4333,7 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                           groups: dict, edges, band_labels, dbins,
                           position_bin: int, max_widen: int, n_boot: int,
                           seed: int, n_threads: int = 1, classes=None,
-                          track_bin: int = 0):
+                          track_bin: int = 0, track_step: int = 0):
     """chrX against the autosomes on the contacts a phased SNP puts on one
     copy (``hap`` 1 or 2, 0 untagged; allelic_imbalance.py
     --haplotype-dir).  Ends centred on the cell's mean on autosomes or on X
@@ -4369,9 +4369,9 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
     HAP_COPY_PART (value_A the autosomes' copy part, value_B X's) -- and
     statistic; per cell, at all distances, each haplotype's contacts and
     level, and ΔC on X and the autosomes with each null; and with
-    ``track_bin`` (bp, or -1: :func:`track_bin_auto`), along X
-    (:func:`_haplotype_tracks`) per group, bin and haplotype, ΔC with
-    partners from the same copy and the level."""
+    ``track_bin`` (a window, bp, or -1: :func:`track_bin_auto`; slid
+    ``track_step``), along X (:func:`_haplotype_tracks`) per group, window
+    and haplotype, ΔC with partners from the same copy and the level."""
     lk = classes if classes is not None else ChromosomeClasses()
     kc = lk.lookup_g(g_lo).astype(np.int64)
     k2 = lk.lookup_g(g_hi).astype(np.int64)
@@ -4513,7 +4513,7 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
         d_ = 2 * (xi * yi - 0.5 * (xi * right[0, i] + left[0, i] * yi))
         tracks = _haplotype_tracks(c_[i], k_[i] == 1, h_[i], gl[i], gh[i],
                                    d_, ar, pr, groups, n_cells, track_bin,
-                                   n_boot, seed)
+                                   n_boot, seed, track_step)
     pc = {}
     if lk.i_par is not None or lk.i_esc is not None:
         pc["pairs_X_controls_left_out"] = np.bincount(
@@ -4570,14 +4570,17 @@ def parse_track_bins(spec) -> dict:
 
 
 def _haplotype_tracks(c_, on_x, h_, gl, gh, d_, ar, pr, groups: dict,
-                      n_cells: int, track_bin: int, n_boot: int,
-                      seed: int) -> pd.DataFrame:
-    """Along X, per ``track_bin`` bin (-1: :func:`track_bin_auto`) and
-    haplotype: ΔC (``d_``, each contact's 2(xy - xy1), partners from its own
-    copy) and the level (the ends' mean posterior, ``ar`` the low end's,
-    ``pr`` the high end's), each contact counted half at each end's bin;
-    per group the pooled values, with ΔC's 95% interval from resampling the
-    cells."""
+                      n_cells: int, track_bin: int, n_boot: int, seed: int,
+                      track_step: int = 0) -> pd.DataFrame:
+    """Along X, in windows ``track_bin`` wide (-1: :func:`track_bin_auto`)
+    slid ``track_step`` at a time (0: side by side), per haplotype: ΔC
+    (``d_``, each contact's 2(xy - xy1), partners from its own copy) and the
+    level (the ends' mean posterior, ``ar`` the low end's, ``pr`` the high
+    end's), each contact counted half at each end; per group the pooled
+    values, with ΔC's 95% interval from resampling the cells -- and the
+    haplotypes' difference ('hap1-hap2'), on the same resampled cells.  A
+    window wide enough for the sparse HCG contacts, slid in small steps,
+    still shows where along X the copies' concordance changes."""
     base = _chrom_code("X") * STRIDE
     pos = np.concatenate([gl[on_x], gh[on_x]]) - base
     if not pos.size:
@@ -4585,17 +4588,30 @@ def _haplotype_tracks(c_, on_x, h_, gl, gh, d_, ar, pr, groups: dict,
     if track_bin < 0:
         track_bin = track_bin_auto(pos, np.concatenate([h_[on_x],
                                                         h_[on_x]]))
-    b = pos // track_bin
-    nbin = int(b.max()) + 1
+    step = min(track_step, track_bin) if track_step > 0 else track_bin
+    k = max(int(round(track_bin / step)), 1)
+    fb = pos // step
+    nfine = int(fb.max()) + 1
     cc = np.concatenate([c_[on_x], c_[on_x]])
     hh = np.concatenate([h_[on_x], h_[on_x]])
     dd = np.concatenate([d_[on_x], d_[on_x]])
     lv = np.concatenate([ar[on_x], pr[on_x]])
-    shape = (n_cells, nbin, 2)
+    shape = (n_cells, nfine, 2)
     N, D, L = (np.zeros(shape) for _ in range(3))
-    np.add.at(N, (cc, b, hh), 0.5)
-    np.add.at(D, (cc, b, hh), 0.5 * dd)
-    np.add.at(L, (cc, b, hh), 0.5 * lv)
+    np.add.at(N, (cc, fb, hh), 0.5)
+    np.add.at(D, (cc, fb, hh), 0.5 * dd)
+    np.add.at(L, (cc, fb, hh), 0.5 * lv)
+    # each window: k fine bins around its step, cut at X's ends
+    j = np.arange(nfine)
+    s0 = np.clip(j - k // 2, 0, nfine)
+    s1 = np.clip(j - k // 2 + k, 0, nfine)
+
+    def win(a):
+        c = np.concatenate([np.zeros((a.shape[0], 1, 2)),
+                            np.cumsum(a, axis=1)], axis=1)
+        return c[:, s1] - c[:, s0]
+    N, D, L = win(N), win(D), win(L)
+    w0, w1 = s0 * step, s1 * step
     rng = np.random.default_rng([seed, 23])
     rows = []
     for g, ix in groups.items():
@@ -4607,19 +4623,31 @@ def _haplotype_tracks(c_, on_x, h_, gl, gh, d_, ar, pr, groups: dict,
         n_, d_s, l_ = N[ix].sum(0), D[ix].sum(0), L[ix].sum(0)
         nb_ = np.tensordot(W, N[ix], axes=(1, 0))
         db_ = np.tensordot(W, D[ix], axes=(1, 0))
-        with np.errstate(invalid="ignore", divide="ignore"):
+        with np.errstate(invalid="ignore", divide="ignore"), \
+                warnings.catch_warnings():
+            # a window this group has no contact in: no interval
+            warnings.simplefilter("ignore", RuntimeWarning)
             est, boot, lev = d_s / n_, db_ / nb_, l_ / n_
             lo, hi = np.nanpercentile(boot, [2.5, 97.5], axis=0)
-        for k in range(nbin):
+            dlo, dhi = np.nanpercentile(boot[..., 0] - boot[..., 1],
+                                        [2.5, 97.5], axis=0)
+        for i in range(nfine):
+            if s1[i] <= s0[i]:
+                continue
+            at = {"group": g, "bin_start": int(w0[i]), "bin_end": int(w1[i]),
+                  "center": (w0[i] + w1[i]) / 2}
             for h in (0, 1):
-                if not n_[k, h]:
-                    continue
-                rows.append({"group": g, "bin_start": k * track_bin,
-                             "bin_end": (k + 1) * track_bin,
-                             "haplotype": f"hap{h + 1}",
-                             "contacts": float(n_[k, h]),
-                             "delta": est[k, h], "delta_lo": lo[k, h],
-                             "delta_hi": hi[k, h], "level": lev[k, h]})
+                if n_[i, h]:
+                    rows.append({**at, "haplotype": f"hap{h + 1}",
+                                 "contacts": float(n_[i, h]),
+                                 "delta": est[i, h], "delta_lo": lo[i, h],
+                                 "delta_hi": hi[i, h], "level": lev[i, h]})
+            if n_[i, 0] and n_[i, 1]:
+                rows.append({**at, "haplotype": "hap1-hap2",
+                             "contacts": float(n_[i].sum()),
+                             "delta": est[i, 0] - est[i, 1],
+                             "delta_lo": dlo[i], "delta_hi": dhi[i],
+                             "level": lev[i, 0] - lev[i, 1]})
     return pd.DataFrame(rows)
 
 
@@ -7528,17 +7556,24 @@ def main(argv=None) -> int:
                          "(chrx_haplotype_concordance.tsv, "
                          "chrx_haplotype_percell.tsv.gz, "
                          "chrx_haplotypes_<ctx>).")
-    ap.add_argument("--chrx-track-bin", default="auto",
+    ap.add_argument("--chrx-track-window", "--chrx-track-bin",
+                    dest="chrx_track_bin", default="auto",
                     metavar="auto|none|BP|CTX=BP,...",
-                    help="With --haplotypes: along X, per bin and "
+                    help="With --haplotypes: along X, per window and "
                          "haplotype, ΔC with partners from the same copy "
-                         "and the level, per group and context "
-                         "(chrx_haplotype_tracks.tsv; for "
-                         "haplotype_contacts.py --concordance-tracks).  "
-                         "'auto' (default): per context the finest of 1, "
-                         "2.5, 5, 10, 20 Mb where a copy's median bin holds "
-                         "100 contacts -- HCG's are far sparser than GCH's; "
-                         "or a size, for all or per context (HCG=10000000).")
+                         "and the level, and the haplotypes' difference, "
+                         "per group and context (chrx_haplotype_tracks.tsv; "
+                         "for haplotype_contacts.py --concordance-tracks).  "
+                         "The window: 'auto' (default) per context the "
+                         "narrowest of 1, 2.5, 5, 10, 20 Mb where a copy's "
+                         "median window holds 100 contacts -- HCG's are far "
+                         "sparser than GCH's; or a width, for all or per "
+                         "context (HCG=20000000).")
+    ap.add_argument("--chrx-track-step", type=int, default=500_000,
+                    help="The windows of --chrx-track-window slide this far "
+                         "at a time (0: side by side): a wide window, small "
+                         "steps -- a smooth track that still shows where "
+                         "it turns.")
     ap.add_argument("--sex-column", default=None,
                     help="--samples column with each cell's sex (female / "
                          "male, F / M), used instead of the call from "
@@ -8400,14 +8435,16 @@ def main(argv=None) -> int:
                         args.seed + 6007 * ci_ctx + 3, args.n_threads,
                         classes=x_classes,
                         track_bin=track_bins.get(ctx.upper(),
-                                                 track_bins[None]))
+                                                 track_bins[None]),
+                        track_step=args.chrx_track_step)
                     if not trk.empty:
                         trk.insert(0, "context", ctx)
                         hap_tracks.append(trk)
-                        w_ = int(trk["bin_end"].iloc[0]
-                                 - trk["bin_start"].iloc[0])
+                        w_ = int((trk["bin_end"] - trk["bin_start"]).max())
+                        st_ = min(args.chrx_track_step or w_, w_)
                         logger.info(f"{ctx}: each copy's ΔC and level along "
-                                    f"X in {w_ / 1e6:g} Mb bins "
+                                    f"X in {w_ / 1e6:g} Mb windows, slid "
+                                    f"{st_ / 1e6:g} Mb "
                                     f"(chrx_haplotype_tracks.tsv)")
                     for r_ in rh:
                         r_.update(context=ctx, group_kind=kind_x[r_["group"]])

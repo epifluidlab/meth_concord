@@ -1623,15 +1623,22 @@ def test_chrx_by_haplotype_moves_the_copies_difference_into_the_null(
     # PAR1's tagged contacts are left out of X, not counted on a copy
     assert (t0["pairs_X_controls_left_out"] > 0).all()
     assert (o / "chrx_haplotypes_GCH.png").exists()
-    # along X, bin by bin: T0's hap2 the less accessible everywhere; a
-    # male's X has no SNP, so no track
+    # along X, window by window -- 2.5 Mb, slid 0.5 Mb: T0's hap2 the less
+    # accessible everywhere; a male's X has no SNP, so no track
     tr = pd.read_csv(o / "chrx_haplotype_tracks.tsv", sep="\t")
     g0 = tr[(tr["context"] == "GCH") & (tr["group"] == "T0")]
-    lv = g0.pivot(index="bin_start", columns="haplotype", values="level")
-    assert len(lv) >= 5 and ((lv["hap2"] - lv["hap1"]) < -0.2).all()
-    assert (lv.index.to_series().diff().dropna() == 2_500_000).all()
-    assert (g0["delta_lo"] <= g0["delta"]).mean() > 0.9
-    assert (g0["delta"] <= g0["delta_hi"]).mean() > 0.9
+    cp = g0[g0["haplotype"].isin(["hap1", "hap2"])]
+    lv = cp.pivot(index="center", columns="haplotype",
+                  values="level").dropna()
+    assert len(lv) >= 25 and ((lv["hap2"] - lv["hap1"]) < -0.2).all()
+    assert (g0["bin_end"] - g0["bin_start"]).max() == 2_500_000
+    assert np.median(np.diff(np.sort(cp["center"].unique()))) == 500_000
+    assert (cp["delta_lo"] <= cp["delta"]).mean() > 0.9
+    assert (cp["delta"] <= cp["delta_hi"]).mean() > 0.9
+    # the haplotypes' difference, on the same resampled cells
+    df = g0[g0["haplotype"] == "hap1-hap2"]
+    assert len(df) == len(lv) and (df["level"] > 0.2).all()
+    assert (df["delta_lo"] <= df["delta_hi"]).all()
     assert not tr["group"].isin(["T2", "male"]).any()
 
 
@@ -2117,3 +2124,35 @@ def test_track_bins_per_context():
     assert acc.track_bin_auto(pos[:16_000], hap[:16_000]) == 5_000_000
     # 1,200: ~40 even at 20 Mb -> the coarsest
     assert acc.track_bin_auto(pos[:1_200], hap[:1_200]) == 20_000_000
+
+
+def test_sliding_windows_show_where_concordance_turns():
+    """A wide window slid in small steps: a copy whose ΔC drops from 0.2 to
+    0 at 50 Mb turns there smoothly -- 0.2 a window's half-width before,
+    0 after, halfway at 50 Mb -- the other copy flat; their difference with
+    its interval."""
+    rng = np.random.default_rng(1)
+    n = 40_000
+    base = acc._chrom_code("X") * acc.STRIDE
+    lo = rng.integers(0, 99_000_000, n)
+    hi = lo + 1_000
+    cell = rng.integers(0, 50, n)
+    hap = rng.integers(0, 2, n)
+    d = np.where((hap == 0) & (lo < 50_000_000), 0.2, 0.0) \
+        + rng.normal(0, 0.05, n)
+    t = acc._haplotype_tracks(cell, np.ones(n, bool), hap, base + lo,
+                              base + hi, d, np.full(n, 0.5),
+                              np.full(n, 0.5), {"G": np.arange(50)}, 50,
+                              10_000_000, 100, 0, track_step=1_000_000)
+    h1 = t[t["haplotype"] == "hap1"].set_index("center")
+    assert (t["bin_end"] - t["bin_start"]).max() == 10_000_000
+    assert np.allclose(np.diff(h1.index[5:-5]), 1_000_000)
+    assert abs(h1.loc[40_000_000, "delta"] - 0.2) < 0.01
+    assert abs(h1.loc[60_000_000, "delta"]) < 0.01
+    assert abs(h1.loc[50_000_000, "delta"] - 0.1) < 0.02
+    h2 = t[t["haplotype"] == "hap2"]
+    assert h2["delta"].abs().max() < 0.02
+    df = t[t["haplotype"] == "hap1-hap2"].set_index("center")
+    assert df.loc[40_000_000, "delta_lo"] > 0.15
+    assert df.loc[60_000_000, "delta_lo"] < 0 < df.loc[60_000_000,
+                                                       "delta_hi"]
