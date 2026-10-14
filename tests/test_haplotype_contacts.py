@@ -99,8 +99,9 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
              "--xi-cells", str(d / "allelic_cells.tsv"),
              "--boundaries", str(d / "boundaries.bed"), "--genome", "none",
              "--chrx-par", "0-1000000", "--xi-elements", str(d / "el.bed"),
-             "--loop-window", "150000", "--n-boot", "200",
-             "--plot-format", "png", "--output-dir", str(o)])
+             "--loop-window", "150000", "--profile-exclude", "8000000",
+             "--n-boot", "200", "--plot-format", "png",
+             "--output-dir", str(o)])
     s = pd.read_csv(o / "haplotype_contacts.tsv", sep="\t")
     for g in ("GM", "IMR"):
         t = s[s["group"] == g].set_index(["measure", "set"])
@@ -112,9 +113,10 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
         assert a["ci_lo"] < 0 < a["ci_hi"]
         assert t.loc[("P(s): share ≥ 10 Mb", "chrX − autosomes"),
                      "ci_lo"] > 0
-        # the megadomain boundary: the inactive X dips at DXZ4
-        r = t.loc[("insulation at DXZ4", "chrX")]
-        assert r["copy1"] < -1 and abs(r["copy2"]) < 0.5
+        # the megadomain boundary: the inactive X's contacts avoid
+        # crossing DXZ4, the active X's cross it as expected
+        r = t.loc[("crossing DXZ4: log2 obs/exp", "chrX")]
+        assert r["copy1"] < -1.5 and abs(r["copy2"]) < 0.3
         assert r["ci_hi"] < -1 and r["rank_along_x"] < 0.1
         # TADs: the active X's and both chr1 copies' boundaries insulate
         r = t.loc[("TAD boundary insulation", "chrX")]
@@ -129,8 +131,18 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
         r = t.loc[("superloop DXZ4–FIRRE: obs/exp", "chrX")]
         assert r["copy1"] > 2 and r["copy2"] < 1.6 and r["ci_lo"] > 0
     assert (s.loc[s["group"] == "GM", "cells"] == 40).all()
-    for name in ("ps", "profile", "boundaries"):
+    for name in ("ps", "ps_ratio", "profile", "boundaries"):
         assert (o / f"haplotype_contacts_{name}.tsv").exists()
+    # P(s), copy over copy: below 1 Mb the active X's TADs keep contacts
+    # from crossing their boundaries, the inactive X's do not; chr1 flat
+    r = pd.read_csv(o / "haplotype_contacts_ps_ratio.tsv", sep="\t")
+    r = r[r["group"] == "GM"].set_index(["set", "log10_lo"])
+    assert r.loc[("chrX", 5.75), "log2_ratio"] > 0.5
+    assert r.loc[("chrX", 5.75), "ci_lo"] > 0
+    assert np.isnan(r.loc[("chrX", 7.25), "log2_ratio"])    # none on Xa
+    assert abs(r.loc[("autosomes", 5.0), "log2_ratio"]) < 0.2
+    assert r.loc[("autosomes", 5.0), "ci_lo"] < 0 < r.loc[("autosomes", 5.0),
+                                                          "ci_hi"]
     assert (o / "haplotype_contacts_GM.png").exists()
 
 
@@ -143,12 +155,14 @@ def test_without_a_call_the_copies_are_haplotypes_and_cancel(tmp_path):
     hc.main(["--haplotypes", str(d / "haps"), "--samples",
              str(d / "samples.tsv"), "--groups", "IMR", "--genome", "none",
              "--chrx-par", "0-1000000", "--xi-elements", str(d / "el.bed"),
-             "--n-boot", "100", "--plot-format", "png",
+             "--profile-window", "5000000", "--profile-min-distance",
+             "500000", "--n-boot", "100", "--plot-format", "png",
              "--output-dir", str(o)])
     s = pd.read_csv(o / "haplotype_contacts.tsv", sep="\t")
     t = s.set_index(["measure", "set"])
     assert (t["copies"] == "hap1|hap2").all() and (t["xi"] == "none").all()
-    r = t.loc[("insulation at DXZ4", "chrX")]
+    # within 5 Mb windows: each copy is the inactive X in half the cells
+    r = t.loc[("crossing DXZ4: log2 obs/exp", "chrX")]
     assert r["copy1"] < -0.3 and r["copy2"] < -0.3
     assert abs(r["difference"]) < 0.5
     assert not any(s["measure"].str.startswith("TAD"))

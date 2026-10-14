@@ -17,21 +17,27 @@ interval from resampling the cells, the copies' difference and, where it
 applies, that difference on X less on the autosomes (haplotype_contacts.tsv):
 
   * P(s), the contacts' distances (haplotype_contacts_ps.tsv): the share
-    1 Mb or more apart, and 10 Mb or more, of those --min-distance or more --
-    the inactive X, folded into two megadomains, keeps more of its long-range
-    contacts;
-  * the megadomain boundary at DXZ4: along X, the share of the contacts
-    within --profile-window of a position that cross it, as log2 of its
-    median over X (haplotype_contacts_profile.tsv) -- the inactive X dips at
-    DXZ4; each copy's value there, and its rank among all positions of X;
+    0.1-1 Mb apart (TAD scale), 1 Mb or more, and 10 Mb or more, of those
+    --min-distance or more; and per distance, log2 of one copy's P(s) over
+    the other's with its interval (haplotype_contacts_ps_ratio.tsv) -- the
+    inactive X, folded into two megadomains, trades contacts within TADs
+    for long-range ones;
+  * the megadomain boundary at DXZ4: at each position along X, the
+    contacts --profile-min-distance or more apart that cross it, over those
+    expected of contacts of their lengths placed at random on X outside
+    PAR1 (or, with --profile-window, within that of the position)
+    (haplotype_contacts_profile.tsv) -- the inactive X's contacts avoid
+    crossing DXZ4; each copy's log2 there, and the rank of the copies'
+    difference there among the positions --profile-exclude or more away;
   * TAD boundaries (--boundaries: positions, e.g. CTCF-anchored boundaries
     of bulk Hi-C): log2 of the share of contacts crossing a position
     --boundary-flank or more from a boundary over the share crossing the
-    boundary, the boundaries pooled -- the inactive X's TADs are attenuated;
-    the autosomes' copies insulate alike, and show that the data see TADs;
+    boundary, the boundaries pooled; the autosomes' copies show that the
+    data see TADs;
   * superloops between the inactive X's elements (DXZ4, FIRRE, ICCE, XIST):
     the contacts linking two of their windows (--loop-window) over those
-    linking the same windows slid together along X.
+    linking the same windows slid together along X -- a handful of contacts
+    each at single-cell depth, so in the table only.
 
 Contacts with an end in PAR1 -- both copies active there -- are not X's;
 those within PAR1 are a control set of P(s).  Figures:
@@ -67,12 +73,17 @@ logger = logging.getLogger("haplotype_contacts")
 
 #: P(s) bins, log10 of the distance: from 1 kb, a quarter decade each.
 PS_EDGES = np.arange(3.0, 8.51, 0.25)
-#: P(s) is summarised by the share of contacts at least this far apart.
-PS_SHARES = (1_000_000, 10_000_000)
+#: P(s) is summarised by the share of contacts this far apart: (name,
+#: from, to -- None: no end).
+PS_CLASSES = (("0.1–1 Mb", 100_000, 1_000_000), ("≥ 1 Mb", 1_000_000, None),
+              ("≥ 10 Mb", 10_000_000, None))
 #: The sets of contacts: X outside PAR1, X within PAR1, the autosomes.
 SETS = ("chrX", "chrX PAR1", "autosomes")
 #: The boundary profile's offsets from the boundaries.
 BOUNDARY_OFFSETS = np.arange(-1_000_000, 1_000_001, 100_000)
+#: Without --profile-window, the crossing profile keeps this far from
+#: either end of X (outside PAR1), where few contacts cross.
+PROFILE_MARGIN = 5_000_000
 
 
 class Geometry:
@@ -85,12 +96,14 @@ class Geometry:
         self.par = par
         self.min_d = int(args.min_distance)
         self.x_lo = int(par[1]) if par else 0
-        self.w = int(args.profile_window)
+        self.x_hi = int(x_len)
+        self.w = int(args.profile_window)          # 0: the whole of X
         self.prof_min = int(args.profile_min_distance)
+        self.prof_excl = int(args.profile_exclude)
         step = int(args.profile_step)
-        # a window's width from either end of X (outside PAR1): no window
-        # runs off the chromosome
-        self.grid = np.arange(self.x_lo + self.w, x_len - self.w + 1, step,
+        # no window runs off the chromosome
+        margin = self.w if self.w > 0 else PROFILE_MARGIN
+        self.grid = np.arange(self.x_lo + margin, x_len - margin + 1, step,
                               dtype=np.int64)
         self.dxz4 = None
         if "DXZ4" in elements and self.grid.size:
@@ -176,15 +189,35 @@ def _span_counts(pos, lo, hi, w):
     return a_n, b_n, a_c, b_c
 
 
+def _crossing(lo, hi, geo: Geometry):
+    """Per contact (lo < hi) and position of the profile: whether it
+    crosses the position, and the chance that a contact of its length placed
+    at random would -- anywhere on X outside PAR1, or, with a window, with
+    both ends within it of the position (the contact then counts only
+    there)."""
+    g = geo.grid[None, :].astype(float)
+    lo_, hi_ = lo[:, None], hi[:, None]
+    d = (hi - lo).astype(float)[:, None]
+    cross = (lo_ < g) & (g <= hi_)
+    if geo.w > 0:
+        inw = (lo_ >= g - geo.w) & (hi_ < g + geo.w)
+        e = np.where(inw, np.minimum(d / (2 * geo.w - d), 1.0), 0.0)
+        return cross & inw, e
+    a_, b_ = geo.x_lo, geo.x_hi
+    span = b_ - a_ - d
+    num = np.clip(np.minimum(g, b_ - d) - np.maximum(a_, g - d), 0, None)
+    return cross, np.where(span > 0, num / np.maximum(span, 1.0), 0.0)
+
+
 def cell_counts(t: pd.DataFrame, xi_hap: int, geo: Geometry) -> dict:
     """One cell's counts per copy -- 0 the haplotype ``xi_hap`` (the
     inactive X's, on every chromosome), 1 the other; hap1, hap2 when it is
     0."""
     n_ps = PS_EDGES.size - 1
     out = {"ps": np.zeros((len(SETS), 2, n_ps)),
-           "share": np.zeros((len(SETS), 2, 1 + len(PS_SHARES))),
-           "prof_n": np.zeros((2, geo.grid.size)),
-           "prof_c": np.zeros((2, geo.grid.size)),
+           "share": np.zeros((len(SETS), 2, 1 + len(PS_CLASSES))),
+           "prof_o": np.zeros((2, geo.grid.size)),
+           "prof_e": np.zeros((2, geo.grid.size)),
            "bnd_n": np.zeros((2, 2, BOUNDARY_OFFSETS.size)),
            "bnd_c": np.zeros((2, 2, BOUNDARY_OFFSETS.size))}
     for i, (_, _, _, sh) in enumerate(geo.loops):
@@ -213,17 +246,19 @@ def cell_counts(t: pd.DataFrame, xi_hap: int, geo: Geometry) -> dict:
     np.add.at(out["ps"], (s_[ok], copy[ok], b[ok]), 1)
     far = ok & (d >= geo.min_d)
     np.add.at(out["share"], (s_[far], copy[far], 0), 1)
-    for j, thr in enumerate(PS_SHARES, 1):
-        m = far & (d >= thr)
+    for j, (_, lo_d, hi_d) in enumerate(PS_CLASSES, 1):
+        m = far & (d >= lo_d) & (d < (hi_d or np.inf))
         np.add.at(out["share"], (s_[m], copy[m], j), 1)
-    # the profile along X
-    m = (s_ == 0) & (d >= geo.prof_min) & (d < 2 * geo.w)
+    # the crossing profile along X
+    m = (s_ == 0) & (d >= geo.prof_min)
+    if geo.w > 0:
+        m &= d < 2 * geo.w
     if m.any() and geo.grid.size:
-        a_n, b_n, a_c, b_c = _span_counts(geo.grid, lo[m], hi[m], geo.w)
+        o_, e_ = _crossing(lo[m], hi[m], geo)
         for k in (0, 1):
             mk = copy[m] == k
-            out["prof_n"][k] += _ranges(geo.grid.size, a_n[mk], b_n[mk])
-            out["prof_c"][k] += _ranges(geo.grid.size, a_c[mk], b_c[mk])
+            out["prof_o"][k] += o_[mk].sum(0)
+            out["prof_e"][k] += e_[mk].sum(0)
     # the boundaries, pooled, at each offset
     for si, sname in enumerate(("chrX", "autosomes")):
         want = 0 if sname == "chrX" else 2
@@ -269,16 +304,14 @@ def contact_stats(a: dict, geo: Geometry) -> list:
             if sname == "chrX PAR1" and not geo.par:
                 continue
             sh = a["share"][..., si, :, :]
-            for j, thr in enumerate(PS_SHARES, 1):
-                if sname == "chrX PAR1" and thr >= geo.par[1] - geo.par[0]:
+            for j, (nm, lo_d, _) in enumerate(PS_CLASSES, 1):
+                if sname == "chrX PAR1" and lo_d >= geo.par[1] - geo.par[0]:
                     continue
-                out.append((f"P(s): share ≥ {thr / 1e6:g} Mb", sname,
+                out.append((f"P(s): share {nm}", sname,
                             sh[..., j] / sh[..., 0]))
         if geo.dxz4 is not None:
-            f = a["prof_c"] / a["prof_n"]
-            ins = np.log2(f / np.nanmedian(f, axis=-1, keepdims=True))
-            out.append(("insulation at DXZ4", "chrX",
-                        ins[..., geo.dxz4]))
+            out.append(("crossing DXZ4: log2 obs/exp", "chrX", np.log2(
+                a["prof_o"][..., geo.dxz4] / a["prof_e"][..., geo.dxz4])))
         flank = np.abs(BOUNDARY_OFFSETS) >= geo.flank
         zero = int(np.flatnonzero(BOUNDARY_OFFSETS == 0)[0])
         for si, sname in enumerate(("chrX", "autosomes")):
@@ -317,16 +350,13 @@ def _stack(counts: list) -> dict:
     return {k: np.stack([c[k] for c in counts]) for k in counts[0]}
 
 
-def group_stats(counts: list, geo: Geometry, n_boot: int, rng,
-                labels) -> pd.DataFrame:
+def group_stats(a: dict, geo: Geometry, w, labels) -> pd.DataFrame:
     """Per measure and set each copy's value, their difference with its
-    95% interval over resampled cells, p (normal, from the resampled SE);
+    95% interval over resampled cells (``w``: the resamplings' weights of
+    the cells of ``a``, stacked counts), p (normal, from the resampled SE);
     where both X and the autosomes have it, the difference on X less on the
     autosomes."""
     from scipy.stats import norm
-    a = _stack(counts)
-    n = len(counts)
-    w = rng.multinomial(n, np.full(n, 1.0 / n), size=n_boot).astype(float)
     full = contact_stats({k: v.sum(0) for k, v in a.items()}, geo)
     boot = contact_stats({k: np.tensordot(w, v, axes=(1, 0))
                           for k, v in a.items()}, geo)
@@ -355,23 +385,52 @@ def _row(meas, sname, v, d, db, norm, labels) -> dict:
                   else np.nan)}
 
 
-def profile_table(counts: list, geo: Geometry, labels) -> pd.DataFrame:
-    a = _stack(counts)
-    n_, c_ = a["prof_n"].sum(0), a["prof_c"].sum(0)
+def profile_table(a: dict, geo: Geometry, labels) -> pd.DataFrame:
+    """Per position along X and copy: the contacts crossing it, those
+    expected, log2 of their ratio; and the copies' difference."""
+    o_, e_ = a["prof_o"].sum(0), a["prof_e"].sum(0)
     with np.errstate(invalid="ignore", divide="ignore"):
-        f = c_ / n_
-        ins = np.log2(f / np.nanmedian(f, axis=-1, keepdims=True))
+        r = np.log2(o_ / e_)
     t = pd.DataFrame({"pos": geo.grid})
     for k, lab in enumerate(labels):
-        t[f"contacts_{lab}"] = n_[k]
-        t[f"crossing_{lab}"] = c_[k]
-        t[f"insulation_{lab}"] = ins[k]
-    t["difference"] = ins[0] - ins[1]
+        t[f"crossing_{lab}"] = o_[k]
+        t[f"expected_{lab}"] = e_[k]
+        t[f"log2_obs_exp_{lab}"] = r[k]
+    t["difference"] = r[0] - r[1]
     return t
 
 
-def ps_table(counts: list, labels) -> pd.DataFrame:
-    ps = _stack(counts)["ps"].sum(0)
+def ps_ratio_table(a: dict, w, labels) -> pd.DataFrame:
+    """Per set and distance bin: log2 of the first copy's P(s) over the
+    second's, each a share of its own contacts, with its 95% interval over
+    the resampled cells (``w``)."""
+    ps = a["ps"]
+    full, boot = ps.sum(0), np.tensordot(w, ps, axes=(1, 0))
+
+    def ratio(x):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            f = x / x.sum(-1, keepdims=True)
+            return np.log2(f[..., 0, :] / f[..., 1, :])
+    r, rb = ratio(full), ratio(boot)
+    # a bin without contacts on either copy: no ratio
+    r = np.where((full[:, 0, :] > 0) & (full[:, 1, :] > 0), r, np.nan)
+    rows = []
+    for si, sname in enumerate(SETS):
+        for b in range(PS_EDGES.size - 1):
+            v = rb[:, si, b]
+            v = v[np.isfinite(v)]
+            lo, hi = (np.percentile(v, [2.5, 97.5]) if v.size > 1
+                      else (np.nan, np.nan))
+            rows.append({"set": sname, "log10_lo": PS_EDGES[b],
+                         "log10_hi": PS_EDGES[b + 1],
+                         f"contacts_{labels[0]}": int(full[si, 0, b]),
+                         f"contacts_{labels[1]}": int(full[si, 1, b]),
+                         "log2_ratio": r[si, b], "ci_lo": lo, "ci_hi": hi})
+    return pd.DataFrame(rows)
+
+
+def ps_table(a: dict, labels) -> pd.DataFrame:
+    ps = a["ps"].sum(0)
     rows = []
     for si, sname in enumerate(SETS):
         for k, lab in enumerate(labels):
@@ -387,8 +446,7 @@ def ps_table(counts: list, labels) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def boundary_table(counts: list, labels) -> pd.DataFrame:
-    a = _stack(counts)
+def boundary_table(a: dict, labels) -> pd.DataFrame:
     n_, c_ = a["bnd_n"].sum(0), a["bnd_c"].sum(0)
     rows = []
     for si, sname in enumerate(("chrX", "autosomes")):
@@ -426,13 +484,15 @@ def xi_of_cells(path, context: str, min_sites: int) -> dict:
 _COLS = ("#b2182b", "#2166ac")
 
 
-def plot_contacts(stats: pd.DataFrame, ps: pd.DataFrame, prof: pd.DataFrame,
-                  bnd: pd.DataFrame, geo: Geometry, elements: dict, labels,
-                  group: str, path):
-    """a: P(s) of each copy, X and the autosomes; b: the insulation along X,
-    the inactive X's elements marked; c: the share of contacts crossing a
-    position by its offset from the boundaries, over the flanks'; d: the
-    superloops' observed over expected."""
+def plot_contacts(stats: pd.DataFrame, ps: pd.DataFrame, ratio: pd.DataFrame,
+                  prof: pd.DataFrame, bnd: pd.DataFrame, geo: Geometry,
+                  elements: dict, labels, group: str, path):
+    """a: P(s) of each copy, X and the autosomes; b: log2 of one copy's
+    P(s) over the other's, with its 95% interval -- X and the autosomes;
+    c: along X, the contacts crossing each position over those expected,
+    each copy and their difference, the inactive X's elements marked; d:
+    the share of contacts crossing a position by its offset from the TAD
+    boundaries, over the flanks'."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -452,28 +512,50 @@ def plot_contacts(stats: pd.DataFrame, ps: pd.DataFrame, prof: pd.DataFrame,
     ax_a.set_xlabel("distance, bp", fontsize=6)
     ax_a.set_ylabel("contacts per log10 distance (share)", fontsize=6)
     st = stats.set_index(["measure", "set"])
-    k_ = (f"P(s): share ≥ {PS_SHARES[0] / 1e6:g} Mb", "chrX")
     ttl = "a  P(s)"
+    k_ = (f"P(s): share {PS_CLASSES[1][0]}", "chrX")
     if k_ in st.index:
         r = st.loc[k_]
-        ttl += (f": ≥ 1 Mb {100 * r[labels[0]]:.0f}% vs "
+        ttl += (f": {PS_CLASSES[1][0]} {100 * r[labels[0]]:.0f}% vs "
                 f"{100 * r[labels[1]]:.0f}% on X")
     ax_a.set_title(ttl, loc="left", fontsize=6.5)
     ax_a.legend(fontsize=5, frameon=False)
-    if len(prof):
-        for k, lab in enumerate(labels):
-            ax_b.plot(prof["pos"] / 1e6, prof[f"insulation_{lab}"],
-                      color=_COLS[k], lw=0.8, label=f"X {lab}")
-        for nm, (a_, b_) in elements.items():
-            ax_b.axvline((a_ + b_) / 2e6, color="0.4", lw=0.5, ls=":")
-            ax_b.text((a_ + b_) / 2e6, 1.0, nm, fontsize=5, ha="center",
-                      va="bottom", transform=ax_b.get_xaxis_transform())
-        ax_b.axhline(0, color="0.6", lw=0.4)
-        ax_b.legend(fontsize=5, frameon=False, loc="lower left")
-    ax_b.set_xlabel("chrX, Mb", fontsize=6)
-    ax_b.set_ylabel("log2 share crossing / median", fontsize=6)
-    ax_b.set_title(f"b  insulation along X ({geo.w / 1e6:g} Mb window)",
+    for sname, col in (("chrX", _COLS[0]), ("autosomes", "0.45")):
+        t = ratio[(ratio["set"] == sname)
+                  & (ratio[[f"contacts_{lab}" for lab in labels]].min(axis=1)
+                     >= 20)]
+        if t.empty:
+            continue
+        x = 10 ** ((t["log10_lo"] + t["log10_hi"]) / 2)
+        ax_b.fill_between(x, t["ci_lo"], t["ci_hi"], color=col, alpha=0.2,
+                          lw=0)
+        ax_b.plot(x, t["log2_ratio"], color=col, lw=0.9, label=sname)
+    ax_b.axhline(0, color="0.6", lw=0.4)
+    ax_b.set_xscale("log")
+    ax_b.set_xlabel("distance, bp", fontsize=6)
+    ax_b.set_ylabel(f"log2 P(s) {labels[0]} / {labels[1]}", fontsize=6)
+    ax_b.set_title("b  where the copies' contacts differ (95% interval)",
                    loc="left", fontsize=6.5)
+    if ax_b.get_legend_handles_labels()[0]:
+        ax_b.legend(fontsize=5, frameon=False)
+    if len(prof):
+        x = prof["pos"] / 1e6
+        for k, lab in enumerate(labels):
+            ax_c.plot(x, prof[f"log2_obs_exp_{lab}"], color=_COLS[k], lw=0.8,
+                      label=f"X {lab}")
+        ax_c.plot(x, prof["difference"], color="black", lw=0.8,
+                  label=f"{labels[0]} − {labels[1]}")
+        for nm, (a_, b_) in elements.items():
+            ax_c.axvline((a_ + b_) / 2e6, color="0.4", lw=0.5, ls=":")
+            ax_c.text((a_ + b_) / 2e6, 1.0, nm, fontsize=5, ha="center",
+                      va="bottom", transform=ax_c.get_xaxis_transform())
+        ax_c.axhline(0, color="0.6", lw=0.4)
+        ax_c.legend(fontsize=5, frameon=False, loc="lower left")
+    ax_c.set_xlabel("chrX, Mb", fontsize=6)
+    ax_c.set_ylabel("log2 contacts crossing, obs / exp", fontsize=6)
+    scope = (f"within {geo.w / 1e6:g} Mb" if geo.w > 0 else "on all of X")
+    ax_c.set_title(f"c  crossing each position (≥ {geo.prof_min / 1e6:g} "
+                   f"Mb apart, {scope})", loc="left", fontsize=6.5)
     flank = np.abs(BOUNDARY_OFFSETS) >= geo.flank
     for sname, ls in (("chrX", "-"), ("autosomes", "--")):
         for k, lab in enumerate(labels):
@@ -482,29 +564,14 @@ def plot_contacts(stats: pd.DataFrame, ps: pd.DataFrame, prof: pd.DataFrame,
                 continue
             base = (t["crossing"].to_numpy()[flank].sum()
                     / t["contacts"].to_numpy()[flank].sum())
-            ax_c.plot(t["offset"] / 1e3, np.log2(t["share_crossing"] / base),
+            ax_d.plot(t["offset"] / 1e3, np.log2(t["share_crossing"] / base),
                       ls, marker="o", ms=1.8, color=_COLS[k], lw=0.8,
                       alpha=1 if sname == "chrX" else 0.5,
                       label=f"{sname} {lab}")
-    ax_c.axhline(0, color="0.6", lw=0.4)
-    ax_c.set_xlabel("offset from the TAD boundaries, kb", fontsize=6)
-    ax_c.set_ylabel("log2 share crossing / flanks'", fontsize=6)
-    ax_c.set_title("c  TAD boundaries", loc="left", fontsize=6.5)
-    if ax_c.get_legend_handles_labels()[0]:
-        ax_c.legend(fontsize=5, frameon=False)
-    lp = stats[stats["measure"].str.startswith("superloop")
-               & stats["set"].eq("chrX")]
-    for i, (_, r) in enumerate(lp.iterrows()):
-        for k, lab in enumerate(labels):
-            ax_d.scatter(r[lab], i + (0.12 if k == 0 else -0.12), s=10,
-                         color=_COLS[k], label=lab if i == 0 else None)
-    ax_d.set_yticks(range(len(lp)))
-    ax_d.set_yticklabels([m.replace("superloop ", "").replace(": obs/exp",
-                                                              "")
-                          for m in lp["measure"]], fontsize=5.5)
-    ax_d.axvline(1, color="0.6", lw=0.4)
-    ax_d.set_xlabel("contacts observed / slid along X", fontsize=6)
-    ax_d.set_title("d  superloops", loc="left", fontsize=6.5)
+    ax_d.axhline(0, color="0.6", lw=0.4)
+    ax_d.set_xlabel("offset from the TAD boundaries, kb", fontsize=6)
+    ax_d.set_ylabel("log2 share crossing / flanks'", fontsize=6)
+    ax_d.set_title("d  TAD boundaries", loc="left", fontsize=6.5)
     if ax_d.get_legend_handles_labels()[0]:
         ax_d.legend(fontsize=5, frameon=False)
     for ax in axes.ravel():
@@ -564,9 +631,16 @@ def main(argv=None) -> int:
                          "(hg38): XIST, FIRRE, ICCE, DXZ4.")
     ap.add_argument("--min-distance", type=int, default=20_000,
                     help="P(s)'s shares: of the contacts this far apart.")
-    ap.add_argument("--profile-window", type=int, default=5_000_000)
-    ap.add_argument("--profile-step", type=int, default=500_000)
-    ap.add_argument("--profile-min-distance", type=int, default=500_000)
+    ap.add_argument("--profile-window", type=int, default=0,
+                    help="The crossing profile: count a contact at a "
+                         "position only with both ends within this of it "
+                         "(0, default: anywhere on X).")
+    ap.add_argument("--profile-step", type=int, default=1_000_000)
+    ap.add_argument("--profile-min-distance", type=int, default=1_000_000,
+                    help="The crossing profile: contacts this far apart.")
+    ap.add_argument("--profile-exclude", type=int, default=20_000_000,
+                    help="DXZ4's rank: against the positions this far from "
+                         "it or more.")
     ap.add_argument("--boundary-window", type=int, default=300_000)
     ap.add_argument("--boundary-min-distance", type=int, default=20_000)
     ap.add_argument("--boundary-flank", type=int, default=500_000)
@@ -636,7 +710,7 @@ def main(argv=None) -> int:
     if not args.boundaries:
         logger.warning("no --boundaries: no TAD boundary insulation")
     rng = np.random.default_rng(args.seed)
-    all_stats, all_ps, all_prof, all_bnd = [], [], [], []
+    all_stats, all_ps, all_prof, all_bnd, all_ratio = [], [], [], [], []
     for g, got in data.items():
         mode = xi.get(g)
         labels = ("Xi", "Xa") if mode else ("hap1", "hap2")
@@ -657,7 +731,11 @@ def main(argv=None) -> int:
                         f"left out")
         if not counts:
             continue
-        st = group_stats(counts, geo, args.n_boot, rng, labels)
+        a = _stack(counts)
+        n = len(counts)
+        w = rng.multinomial(n, np.full(n, 1.0 / n),
+                            size=args.n_boot).astype(float)
+        st = group_stats(a, geo, w, labels)
         st.insert(0, "group", g)
         st.insert(1, "xi", mode or "none")
         st.insert(2, "cells", len(counts))
@@ -665,30 +743,33 @@ def main(argv=None) -> int:
         st.insert(st.columns.get_loc("copy1"), "copies",
                   f"{labels[0]}|{labels[1]}")
         all_stats.append(st)
-        ps = ps_table(counts, labels).assign(group=g)
-        prof = profile_table(counts, geo, labels).assign(group=g)
-        bt = boundary_table(counts, labels).assign(group=g)
+        ps = ps_table(a, labels).assign(group=g)
+        ratio = ps_ratio_table(a, w, labels).assign(group=g)
+        prof = profile_table(a, geo, labels).assign(group=g)
+        bt = boundary_table(a, labels).assign(group=g)
         all_ps.append(ps)
+        all_ratio.append(ratio)
         all_prof.append(prof)
         all_bnd.append(bt)
-        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(g))
-        plot_contacts(st.rename(columns={"copy1": labels[0],
-                                         "copy2": labels[1]}),
-                      ps, prof, bt, geo, elements, labels, g,
-                      out / f"haplotype_contacts_{name}.{args.plot_format}")
         if geo.dxz4 is not None:
             dif = prof["difference"].to_numpy()
-            far = np.abs(geo.grid - geo.grid[geo.dxz4]) >= geo.w
+            far = np.abs(geo.grid - geo.grid[geo.dxz4]) >= geo.prof_excl
             ok = far & np.isfinite(dif)
             if ok.any() and np.isfinite(dif[geo.dxz4]):
                 rank = (1 + int((dif[ok] <= dif[geo.dxz4]).sum())) / (
                     1 + int(ok.sum()))
-                logger.info(f"{g}: insulation at DXZ4, {labels[0]} less "
-                            f"{labels[1]}: {dif[geo.dxz4]:+.2f}; as low or "
-                            f"lower at {rank:.1%} of X's positions "
-                            f"{geo.w / 1e6:g} Mb or more away")
-                st.loc[st["measure"].eq("insulation at DXZ4"),
+                logger.info(f"{g}: contacts crossing DXZ4, log2 obs/exp, "
+                            f"{labels[0]} less {labels[1]}: "
+                            f"{dif[geo.dxz4]:+.2f}; as low or lower at "
+                            f"{rank:.1%} of X's {int(ok.sum())} positions "
+                            f"{geo.prof_excl / 1e6:g} Mb or more away")
+                st.loc[st["measure"].eq("crossing DXZ4: log2 obs/exp"),
                        "rank_along_x"] = rank
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(g))
+        plot_contacts(st.rename(columns={"copy1": labels[0],
+                                         "copy2": labels[1]}),
+                      ps, ratio, prof, bt, geo, elements, labels, g,
+                      out / f"haplotype_contacts_{name}.{args.plot_format}")
     if not all_stats:
         sys.exit("no cell left to analyse")
     stats = pd.concat(all_stats, ignore_index=True)
@@ -696,6 +777,8 @@ def main(argv=None) -> int:
     stats.to_csv(out / "haplotype_contacts.tsv", sep="\t", index=False)
     pd.concat(all_ps, ignore_index=True).to_csv(
         out / "haplotype_contacts_ps.tsv", sep="\t", index=False)
+    pd.concat(all_ratio, ignore_index=True).to_csv(
+        out / "haplotype_contacts_ps_ratio.tsv", sep="\t", index=False)
     pd.concat(all_prof, ignore_index=True).to_csv(
         out / "haplotype_contacts_profile.tsv", sep="\t", index=False)
     pd.concat(all_bnd, ignore_index=True).to_csv(
