@@ -8023,11 +8023,13 @@ def main(argv=None) -> int:
             sys.exit(f"--contrast-column {ccol!r} not in --samples")
         lab = samples[ccol].astype(str).str.strip()
         for nm, v in cg.items():
-            want = {x.strip().lower() for x in v.split(",") if x.strip()}
-            hit = lab[lab.str.lower().isin(want)]
+            # not `want`: that name holds --systems, and reusing it here
+            # dropped A/B from every run with --contrast-group
+            types_ = {x.strip().lower() for x in v.split(",") if x.strip()}
+            hit = lab[lab.str.lower().isin(types_)]
             if hit.empty:
                 sys.exit(f"--contrast-group {nm}: no cell with {ccol} in "
-                         f"{sorted(want)} (have: "
+                         f"{sorted(types_)} (have: "
                          f"{sorted(lab.unique())[:20]})")
             for c in hit.index:
                 if c in group_of:

@@ -205,6 +205,20 @@ def test_ab_is_called_per_cell_type_and_oriented(planted):
     assert (qc["r_with_reference"] > 0.5).all()
 
 
+def test_contrast_groups_keep_the_ab_system(tmp_path):
+    """--contrast-group once reused the name holding --systems, and every
+    run with it silently lost A/B."""
+    d = make_data(tmp_path, per=8, n_contacts=800, n_short=400, seed=5)
+    s, _, o = run(d, systems="ab,pmd",
+                  extra=("--contrast-group", "first=T0",
+                         "--contrast-group", "rest=T1,T2",
+                         "--celltype-auc-stats", "none",
+                         "--n-locus-perm", "0"))
+    assert set(s["system"]) == {"ab", "pmd"}
+    assert (o / "compartments_ab.tsv").exists()
+    assert (o / "compartments_qc.tsv").exists()
+
+
 def test_no_coordination_gives_nothing_to_find(tmp_path):
     s, _, _ = run(make_data(tmp_path, per=20, seed=3), systems="pmd")
     for k in (("HMD", "HMD"), ("PMD", "PMD")):
