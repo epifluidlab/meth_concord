@@ -6434,6 +6434,19 @@ def call_hotspots(hs: pd.DataFrame, n_band: int, fdr: float,
     return hs
 
 
+def _merge_touching_g(g0, g1):
+    """Intervals [g0, g1) on the genome coordinate, those overlapping or
+    touching merged (sorted)."""
+    g0, g1 = np.asarray(g0, np.int64), np.asarray(g1, np.int64)
+    if not g0.size:
+        return g0, g1
+    o = np.argsort(g0, kind="mergesort")
+    g0, g1 = g0[o], g1[o]
+    reach = np.maximum.accumulate(g1)
+    new = np.concatenate([[True], g0[1:] > reach[:-1]])
+    return g0[new], np.maximum.reduceat(g1, np.flatnonzero(new))
+
+
 def hotspot_tracks(grid: BinGrid, systems: dict, ab_maps, genes, cpg,
                    user: dict) -> dict:
     """Per-bin annotation values the hotspot map is tested against: the
@@ -6451,9 +6464,12 @@ def hotspot_tracks(grid: BinGrid, systems: dict, ab_maps, genes, cpg,
             sel = iv._k == k
             tracks[f"{lab}: {cls}"] = grid.coverage_g(iv._g0[sel], iv._g1[sel])
         if name == "pmd" and "PMD" in iv.classes:
+            # a border is where a PMD meets the rest: the file's PMDs come
+            # tiled (Zhou lab: 100 kb), so touching tiles are one PMD first
             sel = iv._k == iv.classes.index("PMD")
-            tracks["PMD borders"] = grid.counts_g(
-                np.concatenate([iv._g0[sel], iv._g1[sel] - 1]))
+            g0, g1 = _merge_touching_g(iv._g0[sel], iv._g1[sel])
+            tracks["PMD borders"] = grid.counts_g(np.concatenate([g0,
+                                                                  g1 - 1]))
     if cpg is not None and len(cpg):
         tracks["CpG islands"] = grid.coverage(cpg)
     if genes is not None and len(genes):

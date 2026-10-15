@@ -1200,6 +1200,26 @@ def test_several_beds_make_one_system_a_class_each(tmp_path):
     assert [iv.classes[x] for x in k] == ["cLAD", "fLAD", "ciLAD"]
 
 
+def test_pmd_borders_are_where_pmds_meet_the_rest_not_tile_edges():
+    """PMDs tiled in 100 kb, as the Zhou-lab file has them: 0-1 and 2-3 Mb,
+    HMD between -- two borders in the first Mb bin, none in the second,
+    two in the third; PMD coverage itself unchanged."""
+    code = acc._chrom_code("chr1")
+    grid = acc.BinGrid([code], 4_000_000, 1_000_000)
+    rows = [(s_, s_ + 100_000, "PMD") for s_ in range(0, 1_000_000, 100_000)]
+    rows += [(1_000_000, 2_000_000, "HMD")]
+    rows += [(s_, s_ + 100_000, "PMD")
+             for s_ in range(2_000_000, 3_000_000, 100_000)]
+    iv = acc.Intervals("pmd", ("HMD", "PMD"), ["chr1"] * len(rows),
+                       [r[0] for r in rows], [r[1] for r in rows],
+                       [0 if r[2] == "HMD" else 1 for r in rows])
+    tr = acc.hotspot_tracks(grid, {"pmd": iv}, None, None, None, {})
+    assert tr["PMD borders"][:4].tolist() == [2, 0, 2, 0]
+    assert np.allclose(tr["PMD / HMD: PMD"][:4], [1, 0, 1, 0])
+    g0, g1 = acc._merge_touching_g([5, 0, 20, 10], [10, 5, 30, 12])
+    assert g0.tolist() == [0, 20] and g1.tolist() == [12, 30]
+
+
 def test_human_gene_symbols_reach_the_hotspot_tracks():
     code = acc._chrom_code("chr19")
     grid = acc.BinGrid([code], 60_000_000, 1_000_000)
