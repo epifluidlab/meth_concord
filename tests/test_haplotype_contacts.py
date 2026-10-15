@@ -302,6 +302,30 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
     assert (o / "haplotype_contacts_GM.png").exists()
 
 
+def test_the_locus_panels_put_each_position_at_one_place():
+    # the maps' colour bars sit beside them, not in their width: an
+    # element's dotted line runs straight down every panel
+    import matplotlib.pyplot as plt
+    rng = np.random.default_rng(0)
+    lo = rng.integers(0, L - 6_000_000, 4000)
+    hi = lo + (10 ** rng.uniform(4, 6.7, 4000)).astype(np.int64)
+    cp = rng.integers(0, 2, 4000).astype(np.int8)
+    tr = hc.locus_tracks(lo, hi, cp, 0, L, None, "chrX", None, None, [], 1,
+                         1.0)
+    fig = hc.locus_figure(tr, "chrX", 0, L, "GM", ("Xi", "Xa"), [],
+                          {"DXZ4": (DXZ4 - 50_000, DXZ4 + 50_000)},
+                          np.arange(500_000, L, 1_000_000), None)
+    fig.canvas.draw()
+    along = [ax for ax in fig.axes if ax.get_xlim() == (0.0, L / 1e6)]
+    assert len(along) == 5              # the maps, TADs, ratio, insulation
+    at = [ax.transData.transform((DXZ4 / 1e6, 0))[0] for ax in along]
+    assert np.ptp(at) < 0.5             # pixels
+    bars = [ax for ax in fig.axes if ax not in along]
+    assert len(bars) == 2 and min(ax.get_position().x0 for ax in bars) > \
+        max(ax.get_position().x1 for ax in along)
+    plt.close(fig)
+
+
 def test_without_a_call_the_copies_are_haplotypes_and_cancel(tmp_path):
     """IMR without --xi: hap1 against hap2, each the inactive X in half the
     cells -- the megadomain boundary shows on both, the difference

@@ -1067,8 +1067,27 @@ def _triangle(ax, m, edges, up: bool, vmin, vmax, depth: float,
     return qm
 
 
+def _beside(fig, axes, width=0.012, pad=0.01):
+    """Axes for a colour bar just right of ``axes``, as tall as they are
+    together: beside them, not taken out of their width, so every panel
+    keeps one x for one position."""
+    b = [ax.get_position() for ax in axes]
+    y0, y1 = min(p.y0 for p in b), max(p.y1 for p in b)
+    return fig.add_axes([max(p.x1 for p in b) + pad, y0, width, y1 - y0])
+
+
 def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
                labels, contexts, elements: dict, tads, escape, path):
+    """:func:`locus_figure`, saved to ``path``."""
+    import matplotlib.pyplot as plt
+    fig = locus_figure(tr, name, start, end, group, labels, contexts,
+                       elements, tads, escape)
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
+def locus_figure(tr: dict, name: str, start: int, end: int, group: str,
+                 labels, contexts, elements: dict, tads, escape):
     """The two copies along one locus, as a genome browser shows them: each
     copy's contact map (copy 1 up, copy 2 down), the bulk TADs between them,
     log2 of copy 1's over copy 2's, each as observed over expected at its
@@ -1121,7 +1140,7 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
     _triangle(ax_dn, tr["maps"][1], tr["edges"], False, vmin, vmax, depth)
     ax_dn.set_ylabel(labels[1], rotation=0, ha="right", va="center",
                      fontsize=7)
-    cb = fig.colorbar(qm, ax=[ax_up, ax_dn], fraction=0.015, pad=0.01)
+    cb = fig.colorbar(qm, cax=_beside(fig, [ax_up, ax_dn]))
     cb.set_label("log10 share of the copy's contacts", fontsize=5.5)
     cb.ax.tick_params(labelsize=5)
     # where the copies fold differently, their P(s) aside
@@ -1130,7 +1149,7 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
                    log=False, cmap="RdBu_r")
     ax_r.set_ylabel(f"{labels[0]} / {labels[1]}", rotation=0, ha="right",
                     va="center", fontsize=7)
-    cr = fig.colorbar(qr, ax=ax_r, fraction=0.015, pad=0.01)
+    cr = fig.colorbar(qr, cax=_beside(fig, [ax_r]))
     cr.set_label("log2 obs/exp,\n" + f"{labels[0]} over {labels[1]}",
                  fontsize=5.5)
     cr.ax.tick_params(labelsize=5)
@@ -1199,8 +1218,7 @@ def plot_locus(tr: dict, name: str, start: int, end: int, group: str,
         ax.tick_params(axis="x", length=0)
     if axes:
         axes[-1].set_xlabel("chrX, Mb", fontsize=6.5)
-    fig.savefig(path, bbox_inches="tight", dpi=300)
-    plt.close(fig)
+    return fig
 
 
 #: The two six-panel figures' rows of concordance: (context in the tables,
