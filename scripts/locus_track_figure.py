@@ -339,11 +339,25 @@ def _gene_rows(genes, chrom, lo, hi, max_rows=4):
     return g
 
 
+def _beside(fig, ax, width=0.009, pad=0.004):
+    """Axes for a colour bar just right of ``ax``, as tall as it.
+
+    Beside, not taken out of its width: ``fig.colorbar(ax=...)`` narrows the
+    heatmap alone, so it ends short of the tracks under it, and one position
+    -- the run's highlight, a domain edge -- sits at a different x on the
+    heatmap than below it.
+    """
+    p = ax.get_position()
+    return fig.add_axes([p.x1 + pad, p.y0, width, p.height])
+
+
 def locus_figure(M, ct, order, region, tracks, genes, path, title,
                  ct_colors=None, step=10_000, window=250_000, bin_bp=250_000,
                  highlight=None, heat_groups=None, cytoband=None,
                  vmin=None, vmax=None, cmap="RdYlBu_r"):
-    """Cells over the locus, then the tracks, then the genes -- one x axis."""
+    """Cells over the locus, then the tracks, then the genes -- one x axis.
+
+    ``path`` None: the figure itself, unsaved."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -393,7 +407,7 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
                     extent=extent, interpolation="nearest")
     ax0.set_yticks([])
     ax0.set_title(title, fontsize=11)
-    cb = fig.colorbar(im, ax=ax0, fraction=0.012, pad=0.005)
+    cb = fig.colorbar(im, cax=_beside(fig, ax0))
     cb.set_label("concordance D", fontsize=8)
     cb.ax.tick_params(labelsize=7)
 
@@ -440,7 +454,7 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
         ax.tick_params(axis="y", length=0)
         ax.set_ylabel(gname, fontsize=9, rotation=0, ha="right",
                       va="center", labelpad=42)
-        gcb = fig.colorbar(gim, ax=ax, fraction=0.012, pad=0.005)
+        gcb = fig.colorbar(gim, cax=_beside(fig, ax))
         gcb.ax.tick_params(labelsize=6)
         for sp in ax.spines.values():
             sp.set_visible(False)
@@ -519,6 +533,8 @@ def locus_figure(M, ct, order, region, tracks, genes, path, title,
              f"interpolation between {bin_bp // 1000} kb bins, not "
              f"{step // 1000} kb resolution",
              ha="center", fontsize=7.5, color="#4B5563")
+    if path is None:
+        return fig
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -535,7 +551,7 @@ def locus_mean_figure(M, ct, order, region, tracks, genes, path, title,
     The per-cell heatmap shows every observation and hides whether the groups
     are actually resolved; a band shows the second and not the first.  They
     answer different questions, so this is a separate layout rather than an
-    option on the other one.
+    option on the other one.  ``path`` None: the figure itself, unsaved.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -667,7 +683,7 @@ def locus_mean_figure(M, ct, order, region, tracks, genes, path, title,
         ax.tick_params(axis="y", length=0)
         ax.set_ylabel(gname, fontsize=9, rotation=0, ha="right", va="center",
                       labelpad=42)
-        cbb = fig.colorbar(gim, ax=ax, fraction=0.012, pad=0.005)
+        cbb = fig.colorbar(gim, cax=_beside(fig, ax))
         cbb.ax.tick_params(labelsize=6)
         for sp in ax.spines.values():
             sp.set_visible(False)
@@ -699,6 +715,8 @@ def locus_mean_figure(M, ct, order, region, tracks, genes, path, title,
              f"interpolation between {bin_bp // 1000} kb bins, not "
              f"{step // 1000} kb resolution",
              ha="center", fontsize=7.5, color="#4B5563")
+    if path is None:
+        return fig
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path

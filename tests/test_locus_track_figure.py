@@ -399,3 +399,50 @@ def test_smoothing_preserves_the_plateau_values():
     _, out = m.smooth(vals, starts, 10_000, 1_000_000, bin_bp=250_000)
     ok = np.isfinite(out)
     np.testing.assert_allclose(out[ok], 0.42)
+
+
+# --------------------------------------------------------- figures ---------
+
+def _locus(n_bins=16, step=250_000, n_cells=30):
+    """Two cell types over 4 Mb of chr1, two line tracks, one track
+    heatmap and a gene."""
+    rng = np.random.default_rng(0)
+    starts = 10_000_000 + np.arange(n_bins) * step
+    cells = [f"c{i}" for i in range(n_cells)]
+    M = pd.DataFrame(rng.normal(0.5, 0.1, (n_cells, n_bins)), index=cells,
+                     columns=[f"chr1:{s}" for s in starts])
+    ct = pd.Series(["a"] * (n_cells // 2) + ["b"] * (n_cells - n_cells // 2),
+                   index=cells)
+    tracks = {"RT": rng.normal(0, 1, n_bins),
+              "LaminB1": rng.normal(0, 1, n_bins)}
+    heat = {"marks": {"H3K9me3": rng.normal(0, 1, n_bins),
+                      "H3K27me3": rng.normal(0, 1, n_bins)}}
+    genes = pd.DataFrame({"chrom": ["chr1"], "start": [11_000_000],
+                          "end": [11_200_000], "name": ["G1"]})
+    region = ("chr1", int(starts[0]), int(starts[-1] + step))
+    return M, ct, ["a", "b"], region, tracks, genes, heat
+
+
+@pytest.mark.parametrize("draw, n_bars", [("locus_figure", 2),
+                                          ("locus_mean_figure", 1)])
+def test_the_colour_bars_leave_one_x_per_position(draw, n_bars):
+    """The heatmaps' colour bars sit beside them, not in their width: taken
+    out of the heatmaps alone they ended the heatmaps short of the tracks,
+    so the run's highlight and every boundary stepped between panels."""
+    import matplotlib.pyplot as plt
+    m = _mod()
+    M, ct, order, region, tracks, genes, heat = _locus()
+    fig = getattr(m, draw)(M, ct, order, region, tracks, genes, None, "t",
+                           heat_groups=heat, bin_bp=250_000,
+                           highlight=(11_000_000, 12_000_000))
+    fig.canvas.draw()
+    ref = fig.axes[0]                    # the first locus panel
+    along = [ax for ax in fig.axes if ax.get_xlim() == ref.get_xlim()]
+    assert len(along) == 5               # cells or means, track heatmap,
+    #                                      two tracks, genes
+    at = [ax.transData.transform((12_000_000, 0))[0] for ax in along]
+    assert np.ptp(at) < 0.5              # pixels
+    bars = [ax for ax in fig.axes if ax not in along]
+    assert len(bars) == n_bars and min(ax.get_position().x0 for ax in bars) \
+        > max(ax.get_position().x1 for ax in along)
+    plt.close(fig)
