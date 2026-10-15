@@ -76,6 +76,20 @@ difference, Spearman's rho with p from sliding one series along X against
 the other (haplotype_windows_<line>.tsv, _correlation_<line>.tsv).  Figure:
 haplotype_genes_windows_<line>.
 
+What single cells add.  A line whose cells silence either X (--xi
+GROUP=cells) is also measured as bulk data sees it: hap1 against hap2, each
+the inactive X in about half the cells, so the copies' differences cancel
+-- beside each cell's own inactive X (haplotype_contacts.tsv rows with xi
+'haplotypes (bulk view)'; figure haplotype_bulk_vs_cells_<line>, with each
+cell's hap1 less hap2 at X's islands).  A line silencing one haplotype
+(--xi GROUP=1|2) with --xi-cells: its cells grouped by their own XCI
+strength (Xi less Xa at --xi-context) into --xci-strata quantile strata --
+per stratum the copies' measures, per measure the slope on the strata's
+strength with a permutation p, and how much the cells' strengths spread
+beyond their sites' noise (haplotype_xci_strata_, _trend_ and
+_cells_<line>.tsv; figure haplotype_xci_strata_<line>): does a cell's
+inactive X fold the more like one the more firmly it is methylated?
+
     python scripts/haplotype_contacts.py \\
         --haplotypes output/haplotypes --samples samples.tsv \\
         --group-column cell_type --xi GM12878=1 \\
@@ -105,8 +119,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from nome_hic_concordance.utils import chrom_key, manifest_text  # noqa: E402
 from nome_hic_concordance.xci import (  # noqa: E402
-    GENE_CLASSES, gene_classes, in_intervals, parse_elements, parse_escape,
-    parse_par, read_genes)
+    GENE_CLASSES, cell_xi_table, gene_classes, in_intervals, parse_elements,
+    parse_escape, parse_par, read_genes)
 
 logger = logging.getLogger("haplotype_contacts")
 
@@ -493,6 +507,100 @@ def group_stats(a: dict, geo: Geometry, w, labels) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _sum_by(a: dict, groups: np.ndarray, k: int) -> dict:
+    """The stacked counts ``a`` (cells first) summed per group 0..k-1:
+    each array with the groups as its leading axis."""
+    return {key: np.stack([v[groups == j].sum(0) for j in range(k)])
+            for key, v in a.items()}
+
+
+def _quantile_groups(vals: np.ndarray, k: int) -> np.ndarray:
+    """Each value's quantile group 0..k-1, by rank (ties in order)."""
+    r = np.argsort(np.argsort(vals, kind="stable"), kind="stable")
+    return (r * k) // max(vals.size, 1)
+
+
+def xci_strata(a: dict, strength: np.ndarray, geo: Geometry, labels,
+               k: int, n_boot: int, n_perm: int, rng):
+    """A line with one inactive X, its cells grouped by their own XCI
+    strength (``strength``, per cell of ``a``; NaN without a call) into
+    ``k`` quantile strata: per stratum each measure's copies and their
+    difference with its 95% interval over the stratum's cells resampled
+    (:func:`group_stats`); and per measure the slope of that difference on
+    the strata's mean strength, its p from the strengths permuted among the
+    cells (``n_perm``).  A cell's two copies share its depth and its
+    preparation, so their difference is the cell's inactive X against its
+    active one whatever the cell's quality; the autosomes' copies are the
+    control.  Returns (strata rows, slope rows)."""
+    ok = np.flatnonzero(np.isfinite(strength))
+    if ok.size < 2 * k:
+        return pd.DataFrame(), pd.DataFrame()
+    s = strength[ok]
+    sub = {key: v[ok] for key, v in a.items()}
+    grp = _quantile_groups(s, k)
+    rows = []
+    for j in range(k):
+        m = grp == j
+        n = int(m.sum())
+        w = rng.multinomial(n, np.full(n, 1.0 / n),
+                            size=n_boot).astype(float)
+        t = group_stats({key: v[m] for key, v in sub.items()}, geo, w,
+                        labels)
+        t.insert(0, "stratum", j + 1)
+        t.insert(1, "cells", n)
+        t.insert(2, "strength_mean", float(s[m].mean()))
+        t.insert(3, "strength_min", float(s[m].min()))
+        t.insert(4, "strength_max", float(s[m].max()))
+        rows.append(t)
+
+    def slopes(g_, vals):
+        # the strata's mean strength, of the strengths that made them
+        x = np.array([vals[g_ == j].mean() for j in range(k)])
+        out = {}
+        with np.errstate(invalid="ignore", divide="ignore"):
+            for meas, sname, v in contact_stats(_sum_by(sub, g_, k), geo):
+                d = v[:, 0] - v[:, 1]
+                f = np.isfinite(d)
+                if f.sum() >= 3 and np.ptp(x[f]) > 0:
+                    out[(meas, sname)] = float(np.polyfit(x[f], d[f], 1)[0])
+        return out
+    obs = slopes(grp, s)
+    null = {key: [] for key in obs}
+    for _ in range(n_perm):
+        sp = rng.permutation(s)
+        res = slopes(_quantile_groups(sp, k), sp)
+        for key in obs:
+            null[key].append(res.get(key, np.nan))
+    trend = []
+    for (meas, sname), b in obs.items():
+        nb_ = np.asarray(null[(meas, sname)], float)
+        nb_ = np.abs(nb_[np.isfinite(nb_)])
+        trend.append({"measure": meas, "set": sname, "strata": k,
+                      "cells": int(ok.size), "slope": b,
+                      "p_perm": (1 + int((nb_ >= abs(b) - 1e-12).sum()))
+                      / (1 + nb_.size), "permutations": int(nb_.size)})
+    return pd.concat(rows, ignore_index=True), pd.DataFrame(trend)
+
+
+def strength_summary(strength: np.ndarray, noise_sd: np.ndarray) -> dict:
+    """How much of the cells' spread in XCI strength is more than their
+    sites' binomial noise: the observed SD, the noise's (root mean square),
+    the excess, the share of cells whose inactive X reads the less
+    methylated, and that share expected of the noise alone."""
+    from scipy.stats import norm
+    ok = np.isfinite(strength) & np.isfinite(noise_sd) & (noise_sd > 0)
+    s, e = strength[ok], noise_sd[ok]
+    if s.size < 3:
+        return {}
+    var = float(np.var(s, ddof=1))
+    nv = float(np.mean(e ** 2))
+    return {"cells": int(s.size), "mean": float(s.mean()),
+            "sd": var ** 0.5, "noise_sd": nv ** 0.5,
+            "excess_sd": max(var - nv, 0.0) ** 0.5,
+            "share_below_0": float((s < 0).mean()),
+            "share_below_0_noise": float(np.mean(norm.cdf(-s.mean() / e)))}
+
+
 def _row(meas, sname, v, d, db, norm, labels) -> dict:
     db = db[np.isfinite(db)]
     se = float(np.std(db, ddof=1)) if db.size > 1 else np.nan
@@ -582,25 +690,6 @@ def boundary_table(a: dict, labels) -> pd.DataFrame:
                                                 if n_[si, k, oi] else
                                                 np.nan)})
     return pd.DataFrame(rows)
-
-
-def xi_of_cells(path, context: str, min_sites: int) -> dict:
-    """Each cell's inactive X from allelic_cells.tsv: the haplotype the more
-    methylated at ``context`` on X (outside PAR1 and the escape genes when
-    the table has X's parts), ``min_sites`` on each; {cell: 1 | 2}."""
-    c = pd.read_csv(path, sep="\t", dtype={"cell": str})
-    x = c[c["chrom"].map(chrom_key).eq("X")]
-    if "part" in x and x["part"].eq("rest").any():
-        x = x[x["part"].eq("rest")]
-    elif "part" in x:
-        x = x[x["part"].eq("all")]
-    need = [f"{context}_sites_hap1", f"{context}_sites_hap2",
-            f"{context}_hap1_minus_hap2"]
-    if not set(need) <= set(x.columns):
-        sys.exit(f"--xi-cells {path}: no {context} columns (--xi-context)")
-    x = x[(x[need[0]] >= min_sites) & (x[need[1]] >= min_sites)
-          & x[need[2]].notna() & x[need[2]].ne(0)]
-    return dict(zip(x["cell"], np.where(x[need[2]] > 0, 1, 2)))
 
 
 #: haplotype_contacts_<line>: the copies' colours (the inactive X red).
@@ -1621,6 +1710,127 @@ def plot_genes_windows(stats: pd.DataFrame, glev: pd.DataFrame,
     plt.close(fig)
 
 
+#: The measures the per-cell figures follow, in order, where present.
+_KEY_MEASURES = ("P(s): share 0.1–1 Mb", "P(s): share ≥ 1 Mb",
+                 "P(s): share ≥ 10 Mb", "A/B compartments: ends' correlation",
+                 "crossing DXZ4: log2 obs/exp")
+
+
+def plot_xci_strata(cells: pd.DataFrame, summ: dict, strata: pd.DataFrame,
+                    trend: pd.DataFrame, labels, group: str, path):
+    """a, the cells' XCI strength (their inactive X less their active one at
+    the islands) against what their sites' noise alone would spread; b-d,
+    per stratum of it the copies' difference in folding, X (red) and the
+    autosomes' copies (grey), 95% intervals, with the slope's permutation
+    p."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.stats import norm
+    meas = [m for m in _KEY_MEASURES[:4] if m in set(strata["measure"])][:3]
+    fig, axes = plt.subplots(1, 1 + len(meas),
+                             figsize=(2.6 * (1 + len(meas)), 2.5),
+                             squeeze=False)
+    ax = axes[0, 0]
+    s = cells["strength"].to_numpy(float)
+    s = s[np.isfinite(s)]
+    bins = np.linspace(np.nanmin(s) - 0.05, np.nanmax(s) + 0.05, 31)
+    ax.hist(s, bins=bins, color="0.6")
+    if summ:
+        xs = np.linspace(bins[0], bins[-1], 200)
+        e = cells["noise_sd"].to_numpy(float)
+        e = e[np.isfinite(e) & (e > 0)]
+        dens = np.mean([norm.pdf(xs, summ["mean"], v) for v in e], axis=0)
+        ax.plot(xs, dens * s.size * (bins[1] - bins[0]), color="black",
+                lw=0.9, label="sites' noise alone")
+        ax.legend(fontsize=5, frameon=False)
+        ax.set_title(f"a  XCI strength per cell\nSD {summ['sd']:.3f}, noise "
+                     f"{summ['noise_sd']:.3f}, excess "
+                     f"{summ['excess_sd']:.3f}", loc="left", fontsize=6.2)
+    ax.axvline(0, color="0.5", lw=0.5)
+    ax.set_xlabel(f"{labels[0]} − {labels[1]} at islands", fontsize=6)
+    ax.tick_params(labelsize=5.5)
+    for ax, m, ttl in zip(axes[0, 1:], meas, "bcd"):
+        sub_ = []
+        for sname, col in (("chrX", _COLS[0]), ("autosomes", "0.45")):
+            t = strata[(strata["measure"] == m) & (strata["set"] == sname)]
+            if not len(t):
+                continue
+            ax.errorbar(t["strength_mean"], t["difference"],
+                        yerr=[t["difference"] - t["ci_lo"],
+                              t["ci_hi"] - t["difference"]],
+                        fmt="o-", ms=3, lw=0.8, color=col, capsize=1.5,
+                        label=sname)
+            r = (trend[(trend["measure"] == m) & (trend["set"] == sname)]
+                 if len(trend) else trend)
+            if len(r):
+                sub_.append(f"{sname} slope {r['slope'].iloc[0]:+.2f}, "
+                            f"p {r['p_perm'].iloc[0]:.2g}")
+        ax.axhline(0, color="0.6", lw=0.4)
+        ax.set_title(f"{ttl}  {m}\n" + "; ".join(sub_), loc="left",
+                     fontsize=5.4)
+        ax.set_xlabel("stratum's mean XCI strength", fontsize=6)
+        ax.set_ylabel(f"{labels[0]} − {labels[1]}", fontsize=6)
+        ax.tick_params(labelsize=5.5)
+        ax.legend(fontsize=5, frameon=False)
+    fig.suptitle(f"{group}: cells grouped by their own XCI strength",
+                 fontsize=7, y=1.02)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
+def plot_bulk_vs_cells(st_cells: pd.DataFrame, st_hap: pd.DataFrame,
+                       calls: pd.DataFrame, group: str, path):
+    """A line whose cells silence either X: a, each cell's hap1 less hap2
+    at the islands -- one or the other haplotype silenced; then per
+    measure the copies' difference on X as bulk data sees it (hap1 against
+    hap2) and with each cell's own inactive X (95% intervals)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    meas = [m for m in _KEY_MEASURES
+            if ((st_cells["measure"] == m) & (st_cells["set"] == "chrX"))
+            .any()]
+    fig, axes = plt.subplots(1, 1 + len(meas),
+                             figsize=(2.2 * (1 + len(meas)), 2.4),
+                             squeeze=False)
+    ax = axes[0, 0]
+    v = calls["hap1_minus_hap2"].to_numpy(float) if len(calls) else []
+    ax.hist(v, bins=30, color="0.6")
+    ax.axvline(0, color="0.5", lw=0.5)
+    n1 = int((np.asarray(v) > 0).sum())
+    ax.set_title(f"a  each cell's X: hap1 − hap2\nhap1 silenced in {n1}, "
+                 f"hap2 in {len(v) - n1}", loc="left", fontsize=6.2)
+    ax.set_xlabel("methylation at X's islands", fontsize=6)
+    ax.tick_params(labelsize=5.5)
+    for ax, m in zip(axes[0, 1:], meas):
+        for i, (t, lab, col) in enumerate(((st_hap, "hap1 − hap2\n(bulk)",
+                                            "0.45"),
+                                           (st_cells, "Xi − Xa\n(per cell)",
+                                            _COLS[0]))):
+            r = t[(t["measure"] == m) & (t["set"] == "chrX")]
+            if not len(r):
+                continue
+            r = r.iloc[0]
+            ax.errorbar(i, r["difference"],
+                        yerr=[[r["difference"] - r["ci_lo"]],
+                              [r["ci_hi"] - r["difference"]]],
+                        fmt="o", ms=4, color=col, capsize=2, lw=1)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["hap1 − hap2\n(bulk)", "Xi − Xa\n(per cell)"],
+                           fontsize=5.5)
+        ax.set_xlim(-0.6, 1.6)
+        ax.axhline(0, color="0.6", lw=0.4)
+        ax.set_title(m, loc="left", fontsize=5.8)
+        ax.tick_params(labelsize=5.5)
+    fig.suptitle(f"{group}: as bulk sees it, and cell by cell", fontsize=7,
+                 y=1.02)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
 def _pairs(values) -> dict:
     out = {}
     for v in values or []:
@@ -1745,6 +1955,17 @@ def main(argv=None) -> int:
                          "copy's 3D measures against its level at the "
                          "phased SNPs, for a line with one inactive X "
                          "(haplotype_windows_<line>.tsv); 0: none.")
+    ap.add_argument("--xci-strata", type=int, default=4,
+                    help="A line whose cells silence the same haplotype "
+                         "(--xi GROUP=1|2), its cells grouped by their own "
+                         "XCI strength -- Xi less Xa at --xi-context, from "
+                         "--xi-cells -- into this many quantile strata: does "
+                         "the copies' folding follow (haplotype_xci_strata_"
+                         "<line>)?  0: none.  Not for --xi GROUP=cells, "
+                         "whose calls come from the same signal and would "
+                         "misorient the weakest cells.")
+    ap.add_argument("--n-perm", type=int, default=200,
+                    help="--xci-strata: permutations for the slopes' p.")
     ap.add_argument("--window-min-ends", type=int, default=50,
                     help="--windows: the contact ends a copy needs in a "
                          "window for its shares.")
@@ -1777,9 +1998,15 @@ def main(argv=None) -> int:
               if args.groups else list(dict.fromkeys(
                   samples[args.group_column].dropna())))
     hdir = Path(args.haplotypes)
-    cells_xi = (xi_of_cells(args.xi_cells, args.xi_context,
-                            args.min_cell_sites)
-                if "cells" in xi.values() else {})
+    calls = pd.DataFrame()
+    if args.xi_cells:
+        try:
+            calls = cell_xi_table(args.xi_cells, args.xi_context,
+                                  args.min_cell_sites)
+        except ValueError as e:
+            sys.exit(f"--xi-cells {e} (--xi-context)")
+    cells_xi = dict(zip(calls["cell"], calls["xi_hap"])) if len(calls) \
+        else {}
     data: dict = {}
     x_len, x_name = 0, "chrX"
     for g in groups:
@@ -1853,7 +2080,7 @@ def main(argv=None) -> int:
     for g, got in data.items():
         mode = xi.get(g)
         labels = ("Xi", "Xa") if mode else ("hap1", "hap2")
-        counts, pooled = [], []
+        counts, pooled, names, counts_h = [], [], [], []
         n_drop = 0
         for c, t in got.items():
             if mode == "cells":
@@ -1861,9 +2088,12 @@ def main(argv=None) -> int:
                 if h is None:
                     n_drop += 1
                     continue
+                # as bulk data would see the same cells: hap1 against hap2
+                counts_h.append(cell_counts(t, 0, geo))
             else:
                 h = int(mode) if mode else 0
             counts.append(cell_counts(t, h, geo))
+            names.append(c)
             if loci or args.windows > 0:
                 pooled.append(x_contacts(t, h, geo))
         if mode == "cells":
@@ -1884,6 +2114,63 @@ def main(argv=None) -> int:
         st.insert(st.columns.get_loc("copy1"), "copies",
                   f"{labels[0]}|{labels[1]}")
         all_stats.append(st)
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(g))
+        # a mosaic line: hap1 against hap2, as bulk sees it, beside each
+        # cell's own inactive X
+        if counts_h:
+            sh = group_stats(_stack(counts_h), geo, w, ("hap1", "hap2"))
+            sh.insert(0, "group", g)
+            sh.insert(1, "xi", "haplotypes (bulk view)")
+            sh.insert(2, "cells", len(counts_h))
+            sh = sh.rename(columns={"hap1": "copy1", "hap2": "copy2"})
+            sh.insert(sh.columns.get_loc("copy1"), "copies", "hap1|hap2")
+            all_stats.append(sh)
+            cg = calls[calls["cell"].isin(set(names))]
+            plot_bulk_vs_cells(st, sh, cg, g,
+                               out / f"haplotype_bulk_vs_cells_{name}."
+                                     f"{args.plot_format}")
+        # a line silencing one haplotype: its cells by their own strength
+        if mode in ("1", "2") and args.xci_strata > 0 and len(calls):
+            sign = 1.0 if mode == "1" else -1.0
+            cx = calls.set_index("cell").reindex(names)
+            strength = sign * cx["hap1_minus_hap2"].to_numpy(float)
+            strata, trend = xci_strata(a, strength, geo, labels,
+                                       args.xci_strata, args.n_boot,
+                                       args.n_perm, rng)
+            if len(strata):
+                summ = strength_summary(strength,
+                                        cx["noise_sd"].to_numpy(float))
+                per_cell = pd.DataFrame({"cell": names,
+                                         "strength": strength,
+                                         "noise_sd": cx["noise_sd"]
+                                         .to_numpy(float)})
+                for t_, f_ in ((strata, "strata"), (trend, "trend"),
+                               (per_cell, "cells")):
+                    t_.assign(group=g).to_csv(
+                        out / f"haplotype_xci_{f_}_{name}.tsv", sep="\t",
+                        index=False)
+                plot_xci_strata(per_cell, summ, strata, trend, labels, g,
+                                out / f"haplotype_xci_strata_{name}."
+                                      f"{args.plot_format}")
+                key = (trend[trend["set"].isin(["chrX", "autosomes"])]
+                       if len(trend) else trend)
+                logger.info(
+                    f"{g}: XCI strength per cell"
+                    + (f", mean {summ['mean']:+.3f}, SD {summ['sd']:.3f} "
+                       f"against {summ['noise_sd']:.3f} from its sites "
+                       f"alone (excess {summ['excess_sd']:.3f}); "
+                       f"{summ['share_below_0']:.1%} of cells below 0 "
+                       f"against {summ['share_below_0_noise']:.1%} expected "
+                       f"of noise" if summ else "")
+                    + ".  The copies' difference on the strata's strength:\n"
+                    + (key.to_string(index=False,
+                                     float_format=lambda v: f"{v:.3g}")
+                       if len(key) else "no slope (one strength)"))
+            else:
+                logger.info(f"{g}: too few cells with an XCI strength for "
+                            f"{args.xci_strata} strata")
+        elif mode in ("1", "2") and args.xci_strata > 0:
+            logger.info(f"{g}: no --xi-cells, so no XCI strata")
         ps = ps_table(a, labels).assign(group=g)
         ratio = ps_ratio_table(a, w, labels).assign(group=g)
         prof = profile_table(a, geo, labels).assign(group=g)
@@ -1906,7 +2193,6 @@ def main(argv=None) -> int:
                             f"{geo.prof_excl / 1e6:g} Mb or more away")
                 st.loc[st["measure"].eq("crossing DXZ4: log2 obs/exp"),
                        "rank_along_x"] = rank
-        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(g))
         plot_contacts(st.rename(columns={"copy1": labels[0],
                                          "copy2": labels[1]}),
                       ps, ratio, prof, bt, geo, elements, labels, g,

@@ -293,3 +293,48 @@ def gene_classes(genes: pd.DataFrame, escape, par=None,
                      par)
     return {GENE_CLASSES[0]: np.asarray(escape, np.int64).reshape(-1, 2),
             GENE_CLASSES[1]: subtract_intervals(iv, escape)}
+
+
+def cell_xi_table(path, context: str = "HCG_island",
+                  min_sites: int = 20) -> pd.DataFrame:
+    """Per cell, from allelic_imbalance.py's allelic_cells.tsv, on X
+    outside PAR1 and the escape genes when the table has X's parts: the
+    sites on each haplotype at ``context``, each one's level, hap1 less
+    hap2, the haplotype the more methylated -- at CpG islands, the cell's
+    inactive X -- and the binomial SD of the difference from its sites
+    alone (sites on one read move together, so the true noise is wider).
+    Cells with ``min_sites`` on each haplotype and the two levels unequal."""
+    c = pd.read_csv(path, sep="\t", dtype={"cell": str})
+    x = c[c["chrom"].map(chrom_key).eq("X")]
+    if "part" in x and x["part"].eq("rest").any():
+        x = x[x["part"].eq("rest")]
+    elif "part" in x:
+        x = x[x["part"].eq("all")]
+    need = [f"{context}_sites_hap1", f"{context}_sites_hap2",
+            f"{context}_hap1_minus_hap2"]
+    if not set(need) <= set(x.columns):
+        raise ValueError(f"{path}: no {context} columns")
+    x = x[(x[need[0]] >= min_sites) & (x[need[1]] >= min_sites)
+          & x[need[2]].notna() & x[need[2]].ne(0)]
+    out = pd.DataFrame({"cell": x["cell"].to_numpy(),
+                        "group": (x["group"].to_numpy() if "group" in x
+                                  else ""),
+                        "sites_hap1": x[need[0]].to_numpy(float),
+                        "sites_hap2": x[need[1]].to_numpy(float),
+                        "hap1_minus_hap2": x[need[2]].to_numpy(float)})
+    for h in (1, 2):
+        col = f"{context}_hap{h}"
+        out[f"hap{h}"] = x[col].to_numpy(float) if col in x else np.nan
+    out["xi_hap"] = np.where(out["hap1_minus_hap2"] > 0, 1, 2)
+    with np.errstate(invalid="ignore"):
+        out["noise_sd"] = np.sqrt(
+            out["hap1"] * (1 - out["hap1"]) / out["sites_hap1"]
+            + out["hap2"] * (1 - out["hap2"]) / out["sites_hap2"])
+    return out.drop_duplicates("cell").reset_index(drop=True)
+
+
+def xi_of_cells(path, context: str = "HCG_island",
+                min_sites: int = 20) -> dict:
+    """Each cell's inactive X, :func:`cell_xi_table`'s: {cell: 1 | 2}."""
+    t = cell_xi_table(path, context, min_sites)
+    return dict(zip(t["cell"], t["xi_hap"]))

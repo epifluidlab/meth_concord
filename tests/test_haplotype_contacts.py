@@ -186,6 +186,16 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
              "--n-boot", "200", "--plot-format", "png",
              "--output-dir", str(o)])
     s = pd.read_csv(o / "haplotype_contacts.tsv", sep="\t")
+    bulk = s[s["xi"] == "haplotypes (bulk view)"]
+    s = s[s["xi"] != "haplotypes (bulk view)"]
+    # IMR as bulk data sees it: each haplotype the inactive X in half the
+    # cells, so the copies' difference cancels; GM has no such view
+    assert set(bulk["group"]) == {"IMR"} and (bulk["copies"]
+                                              == "hap1|hap2").all()
+    b_ = bulk.set_index(["measure", "set"])
+    r = b_.loc[("P(s): share ≥ 10 Mb", "chrX")]
+    assert abs(r["difference"]) < 0.01 and r["ci_lo"] < 0 < r["ci_hi"]
+    assert (o / "haplotype_bulk_vs_cells_IMR.png").exists()
     for g in ("GM", "IMR"):
         t = s[s["group"] == g].set_index(["measure", "set"])
         assert (t["copies"] == "Xi|Xa").all()
@@ -450,3 +460,86 @@ def test_window_link_through_the_active_x_alone_vanishes_given_its_level():
     assert r["rho"] < -0.6 and r["p_shift"] < 0.05
     assert abs(r["rho_given_Xa_level"]) < 0.3
     assert r["p_shift_given_Xa_level"] > 0.05
+
+
+
+def make_strength_data(out: Path, n_cells=60, n=700, seed=7, follow=True):
+    """GM, its inactive X hap1 in every cell, each cell's XCI strength
+    (Xi less Xa at its islands) one of 0.05, 0.25, 0.45, 0.65.  With
+    ``follow`` a cell's inactive X folds the more like one the stronger
+    its XCI -- that share of its contacts drawn long-range -- otherwise
+    every cell's alike."""
+    rng = np.random.default_rng(seed)
+    hd = out / "haps"
+    hd.mkdir(parents=True)
+    rows, calls = [], []
+    levels = (0.05, 0.25, 0.45, 0.65)
+    for ci in range(n_cells):
+        name = f"GM_{ci}"
+        st = levels[ci % 4]
+        q = st / 0.65 if follow else 0.6
+        t = []
+        for chrom in ("chr1", "chrX"):
+            for hap in (1, 2):
+                xi = chrom == "chrX" and hap == 1
+                k = 0
+                while k < n:
+                    p1 = int(rng.integers(0, L))
+                    far = xi and rng.random() < q
+                    p2 = p1 + int(10 ** rng.uniform(3.0, 7.6 if far
+                                                    else 7.1))
+                    if p2 >= L:
+                        continue
+                    t.append((chrom, p1, p2, hap, 1))
+                    k += 1
+        pd.DataFrame(t, columns=["chrom", "pos1", "pos2", "hap",
+                                 "snp_reads"]).to_parquet(
+            hd / f"{name}.haplotypes.parquet", index=False)
+        rows.append((name, "GM"))
+        calls.append((name, "GM", "chrX", "rest", 200, 200, 0.3 + st, 0.3,
+                      st))
+    pd.DataFrame(rows, columns=["cell_name", "group"]).to_csv(
+        out / "samples.tsv", sep="\t", index=False)
+    pd.DataFrame(calls, columns=[
+        "cell", "group", "chrom", "part", "HCG_island_sites_hap1",
+        "HCG_island_sites_hap2", "HCG_island_hap1", "HCG_island_hap2",
+        "HCG_island_hap1_minus_hap2"]).to_csv(
+        out / "allelic_cells.tsv", sep="\t", index=False)
+    return out
+
+
+def _strata_run(d: Path, o: Path):
+    hc.main(["--haplotypes", str(d / "haps"), "--samples",
+             str(d / "samples.tsv"), "--xi", "GM=1", "--xi-cells",
+             str(d / "allelic_cells.tsv"), "--genome", "none",
+             "--chrx-par", "0-1000000", "--xi-elements", "none",
+             "--locus", "none", "--windows", "0", "--xci-strata", "4",
+             "--n-perm", "100", "--n-boot", "100", "--plot-format", "png",
+             "--output-dir", str(o)])
+    tr = pd.read_csv(o / "haplotype_xci_trend_GM.tsv", sep="\t")
+    return tr.set_index(["measure", "set"]), pd.read_csv(
+        o / "haplotype_xci_strata_GM.tsv", sep="\t")
+
+
+def test_cells_with_stronger_xci_fold_more_like_an_inactive_x(tmp_path):
+    tr, st = _strata_run(make_strength_data(tmp_path / "d"),
+                         tmp_path / "o")
+    m = "P(s): share ≥ 1 Mb"
+    r = tr.loc[(m, "chrX")]
+    assert r["slope"] > 0.04 and r["p_perm"] < 0.05
+    # the autosomes' copies follow nothing
+    assert tr.loc[(m, "autosomes"), "p_perm"] > 0.05
+    x = st[(st["measure"] == m) & (st["set"] == "chrX")].set_index(
+        "stratum")
+    assert x.loc[4, "difference"] > x.loc[1, "difference"] + 0.03
+    assert np.allclose(x["strength_mean"], [0.05, 0.25, 0.45, 0.65])
+    c = pd.read_csv(tmp_path / "o" / "haplotype_xci_cells_GM.tsv",
+                    sep="\t")
+    assert len(c) == 60 and c["noise_sd"].between(0.03, 0.06).all()
+    assert (tmp_path / "o" / "haplotype_xci_strata_GM.png").exists()
+
+
+def test_cells_alike_in_folding_show_no_slope(tmp_path):
+    tr, _ = _strata_run(make_strength_data(tmp_path / "d", follow=False),
+                        tmp_path / "o")
+    assert tr.loc[("P(s): share ≥ 1 Mb", "chrX"), "p_perm"] > 0.05
