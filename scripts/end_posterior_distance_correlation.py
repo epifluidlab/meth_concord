@@ -88,6 +88,20 @@ draw) and end_posterior_percell.<fmt>, the Figure 5c panel.  See
 nome_hic_concordance/percell_existence.py for why the SE is a block bootstrap
 and why the control is a second null draw.
 
+--haplotypes (allelic_imbalance.py --haplotype-dir) asks the same of each
+copy of a chromosome.  Every cell is split into units -- chrX's inactive
+copy, its active copy and both together (outside PAR1 and the escape
+genes), and the same on the autosomes (--units) -- each run as a cell of its
+own, so --null-scope cell draws non-ligated pairs of the same cell AND the
+same copy: what bulk data, which cannot keep one cell's reads apart, cannot
+do.  The inactive X per line: --xi GROUP=1|2, or each cell's own (cells,
+--xi-cells).  Per line, end_posterior_units_<line>.tsv/.<fmt>, by
+--unit-bands: each copy's Δ; 'same copy', the mean of the two copies' Δ;
+'both copies', their pairs pooled against donors of either copy; X against
+the autosomes either way; and what pooling the copies makes ('both - same')
+on X less on the autosomes -- the cells resampled jointly, since a cell's
+units are paired.
+
     python scripts/end_posterior_distance_correlation.py \\
         --posteriors GCH=output/signed_250kb_rwr/context_GCH/04_posteriors \\
         --posteriors HCG=output/signed_250kb_rwr/context_HCG/04_posteriors \\
@@ -334,6 +348,310 @@ def _load_cell(paths: dict[str, Path], cell: str, min_sites: int,
         for ctx, f in out.items():
             out[ctx] = f.assign(chrom=f["chrom"].cat.set_categories(cats))
     return out
+
+
+#: --haplotypes: a cell's read pairs split into units, each run as if it were
+#: a cell of its own, so the within-cell null (--null-scope cell) draws from
+#: the unit's own ends -- the same cell AND the same copy; a pooled null's
+#: strata are kept per unit, so its donors are of the same copy too.  The
+#: unit rides in the cell's name after UNIT_SEP.
+UNIT_SEP = "::"
+#: (chromosomes, copy) per unit: chrX outside PAR1 and the escape genes, or
+#: the autosomes; the copy on the cell's inactive X's haplotype, the other
+#: one, or both together -- whose within-cell null draws from either copy.
+UNITS = {"x_xi": ("X", "xi"), "x_xa": ("X", "xa"), "x_both": ("X", "both"),
+         "a_xi": ("A", "xi"), "a_xa": ("A", "xa"), "a_both": ("A", "both")}
+
+
+def unit_label(key: str, named: bool = True) -> str:
+    """A unit's name in groups and figures; ``named``: the line has an
+    inactive X called (else the copies are hap1 and hap2)."""
+    chrom, copy = UNITS[key]
+    one, two = ("Xi", "Xa") if named else ("hap1", "hap2")
+    if chrom == "X":
+        return {"xi": f"chrX {one}", "xa": f"chrX {two}",
+                "both": "chrX both copies"}[copy]
+    return {"xi": f"autosomes {one}'s haplotype" if named
+            else "autosomes hap1",
+            "xa": f"autosomes {two}'s haplotype" if named
+            else "autosomes hap2",
+            "both": "autosomes both copies"}[copy]
+
+
+def _hap_frame(hap_dir, cell: str):
+    """A cell's read pairs on one haplotype (allelic_imbalance.py
+    --haplotype-dir), keyed as the posteriors key a read pair -- chrom and
+    its two ends' midpoints, low and high -- a pair given both haplotypes
+    left out: a Series of the haplotype by (chrom, lo, hi); None without a
+    file."""
+    p = Path(hap_dir) / f"{cell}.haplotypes.parquet"
+    if not p.exists():
+        return None
+    t = pd.read_parquet(p, columns=["chrom", "pos1", "pos2", "hap"])
+    p1 = t["pos1"].to_numpy(np.int64)
+    p2 = t["pos2"].to_numpy(np.int64)
+    g = pd.DataFrame({"chrom": t["chrom"].astype(str).to_numpy(),
+                      "lo": np.minimum(p1, p2), "hi": np.maximum(p1, p2),
+                      "hap": t["hap"].to_numpy(np.int8)}).groupby(
+        ["chrom", "lo", "hi"], sort=False)["hap"].agg(["min", "max"])
+    return g.loc[g["min"] == g["max"], "min"]
+
+
+def _unit_filter(per_ctx: dict, haps, key: str, xi_hap: int, par=None,
+                 escape=None) -> dict:
+    """Each context's read pairs of unit ``key`` (UNITS): tagged in
+    ``haps`` (:func:`_hap_frame`), on its chromosomes -- on X with both ends
+    outside PAR1 (``par``) and the escape genes (``escape``) -- and on its
+    copy."""
+    from nome_hic_concordance.xci import in_intervals
+    chroms, copy = UNITS[key]
+    want = np.array(sorted({"xi": {xi_hap}, "xa": {3 - xi_hap},
+                            "both": {1, 2}}[copy]), np.int8)
+    out = {}
+    for ctx, f in per_ctx.items():
+        name = f["chrom"].astype(str).to_numpy()
+        canon = np.array([_canon(c).upper() for c in name], dtype=object)
+        on = (canon == "X") if chroms == "X" else np.array(
+            [c.isdigit() for c in canon], bool)
+        if not on.any() or haps is None or not len(haps):
+            continue
+        p1 = f["pos1"].to_numpy(np.int64)
+        p2 = f["pos2"].to_numpy(np.int64)
+        lo, hi = np.minimum(p1, p2), np.maximum(p1, p2)
+        h = haps.reindex(pd.MultiIndex.from_arrays([name, lo, hi])).to_numpy(
+            float)
+        keep = on & np.isin(np.nan_to_num(h, nan=0).astype(np.int8), want)
+        if chroms == "X":
+            for a_, b_ in ([par] if par else []):
+                keep &= ~((lo >= a_) & (lo < b_)) & ~((hi >= a_) & (hi < b_))
+            if escape is not None and len(escape):
+                keep &= ~in_intervals(lo, escape) & ~in_intervals(hi, escape)
+        if keep.any():
+            out[ctx] = f[keep]
+    return out
+
+
+def _load_any(paths: dict, cell: str, min_sites, merged, excl_chrom, args):
+    """:func:`_load_cell`, or with --haplotypes and a unit in the name
+    (UNIT_SEP) that cell's read pairs of the unit."""
+    cfg = getattr(args, "units_cfg", None)
+    if not cfg or UNIT_SEP not in cell:
+        return _load_cell(paths, cell, min_sites, merged, excl_chrom)
+    name, key = cell.split(UNIT_SEP, 1)
+    per_ctx = _load_cell(paths, name, min_sites, merged, excl_chrom)
+    if not per_ctx:
+        return {}
+    return _unit_filter(per_ctx, _hap_frame(cfg["dir"], name), key,
+                        int(cfg["xi"].get(name, 1)), cfg.get("par"),
+                        cfg.get("escape"))
+
+
+#: The units' comparisons (unit_comparisons): (name, {unit: weight}).
+#: "same" is the mean of the two copies' Δ, each against donors of its own
+#: copy -- not their pairs pooled into one correlation, where the copies'
+#: different levels would enter the linked and the null r alike and squeeze
+#: their difference; "both" is the same pairs pooled against donors of
+#: either copy, so "both - same" is what pooling the copies makes.
+UNIT_COMPARISONS = (
+    ("chrX Xi − chrX Xa", {"x_xi": 1, "x_xa": -1}),
+    ("chrX − autosomes, same copy", {"x_same": 1, "a_same": -1}),
+    ("chrX − autosomes, both copies", {"x_both": 1, "a_both": -1}),
+    ("chrX: both copies − same copy", {"x_both": 1, "x_same": -1}),
+    ("autosomes: both copies − same copy", {"a_both": 1, "a_same": -1}),
+    ("copy part: chrX − autosomes", {"x_both": 1, "x_same": -1,
+                                     "a_both": -1, "a_same": 1}))
+#: Each unit alone, as the comparisons' rows name it.
+UNIT_SINGLES = ("x_xi", "x_xa", "x_same", "x_both", "a_xi", "a_xa",
+                "a_same", "a_both")
+
+
+def unit_comparisons(kept: dict, labels: dict, edges, bands, args,
+                     named: bool = True) -> pd.DataFrame:
+    """One line's units against each other, by distance band: Δ (the
+    --delta-arm arm less the null) of each unit and of UNIT_COMPARISONS'
+    combinations, with 95% intervals and two-sided p from resampling the
+    CELLS jointly -- a cell's units move together, so a comparison between
+    them is paired.  ``kept``: {group label: per-cell accumulators, in the
+    cells' order}; ``labels``: {unit key: its group label}."""
+    arm = getattr(args, "delta_arm", "linked")
+    have = {k: kept.get(lab) for k, lab in labels.items()}
+    if any(v is None for v in have.values()):
+        return pd.DataFrame()
+    n = len(next(iter(have.values())))
+    if n < 3 or any(len(v) != n for v in have.values()):
+        return pd.DataFrame()
+    centers = np.sqrt(edges[:-1] * edges[1:])
+    bix = np.searchsorted(bands, centers, side="right") - 1
+    nbd = len(bands) - 1
+    rng = np.random.default_rng(args.seed + 99)
+    W = np.vstack([np.ones((1, n)),
+                   rng.multinomial(n, np.full(n, 1.0 / n),
+                                   size=max(args.n_bootstrap, 1))
+                   .astype(float)])
+    rows = []
+    for m, _ in _MEASURES:
+        delta = {}
+        for k, pc in have.items():
+            arrs = []
+            for cond in (arm, "null"):
+                a = np.stack([x[(m, cond)] for x in pc]).astype(float)
+                bd = np.zeros(a.shape[:2] + (nbd,))
+                for j in range(nbd):
+                    sel = bix == j
+                    if sel.any():
+                        bd[:, :, j] = a[:, :, sel].sum(-1)
+                arrs.append(bd)
+            delta[k] = arrs
+        d_of = {}
+        with np.errstate(invalid="ignore", divide="ignore"):
+            for k, (ao, an) in delta.items():
+                ro = corr_from_acc((W @ ao.reshape(n, -1)).reshape(
+                    W.shape[0], 6, nbd), args.min_pairs)[0]
+                rn = corr_from_acc((W @ an.reshape(n, -1)).reshape(
+                    W.shape[0], 6, nbd), args.min_pairs)[0]
+                d_of[k] = ro - rn
+        for tot, (u1, u2) in (("x_same", ("x_xi", "x_xa")),
+                              ("a_same", ("a_xi", "a_xa"))):
+            d_of[tot] = (d_of[u1] + d_of[u2]) / 2
+        combos = [(unit_label(k, named) if k in UNITS else
+                   {"x_same": "chrX same copy",
+                    "a_same": "autosomes same copy"}[k], {k: 1})
+                  for k in UNIT_SINGLES] + list(UNIT_COMPARISONS)
+        for name, wts in combos:
+            if not named:
+                name = name.replace("Xi", "hap1").replace("Xa", "hap2")
+            v = sum(w_ * d_of[k] for k, w_ in wts.items())
+            for j in range(nbd):
+                b = v[1:, j]
+                b = b[np.isfinite(b)]
+                lo, hi = (np.percentile(b, [2.5, 97.5]) if b.size >= 20
+                          else (np.nan, np.nan))
+                p = (min(1.0, 2.0 * (1 + min((b <= 0).sum(), (b >= 0).sum()))
+                         / (b.size + 1)) if b.size >= 20 else np.nan)
+                rows.append({"measure": m, "comparison": name,
+                             "band_lo": bands[j], "band_hi": bands[j + 1],
+                             "value": v[0, j], "lo": lo, "hi": hi, "p": p,
+                             "cells": n})
+    return pd.DataFrame(rows)
+
+
+def unit_figure(t: pd.DataFrame, line: str, path) -> bool:
+    """Per measure: a, each copy's Δ against its within-cell null on X and
+    on the autosomes, by distance band; b, the comparisons -- X against the
+    autosomes, and the part the copies differing makes."""
+    if t is None or not len(t):
+        return False
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    meas = [m for m, _ in _MEASURES if (t["measure"] == m).any()]
+    singles = (("chrX same copy", "#b2182b"), ("chrX both copies", "#ef8a62"),
+               ("autosomes same copy", "0.25"),
+               ("autosomes both copies", "0.6"))
+    comps = (("chrX − autosomes, same copy", "#b2182b"),
+             ("chrX − autosomes, both copies", "#ef8a62"),
+             ("copy part: chrX − autosomes", "black"))
+    fig, axes = plt.subplots(2, len(meas), figsize=(3.4 * len(meas), 5.2),
+                             squeeze=False)
+    for j, m in enumerate(meas):
+        for row, items in ((0, singles), (1, comps)):
+            ax = axes[row, j]
+            for i, (nm, col) in enumerate(items):
+                u = t[(t["measure"] == m) & (t["comparison"] == nm)]
+                if not len(u):
+                    continue
+                x = np.sqrt(u["band_lo"] * u["band_hi"]) * (
+                    1.12 ** (i - (len(items) - 1) / 2))
+                ax.errorbar(x, u["value"], yerr=[u["value"] - u["lo"],
+                                                 u["hi"] - u["value"]],
+                            fmt="o", ms=3, lw=0.8, capsize=1.5, color=col,
+                            label=nm)
+            ax.axhline(0, color="0.6", lw=0.5)
+            ax.set_xscale("log")
+            ax.set_xlabel("distance between the ends, bp", fontsize=6)
+            ax.set_ylabel("Δr, linked − within-cell null" if row == 0
+                          else "difference in Δr", fontsize=6)
+            ax.tick_params(labelsize=5.5)
+            ax.legend(fontsize=4.8, frameon=False)
+            ax.set_title(f"{'ab'[row]}  {dict(_MEASURES)[m].split('  ')[0]}",
+                         loc="left", fontsize=6.5)
+    fig.suptitle(f"{line}: each copy against donors of the same cell -- of "
+                 f"its own copy, or of either", fontsize=7, y=1.0)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom):
+    """--haplotypes: the cells split into units (UNITS), one group per line
+    (--group-column) and unit; each cell's inactive X (--xi); a pooled
+    null's strata kept per unit.  Returns (groups, the units' strata,
+    {line: ({unit key: group label}, the copies named)})."""
+    from nome_hic_concordance.xci import (cell_xi_table, parse_escape,
+                                          parse_par)
+    if any(_canon(c).upper() == "X" for c in excl_chrom):
+        raise SystemExit("--haplotypes: chrX is in --exclude-chrom")
+    keys = [k.strip() for k in args.units.split(",") if k.strip()]
+    bad = set(keys) - set(UNITS)
+    if bad:
+        raise SystemExit(f"--units: unknown {sorted(bad)}; choose from "
+                         f"{list(UNITS)}")
+    xi = {}
+    for v in args.xi or []:
+        for tok in str(v).split(","):
+            g, _, m = tok.partition("=")
+            if g.strip():
+                if m.strip() not in ("1", "2", "cells"):
+                    raise SystemExit(f"--xi {tok}: GROUP=1, 2 or cells")
+                xi[g.strip()] = m.strip()
+    calls = {}
+    if args.xi_cells:
+        t = cell_xi_table(args.xi_cells, args.xi_context,
+                          args.min_cell_sites)
+        calls = dict(zip(t["cell"].astype(str), t["xi_hap"]))
+    elif "cells" in xi.values():
+        raise SystemExit("--xi GROUP=cells needs --xi-cells")
+    idx = samples.set_index(args.cell_column)
+    line_of = (idx[args.group_column].astype(str).to_dict()
+               if args.group_column else {})
+    genome = None if str(args.genome).lower() == "none" else args.genome
+    par = parse_par(args.chrx_par, genome)
+    esc = parse_escape(args.chrx_escape, genome, par)
+    hd = Path(args.haplotypes)
+    xi_of, groups, lines, strata = {}, {}, {}, {}
+    n_file = n_call = 0
+    for c in cells:
+        if not (hd / f"{c}.haplotypes.parquet").exists():
+            n_file += 1
+            continue
+        line = line_of.get(c, "all")
+        mode = xi.get(line)
+        if mode == "cells":
+            h = calls.get(c)
+            if h is None:
+                n_call += 1
+                continue
+        else:
+            h = int(mode) if mode else 1
+        xi_of[c] = int(h)
+        labs = lines.setdefault(line, (
+            {k: f"{line} {unit_label(k, mode is not None)}" for k in keys},
+            mode is not None))[0]
+        for k in keys:
+            u = f"{c}{UNIT_SEP}{k}"
+            groups.setdefault(labs[k], []).append(u)
+            strata[u] = (f"{batch_of.get(c, '')}|{k}" if batch_of
+                         else f"|{k}")
+    if not xi_of:
+        raise SystemExit(f"--haplotypes: no cell has {hd}/<cell>"
+                         f".haplotypes.parquet (and an inactive X call)")
+    args.units_cfg = {"dir": str(hd), "xi": xi_of, "par": par,
+                      "escape": esc}
+    logger.info(f"--haplotypes: {len(xi_of):,} cells in {len(keys)} units "
+                f"each ({n_file} without a haplotype file, {n_call} without "
+                f"an inactive-X call); lines: {sorted(lines)}")
+    return groups, strata, lines
 
 
 def _pair_frames(per_ctx: dict[str, pd.DataFrame]):
@@ -1041,7 +1359,8 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
     pc_set_of = _percell_set_of(args) if want_percell else None
     separate = want_percell and pc_set_of != set_of
     pc_sets = sorted(set(pc_set_of.values())) if separate else []
-    per_ctx = _load_cell(paths, cell, _min_sites(args), merged, excl_chrom)
+    per_ctx = _load_any(paths, cell, _min_sites(args), merged, excl_chrom,
+                        args)
     frames = set_frames(per_ctx, sorted(set(a_sets) | set(pc_sets)))
     if _center_on(args):
         frames = {sk: _center_frame(f, _SET_COLS[sk])
@@ -1284,8 +1603,8 @@ def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
 
     def _one(job):
         ci, cell = job
-        frames = set_frames(_load_cell(paths, cell, ms, merged, excl_chrom),
-                            sets)
+        frames = set_frames(_load_any(paths, cell, ms, merged, excl_chrom,
+                                      args), sets)
         if not frames:
             return None
         key = batch_of.get(cell, "") if batch_of else ""
@@ -1369,8 +1688,8 @@ def _stratum_pool(members, paths, edges, args, merged, excl_chrom):
     sets = _pool_sets(args)
     parts: dict = {}
     for cell, i in members:
-        frames = set_frames(_load_cell(paths, cell, ms, merged, excl_chrom),
-                            sets)
+        frames = set_frames(_load_any(paths, cell, ms, merged, excl_chrom,
+                                      args), sets)
         for sk, f in frames.items():
             if _center_on(args):
                 f = _center_frame(f, _SET_COLS[sk])
@@ -1458,7 +1777,8 @@ def _run_strata(cells, paths, edges, args, batch_of, merged, excl_chrom,
 
 
 def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
-              merged=None, excl_chrom=(), executor=None, percell=None):
+              merged=None, excl_chrom=(), executor=None, percell=None,
+              keep=None):
     nb = len(edges) - 1
     accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
     links = (args.null_type == "link-shuffle"
@@ -1517,6 +1837,8 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                 logger.info(f"  {label}: {i + 1}/{len(cells)} cells")
 
     curves = {k: corr_from_acc(a, args.min_pairs) for k, a in accs.items()}
+    if keep is not None:            # --haplotypes: the units' comparisons
+        keep[label] = per_cell
 
     # Cell-level bootstrap of Δ = linked − null, then FDR across the whole
     # figure.  Resampling CELLS rather than end pairs is the honest unit: a
@@ -2102,6 +2424,38 @@ def main(argv=None) -> int:
     ap.add_argument("--exclude-chrom", default="",
                     help="Comma-separated chromosomes to drop entirely "
                          "(e.g. chrM,chrX,chrY).")
+    ap.add_argument("--haplotypes", default=None, metavar="DIR",
+                    help="allelic_imbalance.py --haplotype-dir: per cell the "
+                         "read pairs a phased SNP puts on one copy.  Each "
+                         "cell is then split into --units -- chrX's inactive "
+                         "and active copy and both together, and the same on "
+                         "the autosomes -- each run as a cell of its own, so "
+                         "--null-scope cell draws from the same cell AND the "
+                         "same copy (or, for 'both', either copy).  One group "
+                         "per line (--group-column) and unit, and per line "
+                         "end_posterior_units_<line>.tsv/.<fmt>: each copy "
+                         "and the comparisons between them, cells resampled "
+                         "jointly.  chrX must not be in --exclude-chrom.")
+    ap.add_argument("--xi", action="append", default=None,
+                    metavar="GROUP=1|2|cells",
+                    help="--haplotypes: a line's inactive X -- the "
+                         "haplotype, the same in every cell, or each cell's "
+                         "own from --xi-cells.  Without: hap1 and hap2.")
+    ap.add_argument("--xi-cells", default=None,
+                    help="allelic_imbalance.py's allelic_cells.tsv.")
+    ap.add_argument("--xi-context", default="HCG_island")
+    ap.add_argument("--min-cell-sites", type=int, default=20)
+    ap.add_argument("--units", default=",".join(UNITS),
+                    help="--haplotypes: the units, of " + ", ".join(UNITS)
+                         + ".")
+    ap.add_argument("--unit-bands", default="1000,10000,100000,1000000,"
+                                            "10000000",
+                    help="--haplotypes: distance-band edges (bp) of the "
+                         "units' comparisons.")
+    ap.add_argument("--genome", default="hg38",
+                    help="--haplotypes: for PAR1 and the escape genes.")
+    ap.add_argument("--chrx-par", default="auto")
+    ap.add_argument("--chrx-escape", default="auto")
     ap.add_argument("--backend", choices=["auto", "thread", "process"],
                     default="auto",
                     help="'auto' (default) takes 'thread' below "
@@ -2249,6 +2603,11 @@ def main(argv=None) -> int:
         for c in cells:
             g = str(gmap.get(c, "NA"))
             groups.setdefault(g, []).append(c)
+    unit_lines = {}
+    if args.haplotypes:
+        groups, batch_of, unit_lines = _unit_setup(samples, cells, args,
+                                                   batch_of, excl_chrom)
+        cells = [u for us in groups.values() for u in us]
     executor = None
     if args.n_threads > 1 and len(cells) > 1:
         # Resolve 'auto' ONCE, here, so run_group and the workers all see a
@@ -2276,7 +2635,7 @@ def main(argv=None) -> int:
     elif args.backend == "auto":            # serial: nothing to choose
         args.backend = "thread"
     percell = None
-    if args.per_cell == "on":
+    if args.per_cell == "on" and not unit_lines:
         idx = samples.set_index(args.cell_column)
         group_of = ({c: str(idx[args.group_column].get(c, "NA")) for c in cells}
                     if args.group_column else {})
@@ -2291,6 +2650,7 @@ def main(argv=None) -> int:
                       .groupby(args.group_column)[args.color_column].first()
                       .astype(str).to_dict())
         percell = {"group_of": group_of, "order": order, "colors": colors}
+    kept: dict = {}
     try:
         per_group = {}
         for label, gcells in groups.items():
@@ -2301,7 +2661,26 @@ def main(argv=None) -> int:
             per_group[label] = run_group(
                 gcells, paths, edges, args, safe, out_dir, batch_of, merged,
                 excl_chrom, executor,
-                percell=percell if label == "all" else None)
+                percell=percell if label == "all" else None,
+                keep=kept if unit_lines else None)
+        bands = np.array([float(x) for x in args.unit_bands.split(",")
+                          if x.strip()])
+        for line, (labels, named) in unit_lines.items():
+            safe = str(line).replace("/", "_").replace(" ", "_")
+            # run_group keeps each group under its file-safe label
+            safe_of = {k: lab.replace("/", "_").replace(" ", "_")
+                       for k, lab in labels.items()}
+            t = unit_comparisons(kept, safe_of, edges, bands, args, named)
+            if len(t):
+                t.insert(0, "line", line)
+                f_ = out_dir / f"end_posterior_units_{safe}.tsv"
+                t.to_csv(f_, sep="\t", index=False)
+                unit_figure(t, line, out_dir / f"end_posterior_units_{safe}."
+                                               f"{args.plot_format}")
+                logger.info(f"{line}: the copies against each other -> {f_}")
+            else:
+                logger.warning(f"{line}: too few cells in some unit for the "
+                               f"comparisons")
         overlay = out_dir / f"end_posterior_dist_by_group.{args.plot_format}"
         if _figure_by_group(per_group, overlay, args):
             logger.info(f"wrote {overlay}  "
