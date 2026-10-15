@@ -885,6 +885,10 @@ All items below are now locked. Decisions in **bold**.
 
 ## 6b. Empirical findings — does long-range concordance carry cell-type information beyond marginal levels?
 
+> **Superseded by §6b.6** (2026-10-07, confirmed 2026-10-15): the positive
+> result in §6b.4–6b.5 does not survive a drawn link-shuffle null.  Read
+> §6b.6 before citing anything above it.
+
 **The question.** Does long-range HCG-methylation (or GCH-accessibility)
 concordance carry cell-type identity *beyond* what the **marginal** (per-locus
 mean) methylation/accessibility already provides — i.e., is the
@@ -947,7 +951,7 @@ The cell-type signal was required to survive, **simultaneously**:
 appears in both chromosome halves — so split-half alone cannot catch it;
 `--batch-column` is the dedicated control.
 
-### 6b.4 Result — two systems, both positive
+### 6b.4 Result — two systems, both positive (superseded: §6b.6)
 
 - **IMR90 / GM12878 cell lines (HCG, binary AUC).** Long-range (20 kb–2 Mb)
   `Δ|m+cov` ≈ **0.79 (5 Mb) – 0.89 (1 Mb)**, p = 0.005, ≫ `miss` (~0.67–0.70);
@@ -966,7 +970,7 @@ the marginal *sharpens* rather than reduces the AUC), i.e. the coordination
 signal was partly *obscured* by residual marginal structure, not produced by
 it.
 
-### 6b.5 Conclusion + honest scope
+### 6b.5 Conclusion + honest scope (superseded: §6b.6)
 
 **Long-range HCG-methylation concordance carries cell-type identity beyond
 marginal levels**, demonstrated in two systems including primary mouse cortex
@@ -987,6 +991,84 @@ Stated honestly:
   **co-observed-only / depth-matched** classification (the last global per-cell
   sequencing-depth loophole). The additive multi-factor batch control is the
   standard one, and the signal survived it.
+
+### 6b.6 Superseded — links with no coordination give the same cell-type signal (2026-10-07; confirmed 2026-10-15)
+
+**What was wrong with §6b.3–6b.5.** They judged the classifier against a
+label-permutation null.  That null asks whether the features separate cell
+types at all, and here they do even with no coordination.  The reference has
+to keep everything except the pairing: the **link-shuffle drawn null**
+(`nome_hic_concordance/link_shuffle.py`).  Each contact keeps its anchor, and
+its partner is replaced by a long-range read end from another cell of the same
+type, at the partner's position and distance.
+
+**Without imputation, the real matches its drawn null.**
+`ep_coordination_existence.py --null` on mouse cortex HCG (random forest,
+9 draws):
+
+| region | `Δ\|m+cov` real | null | rank p | `+batch` real | null |
+|---|---|---|---|---|---|
+| 5 Mb | 0.788 | 0.789 ± 0.007 | 0.6 | 0.601 | 0.596 |
+| 2 Mb | 0.806 | 0.811 ± 0.007 | 0.8 | 0.582 | 0.593 |
+| 1 Mb | 0.816 | 0.812 ± 0.007 | 0.3 | 0.590 | 0.591 |
+
+So the §6b.4 AUCs are what level, depth and batch give with no coordination.
+
+Why a null with no coordination still classifies: at 1–3 contacts per region a
+contact's C = (2a − 1)(q − m) has mean zero, but its spread and the values it
+can take depend on the cell type's level m.
+- On synthetic cells with no coordination, the null's AUC was 0.60–0.81 when
+  the cell types differed in level (higher, not lower, with E set to the exact
+  level), and 0.50–0.57 when they did not.
+- Residualizing on m, m² and coverage removes only the mean of C, which is
+  already about zero.
+
+**Through the whole pipeline, the null clusters by cell type too.**
+Step 5 ran with `--emit-null --null-type link-shuffle --null-graph own`:
+- The null gets its own RWR refinement passes, its own E and its own prior.
+- Pass 0 is the accessibility/methylation graph, which the null shares with the
+  real because re-pairing does not change it.
+
+Results:
+- **UMAP purity** (`celltype_metric_barplots.py`; HCG, 2.5 Mb, 10 types,
+  random control 0.12):
+  - C residual 0.832, drawn null 0.825.
+  - With `--rwr-init coordination --rwr-refine-passes 0`, where no graph ever
+    sees the level, the real C's purity fell to near chance.
+  - Synthetic (3 types, chance 0.33): with the methylation-built graph, a null
+    with no coordination reached 0.67–0.72. With the graph built from C, the
+    null stayed at chance and the real rose only when coordination was planted.
+- **Marker-bin heatmaps** (`celltype_marker_bins.py`, 500 bins,
+  `--remove-batch within-celltype`) of the null residual matrices cluster by
+  cell type as cleanly as the real ones:
+  - HCG (2.5 Mb, 1,235 cells; `concordance_coordination.resid_null.parquet`):
+    every type forms its own block.
+  - GCH (250 kb, 1,577 cells;
+    `concordance_coordination.margreg_k5.method1_local.resid_null.parquet`):
+    glia and Inhib form blocks, and the excitatory subtypes mix.
+
+**Revised conclusion.** No cell-type-specific long-range coordination is
+detectable beyond the link-shuffle null, with or without imputation.
+- §6b.1's leakage trap holds, and is wider than first stated. The shared pass-0
+  graph is enough to make an imputed null cluster by cell type. Without
+  imputation, the level still enters through C's distribution.
+- §6b.2's test remains a useful tool, but only real minus drawn null counts as
+  evidence.
+
+Still standing (imputation-free, tested against reshuffled links):
+- Long-range concordance exists in single cells, well above reshuffled links,
+  with its distance and context profile (`end_posterior_distance_correlation.py`).
+- The annotation-class results (`annotation_class_concordance.py`).
+- The Xi/Xa comparison: GCH-GCH concordance is equal on the two copies,
+  Xi − Xa −0.004 [−0.010, +0.003] (`haplotype_contacts.py`).
+
+One cell-type candidate remains: neuron vs non-neuron GCH, AUC 0.584 against
+0.521 for reshuffled links.  It still needs the GCY-only check for neuronal mCA
+(`split_context_bed.py`, `context_levels.py`).
+
+**Rule.** A cell-type claim from these data needs real minus a drawn null run
+through identical steps.  Neither a label-permutation null nor a null imputed
+over the observed's graph (`--null-graph shared`) can supply it.
 
 ---
 
