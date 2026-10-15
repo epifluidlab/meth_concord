@@ -196,6 +196,8 @@ def test_the_inactive_x_folds_apart_and_the_autosomes_do_not(tmp_path):
     r = b_.loc[("P(s): share ≥ 10 Mb", "chrX")]
     assert abs(r["difference"]) < 0.01 and r["ci_lo"] < 0 < r["ci_hi"]
     assert (o / "haplotype_bulk_vs_cells_IMR.png").exists()
+    xc = pd.read_csv(o / "haplotype_xi_calls_IMR.tsv", sep="\t")
+    assert len(xc) == 40 and set(xc["xi_hap"]) == {1, 2}
     for g in ("GM", "IMR"):
         t = s[s["group"] == g].set_index(["measure", "set"])
         assert (t["copies"] == "Xi|Xa").all()

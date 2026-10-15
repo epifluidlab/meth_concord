@@ -81,7 +81,8 @@ GROUP=cells) is also measured as bulk data sees it: hap1 against hap2, each
 the inactive X in about half the cells, so the copies' differences cancel
 -- beside each cell's own inactive X (haplotype_contacts.tsv rows with xi
 'haplotypes (bulk view)'; figure haplotype_bulk_vs_cells_<line>, with each
-cell's hap1 less hap2 at X's islands).  A line silencing one haplotype
+cell's hap1 less hap2 at X's islands; the calls in
+haplotype_xi_calls_<line>.tsv).  A line silencing one haplotype
 (--xi GROUP=1|2) with --xi-cells: its cells grouped by their own XCI
 strength (Xi less Xa at --xi-context) into --xci-strata quantile strata --
 per stratum the copies' measures, per measure the slope on the strata's
@@ -2126,6 +2127,8 @@ def main(argv=None) -> int:
             sh.insert(sh.columns.get_loc("copy1"), "copies", "hap1|hap2")
             all_stats.append(sh)
             cg = calls[calls["cell"].isin(set(names))]
+            cg.assign(group=g).to_csv(out / f"haplotype_xi_calls_{name}.tsv",
+                                      sep="\t", index=False)
             plot_bulk_vs_cells(st, sh, cg, g,
                                out / f"haplotype_bulk_vs_cells_{name}."
                                      f"{args.plot_format}")
