@@ -1449,39 +1449,77 @@ def window_table(lo, hi, cp, geo: Geometry, x_end: int, size: int,
     return t
 
 
-def window_correlations(t: pd.DataFrame, contexts,
+def _shift_test(x, y, min_shift: int):
+    """Spearman's rho of the windows where both series are finite, and its
+    p against the series slid against each other along X, circularly, by
+    each shift of ``min_shift`` windows or more -- which keeps either's
+    autocorrelation: (rho, p, shifts, windows)."""
+    from scipy.stats import spearmanr
+    ok = np.isfinite(x) & np.isfinite(y)
+    # a series without variation has no rank correlation
+    if ok.sum() < 8 or np.ptp(x[ok]) == 0 or np.ptp(y[ok]) == 0:
+        return np.nan, np.nan, 0, int(ok.sum())
+    rho = float(spearmanr(x[ok], y[ok])[0])
+    null = []
+    for s in range(min_shift, x.size - min_shift + 1):
+        xs = np.roll(x, s)
+        o2 = np.isfinite(xs) & np.isfinite(y)
+        if o2.sum() >= 8:
+            null.append(spearmanr(xs[o2], y[o2])[0])
+    null = np.abs(np.asarray(null, float))
+    p = (1 + int((null >= abs(rho) - 1e-12).sum())) / (1 + null.size)
+    return rho, p, int(null.size), int(ok.sum())
+
+
+def _rank_residual(v, z) -> np.ndarray:
+    """``v``'s ranks less their least-squares line on ``z``'s, over the
+    windows where both are finite (NaN elsewhere)."""
+    from scipy.stats import rankdata
+    out = np.full(v.shape, np.nan)
+    ok = np.isfinite(v) & np.isfinite(z)
+    if ok.sum() < 3:
+        return out
+    rv, rz = rankdata(v[ok]), rankdata(z[ok])
+    X = np.column_stack([rz, np.ones(rz.size)])
+    out[ok] = rv - X @ np.linalg.lstsq(X, rv, rcond=None)[0]
+    return out
+
+
+def window_correlations(t: pd.DataFrame, contexts, labels=None,
                         min_shift: int = 2) -> pd.DataFrame:
     """Across the windows, each context's level difference against each 3D
-    difference (WINDOW_3D): Spearman's rho, and its p against the two
-    series slid against each other along X, circularly, by each shift of
-    ``min_shift`` windows or more -- which keeps either's autocorrelation."""
-    from scipy.stats import spearmanr
+    difference (WINDOW_3D): Spearman's rho with its p from circular shifts
+    (:func:`_shift_test`); and with ``labels``, the same given the second
+    copy's own level of the context -- both series' ranks residualised on
+    it before the test.  The copies' differences can follow the active X
+    alone: where it is the more methylated (gene bodies) it is the more
+    folded into TADs, with the inactive X alike everywhere."""
     rows = []
     for ctx in contexts:
         if f"d_{ctx}" not in t:
             continue
         x = t[f"d_{ctx}"].to_numpy(float)
+        zc = f"{ctx}_{labels[1]}" if labels else None
+        z = t[zc].to_numpy(float) if zc and zc in t else None
         for col, nm in WINDOW_3D:
             if col not in t:
                 continue
             y = t[col].to_numpy(float)
-            ok = np.isfinite(x) & np.isfinite(y)
-            # a series without variation has no rank correlation
-            if ok.sum() < 8 or np.ptp(x[ok]) == 0 or np.ptp(y[ok]) == 0:
+            rho, p, ns, n = _shift_test(x, y, min_shift)
+            if not np.isfinite(rho):
                 continue
-            rho = float(spearmanr(x[ok], y[ok])[0])
-            null = []
-            for s in range(min_shift, x.size - min_shift + 1):
-                xs = np.roll(x, s)
-                o2 = np.isfinite(xs) & np.isfinite(y)
-                if o2.sum() >= 8:
-                    null.append(spearmanr(xs[o2], y[o2])[0])
-            null = np.abs(np.asarray(null, float))
-            rows.append({"context": ctx, "measure_3d": nm, "column": col,
-                         "windows": int(ok.sum()), "rho": rho,
-                         "p_shift": (1 + int((null >= abs(rho) - 1e-12)
-                                             .sum())) / (1 + null.size),
-                         "shifts": int(null.size)})
+            r = {"context": ctx, "measure_3d": nm, "column": col,
+                 "windows": n, "rho": rho, "p_shift": p, "shifts": ns}
+            if z is not None:
+                if np.ptp(z[np.isfinite(z)]) > 0:
+                    rp, pp, _, _ = _shift_test(_rank_residual(x, z),
+                                               _rank_residual(y, z),
+                                               min_shift)
+                else:
+                    rp, pp = rho, p
+                r[f"rho_given_{labels[1]}_level"] = rp
+                r[f"p_shift_given_{labels[1]}_level"] = pp
+            rows.append(r)
     return pd.DataFrame(rows)
 
 
@@ -1515,7 +1553,7 @@ def plot_genes_windows(stats: pd.DataFrame, glev: pd.DataFrame,
                             capsize=2, lw=0.9,
                             label=gname if i == 0 else None)
         ax.set_xticks(range(len(cats)))
-        ax.set_xticklabels(cats, fontsize=6)
+        ax.set_xticklabels([c.replace("_", "\n") for c in cats], fontsize=6)
         ax.axhline(0, color="0.6", lw=0.4)
         ax.set_title(ttl, loc="left", fontsize=6.5)
         ax.set_ylabel(ylab, fontsize=6)
@@ -1565,8 +1603,12 @@ def plot_genes_windows(stats: pd.DataFrame, glev: pd.DataFrame,
             corr is not None and len(corr) else pd.DataFrame()
         sub = (f"ρ = {r['rho'].iloc[0]:+.2f}, p = {r['p_shift'].iloc[0]:.2g}"
                if len(r) else "")
+        gc = f"rho_given_{labels[1]}_level"
+        if len(r) and gc in r and np.isfinite(r[gc].iloc[0]):
+            sub += (f"; given {labels[1]}'s level ρ = {r[gc].iloc[0]:+.2f}, "
+                    f"p = {r[f'p_shift_given_{labels[1]}_level'].iloc[0]:.2g}")
         ax.set_title(f"{ttl}  {ctx} level vs {nm}\n{sub}", loc="left",
-                     fontsize=6.2)
+                     fontsize=5.6)
         ax.set_xlabel(f"{ctx} level, {what}", fontsize=6)
         ax.set_ylabel(f"{nm}, {what}", fontsize=6)
         ax.axhline(0, color="0.7", lw=0.4)
@@ -1914,7 +1956,7 @@ def main(argv=None) -> int:
                 wt = window_table(lo_, hi_, cp_, geo, x_len, args.windows,
                                   al_g, contexts, xh, prof, x_name, escape,
                                   labels, args.window_min_ends)
-                corr = window_correlations(wt, contexts)
+                corr = window_correlations(wt, contexts, labels)
                 wt.assign(group=g).to_csv(
                     out / f"haplotype_windows_{name}.tsv", sep="\t",
                     index=False)

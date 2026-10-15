@@ -429,5 +429,24 @@ def test_escape_genes_fold_and_read_like_the_active_x(tmp_path):
                     sep="\t").set_index(["context", "column"])
     r = c.loc[("HCG", "d_share_far")]
     assert r["rho"] > 0.4 and r["p_shift"] < 0.1
+    # the active X's level is the same everywhere: given it, the link stays
+    assert r["rho_given_Xa_level"] > 0.3
     assert c.loc[("GCH", "d_share_far"), "rho"] < 0
     assert (o / "haplotype_genes_windows_GM.png").exists()
+
+
+def test_window_link_through_the_active_x_alone_vanishes_given_its_level():
+    """Both copies' differences made by the active X's level alone (the
+    inactive X flat): a strong rank correlation, gone given that level."""
+    rng = np.random.default_rng(5)
+    n = 80
+    xa = np.convolve(rng.normal(0, 1, n + 9), np.ones(10) / 10, "valid")
+    t = pd.DataFrame({"d_HCG": -xa + rng.normal(0, 0.05, n),
+                      "d_share_far": xa + rng.normal(0, 0.05, n),
+                      "HCG_Xa": xa + rng.normal(0, 0.01, n)})
+    c = hc.window_correlations(t, ["HCG"], ("Xi", "Xa")).set_index(
+        "column")
+    r = c.loc["d_share_far"]
+    assert r["rho"] < -0.6 and r["p_shift"] < 0.05
+    assert abs(r["rho_given_Xa_level"]) < 0.3
+    assert r["p_shift_given_Xa_level"] > 0.05
