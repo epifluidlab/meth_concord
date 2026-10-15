@@ -159,6 +159,22 @@ def test_the_overview_puts_each_position_at_one_x(tmp_path):
     plt.close(fig)
 
 
+def test_the_partners_lines_sit_about_their_own_mean(tmp_path):
+    # each copy's partners average over X's B-leaning track: drawn about
+    # their mean, so 0 is X's average and the bars' 0 the A/B boundary
+    import matplotlib.pyplot as plt
+    c, cm, un = _tables(tmp_path)
+    fig = f6.figure_from_args(f6.parse_args(_argv(tmp_path, c, cm, un)))
+    lab = dict(f6.B_TRACKS)["partners_compartment"]
+    ax = next(a for a in fig.axes if a.get_ylabel() == lab)
+    lines = [ln.get_ydata() for ln in ax.get_lines()
+             if len(ln.get_ydata()) > 2]
+    assert len(lines) == 2
+    for y in lines:
+        assert abs(np.nanmean(y)) < 1e-9 and np.nanstd(y) > 0.05
+    plt.close(fig)
+
+
 def test_the_overview_needs_its_locus_tables(tmp_path):
     c, cm, un = _tables(tmp_path)
     (c / "haplotype_locus_GM_chrX_map.tsv.gz").unlink()

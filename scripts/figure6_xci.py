@@ -6,10 +6,12 @@ The panels, from the runs' tables:
   a  how a read pair is put on one copy, and which copy a cell silences
   b  X copy by copy, as a genome browser shows it: each copy's contact map
      (haplotype_locus_<line>_chrX_map.tsv.gz), then along X the contacts
-     1 Mb or more crossing each position (haplotype_contacts_profile.tsv),
-     the compartment of each copy's long-range partners over the bulk A/B,
-     and each copy's HCG and GCH level (haplotype_locus_<line>_chrX.tsv);
-     X's elements dotted through all, at one x on every panel
+     1 Mb or more spanning each position, over those expected of their
+     lengths placed at random (haplotype_contacts_profile.tsv), the
+     compartment of each copy's long-range partners about its mean along X
+     over the bulk A/B, and each copy's HCG and GCH level
+     (haplotype_locus_<line>_chrX.tsv); X's elements dotted through all, at
+     one x on every panel
   c  P(s): log2 Xi over Xa by distance, chrX against the autosomes' copies
      (haplotype_contacts_ps_ratio.tsv)
   d  Xi less Xa methylation and accessibility per kind of element
@@ -146,8 +148,8 @@ def panel_a(ax):
 
 #: Panel b's tracks under the maps: (the locus table's column stem, or
 #: 'crossing' from the profile; label).
-B_TRACKS = (("crossing", "≥1 Mb\ncrossing"),
-            ("partners_compartment", "partners'\nA/B"),
+B_TRACKS = (("crossing", "≥1 Mb\ncontacts\nspanning"),
+            ("partners_compartment", "partners'\nA/B\n(grey: A)"),
             ("HCG", "HCG\nlevel"), ("GCH", "GCH\nlevel"))
 
 
@@ -210,7 +212,6 @@ def panel_b(axes, maps, edges, tracks: pd.DataFrame, prof: pd.DataFrame,
     cb.outline.set_linewidth(0.4)
     cb.ax.set_title("log$_{10}$ share", fontsize=4.6, pad=2, loc="right")
     mid = (tracks["start"] + tracks["end"]).to_numpy() / 2e6
-    width = (tracks["end"] - tracks["start"]).to_numpy() / 1e6
     p = prof[prof["group"] == group]
     for ax, (key, lab_) in zip(tr_axes, B_TRACKS):
         if key == "crossing":
@@ -220,18 +221,28 @@ def panel_b(axes, maps, edges, tracks: pd.DataFrame, prof: pd.DataFrame,
             _zero(ax)
         else:
             if key == "partners_compartment" and "compartment_bulk" in tracks:
-                e = tracks["compartment_bulk"].to_numpy(float)
-                ax.bar(mid, np.where(e > 0, e, 0), width=width, color="0.6",
-                       lw=0)
-                ax.bar(mid, np.where(e < 0, e, 0), width=width,
-                       color="0.82", lw=0)
-                for y, t in ((0.82, "A"), (0.18, "B")):
-                    ax.text(1.006, y, t, transform=ax.transAxes, fontsize=4.6,
-                            va="center", ha="left", color="0.4")
+                # the bulk A bins shaded, runs merged: the lines keep the
+                # track's height, where bars of the track itself (to +/-1)
+                # would flatten them
+                a = np.r_[False, tracks["compartment_bulk"].to_numpy(float)
+                          > 0, False]
+                ed = np.flatnonzero(np.diff(a.astype(int)))
+                for i, j in zip(ed[::2], ed[1::2]):
+                    ax.axvspan(tracks["start"].iloc[i] / 1e6,
+                               tracks["end"].iloc[j - 1] / 1e6, color="0.89",
+                               lw=0, zorder=0)
+                _zero(ax)
             for lab, col in (("Xi", XI), ("Xa", XA)):
-                if f"{key}_{lab}" in tracks:
-                    ax.plot(mid, tracks[f"{key}_{lab}"], color=col, lw=0.6,
-                            marker="o", ms=0.9)
+                if f"{key}_{lab}" not in tracks:
+                    continue
+                v = tracks[f"{key}_{lab}"].to_numpy(float)
+                if key == "partners_compartment":
+                    # about the copy's own mean along X: partners spread
+                    # over X pull every bin toward X's B-leaning average;
+                    # what tells is whether a bin's partners are more A or
+                    # more B than that
+                    v = v - np.nanmean(v)
+                ax.plot(mid, v, color=col, lw=0.6, marker="o", ms=0.9)
         ax.set_ylabel(lab_, rotation=0, ha="right", va="center", fontsize=5.3,
                       labelpad=2)
         ax.yaxis.set_major_locator(MaxNLocator(2))
