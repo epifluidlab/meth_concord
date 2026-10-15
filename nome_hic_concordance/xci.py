@@ -1,9 +1,13 @@
 """X inactivation: the parts of chrX where a cell's two copies are alike --
-PAR1, the genes that escape X inactivation -- and the elements specific to
-the inactive X, shared by the chrX analyses (annotation_class_concordance.py,
+PAR1, the genes that escape X inactivation -- the elements specific to the
+inactive X, and X's genes split into those that escape and those it
+silences, shared by the chrX analyses (annotation_class_concordance.py,
 allelic_imbalance.py, haplotype_contacts.py)."""
 
 from __future__ import annotations
+
+import gzip
+import re
 
 import numpy as np
 import pandas as pd
@@ -202,3 +206,90 @@ def x_part(pos, par=None, escape=None, elements=None) -> np.ndarray:
     if par:
         out[(pos >= par[0]) & (pos < par[1])] = "PAR1"
     return out
+
+
+def read_genes(path) -> pd.DataFrame:
+    """Genes (chrom, start, end, name; 0-based) from a GTF ('gene'
+    features, gene_name), a UCSC genePred table (refGene,
+    ncbiRefSeqCurated: name2) or a BED (name in column 4)."""
+    p = str(path).lower()
+    opener = gzip.open if p.endswith(".gz") else open
+    if p.endswith((".gtf", ".gtf.gz", ".gff", ".gff.gz", ".gff3",
+                   ".gff3.gz")):
+        rows = []
+        with opener(path, "rt") as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if line.startswith("#") or len(f) < 9 or f[2] != "gene":
+                    continue
+                m = (re.search(r'gene_name "([^"]+)"', f[8])
+                     or re.search(r'gene_id "([^"]+)"', f[8]))
+                if m:
+                    rows.append((f[0], int(f[3]) - 1, int(f[4]), m.group(1)))
+        return pd.DataFrame(rows, columns=["chrom", "start", "end", "name"])
+    t = pd.read_csv(path, sep="\t", header=None, comment="#", dtype=str)
+    if t.shape[1] >= 13 and t[3].isin(["+", "-"]).all():
+        # genePred with its bin: chrom, strand, txStart, txEnd ... name2
+        g = pd.DataFrame({"chrom": t[2], "start": t[4], "end": t[5],
+                          "name": t[12]})
+    elif t.shape[1] >= 10 and t[2].isin(["+", "-"]).all():
+        g = pd.DataFrame({"chrom": t[1], "start": t[3], "end": t[4],
+                          "name": t[0]})
+    else:
+        g = pd.DataFrame({"chrom": t[0], "start": t[1], "end": t[2],
+                          "name": t[3] if t.shape[1] > 3 else "."})
+    g = g.astype({"start": np.int64, "end": np.int64})
+    # one row per gene: its transcripts' extent
+    return (g.groupby(["chrom", "name"], as_index=False)
+            .agg(start=("start", "min"), end=("end", "max"))
+            [["chrom", "start", "end", "name"]])
+
+
+def in_intervals(pos, iv) -> np.ndarray:
+    """Whether each position lies in the sorted, disjoint (start, end)
+    rows ``iv``."""
+    pos = np.asarray(pos, np.int64)
+    if iv is None or not len(iv):
+        return np.zeros(pos.shape, bool)
+    i = np.searchsorted(iv[:, 0], pos, side="right") - 1
+    return (i >= 0) & (pos < iv[np.maximum(i, 0), 1])
+
+
+def subtract_intervals(iv, minus):
+    """The sorted, disjoint rows ``iv`` less the sorted, disjoint rows
+    ``minus``."""
+    iv = np.asarray(iv, np.int64).reshape(-1, 2)
+    if minus is None or not len(minus):
+        return iv
+    out = []
+    for a_, b_ in iv:
+        cur = int(a_)
+        for c_, d_ in minus:
+            if d_ <= cur or c_ >= b_:
+                continue
+            if c_ > cur:
+                out.append([cur, int(c_)])
+            cur = max(cur, int(d_))
+            if cur >= b_:
+                break
+        if cur < b_:
+            out.append([cur, int(b_)])
+    return np.array(out, np.int64).reshape(-1, 2)
+
+
+#: The two kinds of X genes compared: those that escape X inactivation, and
+#: the rest of X's genes, which the inactive X silences.
+GENE_CLASSES = ("escape genes", "inactivated genes")
+
+
+def gene_classes(genes: pd.DataFrame, escape, par=None,
+                 flank: int = 10_000) -> dict:
+    """X's genes outside PAR1 in GENE_CLASSES: the escape regions
+    (``escape``), and ``genes``' on chrX, each ``flank`` bp wider, less
+    the escape regions -- {class: sorted, disjoint (start, end) rows}."""
+    x = genes[genes["chrom"].map(chrom_key).str.upper() == "X"]
+    iv = _clip_merge(np.column_stack([x["start"].to_numpy(np.int64) - flank,
+                                      x["end"].to_numpy(np.int64) + flank]),
+                     par)
+    return {GENE_CLASSES[0]: np.asarray(escape, np.int64).reshape(-1, 2),
+            GENE_CLASSES[1]: subtract_intervals(iv, escape)}

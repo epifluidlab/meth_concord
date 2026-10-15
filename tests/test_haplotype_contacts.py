@@ -317,3 +317,117 @@ def test_haplotypes_missing_for_every_cell_stop_early(tmp_path):
     with pytest.raises(SystemExit, match="no cell of --samples"):
         hc.main(["--haplotypes", str(tmp_path), "--samples",
                  str(d / "samples.tsv"), "--output-dir", str(tmp_path / "o")])
+
+
+#: Escape genes on the synthetic X, irregularly spaced: active on both
+#: copies, so the inactive X folds and is methylated there like the active.
+ESCAPE = ((4_000_000, 6_000_000), (11_000_000, 12_000_000),
+          (17_000_000, 18_500_000), (26_000_000, 27_000_000),
+          (33_000_000, 35_000_000))
+
+
+def _in_escape(p) -> bool:
+    return any(a <= p < b for a, b in ESCAPE)
+
+
+def make_gene_data(out: Path, n_cells=30, n=800, seed=3):
+    """GM, its inactive X hap1: its contacts the active X's kind, and a
+    third more of them long-range ones (1 Mb or more) between places outside
+    the escape genes; its SNPs outside the escape genes more methylated,
+    less accessible, those inside read alike on both copies.  Genes 400 kb
+    long every Mb."""
+    rng = np.random.default_rng(seed)
+    hd = out / "haps"
+    hd.mkdir(parents=True)
+    rows = []
+
+    def draw(k, lo_s, hi_s, outside):
+        got = []
+        while len(got) < k:
+            p1 = int(rng.integers(0, L))
+            p2 = p1 + int(10 ** rng.uniform(lo_s, hi_s))
+            if p2 >= L or (outside and (_in_escape(p1) or _in_escape(p2))):
+                continue
+            got.append((p1, p2))
+        return got
+    for ci in range(n_cells):
+        name = f"GM_{ci}"
+        t = []
+        for chrom in ("chr1", "chrX"):
+            for hap in (1, 2):
+                xi = chrom == "chrX" and hap == 1
+                base = draw(int(n * 0.7) if xi else n, 3.0, 7.1, False)
+                extra = draw(n - int(n * 0.7), 6.0, 7.5, True) if xi else []
+                t += [(chrom, p1, p2, hap, 1) for p1, p2 in base + extra]
+        pd.DataFrame(t, columns=["chrom", "pos1", "pos2", "hap",
+                                 "snp_reads"]).to_parquet(
+            hd / f"{name}.haplotypes.parquet", index=False)
+        rows.append((name, "GM"))
+    pd.DataFrame(rows, columns=["cell_name", "group"]).to_csv(
+        out / "samples.tsv", sep="\t", index=False)
+    (out / "escape.bed").write_text(
+        "".join(f"chrX\t{a}\t{b}\n" for a, b in ESCAPE))
+    with open(out / "genes.bed", "w") as fh:
+        for c in ("chr1", "chrX"):
+            for k in range(1, L // 1_000_000):
+                fh.write(f"{c}\t{k * 1_000_000 + 100_000}\t"
+                         f"{k * 1_000_000 + 500_000}\tg{k}\n")
+    pos = np.arange(1_000_000, L, 50_000)
+    rh = np.where(np.arange(pos.size) % 2 == 0, 1, 2)
+    esc = np.array([_in_escape(p) for p in pos])
+    sn = pd.DataFrame({"group": "GM", "chrom": "chrX", "pos": pos,
+                       "ref_hap": rh})
+    for c, xi_lv, xa_lv in (("HCG", 0.8, 0.3), ("GCH", 0.2, 0.5)):
+        xi_ = np.where(esc, xa_lv, xi_lv) + rng.normal(0, 0.02, pos.size)
+        xa_ = np.full(pos.size, xa_lv) + rng.normal(0, 0.02, pos.size)
+        sn[f"{c}_ref"] = np.where(rh == 1, xi_, xa_)
+        sn[f"{c}_alt"] = np.where(rh == 1, xa_, xi_)
+        sn[f"{c}_reads_ref"] = sn[f"{c}_reads_alt"] = 10
+    sn.to_csv(out / "allelic_snps.tsv", sep="\t", index=False)
+    return out
+
+
+def test_escape_genes_fold_and_read_like_the_active_x(tmp_path):
+    d = make_gene_data(tmp_path / "d")
+    o = tmp_path / "out"
+    hc.main(["--haplotypes", str(d / "haps"), "--samples",
+             str(d / "samples.tsv"), "--xi", "GM=1", "--genome", "none",
+             "--chrx-par", "0-1000000", "--xi-elements", "none",
+             "--chrx-escape", str(d / "escape.bed"),
+             "--genes", str(d / "genes.bed"), "--gene-flank", "0",
+             "--allelic-snps", str(d / "allelic_snps.tsv"),
+             "--windows", "1000000", "--locus", "none", "--n-boot", "200",
+             "--plot-format", "png", "--output-dir", str(o)])
+    s = pd.read_csv(o / "haplotype_contacts.tsv", sep="\t").set_index(
+        ["measure", "set"])
+    m = "P(s): share ≥ 1 Mb"
+    # the inactivated genes' contacts: the inactive X's the longer
+    r = s.loc[(m, "chrX inactivated genes")]
+    assert r["difference"] > 0.2 and r["ci_lo"] > 0
+    # the escape genes': alike on both copies, and below the inactivated's
+    r = s.loc[(m, "chrX escape genes")]
+    assert abs(r["difference"]) < 0.04 and r["ci_lo"] < 0 < r["ci_hi"]
+    r = s.loc[(m, "escape − inactivated genes")]
+    assert r["difference"] < -0.15 and r["ci_hi"] < 0
+    # each copy's level at the genes
+    g = pd.read_csv(o / "haplotype_genes_GM.tsv", sep="\t").set_index(
+        ["context", "class"])
+    assert abs(g.loc[("HCG", "inactivated genes"), "difference"] - 0.5) < 0.02
+    assert abs(g.loc[("HCG", "escape genes"), "difference"]) < 0.02
+    assert abs(g.loc[("GCH", "inactivated genes"), "difference"] + 0.3) < 0.02
+    r = g.loc[("HCG", "escape − inactivated genes")]
+    assert r["difference"] < -0.45 and r["ci_hi"] < 0
+    assert g.loc[("HCG", "escape genes"), "snps"] > 50
+    # along X: where the copies' levels differ, so does their folding
+    w = pd.read_csv(o / "haplotype_windows_GM.tsv", sep="\t")
+    assert len(w) == 38 and (w["escape_bp"] > 0).sum() == 8
+    full = w[w["escape_bp"] == 1_000_000]
+    rest = w[w["escape_bp"] == 0]
+    assert full["d_HCG"].abs().max() < 0.05 and (rest["d_HCG"] > 0.45).all()
+    assert rest["d_share_far"].mean() > full["d_share_far"].mean() + 0.15
+    c = pd.read_csv(o / "haplotype_windows_correlation_GM.tsv",
+                    sep="\t").set_index(["context", "column"])
+    r = c.loc[("HCG", "d_share_far")]
+    assert r["rho"] > 0.4 and r["p_shift"] < 0.1
+    assert c.loc[("GCH", "d_share_far"), "rho"] < 0
+    assert (o / "haplotype_genes_windows_GM.png").exists()

@@ -94,7 +94,7 @@ from nome_hic_concordance import bam_parser as _bp  # noqa: E402
 from nome_hic_concordance import reference as _ref  # noqa: E402
 from nome_hic_concordance.utils import chrom_key, manifest_text  # noqa: E402
 from nome_hic_concordance.xci import (  # noqa: E402
-    parse_elements, parse_escape, parse_par, x_part)
+    parse_elements, parse_escape, parse_par, read_genes, x_part)
 
 logger = logging.getLogger("allelic_imbalance")
 
@@ -590,44 +590,6 @@ def plot_allelic(snp: pd.DataFrame, cells: pd.DataFrame, context: str,
                  fontsize=7, y=1.04)
     fig.savefig(path, bbox_inches="tight", dpi=300)
     plt.close(fig)
-
-
-def read_genes(path) -> pd.DataFrame:
-    """Genes (chrom, start, end, name; 0-based) from a GTF ('gene'
-    features, gene_name), a UCSC genePred table (refGene,
-    ncbiRefSeqCurated: name2) or a BED (name in column 4)."""
-    import re
-    p = str(path).lower()
-    opener = gzip.open if p.endswith(".gz") else open
-    if p.endswith((".gtf", ".gtf.gz", ".gff", ".gff.gz", ".gff3",
-                   ".gff3.gz")):
-        rows = []
-        with opener(path, "rt") as fh:
-            for line in fh:
-                f = line.rstrip("\n").split("\t")
-                if line.startswith("#") or len(f) < 9 or f[2] != "gene":
-                    continue
-                m = (re.search(r'gene_name "([^"]+)"', f[8])
-                     or re.search(r'gene_id "([^"]+)"', f[8]))
-                if m:
-                    rows.append((f[0], int(f[3]) - 1, int(f[4]), m.group(1)))
-        return pd.DataFrame(rows, columns=["chrom", "start", "end", "name"])
-    t = pd.read_csv(path, sep="\t", header=None, comment="#", dtype=str)
-    if t.shape[1] >= 13 and t[3].isin(["+", "-"]).all():
-        # genePred with its bin: chrom, strand, txStart, txEnd ... name2
-        g = pd.DataFrame({"chrom": t[2], "start": t[4], "end": t[5],
-                          "name": t[12]})
-    elif t.shape[1] >= 10 and t[2].isin(["+", "-"]).all():
-        g = pd.DataFrame({"chrom": t[1], "start": t[3], "end": t[4],
-                          "name": t[0]})
-    else:
-        g = pd.DataFrame({"chrom": t[0], "start": t[1], "end": t[2],
-                          "name": t[3] if t.shape[1] > 3 else "."})
-    g = g.astype({"start": np.int64, "end": np.int64})
-    # one row per gene: its transcripts' extent
-    return (g.groupby(["chrom", "name"], as_index=False)
-            .agg(start=("start", "min"), end=("end", "max"))
-            [["chrom", "start", "end", "name"]])
 
 
 def _set_masks(cells: pd.DataFrame) -> dict:

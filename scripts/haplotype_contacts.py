@@ -61,6 +61,21 @@ partners against the bulk track, the level per context of its phased SNPs
 chrx_haplotype_tracks.tsv) -- the last two for a line with one inactive X
 (--xi GROUP=1|2), whose haplotypes are its copies.
 
+Is a copy's level tied to its folding?  With --genes, X's genes in two
+classes, those that escape X inactivation (--chrx-escape) and the others,
+which it silences: each copy's P(s) shares over the contacts with an end in
+each (haplotype_contacts.tsv, sets 'chrX escape genes' and 'chrX inactivated
+genes', and 'escape − inactivated genes': the one's copies' difference less
+the other's) and, with --allelic-snps, each copy's level at the phased SNPs
+inside (haplotype_genes_<line>.tsv) -- the escape genes, active on both
+copies, should look like the active X in both.  Along X (--windows), side by
+side windows: per copy its contacts' shares 0.1-1 Mb and 1 Mb or more
+apart, its partners' compartment, the contacts crossing the window and its
+level, and across the windows each level difference against each 3D
+difference, Spearman's rho with p from sliding one series along X against
+the other (haplotype_windows_<line>.tsv, _correlation_<line>.tsv).  Figure:
+haplotype_genes_windows_<line>.
+
     python scripts/haplotype_contacts.py \\
         --haplotypes output/haplotypes --samples samples.tsv \\
         --group-column cell_type --xi GM12878=1 \\
@@ -90,7 +105,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from nome_hic_concordance.utils import chrom_key, manifest_text  # noqa: E402
 from nome_hic_concordance.xci import (  # noqa: E402
-    parse_elements, parse_escape, parse_par)
+    GENE_CLASSES, gene_classes, in_intervals, parse_elements, parse_escape,
+    parse_par, read_genes)
 
 logger = logging.getLogger("haplotype_contacts")
 
@@ -109,6 +125,8 @@ BOUNDARY_OFFSETS = np.arange(-1_000_000, 1_000_001, 100_000)
 PROFILE_MARGIN = 5_000_000
 #: Contacts this far apart or more show which compartments they join.
 COMPARTMENT_MIN_DISTANCE = 2_000_000
+#: The escape genes' copies' difference less the inactivated genes'.
+GENE_CONTRAST = "escape − inactivated genes"
 
 
 class Eigen:
@@ -194,6 +212,8 @@ class Geometry:
                 if 0 in shifts:
                     self.loops.append((f"{na}–{nb}", a_, b_, shifts))
         self.loop_excl = int(args.loop_exclude)
+        # X's genes by GENE_CLASSES (--genes): {class: (start, end) rows}
+        self.gene_iv: dict = {}
 
 
 def read_boundaries(path) -> dict:
@@ -279,6 +299,8 @@ def cell_counts(t: pd.DataFrame, xi_hap: int, geo: Geometry) -> dict:
            "comp": np.zeros((2, 2, 4))}
     for i, (_, _, _, sh) in enumerate(geo.loops):
         out[f"loop{i}"] = np.zeros((2, sh.size))
+    if geo.gene_iv:
+        out["gshare"] = np.zeros((len(geo.gene_iv), 2, 1 + len(PS_CLASSES)))
     if t is None or t.empty:
         return out
     t = t[(t["hi"] - t["lo"]) >= 10 ** PS_EDGES[0]]
@@ -306,6 +328,13 @@ def cell_counts(t: pd.DataFrame, xi_hap: int, geo: Geometry) -> dict:
     for j, (_, lo_d, hi_d) in enumerate(PS_CLASSES, 1):
         m = far & (d >= lo_d) & (d < (hi_d or np.inf))
         np.add.at(out["share"], (s_[m], copy[m], j), 1)
+    # the same of X's contacts with an end in each class of genes
+    for gi, iv in enumerate(geo.gene_iv.values()):
+        inn = far & (s_ == 0) & (in_intervals(lo, iv) | in_intervals(hi, iv))
+        np.add.at(out["gshare"], (gi, copy[inn], 0), 1)
+        for j, (_, lo_d, hi_d) in enumerate(PS_CLASSES, 1):
+            m = inn & (d >= lo_d) & (d < (hi_d or np.inf))
+            np.add.at(out["gshare"], (gi, copy[m], j), 1)
     # the crossing profile along X
     m = (s_ == 0) & (d >= geo.prof_min)
     if geo.w > 0:
@@ -382,6 +411,11 @@ def contact_stats(a: dict, geo: Geometry) -> list:
                     continue
                 out.append((f"P(s): share {nm}", sname,
                             sh[..., j] / sh[..., 0]))
+        for gi, gname in enumerate(geo.gene_iv):
+            sh = a["gshare"][..., gi, :, :]
+            for j, (nm, _, _) in enumerate(PS_CLASSES, 1):
+                out.append((f"P(s): share {nm}", f"chrX {gname}",
+                            sh[..., j] / sh[..., 0]))
         if geo.dxz4 is not None:
             out.append(("crossing DXZ4: log2 obs/exp", "chrX", np.log2(
                 a["prof_o"][..., geo.dxz4] / a["prof_e"][..., geo.dxz4])))
@@ -445,11 +479,17 @@ def group_stats(a: dict, geo: Geometry, w, labels) -> pd.DataFrame:
         d, db = v[0] - v[1], vb[:, 0] - vb[:, 1]
         by[(meas, sname)] = (d, db)
         rows.append(_row(meas, sname, v, d, db, norm, labels))
+    ge, gi = (f"chrX {c}" for c in GENE_CLASSES)
     for meas in dict.fromkeys(m for m, _ in by):
         if (meas, "chrX") in by and (meas, "autosomes") in by:
             (dx, bx), (da, ba) = by[(meas, "chrX")], by[(meas, "autosomes")]
             rows.append(_row(meas, "chrX − autosomes", (np.nan, np.nan),
                              dx - da, bx - ba, norm, labels))
+        # the escape genes' copies' difference less the inactivated genes'
+        if (meas, ge) in by and (meas, gi) in by:
+            (d1, b1), (d2, b2) = by[(meas, ge)], by[(meas, gi)]
+            rows.append(_row(meas, GENE_CONTRAST, (np.nan, np.nan), d1 - d2,
+                             b1 - b2, norm, labels))
     return pd.DataFrame(rows)
 
 
@@ -1287,6 +1327,258 @@ def plot_along_x(prof: pd.DataFrame, levels: dict, conc, labels,
     plt.close(fig)
 
 
+def gene_level_table(allelic: pd.DataFrame, gene_iv: dict, contexts,
+                     xi_hap: int, labels, n_boot: int = 1000,
+                     seed: int = 0) -> pd.DataFrame:
+    """Per context and class of genes (``gene_iv``) each copy's level at
+    the phased SNPs inside, weighted by their reads, and the first copy
+    less the second with its 95% interval from resampling the SNPs; and that
+    difference in the escape genes less in the inactivated ones."""
+    rng = np.random.default_rng([seed, 41])
+    pos = allelic["pos"].to_numpy(np.int64)
+    h0 = xi_hap or 1
+    rows = []
+    for ctx in contexts:
+        if f"{ctx}_hap1" not in allelic:
+            continue
+        l0 = allelic[f"{ctx}_hap{h0}"].to_numpy(float)
+        l1 = allelic[f"{ctx}_hap{3 - h0}"].to_numpy(float)
+        w0 = allelic[f"{ctx}_reads_hap{h0}"].to_numpy(float)
+        w1 = allelic[f"{ctx}_reads_hap{3 - h0}"].to_numpy(float)
+        ok = np.isfinite(l0) & np.isfinite(l1) & (w0 > 0) & (w1 > 0)
+        boot, point = {}, {}
+        for gname, iv in gene_iv.items():
+            m = ok & in_intervals(pos, iv)
+            n = int(m.sum())
+            r = {"context": ctx, "class": gname, "snps": n}
+            if n >= 3:
+                a0, a1 = w0[m] * l0[m], w1[m] * l1[m]
+                x0, x1 = a0.sum() / w0[m].sum(), a1.sum() / w1[m].sum()
+                W = rng.multinomial(n, np.full(n, 1.0 / n), size=n_boot)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    bd = (W @ a0) / (W @ w0[m]) - (W @ a1) / (W @ w1[m])
+                boot[gname], point[gname] = bd, x0 - x1
+                lo, hi = np.nanpercentile(bd, [2.5, 97.5])
+                r.update({labels[0]: x0, labels[1]: x1, "difference": x0 - x1,
+                          "ci_lo": lo, "ci_hi": hi})
+            rows.append(r)
+        if all(c in boot for c in GENE_CLASSES):
+            bd = boot[GENE_CLASSES[0]] - boot[GENE_CLASSES[1]]
+            lo, hi = np.nanpercentile(bd, [2.5, 97.5])
+            rows.append({"context": ctx, "class": GENE_CONTRAST,
+                         "difference": point[GENE_CLASSES[0]]
+                         - point[GENE_CLASSES[1]], "ci_lo": lo, "ci_hi": hi})
+    return pd.DataFrame(rows)
+
+
+#: The windows' 3D measures, each a copy less the other: (column, name).
+WINDOW_3D = (("d_share_far", "share of contacts ≥ 1 Mb"),
+             ("d_share_tad", "share 0.1–1 Mb"),
+             ("d_partners", "partners' compartment"),
+             ("d_crossing", "crossing, log2 obs/exp"))
+
+
+def window_table(lo, hi, cp, geo: Geometry, x_end: int, size: int,
+                 allelic, contexts, xi_hap: int, prof, x_name: str, escape,
+                 labels, min_ends: int = 50) -> pd.DataFrame:
+    """Along X outside PAR1, windows ``size`` wide side by side: per copy
+    the ends inside of its contacts --min-distance or more apart, the
+    share of them 0.1-1 Mb and 1 Mb or more apart (with ``min_ends`` or
+    more), the compartment of their partners 2 Mb or more away
+    (--compartments), the contacts crossing the window's middle (``prof``,
+    the nearest position), and per context the level at the phased SNPs
+    inside; each first copy less the second ('d_'), and the bp of escape
+    genes inside."""
+    edges = np.arange(geo.x_lo, x_end + 1, size, dtype=np.int64)
+    nb = edges.size - 1
+    if nb < 1:
+        return pd.DataFrame()
+    d = hi - lo
+    keep = d >= geo.min_d
+    ends = np.concatenate([lo[keep], hi[keep]])
+    oth = np.concatenate([hi[keep], lo[keep]])
+    dd = np.concatenate([d[keep], d[keep]])
+    cc = np.concatenate([cp[keep], cp[keep]])
+    b = np.searchsorted(edges, ends, "right") - 1
+    inw = (b >= 0) & (b < nb)
+    mid = (edges[:-1] + edges[1:]) // 2
+    t = pd.DataFrame({"start": edges[:-1], "end": edges[1:]})
+    for k, lab in enumerate(labels):
+        m = inw & (cc == k)
+        n_ = np.bincount(b[m], minlength=nb).astype(float)
+        ok = n_ >= min_ends
+        t[f"ends_{lab}"] = n_
+        for col, a_, b_ in (("share_far", 1_000_000, np.inf),
+                            ("share_tad", 100_000, 1_000_000)):
+            c_ = np.bincount(b[m & (dd >= a_) & (dd < b_)], minlength=nb)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                t[f"{col}_{lab}"] = np.where(ok, c_ / n_, np.nan)
+        if geo.eig is not None:
+            mm = m & (dd >= COMPARTMENT_MIN_DISTANCE)
+            ev = geo.eig.at(np.full(int(mm.sum()), x_name), oth[mm])
+            fin = np.isfinite(ev)
+            s_ = np.bincount(b[mm][fin], ev[fin], nb)
+            c_ = np.bincount(b[mm][fin], minlength=nb)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                t[f"partners_{lab}"] = np.where(c_ >= max(10, min_ends // 5),
+                                                s_ / c_, np.nan)
+        if prof is not None and len(prof):
+            gp = prof["pos"].to_numpy(np.int64)
+            j = np.abs(gp[None, :] - mid[:, None]).argmin(1)
+            near = np.abs(gp[j] - mid) <= size // 2
+            t[f"crossing_{lab}"] = np.where(
+                near, prof[f"log2_obs_exp_{lab}"].to_numpy(float)[j], np.nan)
+        if allelic is not None and len(allelic):
+            h = (xi_hap or 1) if k == 0 else 3 - (xi_hap or 1)
+            pos = allelic["pos"].to_numpy(np.int64)
+            for c in contexts:
+                if f"{c}_hap{h}" in allelic:
+                    t[f"{c}_{lab}"] = _binned(
+                        pos, allelic[f"{c}_hap{h}"].to_numpy(float),
+                        allelic[f"{c}_reads_hap{h}"].to_numpy(float), edges)
+    for meas in ("share_far", "share_tad", "partners", "crossing", *contexts):
+        a_, b_ = f"{meas}_{labels[0]}", f"{meas}_{labels[1]}"
+        if a_ in t and b_ in t:
+            t[f"d_{meas}"] = t[a_] - t[b_]
+    esc = np.zeros(nb)
+    if escape is not None and len(escape):
+        for e0, e1 in escape:
+            esc += np.clip(np.minimum(edges[1:], e1)
+                           - np.maximum(edges[:-1], e0), 0, None)
+    t["escape_bp"] = esc
+    return t
+
+
+def window_correlations(t: pd.DataFrame, contexts,
+                        min_shift: int = 2) -> pd.DataFrame:
+    """Across the windows, each context's level difference against each 3D
+    difference (WINDOW_3D): Spearman's rho, and its p against the two
+    series slid against each other along X, circularly, by each shift of
+    ``min_shift`` windows or more -- which keeps either's autocorrelation."""
+    from scipy.stats import spearmanr
+    rows = []
+    for ctx in contexts:
+        if f"d_{ctx}" not in t:
+            continue
+        x = t[f"d_{ctx}"].to_numpy(float)
+        for col, nm in WINDOW_3D:
+            if col not in t:
+                continue
+            y = t[col].to_numpy(float)
+            ok = np.isfinite(x) & np.isfinite(y)
+            # a series without variation has no rank correlation
+            if ok.sum() < 8 or np.ptp(x[ok]) == 0 or np.ptp(y[ok]) == 0:
+                continue
+            rho = float(spearmanr(x[ok], y[ok])[0])
+            null = []
+            for s in range(min_shift, x.size - min_shift + 1):
+                xs = np.roll(x, s)
+                o2 = np.isfinite(xs) & np.isfinite(y)
+                if o2.sum() >= 8:
+                    null.append(spearmanr(xs[o2], y[o2])[0])
+            null = np.abs(np.asarray(null, float))
+            rows.append({"context": ctx, "measure_3d": nm, "column": col,
+                         "windows": int(ok.sum()), "rho": rho,
+                         "p_shift": (1 + int((null >= abs(rho) - 1e-12)
+                                             .sum())) / (1 + null.size),
+                         "shifts": int(null.size)})
+    return pd.DataFrame(rows)
+
+
+_GENE_COLS = {GENE_CLASSES[0]: "#e08214", GENE_CLASSES[1]: "#5e3c99"}
+
+
+def plot_genes_windows(stats: pd.DataFrame, glev: pd.DataFrame,
+                       wt: pd.DataFrame, corr: pd.DataFrame, labels,
+                       group: str, path):
+    """The copies' differences and the genes and windows: a, each
+    context's level at the escape and the inactivated genes; b, the share
+    of their contacts 0.1-1 Mb and 1 Mb or more apart (95% intervals); c-f,
+    along X, windows' level difference against their 3D differences
+    (rho, p from sliding the series along X)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 3, figsize=(8.4, 5.2),
+                             gridspec_kw={"hspace": 0.6, "wspace": 0.4})
+    what = f"{labels[0]} − {labels[1]}"
+
+    def pts(ax, cats, get, ttl, ylab):
+        for j, gname in enumerate(GENE_CLASSES):
+            for i, cat in enumerate(cats):
+                r = get(cat, gname)
+                if r is None or not np.isfinite(r[0]):
+                    continue
+                x = i + (j - 0.5) * 0.3
+                ax.errorbar(x, r[0], yerr=[[r[0] - r[1]], [r[2] - r[0]]],
+                            fmt="o", ms=3.5, color=_GENE_COLS[gname],
+                            capsize=2, lw=0.9,
+                            label=gname if i == 0 else None)
+        ax.set_xticks(range(len(cats)))
+        ax.set_xticklabels(cats, fontsize=6)
+        ax.axhline(0, color="0.6", lw=0.4)
+        ax.set_title(ttl, loc="left", fontsize=6.5)
+        ax.set_ylabel(ylab, fontsize=6)
+        ax.tick_params(labelsize=5.5)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=5, frameon=False)
+
+    def lev(cat, gname):
+        if glev is None or not len(glev):
+            return None
+        r = glev[(glev["context"] == cat) & (glev["class"] == gname)]
+        if not len(r) or "difference" not in r:
+            return None
+        r = r.iloc[0]
+        return r["difference"], r["ci_lo"], r["ci_hi"]
+    cats = list(dict.fromkeys(glev["context"])) if glev is not None and \
+        len(glev) else []
+    pts(axes[0, 0], cats, lev, f"a  level at the genes, {what}",
+        "level difference")
+
+    def ps(cat, gname):
+        r = stats[(stats["measure"] == f"P(s): share {cat}")
+                  & (stats["set"] == f"chrX {gname}")]
+        if not len(r):
+            return None
+        r = r.iloc[0]
+        return r["difference"], r["ci_lo"], r["ci_hi"]
+    pts(axes[0, 1], [nm for nm, _, _ in PS_CLASSES[:2]], ps,
+        f"b  their contacts, P(s) share, {what}", "share difference")
+    panels = [(ctx, col, nm) for ctx in ("HCG", "GCH")
+              for col, nm in WINDOW_3D if col in ("d_share_far", "d_partners")]
+    for ax, (ctx, col, nm), ttl in zip(
+            [axes[0, 2], axes[1, 0], axes[1, 1], axes[1, 2]], panels,
+            "cdef"):
+        if wt is None or not len(wt) or f"d_{ctx}" not in wt or col not in wt:
+            ax.text(0.5, 0.5, "no windows", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=6, color="0.4")
+            ax.set_title(f"{ttl}  {ctx}: {nm}", loc="left", fontsize=6.5)
+            continue
+        esc = wt["escape_bp"] > 0
+        for m, c_, lab in ((~esc, "0.3", "windows"),
+                           (esc, _GENE_COLS[GENE_CLASSES[0]],
+                            "with escape genes")):
+            ax.scatter(wt.loc[m, f"d_{ctx}"], wt.loc[m, col], s=7, color=c_,
+                       lw=0, label=lab)
+        r = corr[(corr["context"] == ctx) & (corr["column"] == col)] if \
+            corr is not None and len(corr) else pd.DataFrame()
+        sub = (f"ρ = {r['rho'].iloc[0]:+.2f}, p = {r['p_shift'].iloc[0]:.2g}"
+               if len(r) else "")
+        ax.set_title(f"{ttl}  {ctx} level vs {nm}\n{sub}", loc="left",
+                     fontsize=6.2)
+        ax.set_xlabel(f"{ctx} level, {what}", fontsize=6)
+        ax.set_ylabel(f"{nm}, {what}", fontsize=6)
+        ax.axhline(0, color="0.7", lw=0.4)
+        ax.axvline(0, color="0.7", lw=0.4)
+        ax.tick_params(labelsize=5.5)
+        ax.legend(fontsize=4.8, frameon=False)
+    fig.suptitle(f"{group}: {what} at the escape and the inactivated genes, "
+                 f"and in windows along X", fontsize=7, y=0.995)
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
 def _pairs(values) -> dict:
     out = {}
     for v in values or []:
@@ -1393,6 +1685,27 @@ def main(argv=None) -> int:
     ap.add_argument("--map-smooth", type=float, default=1.0,
                     help="The loci's contact maps: Gaussian smoothing, in "
                          "bins (0: none).")
+    ap.add_argument("--genes", default=None,
+                    help="Genes (GTF, genePred -- e.g. ncbiRefSeqCurated -- "
+                         "or BED): X's escape genes (--chrx-escape) against "
+                         "its inactivated ones, in each copy's P(s) and, "
+                         "with --allelic-snps, its level "
+                         "(haplotype_genes_<line>.tsv).")
+    ap.add_argument("--gene-flank", type=int, default=10_000,
+                    help="--genes: each gene this much wider on each side.")
+    ap.add_argument("--gene-contexts",
+                    default="HCG,GCH,HCG_island,GCH_island,HCG_promoter,"
+                            "GCH_promoter",
+                    help="--genes: the contexts of --allelic-snps compared "
+                         "at the genes (those it has).")
+    ap.add_argument("--windows", type=int, default=2_000_000,
+                    help="Along X, windows this wide side by side: each "
+                         "copy's 3D measures against its level at the "
+                         "phased SNPs, for a line with one inactive X "
+                         "(haplotype_windows_<line>.tsv); 0: none.")
+    ap.add_argument("--window-min-ends", type=int, default=50,
+                    help="--windows: the contact ends a copy needs in a "
+                         "window for its shares.")
     ap.add_argument("--n-boot", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--plot-format", default="pdf")
@@ -1460,19 +1773,35 @@ def main(argv=None) -> int:
     if loci and tad_path:
         tb = read_boundaries(tad_path)
         tads = next((v for c, v in tb.items() if chrom_key(c) == "X"), None)
-    escape = parse_escape(args.chrx_escape, genome, par) if loci else None
+    escape = parse_escape(args.chrx_escape, genome, par)
+    if args.genes:
+        if escape is None or not len(escape):
+            logger.warning("--genes but no escape genes (--chrx-escape): no "
+                           "escape against inactivated genes")
+        else:
+            geo.gene_iv = gene_classes(read_genes(args.genes), escape, par,
+                                       args.gene_flank)
+            logger.info("X's genes: " + ", ".join(
+                f"{k} {len(v):,} regions, {int((v[:, 1] - v[:, 0]).sum()):,} "
+                f"bp" for k, v in geo.gene_iv.items()))
     contexts = [c.strip() for c in args.track_contexts.split(",")
                 if c.strip()]
-    allelic = (read_allelic(args.allelic_snps, contexts)
-               if loci and args.allelic_snps else None)
+    # the genes' contexts: those of --gene-contexts the SNP table has
+    gene_ctx = []
+    if args.allelic_snps and geo.gene_iv:
+        head = set(pd.read_csv(args.allelic_snps, sep="\t", nrows=0).columns)
+        gene_ctx = [c for c in (s.strip() for s in
+                                args.gene_contexts.split(","))
+                    if c and {f"{c}_ref", f"{c}_reads_ref"} <= head]
+    allelic = (read_allelic(args.allelic_snps,
+                            list(dict.fromkeys(contexts + gene_ctx)))
+               if args.allelic_snps else None)
     conc = (pd.read_csv(args.concordance_tracks, sep="\t",
                         dtype={"group": str})
             if args.concordance_tracks else None)
     cdist = (pd.read_csv(args.concordance_distance, sep="\t",
                          dtype={"group": str})
              if args.concordance_distance else None)
-    if args.allelic_snps and allelic is None:
-        allelic = read_allelic(args.allelic_snps, contexts)
     if geo.dxz4 is None:
         logger.warning("no DXZ4 among --xi-elements: no megadomain boundary")
     if not args.boundaries:
@@ -1493,7 +1822,7 @@ def main(argv=None) -> int:
             else:
                 h = int(mode) if mode else 0
             counts.append(cell_counts(t, h, geo))
-            if loci:
+            if loci or args.windows > 0:
                 pooled.append(x_contacts(t, h, geo))
         if mode == "cells":
             logger.info(f"{g}: each cell's inactive X from {args.xi_cells} "
@@ -1564,10 +1893,45 @@ def main(argv=None) -> int:
                      labels, xh, elements, g,
                      out / f"haplotype_along_x_{name}.{args.plot_format}",
                      x_range=(geo.x_lo, x_len))
-        if loci and pooled:
+        if pooled:
             lo_ = np.concatenate([x[0] for x in pooled])
             hi_ = np.concatenate([x[1] for x in pooled])
             cp_ = np.concatenate([x[2] for x in pooled])
+        # the escape genes against the inactivated ones, and windows along
+        # X: each copy's level against its folding -- per copy only where
+        # the line has one inactive X
+        if one_x and allelic is not None and (geo.gene_iv or
+                                              args.windows > 0):
+            al_g = allelic[allelic["group"] == g]
+            gl = (gene_level_table(al_g, geo.gene_iv, gene_ctx or contexts,
+                                   xh, labels, args.n_boot, args.seed)
+                  if geo.gene_iv else pd.DataFrame())
+            if len(gl):
+                gl.assign(group=g).to_csv(out / f"haplotype_genes_{name}.tsv",
+                                          sep="\t", index=False)
+            wt, corr = pd.DataFrame(), pd.DataFrame()
+            if args.windows > 0 and pooled:
+                wt = window_table(lo_, hi_, cp_, geo, x_len, args.windows,
+                                  al_g, contexts, xh, prof, x_name, escape,
+                                  labels, args.window_min_ends)
+                corr = window_correlations(wt, contexts)
+                wt.assign(group=g).to_csv(
+                    out / f"haplotype_windows_{name}.tsv", sep="\t",
+                    index=False)
+                corr.assign(group=g).to_csv(
+                    out / f"haplotype_windows_correlation_{name}.tsv",
+                    sep="\t", index=False)
+                if len(corr):
+                    logger.info(f"{g}: windows along X, {labels[0]} less "
+                                f"{labels[1]}, level against 3D:\n"
+                                + corr.to_string(index=False, float_format=(
+                                    lambda v: f"{v:.3g}")))
+            plot_genes_windows(st.rename(columns={"copy1": labels[0],
+                                                  "copy2": labels[1]}),
+                               gl, wt, corr, labels, g,
+                               out / f"haplotype_genes_windows_{name}."
+                                     f"{args.plot_format}")
+        if loci and pooled:
             # a polyclonal line's haplotypes are not its copies: the
             # SNPs' and the concordance's tracks are by haplotype
             one = mode not in ("cells",)
