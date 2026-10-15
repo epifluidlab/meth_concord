@@ -18,6 +18,8 @@ _SPEC = importlib.util.spec_from_file_location(
     Path(__file__).resolve().parents[1] / "scripts" / "figure6_xci.py")
 f6 = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(f6)
+#: chrX as haplotype_contacts.py's locus spans it on hg38 (PAR1 aside).
+X_LO, X_HI = 2_781_479, 156_028_938
 
 
 def _tables(root: Path, with_calls=True):
@@ -39,6 +41,21 @@ def _tables(root: Path, with_calls=True):
     pd.DataFrame({"pos": pos, "log2_obs_exp_Xi": xi, "log2_obs_exp_Xa": 0.0,
                   "difference": xi, "group": "GM"}).to_csv(
         c / "haplotype_contacts_profile.tsv", sep="\t", index=False)
+    # all of X in 10 Mb bins, the last short: the tracks and the maps
+    e = np.r_[np.arange(X_LO, X_HI, 10_000_000), X_HI]
+    n = e.size - 1
+    lt = pd.DataFrame({"start": e[:-1], "end": e[1:]})
+    for lab, hcg in (("Xi", 0.25), ("Xa", 0.38)):
+        lt[f"partners_compartment_{lab}"] = -0.15 + 0.1 * np.cos(np.arange(n))
+        lt[f"HCG_{lab}"] = hcg
+        lt[f"GCH_{lab}"] = 0.66
+    lt["compartment_bulk"] = np.sin(np.arange(n))
+    lt.to_csv(c / "haplotype_locus_GM_chrX.tsv", sep="\t", index=False)
+    i, j = np.triu_indices(n)
+    pd.DataFrame({"start_1": e[i], "start_2": e[j],
+                  "Xi": 0.02 / (1 + j - i), "Xa": 0.02 / (1 + j - i) ** 1.4,
+                  "log2_oe_ratio": 0.0}).to_csv(
+        c / "haplotype_locus_GM_chrX_map.tsv.gz", sep="\t", index=False)
     st = []
     for g, xi_, scale in (("GM", "1", 1.0), ("IMR", "cells", 1.0),
                           ("IMR", "haplotypes (bulk view)", -0.2)):
@@ -124,6 +141,29 @@ def test_the_figure_draws_from_the_tables(tmp_path):
     assert f6.main(_argv(tmp_path, c, cm, un)) == 0
     out = tmp_path / "fig" / "Figure6.pdf"
     assert out.exists() and out.stat().st_size > 20_000
+
+
+def test_the_overview_puts_each_position_at_one_x(tmp_path):
+    # b's maps and tracks: one width, so DXZ4's dotted line runs straight
+    # down them all
+    import matplotlib.pyplot as plt
+    c, cm, un = _tables(tmp_path)
+    fig = f6.figure_from_args(f6.parse_args(_argv(tmp_path, c, cm, un)))
+    fig.canvas.draw()
+    along = [ax for ax in fig.axes
+             if np.allclose(ax.get_xlim(), (X_LO / 1e6, X_HI / 1e6))]
+    assert len(along) == 6                       # two maps, four tracks
+    dxz4 = sum(f6.XI_ELEMENTS["hg38"]["DXZ4"]) / 2e6
+    at = [ax.transData.transform((dxz4, 0))[0] for ax in along]
+    assert np.ptp(at) < 0.5                      # pixels
+    plt.close(fig)
+
+
+def test_the_overview_needs_its_locus_tables(tmp_path):
+    c, cm, un = _tables(tmp_path)
+    (c / "haplotype_locus_GM_chrX_map.tsv.gz").unlink()
+    with pytest.raises(SystemExit, match="--locus"):
+        f6.main(_argv(tmp_path, c, cm, un))
 
 
 def test_the_mosaic_calls_come_from_the_table_or_the_option(tmp_path):

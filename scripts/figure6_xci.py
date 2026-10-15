@@ -4,11 +4,14 @@
 The panels, from the runs' tables:
 
   a  how a read pair is put on one copy, and which copy a cell silences
-  b  P(s): log2 Xi over Xa by distance, chrX against the autosomes' copies
+  b  X copy by copy, as a genome browser shows it: each copy's contact map
+     (haplotype_locus_<line>_chrX_map.tsv.gz), then along X the contacts
+     1 Mb or more crossing each position (haplotype_contacts_profile.tsv),
+     the compartment of each copy's long-range partners over the bulk A/B,
+     and each copy's HCG and GCH level (haplotype_locus_<line>_chrX.tsv);
+     X's elements dotted through all, at one x on every panel
+  c  P(s): log2 Xi over Xa by distance, chrX against the autosomes' copies
      (haplotype_contacts_ps_ratio.tsv)
-  c  contacts 1 Mb or more crossing each position along X, each copy, DXZ4
-     marked (haplotype_contacts_profile.tsv); the correlation of the
-     compartment track at contacts' ends (haplotype_contacts.tsv)
   d  Xi less Xa methylation and accessibility per kind of element
      (allelic_imbalance.py's allelic_summary.tsv)
   e  a mosaic line: each cell's inactive X (haplotype_xi_calls_<line>.tsv
@@ -39,13 +42,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from nome_hic_concordance.xci import XI_ELEMENTS  # noqa: E402
+
 #: Colours: the copies, the autosomes' copies, the bulk view, the marks,
 #: the kinds of gene.
 XI, XA, AUTO, BULK = "#b2182b", "#2166ac", "0.45", "0.6"
 HCG_C, GCH_C = "#762a83", "#1b7837"
 ESC_C, INACT_C = "#e08214", "0.25"
-#: DXZ4 on hg38 (Xi's megadomain boundary), Mb.
-DXZ4_MB = (115_630_000 + 115_970_000) / 2e6
 
 
 def _style():
@@ -137,7 +144,115 @@ def panel_a(ax):
             color="0.3")
 
 
-def panel_b(ax, ratio: pd.DataFrame, group: str):
+#: Panel b's tracks under the maps: (the locus table's column stem, or
+#: 'crossing' from the profile; label).
+B_TRACKS = (("crossing", "≥1 Mb\ncrossing"),
+            ("partners_compartment", "partners'\nA/B"),
+            ("HCG", "HCG\nlevel"), ("GCH", "GCH\nlevel"))
+
+
+def locus_maps(m: pd.DataFrame, edges: np.ndarray, labels=("Xi", "Xa")):
+    """haplotype_contacts.py's map table (the upper triangle, pixel by
+    pixel) as each copy's matrix over the bins of ``edges``, NaN below the
+    diagonal."""
+    at = {int(s): k for k, s in enumerate(edges[:-1])}
+    i, j = m["start_1"].map(at), m["start_2"].map(at)
+    ok = (i.notna() & j.notna()).to_numpy()
+    i, j = i[ok].astype(int).to_numpy(), j[ok].astype(int).to_numpy()
+    out = []
+    for lab in labels:
+        a = np.full((edges.size - 1,) * 2, np.nan)
+        a[i, j] = m.loc[ok, lab].to_numpy(float)
+        out.append(a)
+    return out
+
+
+def _triangle(ax, a, edges, up: bool, vmin, vmax, depth):
+    """A copy's map as a triangle along X (Mb), up or down, to ``depth`` bp
+    apart: log10 of each pixel's share of the copy's contacts."""
+    x_, y_ = np.meshgrid(edges / 1e6, edges / 1e6)
+    xs, ys = (x_ + y_) / 2, (x_ - y_) / 2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lm = np.ma.masked_invalid(np.log10(a))
+    qm = ax.pcolormesh(xs, ys if up else -ys, lm, cmap="YlOrRd", vmin=vmin,
+                       vmax=vmax, shading="flat", rasterized=True)
+    h = depth / 2e6
+    ax.set_ylim((0, h) if up else (-h, 0))
+    ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    return qm
+
+
+def panel_b(axes, maps, edges, tracks: pd.DataFrame, prof: pd.DataFrame,
+            group: str, elements: dict):
+    """``axes``: the two maps, then B_TRACKS's, sharing x.  The colour
+    scale goes in the corner the Xi map leaves empty, not beside it, so
+    every panel keeps the one width and an element's line runs straight
+    down them all."""
+    from matplotlib.ticker import MaxNLocator
+    ax_xi, ax_xa, *tr_axes = axes
+    pos = np.concatenate([a[np.isfinite(a) & (a > 0)] for a in maps])
+    vmax = np.log10(np.percentile(pos, 99.5)) if pos.size else 0.0
+    depth = 0.5 * (edges[-1] - edges[0])
+    qm = _triangle(ax_xi, maps[0], edges, True, vmax - 2.5, vmax, depth)
+    _triangle(ax_xa, maps[1], edges, False, vmax - 2.5, vmax, depth)
+    for ax, lab, col in ((ax_xi, "Xi", XI), (ax_xa, "Xa", XA)):
+        ax.set_ylabel(lab, rotation=0, ha="right", va="center", color=col,
+                      fontsize=7, fontweight="bold", labelpad=4)
+    ax_xi.text(0.0, 1.0, f"{group} chrX\n{(edges[1] - edges[0]) / 1e6:g} Mb "
+                         f"bins", transform=ax_xi.transAxes, ha="left",
+               va="top", fontsize=5.3)
+    cax = ax_xi.inset_axes([0.962, 0.46, 0.011, 0.5])
+    cb = ax_xi.figure.colorbar(qm, cax=cax)
+    cb.ax.yaxis.set_ticks_position("left")
+    cb.ax.tick_params(labelsize=4.6, length=1.5, pad=1, width=0.4)
+    cb.outline.set_linewidth(0.4)
+    cb.ax.set_title("log$_{10}$ share", fontsize=4.6, pad=2, loc="right")
+    mid = (tracks["start"] + tracks["end"]).to_numpy() / 2e6
+    width = (tracks["end"] - tracks["start"]).to_numpy() / 1e6
+    p = prof[prof["group"] == group]
+    for ax, (key, lab_) in zip(tr_axes, B_TRACKS):
+        if key == "crossing":
+            for lab, col in (("Xi", XI), ("Xa", XA)):
+                ax.plot(p["pos"] / 1e6, p[f"log2_obs_exp_{lab}"], color=col,
+                        lw=0.7, label=lab)
+            _zero(ax)
+        else:
+            if key == "partners_compartment" and "compartment_bulk" in tracks:
+                e = tracks["compartment_bulk"].to_numpy(float)
+                ax.bar(mid, np.where(e > 0, e, 0), width=width, color="0.6",
+                       lw=0)
+                ax.bar(mid, np.where(e < 0, e, 0), width=width,
+                       color="0.82", lw=0)
+                for y, t in ((0.82, "A"), (0.18, "B")):
+                    ax.text(1.006, y, t, transform=ax.transAxes, fontsize=4.6,
+                            va="center", ha="left", color="0.4")
+            for lab, col in (("Xi", XI), ("Xa", XA)):
+                if f"{key}_{lab}" in tracks:
+                    ax.plot(mid, tracks[f"{key}_{lab}"], color=col, lw=0.6,
+                            marker="o", ms=0.9)
+        ax.set_ylabel(lab_, rotation=0, ha="right", va="center", fontsize=5.3,
+                      labelpad=2)
+        ax.yaxis.set_major_locator(MaxNLocator(2))
+        ax.tick_params(axis="y", labelsize=4.8, length=1.5, pad=1)
+    # X's elements: one dotted line through every panel, named above
+    lo, hi = edges[0] / 1e6, edges[-1] / 1e6
+    for nm, (a_, b_) in elements.items():
+        x = (a_ + b_) / 2e6
+        if not lo < x < hi:
+            continue
+        for ax in axes:
+            ax.axvline(x, color="0.3", lw=0.45, ls=(0, (1, 1.5)), zorder=3)
+        ax_xi.text(x, 1.01, nm, transform=ax_xi.get_xaxis_transform(),
+                   ha="center", va="bottom", fontsize=5)
+    ax_xi.set_xlim(lo, hi)
+    for ax in axes[:-1]:
+        ax.tick_params(axis="x", length=0, labelbottom=False)
+    tr_axes[-1].set_xlabel("chrX (Mb)")
+
+
+def panel_c(ax, ratio: pd.DataFrame, group: str):
     for sname, col, lab in (("chrX", XI, "chrX"),
                             ("autosomes", AUTO, "autosomes' copies")):
         t = ratio[(ratio["group"] == group) & (ratio["set"] == sname)
@@ -153,39 +268,6 @@ def panel_b(ax, ratio: pd.DataFrame, group: str):
     ax.set_ylabel("log$_2$ P(s), Xi / Xa")
     ax.set_title(f"Contact distance ({group})", loc="left")
     ax.legend(frameon=False, loc="upper left")
-
-
-def panel_c(ax, axb, prof: pd.DataFrame, stats: pd.DataFrame, group: str):
-    p = prof[prof["group"] == group]
-    x = p["pos"] / 1e6
-    ax.plot(x, p["log2_obs_exp_Xi"], color=XI, label="Xi")
-    ax.plot(x, p["log2_obs_exp_Xa"], color=XA, label="Xa")
-    ax.plot(x, p["difference"], color="black", lw=0.7, label="Xi − Xa")
-    ax.axvline(DXZ4_MB, color="0.4", lw=0.5, ls=":")
-    ax.text(DXZ4_MB - 3, ax.get_ylim()[1] * 0.98, "DXZ4", ha="right",
-            va="top", fontsize=5)
-    _zero(ax)
-    ax.set_xlabel("chrX (Mb)")
-    ax.set_ylabel("contacts ≥1 Mb crossing\n(log$_2$ obs/exp)")
-    ax.set_title("Crossing each position", loc="left")
-    ax.legend(frameon=False, loc="lower right", ncol=1, handlelength=1.2)
-    # compartments: correlation of the track at a contact's two ends
-    vals, cols, labs = [], [], []
-    for sname, c1, c2 in (("chrX", XI, XA), ("autosomes", "0.35", "0.65")):
-        r = _row(stats, group, "A/B compartments: ends' correlation", sname)
-        if r is None:
-            continue
-        vals += [r["copy1"], r["copy2"]]
-        cols += [c1, c2]
-        labs += (["Xi", "Xa"] if sname == "chrX" else ["hap1", "hap2"])
-    if vals:
-        pos = [0, 1, 2.5, 3.5][:len(vals)]
-        axb.bar(pos, vals, color=cols, width=0.85)
-        axb.set_xticks(pos)
-        axb.set_xticklabels(labs, rotation=90, fontsize=5)
-        axb.set_xlabel("chrX   auto.", fontsize=5.2)
-        axb.set_title("A/B", loc="left")
-        axb.set_ylabel("correlation at contact ends")
 
 
 def panel_d(ax, summ: pd.DataFrame, group: str):
@@ -393,26 +475,31 @@ def panel_i(ax, units: pd.DataFrame):
 
 # ----------------------------------------------------------------- layout --
 
-def make_figure(d: dict, out: Path, clonal: str, mosaic: str,
-                calls: tuple):
+def build_figure(d: dict, clonal: str, mosaic: str, calls: tuple,
+                 elements: dict):
     plt = _style()
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
-    fig = plt.figure(figsize=(7.2, 9.4))
-    gs = GridSpec(4, 6, figure=fig, hspace=0.85, wspace=1.15,
-                  height_ratios=[1.12, 1, 1, 1],
-                  left=0.075, right=0.985, top=0.975, bottom=0.05)
+    fig = plt.figure(figsize=(7.2, 10.0))
+    gs = GridSpec(4, 6, figure=fig, hspace=0.5, wspace=1.15,
+                  height_ratios=[2.35, 1, 1, 1],
+                  left=0.075, right=0.985, top=0.975, bottom=0.045)
     letters = []
-    ax_a = fig.add_subplot(gs[0, 0:2])
+    gl = GridSpecFromSubplotSpec(2, 1, gs[0, 0:2], height_ratios=[1.45, 1],
+                                 hspace=0.3)
+    ax_a = fig.add_subplot(gl[0])
     panel_a(ax_a)
     letters.append(("a", ax_a, 0.0))
-    ax_b = fig.add_subplot(gs[0, 2:4])
-    panel_b(ax_b, d["ratio"], clonal)
-    letters.append(("b", ax_b, 0.045))
-    gc = GridSpecFromSubplotSpec(1, 2, gs[0, 4:6], width_ratios=[2.3, 1],
-                                 wspace=0.75)
-    ax_c, ax_cb = fig.add_subplot(gc[0]), fig.add_subplot(gc[1])
-    panel_c(ax_c, ax_cb, d["profile"], d["stats"], clonal)
-    letters.append(("c", ax_c, 0.05))
+    # b's panels in one column of one grid: one width, one x per position
+    gb = GridSpecFromSubplotSpec(6, 1, gs[0, 2:6], hspace=0.14,
+                                 height_ratios=[2.6, 2.6, 1, 1, 1, 1])
+    ax_b = [fig.add_subplot(gb[0])]
+    ax_b += [fig.add_subplot(gb[i], sharex=ax_b[0]) for i in range(1, 6)]
+    panel_b(ax_b, d["maps"], d["edges"], d["tracks"], d["profile"], clonal,
+            elements)
+    letters.append(("b", ax_b[0], 0.06))
+    ax_c = fig.add_subplot(gl[1])
+    panel_c(ax_c, d["ratio"], clonal)
+    letters.append(("c", ax_c, 0.045))
     ax_d = fig.add_subplot(gs[1, 0:2])
     panel_d(ax_d, d["summary"], clonal)
     letters.append(("d", ax_d, 0.045))
@@ -443,8 +530,7 @@ def make_figure(d: dict, out: Path, clonal: str, mosaic: str,
         bb = ax.get_position()
         fig.text(bb.x0 - dx, bb.y1 + 0.014, lab, fontsize=8,
                  fontweight="bold", va="bottom", ha="left")
-    fig.savefig(out, dpi=300)
-    plt.close(fig)
+    return fig
 
 
 def _calls(args, contacts: Path):
@@ -460,7 +546,7 @@ def _calls(args, contacts: Path):
     return int(kv["hap1"]), int(kv["hap2"])
 
 
-def main(argv=None) -> int:
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--contacts", required=True,
@@ -481,11 +567,33 @@ def main(argv=None) -> int:
                     help="The mosaic line's cells by silenced haplotype, "
                          "where the run wrote no haplotype_xi_calls_<line>"
                          ".tsv.")
+    ap.add_argument("--locus", default="chrX",
+                    help="b's locus: haplotype_contacts.py's haplotype_locus_"
+                         "<clonal>_<locus>.tsv and _map.tsv.gz in --contacts "
+                         "(default all of X, as its runs name it).")
+    ap.add_argument("--genome", default="hg38",
+                    choices=sorted(XI_ELEMENTS) + ["none"],
+                    help="X's elements dotted through b (XI_ELEMENTS), or "
+                         "none.")
     ap.add_argument("--output", required=True)
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv)
+
+
+def read_tables(args) -> dict:
     c = Path(args.contacts)
     cm = Path(args.copy_mixing)
-    d = {"ratio": pd.read_csv(c / "haplotype_contacts_ps_ratio.tsv",
+    lt = c / f"haplotype_locus_{args.clonal}_{args.locus}.tsv"
+    lm = c / f"haplotype_locus_{args.clonal}_{args.locus}_map.tsv.gz"
+    miss = [str(p) for p in (lt, lm) if not p.exists()]
+    if miss:
+        sys.exit(f"no {', '.join(miss)}: haplotype_contacts.py writes them "
+                 f"for each of its --locus (all of X by default); name "
+                 f"another with --locus")
+    tracks = pd.read_csv(lt, sep="\t")
+    edges = np.r_[tracks["start"].to_numpy(np.int64), tracks["end"].iloc[-1]]
+    d = {"tracks": tracks, "edges": edges,
+         "maps": locus_maps(pd.read_csv(lm, sep="\t"), edges),
+         "ratio": pd.read_csv(c / "haplotype_contacts_ps_ratio.tsv",
                               sep="\t"),
          "profile": pd.read_csv(c / "haplotype_contacts_profile.tsv",
                                 sep="\t"),
@@ -505,9 +613,24 @@ def main(argv=None) -> int:
          "units": pd.read_csv(Path(args.units)
                               / f"end_posterior_units_{args.clonal}.tsv",
                               sep="\t")}
+    return d
+
+
+def figure_from_args(args):
+    d = read_tables(args)
+    calls = _calls(args, Path(args.contacts))
+    return build_figure(d, args.clonal, args.mosaic, calls,
+                        XI_ELEMENTS.get(args.genome, {}))
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    fig = figure_from_args(args)            # Agg first (_style)
+    import matplotlib.pyplot as plt
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    make_figure(d, out, args.clonal, args.mosaic, _calls(args, c))
+    fig.savefig(out, dpi=300)
+    plt.close(fig)
     print(f"wrote {out}")
     return 0
 
