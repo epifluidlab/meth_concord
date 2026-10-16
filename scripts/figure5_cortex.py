@@ -4,27 +4,31 @@
 The panels:
 
   a  the end posteriors' correlation by distance, linked pairs against
-     non-linked ones at the same distance in the same cell, and their
-     difference with its interval (end_posterior_dist_all.tsv)
-  b  per 10-Mb region, HCG-HCG against GCH-GCH concordance, and the same
-     for the negative control (end_posterior_regions.tsv, _summary.tsv)
+     non-linked ones -- another end of the same cell at the partner's
+     place and distance -- and their difference with its interval, for
+     GCH-GCH, HCG-HCG and HCG-GCH, over the bins where a tenth of the
+     linked pairs or more found one (end_posterior_dist_all.tsv)
+  b  per 10-Mb region, HCG-HCG against GCH-GCH concordance
+     (end_posterior_regions.tsv, _summary.tsv)
   c  per cell, concordance against the negative control
      (end_posterior_percell.tsv)
   d  the same by cell type
   e  concordance by class pair -- A/B compartments, replication timing,
-     PMD / HMD: ΔC against reshuffled links, and ΔC x w, signed by where
-     the concordant mass sits against the cell's genome (summary.tsv of
+     PMD / HMD: ΔC x w, ΔC against reshuffled links signed by where the
+     concordant mass sits against the cell's genome (summary.tsv of
      annotation_class_concordance.py)
   f  ΔC x w between chromHMM states
   g  concordance along the genome per 1-Mb bin, its hot bins, and what
-     the bins are (locus_hotspots.tsv.gz, locus_hotspot_enrichment.tsv)
+     the bins are -- each track's Spearman rho given TSS density, with p
+     against genome rotations (locus_hotspots.tsv.gz)
 
 The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
 
     python scripts/figure5_cortex.py \\
-        --distance end_posterior_distance_correlation/null_link_shuffled_match_per_cell.cell_center \\
-        --classes annotation_class_concordance_v12 --output Figure5.pdf
+        --distance end_posterior_distance_correlation/end_posterior_dist.null_link_shuffled_match_per_cell.cell_center.excl1kb \\
+        --classes annotation_class_concordance_v14_samecell_excl \\
+        --output Figure5.pdf
 """
 
 from __future__ import annotations
@@ -46,6 +50,11 @@ from nome_hic_concordance.percell_existence import (  # noqa: E402
 #: The marks: (key in the distance table, mark, label).
 MARKS = (("gg", "GCH", "GCH accessibility"),
          ("hh", "HCG", "HCG methylation"))
+#: Panel a's measures: (key in the distance table, title, colour).
+GH_C = "#2ca02c"
+A_MEASURES = (("gg", "GCH–GCH: accessibility", MARK_COLOR["GCH"]),
+              ("hh", "HCG–HCG: methylation", MARK_COLOR["HCG"]),
+              ("gh", "HCG–GCH: methylation × accessibility", GH_C))
 #: Cell types in their order, and their colours where the samples table
 #: gives none.
 CELL_TYPES = {"IT-L2/3": "#f19f5c", "IT-L4": "#d75846", "IT-L5/6": "#834d35",
@@ -68,6 +77,7 @@ STATES = ("promoter", "enhancer", "transcribed", "polycomb",
 SIGN_WORDS = {"GCH": ("co-closed", "co-open"),
               "HCG": ("co-unmethylated", "co-methylated")}
 #: Panel g's tracks, (track, label); TSS density has no value given itself.
+TSS_TRACK = "TSSs (count)"
 G_TRACKS = (("compartment: B", "B compartment"),
             ("replication timing: late", "late replicating"),
             ("PMD / HMD: PMD", "PMD"),
@@ -79,7 +89,10 @@ G_TRACKS = (("compartment: B", "B compartment"),
             ("chromHMM: promoter", "promoter"),
             ("zinc-finger (Zfp / ZNF) genes", "Zfp genes"),
             ("olfactory receptor genes", "olfactory receptors"),
-            ("TSSs (count)", "TSS density"))
+            (TSS_TRACK, "TSS density"))
+#: Panel a draws a bin where this share of its linked pairs or more found
+#: a stand-in: below it, a few pairs, and those the ones with a stand-in.
+MIN_MATCHED = 0.1
 #: The whole distance range of the class tables.
 ALL_BAND = "all 1kb-10Mb"
 #: Panel e's dot, as a share of an axis's range (2.2 pt of ~56): intervals
@@ -132,14 +145,31 @@ def _schematic(ax):
         ax.text(5.0, y + 3.1, lab, ha="center", va="bottom", fontsize=4.6)
 
 
+def matched_bins(dist: pd.DataFrame, k: str,
+                 min_share: float = MIN_MATCHED) -> np.ndarray:
+    """The distance bins where measure ``k`` has both correlations and
+    ``min_share`` of its linked pairs or more were matched."""
+    lk, mt = (dist[f"{k}_{c}_n"].to_numpy(float) for c in ("linked", "matched"))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        share = np.where(lk > 0, mt / lk, 0.0)
+    return (share >= min_share) \
+        & np.isfinite(dist[f"{k}_matched_r"].to_numpy(float)) \
+        & np.isfinite(dist[f"{k}_null_r"].to_numpy(float))
+
+
 def panel_a(axes_r, axes_d, dist: pd.DataFrame):
-    """``axes_r``, ``axes_d``: per mark, the correlations and their
-    difference."""
+    """``axes_r``, ``axes_d``: per measure of A_MEASURES, the correlations
+    and their difference, over its matched_bins."""
     x = dist["center_bp"].to_numpy(float)
-    for j, (k, mark, title) in enumerate(MARKS):
-        col = MARK_COLOR[mark]
+    have = np.zeros(x.size, bool)
+    for k, *_ in A_MEASURES:
+        have |= matched_bins(dist, k)
+    span = (x[have].min() / 1.3, x[have].max() * 1.3) if have.any() else \
+        (x.min() / 1.3, x.max() * 1.3)
+    for j, (k, title, col) in enumerate(A_MEASURES):
         ax, axd = axes_r[j], axes_d[j]
-        lk, nl = (dist[f"{k}_{c}_r"].to_numpy(float)
+        keep = matched_bins(dist, k)
+        lk, nl = (np.where(keep, dist[f"{k}_{c}_r"].to_numpy(float), np.nan)
                   for c in ("matched", "null"))
         ax.plot(x, lk, "-o", color=col, ms=1.6, lw=0.9, label="linked")
         ax.plot(x, nl, "--o", color=col, ms=1.6, mfc="white", mew=0.5,
@@ -147,24 +177,28 @@ def panel_a(axes_r, axes_d, dist: pd.DataFrame):
         _zero(ax)
         ax.set_title(title, loc="left", color=col)
         d = lk - nl
-        axd.fill_between(x, dist[f"{k}_delta_lo"], dist[f"{k}_delta_hi"],
+        axd.fill_between(x, np.where(keep, dist[f"{k}_delta_lo"], np.nan),
+                         np.where(keep, dist[f"{k}_delta_hi"], np.nan),
                          color=col, alpha=0.2, lw=0)
         axd.plot(x, d, "-o", color=col, ms=1.6, lw=0.9)
         q = dist[f"{k}_delta_q"].to_numpy(float)
-        sig = np.isfinite(q) & (q < 0.05)
+        sig = keep & np.isfinite(q) & (q < 0.05)
+        n_ok = int(keep.sum())
         axd.plot(x[sig], d[sig], "o", ms=3.6, mfc="none", mec=col, mew=0.5,
-                 label=f"q < 0.05 ({int(sig.sum())} of {sig.size} bins)")
+                 label=f"q < 0.05 ({int(sig.sum())} of {n_ok} bins)")
         _zero(axd)
         for a in (ax, axd):
             a.set_xscale("log")
-            a.set_xlim(x.min() / 1.3, x.max() * 1.3)
+            a.set_xlim(*span)
         ax.tick_params(labelbottom=False)
         axd.set_xlabel("distance between the two ends (bp)")
-        axd.legend(frameon=False, loc="upper left", handletextpad=0.2)
+        axd.legend(frameon=False, loc="best", handletextpad=0.2)
     axes_r[0].set_ylabel("r of end posteriors")
     axes_d[0].set_ylabel("Δr, linked − non-linked")
-    axes_r[1].legend(frameon=False, loc="upper right", handlelength=1.8)
-    _schematic(axes_r[0].inset_axes([0.5, 0.5, 0.48, 0.48]))
+    # beside the schematic, between the curves
+    axes_r[0].legend(frameon=False, loc="center left", handlelength=1.8,
+                     bbox_to_anchor=(0.0, 0.45))
+    _schematic(axes_r[0].inset_axes([0.42, 0.2, 0.56, 0.5]))
 
 
 def region_table(regions: pd.DataFrame, summ: pd.Series,
@@ -220,21 +254,17 @@ def _scatter(ax, x, y, cmap="Blues", sparse_frac=0.1):
     ax.set_ylim(y0, y1)
 
 
-def panel_b(ax, ax_c, regions: pd.DataFrame, summ: pd.Series):
+def panel_b(ax, regions: pd.DataFrame, summ: pd.Series):
+    """Per region, HCG-HCG against GCH-GCH Δr."""
     t = region_table(regions, summ)
     _scatter(ax, t["delta_gch"], t["delta_hcg"])
     ax.set_title(f"r = {summ['pearson_r']:+.2f}, ρ = "
                  f"{summ['spearman_rho']:+.2f}\ngenome rotation "
                  f"{_p(summ['rotation_p'])}", loc="left")
     ax.set_ylabel("HCG–HCG Δr")
-    ax.set_xlabel(f"GCH–GCH Δr ({len(t)} regions of 10 Mb)")
+    ax.set_xlabel(f"GCH–GCH Δr\n({len(t)} regions of 10 Mb)")
     ax.legend(frameon=False, loc="upper left", fontsize=4.4,
               handlelength=1.6, borderaxespad=0.1)
-    _scatter(ax_c, t["delta_ctl_gch"], t["delta_ctl_hcg"], cmap="Greys")
-    ax_c.set_title(f"control (second null − null): r = "
-                   f"{summ['control_r']:+.2f}", loc="left")
-    ax_c.set_ylabel("HCG–HCG control")
-    ax_c.set_xlabel("GCH–GCH control")
 
 
 def panel_c(axes, percell: pd.DataFrame):
@@ -253,14 +283,17 @@ def panel_c(axes, percell: pd.DataFrame):
         ax.hist(d["delta"], bins=bins, density=True, histtype="step",
                 color=col, lw=0.7)
         ax.axvline(0, color="0.25", lw=0.5, ls="--")
-        ax.text(0.0, 1.17, f"{100 * obs['frac']:.0f}% of {obs['n']:,} cells "
-                           f"Δ > 0, {fmt_p(obs['p'])}",
-                transform=ax.transAxes, ha="left", va="bottom", color=col,
-                fontsize=5.4, fontweight="bold")
-        ax.text(0.0, 1.03, f"negative control (grey): "
-                           f"{100 * ctl['frac']:.0f}% > 0",
-                transform=ax.transAxes, ha="left", va="bottom", color="0.4",
-                fontsize=5)
+        # two short lines, one long one runs into d; spaced in points, as
+        # the p's exponent rises into the line above
+        ax.annotate(f"{100 * obs['frac']:.0f}% of {obs['n']:,} cells Δ > 0",
+                    xy=(0, 1), xycoords="axes fraction", xytext=(0, 10.5),
+                    textcoords="offset points", ha="left", va="bottom",
+                    color=col, fontsize=5.4, fontweight="bold")
+        ax.annotate(f"{fmt_p(obs['p'])}; control (grey) "
+                    f"{100 * ctl['frac']:.0f}%",
+                    xy=(0, 1), xycoords="axes fraction", xytext=(0, 1.5),
+                    textcoords="offset points", ha="left", va="bottom",
+                    color="0.4", fontsize=5)
         ax.set_yticks([])
         ax.spines["left"].set_visible(False)
         ax.set_ylabel(label, color=col)
@@ -325,43 +358,40 @@ def _pairs(summ: pd.DataFrame, context: str, rows) -> pd.DataFrame:
 
 
 def panel_e(axes, summ: pd.DataFrame):
-    """``axes``: GCH ΔC, GCH ΔC x w, HCG ΔC, HCG ΔC x w, rows E_PAIRS."""
+    """``axes``: per mark, ΔC x w by class pair (rows E_PAIRS), the
+    reshuffled links' beneath each."""
+    from matplotlib.ticker import MaxNLocator
     y = np.arange(len(E_PAIRS))[::-1].astype(float)
-    for k, (_, mark, _) in enumerate(MARKS):
+    narrow = []
+    for ax, (_, mark, _) in zip(axes, MARKS):
         t = _pairs(summ, mark, E_PAIRS)
         col = MARK_COLOR[mark]
-        for ax, stat, ctl, xlab in (
-                (axes[2 * k], "delta", "control", "ΔC (pp)"),
-                (axes[2 * k + 1], "signed_rel", "signed_rel_control",
-                 "ΔC × w (pp)")):
+        for stat, dy, fmt, ms, c_, ew in (
+                ("signed_rel", 0.13, "o", 2.2, col, 0.6),
+                ("signed_rel_control", -0.13, "D", 1.6, NULL_GREY, 0.5)):
             v, lo, hi = (100 * t[c].to_numpy(float)
                          for c in (stat, f"{stat}_lo", f"{stat}_hi"))
-            ax.errorbar(v, y + 0.13, xerr=[v - lo, hi - v], fmt="o", ms=2.2,
-                        color=col, elinewidth=0.6, capsize=0)
-            c, clo, chi = (100 * t[c_].to_numpy(float)
-                           for c_ in (ctl, f"{ctl}_lo", f"{ctl}_hi"))
-            ax.errorbar(c, y - 0.13, xerr=[c - clo, chi - c], fmt="D",
-                        ms=1.6, color=NULL_GREY, elinewidth=0.5, capsize=0)
-            _zero(ax, "x")
-            for b in (2.5, 5.5):
-                ax.axhline(b, color="0.85", lw=0.4, zorder=0)
-            if stat == "signed_rel":
-                xlab += f"\n+ {SIGN_WORDS[mark][1]}"
-            ax.set_xlabel(xlab)
-        axes[2 * k].set_title(label_of(mark), loc="left", color=col)
+            ax.errorbar(v, y + dy, xerr=[v - lo, hi - v], fmt=fmt, ms=ms,
+                        color=c_, elinewidth=ew, capsize=0)
+        _zero(ax, "x")
+        for b in (2.5, 5.5):
+            ax.axhline(b, color="0.85", lw=0.4, zorder=0)
+        ax.xaxis.set_major_locator(MaxNLocator(4))
+        ax.set_xlabel("ΔC × w (pp)")
+        # what each side means, at its end, beneath the label
+        neg, pos = SIGN_WORDS[mark]
+        for x_, ha, word in ((0.0, "left", f"← {neg}"),
+                             (1.0, "right", f"{pos} →")):
+            ax.annotate(word, xy=(x_, 0), xycoords="axes fraction",
+                        xytext=(0, -23), textcoords="offset points", ha=ha,
+                        va="top", fontsize=4.8, color="0.3")
+        ax.set_title(label_of(mark), loc="left", color=col)
         # millions of contacts: the intervals can be narrower than the dots
         # -- say so, or they read as missing
-        narrow = []
-        for ax, stat in ((axes[2 * k], "delta"),
-                         (axes[2 * k + 1], "signed_rel")):
-            x0, x1 = ax.get_xlim()
-            w_ = 100 * (t[f"{stat}_hi"] - t[f"{stat}_lo"]).to_numpy(float)
-            narrow.append(np.nanmedian(w_) / (x1 - x0) < DOT_FRACTION)
-        if any(narrow):
-            axes[2 * k + 1].text(1.0, 1.02, "95% CIs within the dots",
-                                 transform=axes[2 * k + 1].transAxes,
-                                 ha="right", va="bottom", fontsize=4.6,
-                                 color="0.4")
+        x0, x1 = ax.get_xlim()
+        w_ = 100 * (t["signed_rel_hi"] - t["signed_rel_lo"]).to_numpy(float)
+        if np.nanmedian(w_) / (x1 - x0) < DOT_FRACTION:
+            narrow.append(mark)
     # the axes share y: the labels once, on the first
     axes[0].set_ylim(-0.6, len(E_PAIRS) - 0.4)
     axes[0].set_yticks(y)
@@ -369,13 +399,16 @@ def panel_e(axes, summ: pd.DataFrame):
     for ax in axes[1:]:
         ax.tick_params(labelleft=False)
     from matplotlib.lines import Line2D
+    # beneath the axis labels: the dots fill both sides of every axis
+    ci = "95% CI" + (f"; {' and '.join(narrow)}'s within the dots"
+                     if narrow else "")
     axes[0].legend([Line2D([], [], marker="o", ms=2.2, color="0.3", ls=""),
                     Line2D([], [], marker="D", ms=1.6, color=NULL_GREY,
                            ls="")],
-                   ["contacts", "reshuffled\nlinks"],
-                   frameon=False, loc="center", fontsize=4.6,
-                   handletextpad=0.1, bbox_to_anchor=(0.42, 0.5),
-                   borderaxespad=0.0)
+                   [f"contacts ({ci})", "reshuffled links"],
+                   frameon=False, loc="upper left", fontsize=4.8, ncol=2,
+                   handletextpad=0.1, columnspacing=1.2,
+                   bbox_to_anchor=(0.0, -0.25), borderaxespad=0.0)
 
 
 def label_of(mark: str) -> str:
@@ -441,6 +474,8 @@ def panel_f(axes, summ: pd.DataFrame):
         ax.set_ylim(n - 0.5, -0.5)
         for sp in ax.spines.values():
             sp.set_visible(False)
+        # the last head runs past the axes: no background to cover it
+        ax.patch.set_visible(False)
         ax.text(1.0, 1.04, label_of(mark), transform=ax.transAxes,
                 ha="right", va="top", color=MARK_COLOR[mark], fontsize=6)
         cax = ax.inset_axes([0.42, -0.1, 0.58, 0.045])
@@ -462,44 +497,133 @@ def _genome_x(hot: pd.DataFrame):
     return key.map(off) + (hot["start"] + hot["end"]) / 2, order, off, ends
 
 
-def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame, enr: pd.DataFrame):
+def fdr_bh(p) -> np.ndarray:
+    p = np.asarray(p, float)
+    q = np.full(p.shape, np.nan)
+    ok = np.flatnonzero(np.isfinite(p))
+    if ok.size:
+        o = ok[np.argsort(p[ok])]
+        v = p[o] * o.size / np.arange(1, o.size + 1)
+        q[o] = np.minimum(np.minimum.accumulate(v[::-1])[::-1], 1.0)
+    return q
+
+
+def _rotation_p(x, y, min_shift: int = 50) -> float:
+    """Two-sided p of the correlation of two series in genome order, against
+    every circular shift of one by ``min_shift`` bins or more (a tenth of
+    the series when that is fewer), as annotation_class_concordance.py
+    tests its contrasts: neighbouring bins are not independent, and a shift
+    keeps each series' own autocorrelation while breaking their alignment.
+    The series as given -- ranks, or their residuals -- so the statistic is
+    the one drawn.  NaN when too few shifts remain to reach p < 0.05."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    n = x.size
+    ms = max(1, min(min_shift, n // 10))
+    if n - 2 * ms + 1 < 19 or x.std() == 0 or y.std() == 0:
+        return np.nan
+    x = (x - x.mean()) / x.std()
+    y = (y - y.mean()) / y.std()
+    # every circular shift at once: cc[s] = mean_i x[i] y[i + s]
+    cc = np.fft.irfft(np.conj(np.fft.rfft(x)) * np.fft.rfft(y), n) / n
+    null = cc[ms:n - ms + 1]
+    return float((1 + np.sum(np.abs(null) >= abs(cc[0]) - 1e-12))
+                 / (1 + null.size))
+
+
+def track_rhos(t: pd.DataFrame) -> pd.DataFrame:
+    """Per track of G_TRACKS, over bins ``t`` (one mark's tested bins, in
+    genome order): Spearman rho between a bin's ΔC and the track, the same
+    given TSS density (the ranks' residuals on its ranks, as the run's
+    rho_given_tss), the control's both, and for the one drawn as the bar --
+    given TSS; TSS density's own, raw -- p against genome rotations and BH
+    q over the tracks.  Not the run's p_rho: that one counts the bins as
+    independent, and neighbouring bins share compartments and contacts."""
+    from scipy.stats import rankdata
+
+    def resid(r, z):
+        z = np.column_stack([np.ones(z.size), z])
+        return r - z @ np.linalg.lstsq(z, r, rcond=None)[0]
+
+    def corr(a, b):
+        return (float(np.corrcoef(a, b)[0, 1])
+                if a.std() > 0 and b.std() > 0 else np.nan)
+    rd, rc = rankdata(t["delta"]), rankdata(t["control"])
+    rt = rankdata(t[TSS_TRACK]) if TSS_TRACK in t else None
+    rows = []
+    for name, _ in G_TRACKS:
+        row = {"track": name}
+        if name in t:
+            rx = rankdata(t[name])
+            row["rho"], row["rho_control"] = corr(rd, rx), corr(rc, rx)
+            a, b = rd, rx
+            if rt is not None and name != TSS_TRACK:
+                a, b = resid(rd, rt), resid(rx, rt)
+                row["rho_given_tss"] = corr(a, b)
+                row["rho_control_given_tss"] = corr(resid(rc, rt), b)
+            row["p"] = _rotation_p(a, b)
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for c in ("rho", "rho_control", "rho_given_tss", "rho_control_given_tss",
+              "p"):
+        if c not in out:
+            out[c] = np.nan
+    out["q"] = fdr_bh(out["p"])
+    return out
+
+
+def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
     """``ax_tracks``: per mark, ΔC per bin along the genome; ``ax_enr``:
     what the bins are, the marks side by side per track."""
     every = hot[hot["band"] == ALL_BAND].copy()
     every["x"], order, off, ends = _genome_x(every)
+    every = every.sort_values("x")
     h = every[every["tested"].astype(bool)]
     for r, (ax, (_, mark, label)) in enumerate(zip(ax_tracks, MARKS)):
         t = h[h["context"] == mark]
         # bins short of contacts are not tested: ticked along the foot, so
         # gaps read as untested bins, not as wider ones
         un = every[(every["context"] == mark) & ~every["tested"].astype(bool)]
+        v = 100 * t["delta"].to_numpy(float)
+        top = np.sort(v[np.isfinite(v)])[::-1]
+        hi = 1.25 * top[0]
+        # one bin far above the rest would flatten them: it sits at the top
+        # edge, its value printed
+        if top.size > 1 and top[0] > 2 * top[1]:
+            hi = 1.35 * top[1]
+        far = v > hi
+        yv = np.where(far, 0.93 * hi, v)
+        xv = t["x"].to_numpy(float) / 1e6
         key = t["chrom"].str.replace("chr", "", regex=False)
-        alt = key.map({c: i % 2 for i, c in enumerate(order)})
-        ax.scatter(t["x"] / 1e6, 100 * t["control"], s=0.6, color="0.88",
-                   lw=0, rasterized=True, zorder=0)
+        alt = key.map({c: i % 2 for i, c in enumerate(order)}).to_numpy()
+        hot_, cold_ = (t[f].to_numpy(bool) for f in ("hot", "cold"))
+        ax.scatter(xv, 100 * t["control"], s=0.6, color="0.88", lw=0,
+                   rasterized=True, zorder=0)
         for k, c in ((0, "0.35"), (1, "0.62")):
-            m = (alt == k) & ~t["hot"] & ~t["cold"]
-            ax.scatter(t.loc[m, "x"] / 1e6, 100 * t.loc[m, "delta"], s=0.8,
-                       color=c, lw=0, rasterized=True, zorder=1)
-        n_ = {}
-        for flag, c in (("hot", HOT_C), ("cold", COLD_C)):
-            m = t[flag].astype(bool)
-            ax.scatter(t.loc[m, "x"] / 1e6, 100 * t.loc[m, "delta"], s=2.2,
-                       color=c, lw=0, rasterized=True, zorder=2)
-            n_[flag] = int(m.sum())
+            m = (alt == k) & ~hot_ & ~cold_
+            ax.scatter(xv[m], yv[m], s=0.8, color=c, lw=0, rasterized=True,
+                       zorder=1)
+        for m, c in ((hot_, HOT_C), (cold_, COLD_C)):
+            ax.scatter(xv[m & ~far], yv[m & ~far], s=2.2, color=c, lw=0,
+                       rasterized=True, zorder=2)
+        for xf, yf, vf, hf in zip(xv[far], yv[far], v[far], hot_[far]):
+            c = HOT_C if hf else "0.35"
+            ax.scatter([xf], [yf], s=5, marker="^", color=c, lw=0, zorder=2)
+            ax.text(xf, yf, f"  {vf:.0f}", ha="left", va="center",
+                    fontsize=4.4, color=c)
         n_bins = len(t) + len(un)
-        ax.text(0.005, 0.98, f"hot {n_['hot']} of {len(t):,} tested bins"
+        ax.text(0.005, 0.98, f"hot {int(hot_.sum())} of {len(t):,} tested "
+                             f"bins"
                 + (f" (of {n_bins:,}; grey ticks: too few contacts)"
                    if len(un) > 0.05 * n_bins else ""),
                 transform=ax.transAxes, ha="left", va="top", fontsize=4.8,
                 color=HOT_C)
-        ax.text(0.995, 0.98, f"cold {n_['cold']}", transform=ax.transAxes,
-                ha="right", va="top", fontsize=4.8, color=COLD_C)
+        ax.text(0.995, 0.98, f"cold {int(cold_.sum())}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=4.8,
+                color=COLD_C)
         _zero(ax)
         ax.set_xlim(0, (off[order[-1]] + ends[order[-1]]) / 1e6)
-        lo = np.nanpercentile(100 * t["delta"], 0.5)
+        lo = np.nanpercentile(v, 0.5)
         lo = min(lo, np.nanpercentile(100 * t["control"], 0.5))
-        hi = 1.25 * np.nanmax(100 * t["delta"])
         if len(un):
             foot = lo - 0.06 * (hi - lo)
             ax.scatter(un["x"] / 1e6, np.full(len(un), foot), s=1.2,
@@ -508,16 +632,18 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame, enr: pd.DataFrame):
             lo = foot - 0.04 * (hi - lo)
         ax.set_ylim(lo, hi)
         ax.set_ylabel(f"{mark}\nΔC (pp)", color=MARK_COLOR[mark])
-        mids = [(off[c] + ends[c] / 2) / 1e6 for c in order]
-        ax.set_xticks(mids)
-        ax.set_xticklabels(order if r == len(ax_tracks) - 1 else [],
-                           fontsize=4.6)
+        # the tracks share x, and with it the labels: set once, hidden above
+        if r < len(ax_tracks) - 1:
+            ax.tick_params(labelbottom=False)
         ax.tick_params(axis="x", length=0)
+    mids = [(off[c] + ends[c] / 2) / 1e6 for c in order]
+    ax_tracks[-1].set_xticks(mids)
+    ax_tracks[-1].set_xticklabels(order, fontsize=4.6)
     ax_tracks[-1].set_xlabel("chromosome (1-Mb bins)")
     y = np.arange(len(G_TRACKS))[::-1].astype(float)
+    span = []
     for k, (_, mark, _) in enumerate(MARKS):
-        e = enr[enr["context"] == mark].set_index("track")
-        e = e.reindex([t for t, _ in G_TRACKS])
+        e = track_rhos(h[h["context"] == mark])
         given = e["rho_given_tss"].to_numpy(float)
         raw = e["rho"].to_numpy(float)
         yk = y + (0.19 if k == 0 else -0.19)
@@ -526,14 +652,30 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame, enr: pd.DataFrame):
                     alpha=0.8, lw=0, label=mark)
         ax_enr.scatter(raw, yk, s=4, facecolor="white", edgecolor="0.2",
                        lw=0.45, zorder=3, label="raw" if k else None)
-        ax_enr.scatter(e["rho_control"], yk, s=5, marker="|", color="0.45",
-                       lw=0.6, zorder=3, label="control" if k else None)
+        # the control as the bar is: given TSS, TSS density's own raw
+        ctl = np.where(ok, e["rho_control_given_tss"], e["rho_control"])
+        ax_enr.scatter(ctl, yk, s=5, marker="|", color="0.45", lw=0.6,
+                       zorder=3, label="control" if k else None)
+        shown = np.where(ok, given, raw)
+        for yy, s_, q_ in zip(yk, shown, e["q"]):
+            if q_ < 0.05:
+                # an asterisk rides high in its line: set down to the bar
+                ax_enr.text(s_ + (0.004 if s_ >= 0 else -0.004), yy - 0.24,
+                            "*", ha="left" if s_ >= 0 else "right",
+                            va="center", fontsize=6.5,
+                            color=MARK_COLOR[mark])
+        span += [given, raw, ctl]
     _zero(ax_enr, "x")
+    v = np.concatenate(span)
+    lim = np.nanmax(np.abs(v[np.isfinite(v)])) * 1.18 if np.isfinite(
+        v).any() else 0.2
+    ax_enr.set_xlim(-lim, lim)
     ax_enr.set_yticks(y)
     ax_enr.set_yticklabels([lab for _, lab in G_TRACKS], fontsize=5)
     ax_enr.set_ylim(-0.7, len(G_TRACKS) - 0.3)
     ax_enr.set_xlabel("Spearman ρ, bins' ΔC against the track\n"
-                      "(bars: given TSS density)")
+                      "(bars: given TSS density; * q < 0.05, "
+                      "genome rotations)")
     ax_enr.legend(frameon=False, loc="lower right", fontsize=4.6, ncol=4,
                   handletextpad=0.2, borderaxespad=0.1, columnspacing=0.9,
                   bbox_to_anchor=(1.0, 1.0))
@@ -544,59 +686,58 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame, enr: pd.DataFrame):
 def build_figure(d: dict, order, colors):
     plt = _style()
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
-    fig = plt.figure(figsize=(7.2, 8.8))
-    gs = GridSpec(3, 12, figure=fig, hspace=0.36, wspace=1.6,
-                  height_ratios=[2.25, 1.75, 2.25],
-                  left=0.075, right=0.975, top=0.965, bottom=0.05)
+    fig = plt.figure(figsize=(7.2, 10.2))
+    gs = GridSpec(4, 12, figure=fig, hspace=0.46, wspace=1.6,
+                  height_ratios=[2.1, 1.75, 2.15, 1.65],
+                  left=0.075, right=0.975, top=0.97, bottom=0.04)
     letters = []
-    ga = GridSpecFromSubplotSpec(2, 2, gs[0, 0:6], hspace=0.12, wspace=0.32)
-    ax_ar = [fig.add_subplot(ga[0, j]) for j in range(2)]
-    ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j]) for j in range(2)]
+    # a: the three measures across the page
+    ga = GridSpecFromSubplotSpec(2, 3, gs[0, :], hspace=0.12, wspace=0.26)
+    ax_ar = [fig.add_subplot(ga[0, j]) for j in range(3)]
+    ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j]) for j in range(3)]
     panel_a(ax_ar, ax_ad, d["dist"])
     letters.append(("a", ax_ar[0], 0.06))
-    # b: a spacer on its left keeps its axis labels off a's
-    gb = GridSpecFromSubplotSpec(2, 2, gs[0, 6:9], hspace=0.75, wspace=0.0,
-                                 width_ratios=[0.16, 1])
-    ax_b = [fig.add_subplot(gb[i, 1]) for i in range(2)]
-    panel_b(*ax_b, d["regions"], d["regions_summary"])
-    letters.append(("b", ax_b[0], 0.06))
-    gc = GridSpecFromSubplotSpec(2, 1, gs[0, 9:12], hspace=0.75)
-    ax_c = [fig.add_subplot(gc[i]) for i in range(2)]
+    # b, c, d: the regions, then the cells, overall and by type
+    gb = GridSpecFromSubplotSpec(1, 2, gs[1, 0:3], width_ratios=[0.12, 1],
+                                 wspace=0.0)
+    ax_b = fig.add_subplot(gb[1])
+    panel_b(ax_b, d["regions"], d["regions_summary"])
+    letters.append(("b", ax_b, 0.06))
+    gc = GridSpecFromSubplotSpec(2, 2, gs[1, 3:6], hspace=0.95, wspace=0.0,
+                                 width_ratios=[0.15, 1])
+    ax_c = [fig.add_subplot(gc[i, 1]) for i in range(2)]
     panel_c(ax_c, d["percell"])
-    letters.append(("c", ax_c[0], 0.03))
-    gd = GridSpecFromSubplotSpec(2, 1, gs[1, 0:6], hspace=0.22)
+    letters.append(("c", ax_c[0], 0.035))
+    gd = GridSpecFromSubplotSpec(2, 1, gs[1, 6:12], hspace=0.22)
     ax_d = [fig.add_subplot(gd[0])]
     ax_d.append(fig.add_subplot(gd[1], sharex=ax_d[0]))
     panel_d(ax_d, d["percell"], order, colors)
     letters.append(("d", ax_d[0], 0.06))
-    # e: a spacer on its left keeps its pairs' names off d
-    ge = GridSpecFromSubplotSpec(1, 5, gs[1, 6:12], wspace=0.18,
-                                 width_ratios=[0.22, 1, 1, 1, 1])
+    # e, f: by class pair
+    ge = GridSpecFromSubplotSpec(1, 3, gs[2, 0:6], wspace=0.12,
+                                 width_ratios=[0.3, 1, 1])
     ax_e = [fig.add_subplot(ge[1])]
-    ax_e += [fig.add_subplot(ge[i], sharey=ax_e[0]) for i in range(2, 5)]
+    ax_e.append(fig.add_subplot(ge[2], sharey=ax_e[0]))
     panel_e(ax_e, d["summary"])
     letters.append(("e", ax_e[0], 0.075))
-    # f: room on the left for the states, on the right for the heads
-    gf = GridSpecFromSubplotSpec(1, 4, gs[2, 0:6], wspace=0.06,
-                                 width_ratios=[0.12, 1, 1, 0.3])
+    gf = GridSpecFromSubplotSpec(1, 4, gs[2, 6:12], wspace=0.06,
+                                 width_ratios=[0.3, 1, 1, 0.25])
     ax_f = [fig.add_subplot(gf[1]), fig.add_subplot(gf[2])]
     panel_f(ax_f, d["summary"])
     letters.append(("f", ax_f[0], 0.075))
-    gg = GridSpecFromSubplotSpec(2, 1, gs[2, 6:12], hspace=0.5,
-                                 height_ratios=[1, 1.45])
-    gt = GridSpecFromSubplotSpec(2, 1, gg[0], hspace=0.12)
+    # g: along the genome, and what the bins are
+    gt = GridSpecFromSubplotSpec(2, 1, gs[3, 0:7], hspace=0.14)
     ax_gt = [fig.add_subplot(gt[0])]
     ax_gt.append(fig.add_subplot(gt[1], sharex=ax_gt[0]))
-    # g's enrichment inset from the left, its track names inside g
-    ge2 = GridSpecFromSubplotSpec(1, 2, gg[1], wspace=0.0,
-                                  width_ratios=[0.3, 1])
+    ge2 = GridSpecFromSubplotSpec(1, 2, gs[3, 7:12], wspace=0.0,
+                                  width_ratios=[0.42, 1])
     ax_ge = fig.add_subplot(ge2[1])
-    panel_g(ax_gt, ax_ge, d["hotspots"], d["enrichment"])
+    panel_g(ax_gt, ax_ge, d["hotspots"])
     letters.append(("g", ax_gt[0], 0.06))
     fig.canvas.draw()
     for lab, ax, dx in letters:
         bb = ax.get_position()
-        fig.text(bb.x0 - dx, bb.y1 + 0.012, lab, fontsize=8,
+        fig.text(bb.x0 - dx, bb.y1 + 0.01, lab, fontsize=8,
                  fontweight="bold", va="bottom", ha="left")
     return fig
 
@@ -626,8 +767,7 @@ def read_tables(args) -> dict:
                              "end_posterior_percell.tsv",
                              "end_posterior_regions.tsv",
                              "end_posterior_regions_summary.tsv")]
-    need += [cc / f for f in ("summary.tsv", "locus_hotspots.tsv.gz",
-                              "locus_hotspot_enrichment.tsv")]
+    need += [cc / f for f in ("summary.tsv", "locus_hotspots.tsv.gz")]
     miss = [str(p) for p in need if not p.exists()]
     if miss:
         sys.exit("missing: " + ", ".join(miss))
@@ -637,8 +777,7 @@ def read_tables(args) -> dict:
             "regions": pd.read_csv(need[2], sep="\t"),
             "regions_summary": rs.iloc[0],
             "summary": pd.read_csv(need[4], sep="\t"),
-            "hotspots": pd.read_csv(need[5], sep="\t"),
-            "enrichment": pd.read_csv(need[6], sep="\t")}
+            "hotspots": pd.read_csv(need[5], sep="\t")}
 
 
 def cell_colors(args, groups) -> tuple:
