@@ -188,3 +188,26 @@ def test_e_comes_from_the_other_half_and_the_null_from_the_contacts_own():
         other = [k / 10 for k in range(6) if half[k] != half[c]]
         assert out[c]["m"][0] == pytest.approx(np.mean(other))
         assert set(out[c]["donor_p"][:, 0]) <= set(own)
+
+
+def test_a_same_cell_donor_is_another_read_pair_of_the_cell_at_its_place():
+    """--null-scope cell: the contact's own cell only, never its own read
+    pair, inside the partner's bin; a contact with none is left out."""
+    dbins = ls.log_dbins(1000, 10_000_000, 4)
+    # (coordinate, posterior, cell, read pair)
+    pool = np.array([(1_040_000, 0.11, 0, 1),     # A's donor
+                     (1_050_000, 0.99, 0, 0),     # A's own partner
+                     (1_045_000, 0.55, 1, 3),     # another cell's, and C's
+                     (1_230_000, 0.33, 0, 5),     # B's own partner
+                     (1_255_000, 0.77, 0, 4)])    # B's distance, not its bin
+    g, p, c, i = (pool[:, j] for j in range(4))
+    lv, m, dp, ru = ls.assign_same_cell(
+        np.array([1_000_000] * 3), np.array([50_000, 230_000, 45_000]),
+        np.array([0, 0, 1]), np.array([0, 5, 3]),
+        (g.astype(np.int64), p, c.astype(np.int64), None),
+        i.astype(np.int64),
+        dbins, np.random.default_rng(0), n_draws=2,
+        bounds=(np.full(3, 1_000_000), np.full(3, 1_250_000)), max_widen=2)
+    assert lv.tolist() == [0, -1, -1] and ru == 0
+    assert dp[:, 0].tolist() == [0.11, 0.11] and m[0] == pytest.approx(0.11)
+    assert np.isnan(dp[:, 1:]).all()

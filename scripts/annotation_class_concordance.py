@@ -55,6 +55,20 @@ fewer than --min-band-pairs contacts is flagged 'sparse' and not drawn
 (cross-class pairs barely exist at short range: two ends 1-30 kb apart are
 in different replication-timing classes only at a domain boundary).
 
+--null-scope cell takes each donor from the contact's OWN cell instead: an
+end of another of its read pairs, never its own, in the same class and
+position bin as the end it replaces, at a distance in the contact's own
+bin -- same nucleus, same place, only the ligation differs, as
+end_posterior_distance_correlation.py's link-shuffle under --null-scope
+cell (with --bins-per-decade 8 --max-widen 0, its distance bins exactly).
+A state a cell holds over a whole region, shared by the two ends of a
+contact, then cancels; against other cells' donors it counts as
+concordance.  At single-cell depth a contact has few such donors or none
+-- short contacts mostly none -- so fewer contacts enter; a donor may serve
+several contacts of its cell, and a contact's two draws are often the same
+donor, so the control is narrower than the null's own noise
+(link_shuffle.assign_same_cell).
+
 SIGNED BY CO-STATE.  C counts agreement whether it is co-open or
 co-closed.  S = ΔC x (2F - 1), with F = co-open / (co-open + co-closed) of
 the cell's real contacts in the class pair, carries the same concordance
@@ -1013,8 +1027,15 @@ def _pool(g, v, cell):
 
 
 def reshuffle(g_lo, g_hi, d, cell, x_cls, y_cls, a_c, p_c, stratum, n_cls,
-              dbins, position_bin, max_widen, seed, names=None, n_threads=1):
+              dbins, position_bin, max_widen, seed, names=None, n_threads=1,
+              same_cell=False):
     """Two null draws for BOTH ends of every contact.
+
+    ``same_cell``: each donor instead an end of the contact's OWN cell's
+    other read pairs, never its own, in the same class, bin and distance
+    bin (link_shuffle.assign_same_cell): only the ligation differs, as
+    end_posterior_distance_correlation.py's link-shuffle under --null-scope
+    cell.
 
     The right end first: keep the left end, and replace the right one by a
     donor -- an end of another cell's contact in the same stratum, in the
@@ -1083,6 +1104,24 @@ def reshuffle(g_lo, g_hi, d, cell, x_cls, y_cls, a_c, p_c, stratum, n_cls,
         pc = np.concatenate([cell[lo_i], cell[hi_i]])
         rng = np.random.default_rng([seed, key, k,
                                      0 if side == "right" else 1])
+        if same_cell:
+            # the read pair each pool end is from: a contact's own two
+            # ends are never its donors
+            pid = np.concatenate([lo_i, hi_i]).astype(np.int64)
+            if side == "right":
+                start = bin_start(g_hi[ask])
+                lv, _, dp, ru = _ls.assign_same_cell(
+                    g_lo[ask], d[ask], cell[ask], ask, (pg, pv, pc, None),
+                    pid, dbins, rng, n_draws=2, bounds=(start, start + pb),
+                    max_widen=max_widen)
+            else:
+                b0 = bin_start(g_lo[ask])
+                lv, _, dp, ru = _ls.assign_same_cell(
+                    M - g_hi[ask], d[ask], cell[ask], ask,
+                    (M - pg, pv, pc, None), pid, dbins, rng, n_draws=2,
+                    bounds=(M - b0 - pb + 1, M - b0 + 1),
+                    max_widen=max_widen)
+            return side, ask, lv, dp, ru
         if side == "right":
             pool = _pool(pg, pv, pc)
             start = bin_start(g_hi[ask])
@@ -3818,7 +3857,8 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
                            edges, band_labels, dbins, position_bin: int,
                            max_widen: int, n_boot: int, seed: int,
                            n_threads: int = 1, map_bin: int = 1_000_000,
-                           min_map_contacts: int = 100, classes=None):
+                           min_map_contacts: int = 100, classes=None,
+                           same_cell: bool = False):
     """chrX against the autosomes (:class:`ChromosomeClasses`), as one
     system's class pairs: every contact's ends centred on its cell's mean
     on autosomes or on X (``marg``: cells x (count, sum, sum of squares) x
@@ -3878,7 +3918,7 @@ def chromosome_concordance(cell, g_lo, g_hi, a, p, marg, strat, groups: dict,
             g_lo[sel], g_hi[sel], dist[sel], cell[sel], kx[sel], ky[sel],
             a_c[sel], p_c[sel], s_code[cell[sel]], nk, dbins, position_bin,
             max_widen, seed=sd_seed, names=list(s_names),
-            n_threads=n_threads)
+            n_threads=n_threads, same_cell=same_cell)
         i = np.flatnonzero(ok)
         x_, y_ = a_c[sel][i], p_c[sel][i]
         w = {"xy": x_ * y_,
@@ -4079,7 +4119,7 @@ def cross_context_chrx(cell, g_lo, g_hi, v_lo, v_hi, m_lo, m_hi, hap, marg,
                        position_bin: int, max_widen: int, n_boot: int,
                        seed: int, n_threads: int = 1, classes=None,
                        track_bin: int = 0, track_step: int = 0,
-                       dist_step: float = 0):
+                       dist_step: float = 0, same_cell: bool = False):
     """HCG at one end of a contact, GCH at the other (:func:`_read_cross`):
     a cell's methylation at one locus against its accessibility at the
     other, beyond the same reshuffled.  Each end is centred on the cell's
@@ -4139,7 +4179,7 @@ def cross_context_chrx(cell, g_lo, g_hi, v_lo, v_hi, m_lo, m_hi, hap, marg,
             g_lo[sel], g_hi[sel], dist[sel], cell[sel], c_lo, c_hi, x[sel],
             y[sel], s_code[cell[sel]], n_codes, dbins, position_bin,
             max_widen, seed=sd_seed, names=list(s_names),
-            n_threads=n_threads)
+            n_threads=n_threads, same_cell=same_cell)
         return ok, right, left
 
     def weights(i, rr, ll):
@@ -4352,7 +4392,7 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
                           position_bin: int, max_widen: int, n_boot: int,
                           seed: int, n_threads: int = 1, classes=None,
                           track_bin: int = 0, track_step: int = 0,
-                          dist_step: float = 0):
+                          dist_step: float = 0, same_cell: bool = False):
     """chrX against the autosomes on the contacts a phased SNP puts on one
     copy (``hap`` 1 or 2, 0 untagged; allelic_imbalance.py
     --haplotype-dir).  Ends centred on the cell's mean on autosomes or on X
@@ -4432,7 +4472,7 @@ def haplotype_concordance(cell, g_lo, g_hi, a, p, hap, marg, strat,
         ok, right, left, _ = reshuffle(
             gl, gh, dist, c_, cls, cls, x_, y_, s_code[c_], 4, dbins,
             position_bin, max_widen, seed=sd_seed, names=list(s_names),
-            n_threads=n_threads)
+            n_threads=n_threads, same_cell=same_cell)
         draws[tag] = (ok, right, left, cls)
     i = np.flatnonzero(draws["either"][0] & draws["same"][0])
     xi, yi, ar, pr, mi = x_[i], y_[i], av[i], pv[i], m_[i]
@@ -7477,6 +7517,18 @@ def main(argv=None) -> int:
     ap.add_argument("--null-match-column", default=None,
                     help="Comma-separated --samples columns that further "
                          "restrict donors (e.g. exp_batch).")
+    ap.add_argument("--null-scope", choices=["pooled", "cell"],
+                    default="pooled",
+                    help="Where a reshuffled end comes from.  'pooled' "
+                         "(default): another cell's contact of the same "
+                         "stratum.  'cell': another read pair of the "
+                         "contact's OWN cell, in the same class, position "
+                         "bin and distance bin -- only the ligation "
+                         "differs, as end_posterior_distance_correlation.py "
+                         "--null-type link-shuffle --null-scope cell; with "
+                         "--bins-per-decade 8 --max-widen 0 its bins "
+                         "exactly.  Fewer contacts enter, short ones "
+                         "least.")
     ap.add_argument("--systems", default="ab,rt,chromhmm,pmd",
                     help="Annotation systems to run; each needs its input "
                          "(ab: contacts plus an orientation reference; rt: "
@@ -8315,7 +8367,8 @@ def main(argv=None) -> int:
                 g_lo, g_hi, dist, cell, kx, ky, a_c, p_c, strat_code[cell],
                 n_k, dbins, args.position_bin, args.max_widen,
                 seed=args.seed + 7919 * ci_ctx + si,
-                names=list(strat_names), n_threads=args.n_threads)
+                names=list(strat_names), n_threads=args.n_threads,
+                same_cell=args.null_scope == "cell")
             # The pair's classes, unordered unless asked: which end of a
             # contact lies on the left carries no meaning.
             if args.ordered_pairs:
@@ -8586,7 +8639,7 @@ def main(argv=None) -> int:
                 *xa_, mx, strat_x, grp_x, edges, band_labels, dbins,
                 args.position_bin, args.max_widen, args.n_boot,
                 args.seed + 6007 * ci_ctx, args.n_threads,
-                classes=x_classes)
+                classes=x_classes, same_cell=args.null_scope == "cell")
             for r_ in rx:
                 r_.update(context=ctx, group_kind=kind_x[r_["group"]])
             chrx_rows += rx
@@ -8612,7 +8665,8 @@ def main(argv=None) -> int:
                         track_bin=track_bins.get(ctx.upper(),
                                                  track_bins[None]),
                         track_step=args.chrx_track_step,
-                        dist_step=dist_step)
+                        dist_step=dist_step,
+                        same_cell=args.null_scope == "cell")
                     trk = ext["tracks"]
                     if not ext["distance"].empty:
                         ext["distance"].insert(0, "context", ctx)
@@ -8926,7 +8980,8 @@ def main(argv=None) -> int:
             track_bin=(track_bins.get("CROSS", track_bins[None])
                        if args.haplotypes else 0),
             track_step=args.chrx_track_step,
-            dist_step=dist_step if args.haplotypes else 0)
+            dist_step=dist_step if args.haplotypes else 0,
+            same_cell=args.null_scope == "cell")
         for k_, lst_ in (("tracks", hap_tracks), ("distance", hap_dist)):
             if not cross_ext[k_].empty:
                 cross_ext[k_].insert(0, "context", "HCG×GCH")

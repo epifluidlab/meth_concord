@@ -32,10 +32,14 @@ def is_a(pos):
 
 
 def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
-              n_short=1500, seed=0, coord_in="A", levels=(0.6, 0.25)):
+              n_short=1500, seed=0, coord_in="A", levels=(0.6, 0.25),
+              region_sd=0.0):
     """``coord(t, c)``: the chance an A-A contact's partner copies its anchor
     in cell c of type t.  ``offset(t, c)`` is added to every posterior of
-    that cell AFTER the calls are drawn, so it changes nothing but level."""
+    that cell AFTER the calls are drawn, so it changes nothing but level.
+    ``region_sd``: each cell's 2 Mb domains each open more or less by a
+    normal shift of this SD -- a state of the cell's, shared by every end
+    in the domain, nothing about its contacts."""
     rng = np.random.default_rng(seed)
     out = Path(out)
     post = out / "GCH"
@@ -51,9 +55,21 @@ def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
             # contacts prefer their own compartment
             move = (is_a(a_pos) != is_a(b_pos)) & (rng.random(n_contacts) < 0.7)
             b_pos[move] += DOM
-            level = lambda x: np.where(is_a(x), *levels)  # noqa: E731
-            pa = np.where(rng.random(n_contacts) < level(a_pos), 0.9, 0.1)
-            pb = np.where(rng.random(n_contacts) < level(b_pos), 0.9, 0.1)
+            if region_sd:
+                sh = rng.normal(0, region_sd, (len(CHROMS), 64))
+                ci = {c_: i for i, c_ in enumerate(CHROMS)}
+
+                def level(x, ch):
+                    return np.clip(np.where(is_a(x), *levels) + sh[
+                        [ci[c_] for c_ in ch], np.asarray(x) // DOM], 0.02,
+                        0.98)
+            else:
+                def level(x, ch):
+                    return np.where(is_a(x), *levels)
+            pa = np.where(rng.random(n_contacts) < level(a_pos, chrom), 0.9,
+                          0.1)
+            pb = np.where(rng.random(n_contacts) < level(b_pos, chrom), 0.9,
+                          0.1)
             if coord is not None:
                 aa = (is_a(a_pos) & is_a(b_pos) if coord_in == "A"
                       else ~is_a(a_pos) & ~is_a(b_pos))
@@ -62,8 +78,10 @@ def make_data(out, n_types=3, per=25, coord=None, offset=None, n_contacts=2500,
             s_chr = rng.choice(list(CHROMS), n_short)
             s_pos = rng.integers(0, 19_000_000, n_short)
             s_end = s_pos + rng.integers(200, 800, n_short)
-            sa = np.where(rng.random(n_short) < level(s_pos), 0.9, 0.1)
-            sb = np.where(rng.random(n_short) < level(s_end), 0.9, 0.1)
+            sa = np.where(rng.random(n_short) < level(s_pos, s_chr), 0.9,
+                          0.1)
+            sb = np.where(rng.random(n_short) < level(s_end, s_chr), 0.9,
+                          0.1)
             df = pd.DataFrame({
                 "chrom": np.concatenate([chrom, s_chr]),
                 "pos1": np.concatenate([a_pos, s_pos]),
@@ -288,6 +306,46 @@ def test_both_ends_are_reshuffled_from_their_own_side_and_class():
     assert left[:, 0].tolist() == [0.3, 0.3]      # cell 1's left end
     assert right[:, 1].tolist() == [-0.1, -0.1]
     assert left[:, 1].tolist() == [0.4, 0.4]
+
+
+def test_a_same_cell_donor_is_another_read_pair_of_the_cell():
+    """--null-scope cell: A's donors are B's ends -- its own cell's other
+    read pair, at A's partner's place and distance -- where pooled they are
+    C's, the other cell's.  B (no own-cell end at its distance) and C (alone
+    in its cell) get none under the cell's scope."""
+    S = acc._ls.GENOME_STRIDE
+    g_lo = np.array([1_000_000, 1_010_000, 1_000_000], np.int64) + S
+    g_hi = np.array([1_050_000, 1_040_000, 1_045_000], np.int64) + S
+    args = (g_lo, g_hi, g_hi - g_lo, np.array([0, 0, 1]), np.zeros(3, int),
+            np.ones(3, int), np.array([0.4, 0.3, 0.2]),
+            np.array([-0.1, -0.2, -0.3]), np.array(["s"] * 3), 2,
+            acc._ls.log_dbins(1000, 10_000_000, 4), 250_000, 0)
+    ok, right, left, _ = acc.reshuffle(*args, seed=0, same_cell=True)
+    assert ok.tolist() == [True, False, False]
+    assert right[:, 0].tolist() == [-0.2, -0.2]   # B's right end
+    assert left[:, 0].tolist() == [0.3, 0.3]      # B's left end
+    ok, right, left, _ = acc.reshuffle(*args, seed=0)
+    assert ok[0] and right[0, 0] == -0.3 and left[0, 0] == 0.2   # C's
+
+
+def test_a_cells_regional_state_cancels_against_its_own_cells_donors(
+        tmp_path):
+    """Each cell's 2 Mb domains sit at levels of their own -- shared by every
+    end there, nothing about contacts.  Against other cells' donors a
+    contact's ends agree, as both share the cell's domain; against the
+    cell's own ends at the same place they do not."""
+    d = make_data(tmp_path, n_types=2, per=12, region_sd=0.3, seed=7)
+    quick = ("--celltype-auc-stats", "none", "--n-locus-perm", "0",
+             "--no-covariates", "--no-hotspots")
+    pooled = _row(run(d, systems="pmd", extra=quick)[0], "pmd", "HMD", "HMD")
+    cell = _row(run(d, systems="pmd",
+                    extra=quick + ("--null-scope", "cell", "--bins-per-decade",
+                                   "8", "--max-widen", "0"))[0],
+                "pmd", "HMD", "HMD")
+    assert pooled["delta_lo"] > 0 and pooled["delta"] > 0.01
+    assert cell["delta_lo"] < 0 < cell["delta_hi"] or \
+        abs(cell["delta"]) < 0.2 * pooled["delta"]
+    assert 0 < cell["pairs"] < pooled["pairs"]       # fewer have a donor
 
 
 def test_pairs_are_unordered_unless_asked(planted, tmp_path):

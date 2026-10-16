@@ -285,6 +285,110 @@ def assign_stratum(anchor_g, d, anchor_cell, pool_e, pool_n, dbins, rng,
     return level, m, donor_p, n_reused
 
 
+def assign_same_cell(anchor_g, d, anchor_cell, anchor_id, pool, pool_id,
+                     dbins, rng, n_draws: int = 1, bounds=None,
+                     max_widen: int = 0, max_rounds: int = 16):
+    """Null donors from each contact's OWN cell, as
+    end_posterior_distance_correlation.py's link-shuffle under --null-scope
+    cell: an end of another of the cell's read pairs -- never the contact's
+    own -- in its window (its own distance bin, widened by up to
+    ``max_widen`` bins on each side, inside ``bounds``), at random and
+    independently per draw.  Same nucleus, same place: only the ligation
+    differs, so a state the cell holds over a whole region, shared by both
+    ends of a contact, cancels.
+
+    A donor may serve several of the cell's contacts: within one cell the
+    candidates are few, and reserving them would leave most contacts
+    without one.  The same few also make a contact's two draws often the
+    same donor, so the control (draw 2 less draw 1) is narrower than the
+    null's own noise -- the WHY OTHER CELLS above, which this mode accepts
+    for the sake of the shared state.
+
+    ``pool``: (coordinates, posteriors, cells, _) of the donor ends, in any
+    order; ``pool_id``: the read pair each belongs to; ``anchor_id``: each
+    contact's own.  Returns (level, m, donor_p, n_reused) as
+    :func:`assign_stratum`: ``m`` the window's mean posterior, the contact's
+    own ends aside; ``n_reused`` 0."""
+    anchor_g = np.asarray(anchor_g, np.int64)
+    anchor_cell = np.asarray(anchor_cell, np.int64)
+    anchor_id = np.asarray(anchor_id, np.int64)
+    n = anchor_g.size
+    n_draws = max(1, int(n_draws))
+    level = np.full(n, -1, np.int64)
+    m = np.full(n, np.nan)
+    donor_p = np.full((n_draws, n), np.nan)
+    g = np.asarray(pool[0], np.int64)
+    if n == 0 or g.size == 0:
+        return level, m, donor_p, 0
+    cell = np.asarray(pool[2], np.int64)
+    nb = len(dbins) - 1
+    k = np.clip(np.searchsorted(dbins, np.asarray(d), side="right") - 1,
+                0, nb - 1)
+    top = max(int(g.max()), int(anchor_g.max()) + int(np.ceil(dbins[-1]))) + 1
+    shift = top.bit_length()
+    if max(int(cell.max()), int(anchor_cell.max())) + 1 >= (1 << (62 - shift)):
+        raise ValueError("too many cells for (cell, coordinate) keys")
+    # the pool by (cell, coordinate): a cell's own ends in a window are two
+    # lookups
+    key = (cell << np.int64(shift)) + g
+    o = np.argsort(key, kind="mergesort")
+    key = key[o]
+    ps = np.asarray(pool[1], float)[o]
+    ids = np.asarray(pool_id, np.int64)[o]
+    cum = np.concatenate([[0.0], np.cumsum(ps)])
+    # where each contact's own ends sit in that order: two at most, its
+    # left and its right
+    oi = np.argsort(ids, kind="mergesort")
+    s0 = np.searchsorted(ids[oi], anchor_id, side="left")
+    s1 = np.searchsorted(ids[oi], anchor_id, side="right")
+    last = oi.size - 1
+    own = np.stack([np.where(s1 > s0, oi[np.minimum(s0, last)], -1),
+                    np.where(s1 > s0 + 1, oi[np.minimum(s0 + 1, last)], -1)])
+    base = anchor_cell << np.int64(shift)
+    L = np.zeros(n, np.int64)
+    H = np.zeros(n, np.int64)
+    for w in range(int(max_widen) + 1):
+        todo = np.flatnonzero(level < 0)
+        if todo.size == 0:
+            break
+        lo = anchor_g[todo] + dbins[np.maximum(k[todo] - w, 0)]
+        hi = anchor_g[todo] + dbins[np.minimum(k[todo] + w + 1, nb)]
+        if bounds is not None:
+            lo = np.maximum(lo, np.asarray(bounds[0])[todo])
+            hi = np.minimum(hi, np.asarray(bounds[1])[todo])
+        lo = np.ceil(lo).astype(np.int64)
+        hi = np.maximum(np.ceil(hi).astype(np.int64), lo)
+        b = base[todo]
+        lw = np.searchsorted(key, b + lo, side="left")
+        hw = np.searchsorted(key, b + hi, side="left")
+        inside = (own[:, todo] >= lw) & (own[:, todo] < hw)
+        n_own = inside.sum(0)
+        s_own = np.where(inside, ps[np.maximum(own[:, todo], 0)], 0.0).sum(0)
+        free = hw - lw - n_own
+        ok = free >= 1
+        hit = todo[ok]
+        level[hit] = w
+        L[hit], H[hit] = lw[ok], hw[ok]
+        m[hit] = (cum[hw] - cum[lw] - s_own)[ok] / free[ok]
+    has = np.flatnonzero(level >= 0)
+    for dr in range(n_draws):
+        got = np.full(n, -1, np.int64)
+        todo = has
+        for _ in range(int(max_rounds)):
+            if todo.size == 0:
+                break
+            j = L[todo] + (rng.random(todo.size)
+                           * (H[todo] - L[todo])).astype(np.int64)
+            ok = ids[j] != anchor_id[todo]
+            got[todo[ok]] = j[ok]
+            todo = todo[~ok]
+        for i in todo:              # windows of the contact's own ends and
+            cand = np.arange(L[i], H[i])            # one other
+            got[i] = rng.choice(cand[ids[cand] != anchor_id[i]])
+        donor_p[dr, has] = ps[got[has]]
+    return level, m, donor_p, 0
+
+
 def _genome(parts: dict, code: dict):
     """{chrom: arrays} -> (genome coordinates, the other arrays...)."""
     if not parts:
