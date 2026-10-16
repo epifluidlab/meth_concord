@@ -19,8 +19,8 @@ The panels:
      annotation_class_concordance.py)
   f  ΔC x w between chromHMM states
   g  concordance along the genome per 1-Mb bin, its hot bins, and what
-     the bins are -- each track's Spearman rho, with p against genome
-     rotations (locus_hotspots.tsv.gz)
+     the hot bins are -- each annotation's share in them over all tested
+     bins, with p against genome rotations (locus_hotspots.tsv.gz)
 
 The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
@@ -76,20 +76,35 @@ STATES = ("promoter", "enhancer", "transcribed", "polycomb",
 #: What + and - of ΔC x w mean, per mark.
 SIGN_WORDS = {"GCH": ("co-closed", "co-open"),
               "HCG": ("co-unmethylated", "co-methylated")}
-#: Panel g's tracks, (track, label).
+#: Panel g's tracks, (track, label), in groups -- domains, chromHMM states,
+#: gene density, gene families; A, early and HMD, near mirror images of B,
+#: late and PMD, are tested but not drawn.
 TSS_TRACK = "TSSs (count)"
 G_TRACKS = (("compartment: B", "B compartment"),
             ("replication timing: late", "late replicating"),
             ("PMD / HMD: PMD", "PMD"),
+            ("PMD borders", "PMD borders"),
             ("chromHMM: heterochromatin", "heterochromatin"),
             ("chromHMM: quiescent", "quiescent"),
             ("chromHMM: polycomb", "polycomb"),
             ("chromHMM: transcribed", "transcribed"),
             ("chromHMM: enhancer", "enhancer"),
             ("chromHMM: promoter", "promoter"),
+            (TSS_TRACK, "TSS density"),
+            ("CpG islands", "CpG islands"),
             ("zinc-finger (Zfp / ZNF) genes", "Zfp genes"),
             ("olfactory receptor genes", "olfactory receptors"),
-            (TSS_TRACK, "TSS density"))
+            ("protocadherin cluster", "protocadherin cluster"),
+            ("imprinted genes", "imprinted genes"))
+#: Where G_TRACKS' groups start.
+G_BREAKS = (4, 10, 12)
+#: The hot-bin table's own columns; every other one is a track the run
+#: tested the bins against.
+HOT_FIELDS = frozenset({
+    "context", "system", "chrom", "start", "end", "band", "contacts",
+    "cells", "delta", "control", "se", "se_control", "z", "z_control",
+    "tested", "excess", "z_excess", "q_hot", "q_cold", "hot", "cold",
+    "grid_index", "code", "band_index", "x"})
 #: Panel a draws a bin where this share of its linked pairs or more found
 #: a stand-in: below it, a few pairs, and those the ones with a stand-in.
 MIN_MATCHED = 0.1
@@ -508,52 +523,65 @@ def fdr_bh(p) -> np.ndarray:
     return q
 
 
-def _rotation_p(x, y, min_shift: int = 50) -> float:
-    """Two-sided p of the correlation of two series in genome order, against
-    every circular shift of one by ``min_shift`` bins or more (a tenth of
-    the series when that is fewer), as annotation_class_concordance.py
-    tests its contrasts: neighbouring bins are not independent, and a shift
-    keeps each series' own autocorrelation while breaking their alignment.
-    The series as given -- ranks, so the statistic is the Spearman rho
-    drawn.  NaN when too few shifts remain to reach p < 0.05."""
-    x, y = np.asarray(x, float), np.asarray(y, float)
-    n = x.size
+def _rotation_p(h, x, min_shift: int = 50) -> float:
+    """Two-sided p of where the hot bins ``h`` sit on a track ``x``, both
+    in genome order -- their covariance, which moves with the fold --
+    against every circular shift of the labels by ``min_shift`` bins or
+    more (a tenth of the series when that is fewer): neighbouring bins are
+    not independent, and a shift keeps runs of hot bins and the track's
+    own stretches while breaking their alignment.  Twice the nearer tail,
+    as a sparse track's null is lopsided.  NaN when too few shifts remain
+    to reach p < 0.05."""
+    h, x = np.asarray(h, float), np.asarray(x, float)
+    n = h.size
     ms = max(1, min(min_shift, n // 10))
-    if n - 2 * ms + 1 < 19 or x.std() == 0 or y.std() == 0:
+    if n - 2 * ms + 1 < 39 or h.std() == 0 or x.std() == 0:
         return np.nan
-    x = (x - x.mean()) / x.std()
-    y = (y - y.mean()) / y.std()
-    # every circular shift at once: cc[s] = mean_i x[i] y[i + s]
-    cc = np.fft.irfft(np.conj(np.fft.rfft(x)) * np.fft.rfft(y), n) / n
+    a, b = h - h.mean(), x - x.mean()
+    # every circular shift at once: cc[s] = sum_i a[i] b[i + s]
+    cc = np.fft.irfft(np.conj(np.fft.rfft(a)) * np.fft.rfft(b), n)
     null = cc[ms:n - ms + 1]
-    return float((1 + np.sum(np.abs(null) >= abs(cc[0]) - 1e-12))
-                 / (1 + null.size))
+    tol = 1e-9 * max(1.0, abs(cc[0]))
+    tail = min(np.sum(null >= cc[0] - tol), np.sum(null <= cc[0] + tol))
+    return float(min(1.0, 2 * (1 + tail) / (1 + null.size)))
 
 
-def track_rhos(t: pd.DataFrame) -> pd.DataFrame:
-    """Per track of G_TRACKS, over bins ``t`` (one mark's tested bins, in
-    genome order): Spearman rho between a bin's ΔC and the track, the
-    control's, and rho's p against genome rotations with BH q over the
-    tracks.  Not the run's p_rho: that one counts the bins as independent,
-    and neighbouring bins share compartments and contacts."""
-    from scipy.stats import rankdata
+def tested_tracks(hot: pd.DataFrame) -> list:
+    """The tracks the run tested the bins against: every numeric column of
+    its hot-bin table but the table's own (HOT_FIELDS), --hotspot-annotation
+    BEDs among them."""
+    return [c for c in hot.columns if c not in HOT_FIELDS
+            and pd.api.types.is_numeric_dtype(hot[c])]
 
-    def corr(a, b):
-        return (float(np.corrcoef(a, b)[0, 1])
-                if a.std() > 0 and b.std() > 0 else np.nan)
-    rd, rc = rankdata(t["delta"]), rankdata(t["control"])
+
+def hot_enrichment(t: pd.DataFrame, tracks) -> pd.DataFrame:
+    """Per track of ``tracks``, over bins ``t`` (one mark's tested bins, in
+    genome order): the track's mean over the hot bins against its mean
+    over all of them (fold); the same for as many of the control map's
+    most extreme bins (control_fold: by its z against the median bin, as
+    the hot calls are made); and the fold's p against genome rotations
+    with BH q over ``tracks`` -- every track the run tested, drawn or not.
+    Not the run's hot_odds_ratio: whether a bin touches a track at all
+    says nothing where a track is in every bin, as heterochromatin is.  A
+    track no tested bin touches has no value, as in the run."""
+    hot_ = t["hot"].to_numpy(bool)
+    k = int(hot_.sum())
+    z0 = ((t["control"] - t["control"].median())
+          / t["se_control"]).to_numpy(float)
+    ctl = np.zeros(len(t), bool)
+    ctl[np.argsort(-np.nan_to_num(z0, nan=-np.inf), kind="stable")[:k]] = True
     rows = []
-    for name, _ in G_TRACKS:
-        row = {"track": name}
-        if name in t:
-            rx = rankdata(t[name])
-            row["rho"], row["rho_control"] = corr(rd, rx), corr(rc, rx)
-            row["p"] = _rotation_p(rd, rx)
-        rows.append(row)
-    out = pd.DataFrame(rows)
-    for c in ("rho", "rho_control", "p"):
-        if c not in out:
-            out[c] = np.nan
+    for name in tracks:
+        x = t[name].to_numpy(float)
+        m = x.mean() if x.size else np.nan
+        if not k or not np.ptp(x) > 0 or not m > 0:
+            rows.append({"track": name})
+            continue
+        rows.append({"track": name, "fold": x[hot_].mean() / m,
+                     "control_fold": x[ctl].mean() / m,
+                     "p": _rotation_p(hot_, x)})
+    out = pd.DataFrame(rows).reindex(
+        columns=["track", "fold", "control_fold", "p"])
     out["q"] = fdr_bh(out["p"])
     return out
 
@@ -627,38 +655,70 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
     ax_tracks[-1].set_xticks(mids)
     ax_tracks[-1].set_xticklabels(order, fontsize=4.6)
     ax_tracks[-1].set_xlabel("chromosome (1-Mb bins)")
+    # what the hot bins are: each track's share in them over all tested
+    # bins, on a log scale, faded where q >= 0.05
+    from matplotlib.colors import to_rgba
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    from matplotlib.ticker import NullLocator
     y = np.arange(len(G_TRACKS))[::-1].astype(float)
-    span = []
+    shown = [t for t, _ in G_TRACKS]
+    tracks = tested_tracks(h)
+    res = {mark: hot_enrichment(h[h["context"] == mark], tracks)
+           .set_index("track").reindex(shown) for _, mark, _ in MARKS}
+    v = np.concatenate([r_[c].to_numpy(float) for r_ in res.values()
+                        for c in ("fold", "control_fold")])
+    v = v[np.isfinite(v) & (v > 0)]
+    lim = max(1.0, 1.15 * np.abs(np.log2(v)).max()) if v.size else 1.0
+    lo, hi = 2.0 ** -lim, 2.0 ** lim
     for k, (_, mark, _) in enumerate(MARKS):
-        e = track_rhos(h[h["context"] == mark])
-        rho = e["rho"].to_numpy(float)
-        ctl = e["rho_control"].to_numpy(float)
+        e = res[mark]
+        f = e["fold"].to_numpy(float)
+        sig = (e["q"] < 0.05).to_numpy()
         yk = y + (0.19 if k == 0 else -0.19)
-        ok = np.isfinite(rho)
-        ax_enr.barh(yk[ok], rho[ok], height=0.36, color=MARK_COLOR[mark],
-                    alpha=0.8, lw=0, label=mark)
-        ax_enr.scatter(ctl, yk, s=5, marker="|", color="0.45", lw=0.6,
-                       zorder=3, label="control" if k else None)
-        for yy, s_, q_ in zip(yk, rho, e["q"]):
-            if q_ < 0.05:
+        ok = np.isfinite(f) & (f > 0)
+        ax_enr.barh(yk[ok], f[ok] - 1, left=1, height=0.36, lw=0,
+                    color=[to_rgba(MARK_COLOR[mark], 0.85 if s_ else 0.22)
+                           for s_ in sig[ok]])
+        # no hot bin on a sparse track: no bar to the axis's edge, a 0
+        for yy in yk[np.isfinite(f) & (f <= 0)]:
+            ax_enr.text(1 / 1.08, yy, "0", ha="right", va="center",
+                        fontsize=4.2, color="0.45")
+        c = e["control_fold"].to_numpy(float)
+        okc = np.isfinite(c) & (c > 0)
+        ax_enr.scatter(c[okc], yk[okc], s=5, marker="|", color="0.35",
+                       lw=0.6, zorder=3)
+        for yy, f_, s_ in zip(yk, f, sig):
+            if s_:
                 # an asterisk rides high in its line: set down to the bar
-                ax_enr.text(s_ + (0.004 if s_ >= 0 else -0.004), yy - 0.24,
-                            "*", ha="left" if s_ >= 0 else "right",
+                ax_enr.text(f_ * 1.06 if f_ >= 1 else f_ / 1.06, yy - 0.24,
+                            "*", ha="left" if f_ >= 1 else "right",
                             va="center", fontsize=6.5,
                             color=MARK_COLOR[mark])
-        span += [rho, ctl]
-    _zero(ax_enr, "x")
-    v = np.concatenate(span)
-    lim = np.nanmax(np.abs(v[np.isfinite(v)])) * 1.18 if np.isfinite(
-        v).any() else 0.2
-    ax_enr.set_xlim(-lim, lim)
+    ax_enr.axvline(1, color="0.7", lw=0.4, zorder=0)
+    ax_enr.set_xscale("log", base=2)
+    ax_enr.set_xlim(lo, hi)
+    ticks = [2.0 ** i for i in range(-int(lim), int(lim) + 1)]
+    ax_enr.set_xticks(ticks)
+    ax_enr.set_xticklabels([f"{t_:g}×" for t_ in ticks])
+    ax_enr.xaxis.set_minor_locator(NullLocator())
+    for b in G_BREAKS:
+        ax_enr.axhline(len(G_TRACKS) - b - 0.5, color="0.85", lw=0.4,
+                       zorder=0)
     ax_enr.set_yticks(y)
     ax_enr.set_yticklabels([lab for _, lab in G_TRACKS], fontsize=5)
     ax_enr.set_ylim(-0.7, len(G_TRACKS) - 0.3)
-    ax_enr.set_xlabel("Spearman ρ, bins' ΔC against the track\n"
+    ax_enr.tick_params(axis="y", length=0)
+    ax_enr.set_xlabel("annotation in hot bins, fold over all tested bins\n"
                       "(* q < 0.05, genome rotations)")
-    ax_enr.legend(frameon=False, loc="lower right", fontsize=4.6, ncol=3,
-                  handletextpad=0.2, borderaxespad=0.1, columnspacing=0.9,
+    handles = [Patch(color=to_rgba(MARK_COLOR[m], 0.85), label=m)
+               for _, m, _ in MARKS]
+    handles += [Patch(color=to_rgba("0.5", 0.22), label="q ≥ 0.05"),
+                Line2D([], [], marker="|", ls="", color="0.35",
+                       label="control")]
+    ax_enr.legend(handles=handles, frameon=False, loc="lower right",
+                  fontsize=4.6, ncol=4, handletextpad=0.3, handlelength=1.2,
+                  borderaxespad=0.1, columnspacing=0.8,
                   bbox_to_anchor=(1.0, 1.0))
 
 
@@ -667,9 +727,9 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
 def build_figure(d: dict, order, colors):
     plt = _style()
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
-    fig = plt.figure(figsize=(7.2, 10.2))
+    fig = plt.figure(figsize=(7.2, 10.5))
     gs = GridSpec(4, 12, figure=fig, hspace=0.46, wspace=1.6,
-                  height_ratios=[2.1, 1.75, 2.15, 1.65],
+                  height_ratios=[2.1, 1.75, 2.15, 1.95],
                   left=0.075, right=0.975, top=0.97, bottom=0.04)
     letters = []
     # a: the three measures across the page

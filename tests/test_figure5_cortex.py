@@ -2,8 +2,8 @@
 
 Small synthetic copies of each table, as the scripts write them; the figure
 must draw from them, take panel b's regions as the run's summary did, read
-a class pair in either order, test a track against genome rotations, and
-stop, naming them, without its tables."""
+a class pair in either order, test what the hot bins are against genome
+rotations, and stop, naming them, without its tables."""
 
 from __future__ import annotations
 
@@ -100,9 +100,12 @@ def _classes(c: Path, rng):
                 row = {"context": ctx, "chrom": chrom, "start": s,
                        "end": s + 1_000_000, "band": f5.ALL_BAND,
                        "delta": v, "control": rng.normal(0, 0.003),
-                       "tested": True, "hot": v > 0.022, "cold": False}
-                # the bins' tracks, as the run writes them beside each bin
+                       "se_control": 0.003, "tested": True,
+                       "hot": v > 0.022, "cold": False}
+                # the bins' tracks, as the run writes them beside each bin,
+                # one it tests that the figure does not draw among them
                 row.update({t: rng.uniform() for t, _ in f5.G_TRACKS})
+                row["compartment: A"] = rng.uniform()
                 row[f5.TSS_TRACK] = rng.poisson(20)
                 hot.append(row)
     pd.DataFrame(hot).to_csv(c / "locus_hotspots.tsv.gz", sep="\t",
@@ -186,41 +189,63 @@ def _drift(rng, n, phi=0.9):
     return lfilter([1], [1, -phi], rng.normal(size=n + 200))[200:]
 
 
-def _bins(rng, n=400):
-    """``n`` bins in genome order, each track drifting along it, ΔC
-    independent of them all."""
-    t = pd.DataFrame({"delta": rng.normal(0, 0.004, n),
-                      "control": rng.normal(0, 0.004, n)})
-    for name, _ in f5.G_TRACKS:
-        t[name] = _drift(rng, n)
+def _bins(rng, n=600):
+    """``n`` bins in genome order, each track drifting along it, and ΔC
+    drifting too, independent of them all: its top 6% are the hot bins,
+    in runs as the real ones are."""
+    dc = _drift(rng, n) + 0.5 * rng.normal(size=n)
+    t = pd.DataFrame({"delta": dc, "hot": dc > np.quantile(dc, 0.94),
+                      "control": rng.normal(0, 1, n), "se_control": 1.0})
+    for name in [n_ for n_, _ in f5.G_TRACKS] + ["compartment: A"]:
+        t[name] = np.exp(_drift(rng, n))
     return t
 
 
-def test_a_track_the_bins_follow_is_starred_and_the_rest_are_not():
+def test_hot_bins_on_a_track_are_starred_and_the_rest_are_not():
     rng = np.random.default_rng(3)
-    t = _bins(rng)
-    b = t["compartment: B"].to_numpy()
-    t["delta"] += 0.004 * (b - b.mean()) / b.std()
-    e = f5.track_rhos(t).set_index("track")
-    assert e.loc["compartment: B", "rho"] > 0.5
+    # bins enough that one track alone can reach q < 0.05 among 17: the
+    # smallest p is two over the shifts
+    t = _bins(rng, n=1200)
+    b = np.log(t["compartment: B"].to_numpy())
+    t["hot"] = b + 0.5 * rng.normal(size=b.size) > np.quantile(b, 0.9)
+    e = f5.hot_enrichment(t, f5.tested_tracks(t)).set_index("track")
+    assert e.loc["compartment: B", "fold"] > 1.5
     assert e.loc["compartment: B", "q"] < 0.05
     assert (e.drop(index="compartment: B")["q"] > 0.05).all()
+    # the control's most extreme bins, as many, sit on it as any bins do
+    assert 0.6 < e.loc["compartment: B", "control_fold"] < 1.6
 
 
 def test_neighbouring_bins_alike_are_not_a_finding():
-    """ΔC that drifts along the genome, independent of tracks that drift
-    too: the plain Spearman p, which counts the bins as independent, calls
-    a third of them; against genome rotations, about one in twenty."""
-    from scipy.stats import spearmanr
-    plain, rot = [], []
+    """Hot bins in runs and tracks in stretches, independent of each other:
+    a test that takes the bins as independent (Mann-Whitney, hot against
+    the rest) calls over a third of them; genome rotations about one in
+    twenty."""
+    from scipy.stats import mannwhitneyu
+    naive, rot = [], []
     for seed in range(40):
-        rng = np.random.default_rng(seed)
-        t = _bins(rng, n=600)
-        t["delta"] += 0.002 * _drift(rng, 600)
-        plain += [spearmanr(t["delta"], t[n])[1] for n, _ in f5.G_TRACKS]
-        rot += list(f5.track_rhos(t)["p"])
-    assert np.mean(np.array(plain) < 0.05) > 0.3
+        t = _bins(np.random.default_rng(seed))
+        h = t["hot"].to_numpy()
+        for name in f5.tested_tracks(t):
+            x = t[name].to_numpy()
+            naive.append(mannwhitneyu(x[h], x[~h]).pvalue)
+        rot += list(f5.hot_enrichment(t, f5.tested_tracks(t))["p"])
+    assert np.mean(np.array(naive) < 0.05) > 0.3
     assert np.mean(np.array(rot) < 0.05) < 0.09
+
+
+def test_every_track_the_run_tested_counts_drawn_or_not(tmp_path):
+    _tables(tmp_path)
+    hot = pd.read_csv(tmp_path / "classes" / "locus_hotspots.tsv.gz",
+                      sep="\t")
+    tracks = f5.tested_tracks(hot)
+    assert "compartment: A" in tracks
+    assert set(t for t, _ in f5.G_TRACKS) <= set(tracks)
+    assert not set(tracks) & f5.HOT_FIELDS
+    # the q of a drawn track is over all of them
+    t = hot[hot["context"] == "GCH"]
+    e = f5.hot_enrichment(t, tracks)
+    assert len(e) == len(tracks) == len(f5.G_TRACKS) + 1
 
 
 def test_the_figure_stops_naming_missing_tables(tmp_path):
