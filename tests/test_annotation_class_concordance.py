@@ -348,6 +348,21 @@ def test_a_cells_regional_state_cancels_against_its_own_cells_donors(
     assert 0 < cell["pairs"] < pooled["pairs"]       # fewer have a donor
 
 
+def test_an_excluded_region_drops_a_read_pair_with_an_end_in_it(tmp_path):
+    """--exclude-bed, as end_posterior_distance_correlation.py: intervals
+    merged, either end inside drops the pair, chromosome names as one."""
+    bl = tmp_path / "bl.bed"
+    pd.DataFrame([("chr1", 100, 200), ("chr1", 150, 300), ("2", 0, 50)]
+                 ).to_csv(bl, sep="\t", header=False, index=False)
+    iv = acc.read_exclude_beds([bl])
+    one = iv[acc._canon("chr1")]
+    assert one[0].tolist() == [100] and one[1].tolist() == [300]
+    bad = acc._in_excluded(np.array([50, 120, 400, 10, 60]),
+                           np.array([90, 500, 299, 70, 80]),
+                           np.array([0, 0, 0, 1, 1]), ["chr1", "chr2"], iv)
+    assert bad.tolist() == [False, True, True, True, False]
+
+
 def test_pairs_are_unordered_unless_asked(planted, tmp_path):
     s, _, _ = planted
     pmd = s[s["system"] == "pmd"]

@@ -874,10 +874,48 @@ def _hap_lookup(tab, g_lo, g_hi) -> np.ndarray:
     return np.nan_to_num(v, nan=0).astype(np.int8)
 
 
+def read_exclude_beds(paths) -> dict:
+    """--exclude-bed: {canonical chromosome: (starts, ends)}, the intervals
+    of every BED merged and sorted."""
+    out: dict = {}
+    for p in paths or []:
+        b = pd.read_csv(p, sep="\t", header=None, comment="#",
+                        usecols=[0, 1, 2], dtype={0: str})
+        for c, g in b.groupby(0):
+            out.setdefault(_canon(c), []).append(g[[1, 2]].to_numpy(np.int64))
+    merged = {}
+    for c, parts in out.items():
+        iv = np.concatenate(parts)
+        iv = iv[np.argsort(iv[:, 0], kind="mergesort")]
+        reach = np.maximum.accumulate(iv[:, 1])
+        new = np.concatenate([[True], iv[1:, 0] > reach[:-1]])
+        merged[c] = (iv[new, 0], np.maximum.reduceat(iv[:, 1],
+                                                     np.flatnonzero(new)))
+    return merged
+
+
+def _in_excluded(pos1, pos2, ci, names, exclude_iv) -> np.ndarray:
+    """Rows with either end in an --exclude-bed interval, as
+    end_posterior_distance_correlation.py drops them."""
+    bad = np.zeros(len(ci), bool)
+    if not exclude_iv:
+        return bad
+    for i, nm in enumerate(names):
+        iv = exclude_iv.get(_canon(nm))
+        rows = np.flatnonzero(ci == i) if iv is not None else ()
+        if not len(rows):
+            continue
+        st, en = iv
+        for pos in (pos1[rows], pos2[rows]):
+            j = np.searchsorted(st, pos, side="right") - 1
+            bad[rows[(j >= 0) & (en[np.clip(j, 0, len(en) - 1)] > pos)]] = True
+    return bad
+
+
 def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
                systems: dict, open_g=None, open_w: int = 200,
                prof_bin: int = 0, with_x: bool = False, loci=None,
-               haps=None, x_classes=None) -> dict:
+               haps=None, x_classes=None, exclude_iv=None) -> dict:
     """One cell's contacts -- both ends called, min_d <= d <= max_d -- as
     genome coordinates, with every system's class at both ends, and per
     system x class the count, sum and sum of squares of ALL its called
@@ -900,7 +938,9 @@ def _read_cell(path, min_sites: int, min_d: int, max_d: int, exclude,
     df, names, ci, lut = _categorical(path, cols + (["k1", "k2"] if has_k
                                                     else []))
     ok_lut = np.array([_canon(c) not in exclude for c in names] + [False])
-    keep = ok_lut[ci]
+    keep = ok_lut[ci] & ~_in_excluded(df["pos1"].to_numpy(np.int64),
+                                      df["pos2"].to_numpy(np.int64), ci,
+                                      names, exclude_iv)
     base = lut[ci][keep] * STRIDE
     pos1 = df["pos1"].to_numpy(np.int64)[keep]
     pos2 = df["pos2"].to_numpy(np.int64)[keep]
@@ -4051,7 +4091,8 @@ CROSS_CONTEXTS = ("HCG", "GCH")
 
 
 def _read_cross(h_path, g_path, ms_h: int, ms_g: int, min_d: int,
-                max_d: int, lk, exclude=(), haps=None) -> dict:
+                max_d: int, lk, exclude=(), haps=None,
+                exclude_iv=None) -> dict:
     """One cell's contacts with HCG called at one end and GCH at the other,
     either way round -- both, when a contact has both at both ends -- the
     two posterior files joined on the read pair's ends, as the pipeline
@@ -4068,7 +4109,9 @@ def _read_cross(h_path, g_path, ms_h: int, ms_g: int, min_d: int,
                                                  "posterior2"])
         ok_l = np.array([_canon(c) not in exclude or _canon(c).upper() == "X"
                          for c in names] + [False])
-        keep = ok_l[ci]
+        keep = ok_l[ci] & ~_in_excluded(df["pos1"].to_numpy(np.int64),
+                                        df["pos2"].to_numpy(np.int64), ci,
+                                        names, exclude_iv)
         base = lut[ci][keep] * STRIDE
         g1 = base + df["pos1"].to_numpy(np.int64)[keep]
         g2 = base + df["pos2"].to_numpy(np.int64)[keep]
@@ -7848,6 +7891,11 @@ def main(argv=None) -> int:
                          "marker_bin_enrichment.py's downloads (mm10).")
     ap.add_argument("--cache-dir", default=None)
     ap.add_argument("--exclude-chrom", default="chrM,chrX,chrY")
+    ap.add_argument("--exclude-bed", action="append", default=None,
+                    help="BED of regions to leave out (e.g. the mm10 "
+                         "blacklist; repeatable): a read pair with either "
+                         "end in one is dropped, as in "
+                         "end_posterior_distance_correlation.py.")
     ap.add_argument("--n-threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--plot-format", default="pdf")
@@ -7862,6 +7910,11 @@ def main(argv=None) -> int:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     exclude = {_canon(c) for c in args.exclude_chrom.split(",") if c.strip()}
+    exclude_iv = read_exclude_beds(args.exclude_bed)
+    if exclude_iv:
+        n_iv = sum(len(v[0]) for v in exclude_iv.values())
+        logger.info(f"--exclude-bed: {n_iv:,} merged intervals on "
+                    f"{len(exclude_iv)} chromosomes")
     try:
         track_bins = parse_track_bins(args.chrx_track_bin)
     except ValueError as e:
@@ -8301,7 +8354,8 @@ def main(argv=None) -> int:
                               haps=(Path(args.haplotypes)
                                     / f"{c}.haplotypes.parquet"
                                     if args.haplotypes and chrx_on
-                                    else None))
+                                    else None),
+                              exclude_iv=exclude_iv)
         logger.info(f"{ctx}: reading {len(cells):,} cells")
         res_ = Parallel(n_jobs=args.n_threads, prefer="threads")(
             delayed(one)(i, c) for i, c in enumerate(cells))
@@ -8938,7 +8992,7 @@ def main(argv=None) -> int:
                 gd_ / f"{c}.posteriors.parquet", ms_h, ms_g,
                 args.min_distance, args.max_distance, x_classes, exclude,
                 haps=(Path(args.haplotypes) / f"{c}.haplotypes.parquet"
-                      if args.haplotypes else None))
+                      if args.haplotypes else None), exclude_iv=exclude_iv)
         logger.info(f"HCG×GCH: reading {len(cells_c):,} cells")
         rc_ = Parallel(n_jobs=args.n_threads, prefer="threads")(
             delayed(one_c)(c) for c in cells_c)
