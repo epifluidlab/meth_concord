@@ -19,8 +19,9 @@ The panels:
      annotation_class_concordance.py)
   f  ΔC x w between chromHMM states
   g  concordance along the genome per 1-Mb bin, its hot bins, and what
-     the hot bins are -- each annotation's share in them over all tested
-     bins, with p against genome rotations (locus_hotspots.tsv.gz)
+     the hot bins are -- each annotation the run tested, its share in
+     them over all tested bins, with p against genome rotations
+     (locus_hotspots.tsv.gz)
 
 The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
@@ -76,28 +77,26 @@ STATES = ("promoter", "enhancer", "transcribed", "polycomb",
 #: What + and - of ΔC x w mean, per mark.
 SIGN_WORDS = {"GCH": ("co-closed", "co-open"),
               "HCG": ("co-unmethylated", "co-methylated")}
-#: Panel g's tracks, (track, label), in groups -- domains, chromHMM states,
-#: gene density, gene families; A, early and HMD, near mirror images of B,
-#: late and PMD, are tested but not drawn.
+#: Panel g's annotations, (track, label), in groups -- domains, chromHMM
+#: states, gene density, gene families; any other track the run tested (a
+#: --hotspot-annotation BED) follows them under its own name.
 TSS_TRACK = "TSSs (count)"
-G_TRACKS = (("compartment: B", "B compartment"),
-            ("replication timing: late", "late replicating"),
-            ("PMD / HMD: PMD", "PMD"),
-            ("PMD borders", "PMD borders"),
-            ("chromHMM: heterochromatin", "heterochromatin"),
-            ("chromHMM: quiescent", "quiescent"),
-            ("chromHMM: polycomb", "polycomb"),
-            ("chromHMM: transcribed", "transcribed"),
-            ("chromHMM: enhancer", "enhancer"),
-            ("chromHMM: promoter", "promoter"),
-            (TSS_TRACK, "TSS density"),
-            ("CpG islands", "CpG islands"),
-            ("zinc-finger (Zfp / ZNF) genes", "Zfp genes"),
-            ("olfactory receptor genes", "olfactory receptors"),
-            ("protocadherin cluster", "protocadherin cluster"),
-            ("imprinted genes", "imprinted genes"))
-#: Where G_TRACKS' groups start.
-G_BREAKS = (4, 10, 12)
+G_GROUPS = (
+    (("compartment: A", "A compartment"),
+     ("compartment: B", "B compartment"),
+     ("replication timing: early", "early replicating"),
+     ("replication timing: late", "late replicating"),
+     ("PMD / HMD: HMD", "HMD"),
+     ("PMD / HMD: PMD", "PMD"),
+     ("PMD borders", "PMD borders")),
+    tuple((f"chromHMM: {st}", st) for st in STATES),
+    ((TSS_TRACK, "TSS density"),
+     ("CpG islands", "CpG islands")),
+    (("zinc-finger (Zfp / ZNF) genes", "Zfp genes"),
+     ("olfactory receptor genes", "olfactory receptors"),
+     ("protocadherin cluster", "protocadherin cluster"),
+     ("imprinted genes", "imprinted genes")))
+G_TRACKS = tuple(t for g in G_GROUPS for t in g)
 #: The hot-bin table's own columns; every other one is a track the run
 #: tested the bins against.
 HOT_FIELDS = frozenset({
@@ -273,6 +272,7 @@ def panel_b(ax, regions: pd.DataFrame, summ: pd.Series):
     """Per region, HCG-HCG against GCH-GCH Δr."""
     t = region_table(regions, summ)
     _scatter(ax, t["delta_gch"], t["delta_hcg"])
+    ax.set_box_aspect(1)
     ax.set_title(f"r = {summ['pearson_r']:+.2f}, ρ = "
                  f"{summ['spearman_rho']:+.2f}\ngenome rotation "
                  f"{_p(summ['rotation_p'])}", loc="left")
@@ -554,6 +554,17 @@ def tested_tracks(hot: pd.DataFrame) -> list:
             and pd.api.types.is_numeric_dtype(hot[c])]
 
 
+def g_rows(tracks) -> tuple:
+    """Panel g's rows, one per track the run tested: G_GROUPS' in order,
+    then any others under their own names; and where each group starts."""
+    tested = list(tracks)
+    groups = [[(t, lab) for t, lab in g if t in tested] for g in G_GROUPS]
+    groups.append([(t, t) for t in tested if t not in dict(G_TRACKS)])
+    groups = [g for g in groups if g]
+    return ([r for g in groups for r in g],
+            [int(b) for b in np.cumsum([len(g) for g in groups])[:-1]])
+
+
 def hot_enrichment(t: pd.DataFrame, tracks) -> pd.DataFrame:
     """Per track of ``tracks``, over bins ``t`` (one mark's tested bins, in
     genome order): the track's mean over the hot bins against its mean
@@ -661,9 +672,10 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
     from matplotlib.ticker import NullLocator
-    y = np.arange(len(G_TRACKS))[::-1].astype(float)
-    shown = [t for t, _ in G_TRACKS]
     tracks = tested_tracks(h)
+    rows, breaks = g_rows(tracks)
+    y = np.arange(len(rows))[::-1].astype(float)
+    shown = [t for t, _ in rows]
     res = {mark: hot_enrichment(h[h["context"] == mark], tracks)
            .set_index("track").reindex(shown) for _, mark, _ in MARKS}
     v = np.concatenate([r_[c].to_numpy(float) for r_ in res.values()
@@ -702,12 +714,11 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
     ax_enr.set_xticks(ticks)
     ax_enr.set_xticklabels([f"{t_:g}×" for t_ in ticks])
     ax_enr.xaxis.set_minor_locator(NullLocator())
-    for b in G_BREAKS:
-        ax_enr.axhline(len(G_TRACKS) - b - 0.5, color="0.85", lw=0.4,
-                       zorder=0)
+    for b in breaks:
+        ax_enr.axhline(len(rows) - b - 0.5, color="0.85", lw=0.4, zorder=0)
     ax_enr.set_yticks(y)
-    ax_enr.set_yticklabels([lab for _, lab in G_TRACKS], fontsize=5)
-    ax_enr.set_ylim(-0.7, len(G_TRACKS) - 0.3)
+    ax_enr.set_yticklabels([lab for _, lab in rows], fontsize=5)
+    ax_enr.set_ylim(-0.7, len(rows) - 0.3)
     ax_enr.tick_params(axis="y", length=0)
     ax_enr.set_xlabel("annotation in hot bins, fold over all tested bins\n"
                       "(* q < 0.05, genome rotations)")
@@ -739,17 +750,17 @@ def build_figure(d: dict, order, colors):
     panel_a(ax_ar, ax_ad, d["dist"])
     letters.append(("a", ax_ar[0], 0.06))
     # b, c, d: the regions, then the cells, overall and by type
-    gb = GridSpecFromSubplotSpec(1, 2, gs[1, 0:3], width_ratios=[0.12, 1],
+    gb = GridSpecFromSubplotSpec(1, 2, gs[1, 0:4], width_ratios=[0.12, 1],
                                  wspace=0.0)
     ax_b = fig.add_subplot(gb[1])
     panel_b(ax_b, d["regions"], d["regions_summary"])
     letters.append(("b", ax_b, 0.06))
-    gc = GridSpecFromSubplotSpec(2, 2, gs[1, 3:6], hspace=0.95, wspace=0.0,
+    gc = GridSpecFromSubplotSpec(2, 2, gs[1, 4:7], hspace=0.95, wspace=0.0,
                                  width_ratios=[0.15, 1])
     ax_c = [fig.add_subplot(gc[i, 1]) for i in range(2)]
     panel_c(ax_c, d["percell"])
     letters.append(("c", ax_c[0], 0.035))
-    gd = GridSpecFromSubplotSpec(2, 1, gs[1, 6:12], hspace=0.22)
+    gd = GridSpecFromSubplotSpec(2, 1, gs[1, 7:12], hspace=0.22)
     ax_d = [fig.add_subplot(gd[0])]
     ax_d.append(fig.add_subplot(gd[1], sharex=ax_d[0]))
     panel_d(ax_d, d["percell"], order, colors)
