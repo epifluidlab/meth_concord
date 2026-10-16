@@ -173,6 +173,39 @@ def test_pooled_null_refuses_a_real_ligation_from_any_cell(tmp_path):
     assert (pi[ka] != pi[kb]).all(), "a real ligation reached the null"
 
 
+def test_a_same_cell_stand_in_may_not_be_the_contact_again():
+    """link-shuffle, --null-scope cell, --null-exclude 1000: an end of a
+    near-copy of the contact (both ends within 1 kb) is refused, a clean
+    end at the partner's distance is taken; without the option the
+    near-copy's end is."""
+    import argparse
+    m = _mod()
+    S = 1 << 33
+    cols = {"g": ("p1", "p2")}
+    edges = m.build_edges(1000, 10_000_000, 8)
+
+    def draw(rows, w):
+        """rows: (end 1, end 2, p1, p2), pair 0 the contact."""
+        j = pd.DataFrame(rows, columns=["gpos1", "gpos2", "p1", "p2"])
+        j[["gpos1", "gpos2"]] += S
+        j["distance"] = j["gpos2"] - j["gpos1"]
+        pool = m._own_contact_pool(j, cols, 0, edges)
+        assert len(pool) == 4                   # the ends' mates come along
+        one = j.iloc[[0]]
+        args = argparse.Namespace(null_scope="cell", link_shuffle_bin=250_000,
+                                  null_exclude=w)
+        return m._draw_link_shuffle(one, one["distance"].to_numpy(), cols,
+                                    pool, 0, edges, args,
+                                    np.random.default_rng(0))
+
+    contact = (1_000_000, 1_050_000, 0.5, 0.5)
+    near_copy = (1_000_300, 1_050_400, 0.9, 0.95)
+    clean = (1_045_000, 3_000_000, 0.2, 0.3)    # 45 kb from the anchor
+    assert draw([contact, near_copy], 0)[1]["g"].tolist() == [0.95]
+    assert draw([contact, near_copy], 1000) is None
+    assert draw([contact, near_copy, clean], 1000)[1]["g"].tolist() == [0.2]
+
+
 # ------------------------------------------------------------------ options --
 
 def test_group_split_emits_a_table_per_group(tmp_path):

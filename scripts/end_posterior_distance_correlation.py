@@ -48,7 +48,12 @@ Nulls mirror the site-level script:
         each end on its own cell's mean in every arm (--cell-center auto), or
         the shared nucleus of a linked pair's two ends -- absent from a
         cross-cell null -- would count as concordance; the same-cell one
-        needs no centring.
+        needs no centring.  Within one cell an end at the real partner's
+        place can be its own molecule, or the end of a near-copy of the
+        contact (a third of a cortex cell's contacts >= 1 kb have another
+        with both ends within 1 kb: the same ligation captured twice), so
+        --null-exclude W refuses a stand-in within W of the real end 2 or
+        ligated to within W of end 1.
 
     --null-scope cell     donors come from the anchor's own cell.
     --null-scope pooled   donors come from every cell in the group, optionally
@@ -832,13 +837,18 @@ def _center_frame(f: pd.DataFrame, cols: dict) -> pd.DataFrame:
 
 
 def _merge_end_tables(parts: list):
-    """Concatenate end tables ``(pos, vals, pair_ids)`` and sort by position."""
+    """Concatenate end tables ``(pos, vals, pair_ids[, mates])`` and sort by
+    position; ``mates``, each end's read pair's other end, when every part
+    has them."""
     pos = np.concatenate([p[0] for p in parts])
     names = parts[0][1].keys()
     vals = {n_: np.concatenate([p[1][n_] for p in parts]) for n_ in names}
     pi = np.concatenate([p[2] for p in parts])
     o = np.argsort(pos, kind="stable")
-    return pos[o], {n_: v[o] for n_, v in vals.items()}, pi[o]
+    out = (pos[o], {n_: v[o] for n_, v in vals.items()}, pi[o])
+    if all(len(p) > 3 for p in parts):
+        out += (np.concatenate([p[3] for p in parts])[o],)
+    return out
 
 
 def _contact_ends(f: pd.DataFrame, edges) -> pd.DataFrame:
@@ -858,10 +868,12 @@ def _own_contact_pool(j: pd.DataFrame, cols: dict, base: int, edges):
     ids = base + keep.astype(np.int64)
     g1 = j["gpos1"].to_numpy(np.int64)[keep]
     g2 = j["gpos2"].to_numpy(np.int64)[keep]
+    # each end with its read pair's other end: --null-exclude refuses a
+    # stand-in ligated to the anchor's locus
     parts = [(g1, {n_: j[c1].to_numpy(float)[keep]
-                   for n_, (c1, _c2) in cols.items()}, ids),
+                   for n_, (c1, _c2) in cols.items()}, ids, g2),
              (g2, {n_: j[c2].to_numpy(float)[keep]
-                   for n_, (_c1, c2) in cols.items()}, ids)]
+                   for n_, (_c1, c2) in cols.items()}, ids, g1)]
     return _merge_end_tables(parts)
 
 
@@ -881,7 +893,8 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
     """
     if pool is None:
         return None
-    d_pos, d_vals, d_pi = pool
+    d_pos, d_vals, d_pi = pool[:3]
+    d_mate = pool[3] if len(pool) > 3 else None
     n = len(j)
     if d_pos.size == 0 or n == 0:
         return None
@@ -909,7 +922,27 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
     hi = np.minimum(hi, np.searchsorted(d_pos, y0 + B, side="left"))
     me = int(base // _PAIR_STRIDE)
     same_cell = getattr(args, "null_scope", "pooled") == "cell"
+    # --null-exclude W: within one cell, a stand-in within W of the real end
+    # 2 is likely its own molecule, and one whose read pair's other end lies
+    # within W of end 1 is ligated to end 1's locus -- a near-copy of the
+    # contact or another contact of the anchor -- so neither is unligated
+    W = int(getattr(args, "null_exclude", 0) or 0)
+    W = W if same_cell and d_mate is not None else 0
+
+    def ok_cell(kk, ii):
+        good = d_pi[kk] != (base + ii)
+        if W:
+            good &= ((np.abs(d_pos[kk] - g2[ii]) > W)
+                     & (np.abs(d_mate[kk] - g1[ii]) > W))
+        return good
+
     alive = in_range & (hi > lo)
+    if W:
+        # windows wholly within W of the real end 2 hold no stand-in
+        a_ = np.flatnonzero(alive)
+        near = ((d_pos[lo[a_]] >= g2[a_] - W)
+                & (d_pos[hi[a_] - 1] <= g2[a_] + W))
+        alive[a_[near]] = False
     kb_out = np.full(n, -1, dtype=np.int64)
     for _ in range(max_rounds):
         idx = np.flatnonzero(alive)
@@ -919,13 +952,20 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
         kk = lo[idx] + (rng.random(idx.size) * span).astype(np.int64)
         if same_cell:
             # the cell's own ends: anything but the real partner's read pair
-            good = d_pi[kk] != (base + idx)
+            good = ok_cell(kk, idx)
         else:
             # another cell (pair ids carry the cell): never a real ligation
             good = (d_pi[kk] // _PAIR_STRIDE) != me
         sel = idx[good]
         kb_out[sel] = kk[good]
         alive[sel] = False
+    if W:
+        # the few left after the rounds: their window, end by end
+        for i in np.flatnonzero(alive):
+            cand = np.arange(lo[i], hi[i])
+            cand = cand[ok_cell(cand, np.full(cand.size, i))]
+            if cand.size:
+                kb_out[i] = rng.choice(cand)
     placed = kb_out >= 0
     if not placed.any():
         return None
@@ -2343,6 +2383,15 @@ def main(argv=None) -> int:
                     choices=["distance-matched", "locus-matched",
                              "link-shuffle"],
                     default="distance-matched")
+    ap.add_argument("--null-exclude", type=int, default=0,
+                    help="link-shuffle under --null-scope cell: refuse a "
+                         "stand-in end within this many bp of the real end "
+                         "2 (likely its own molecule) or whose read pair's "
+                         "other end lies within it of end 1 (ligated to "
+                         "end 1's locus: a near-copy of the contact, or "
+                         "another contact of the anchor).  0 (default): off, "
+                         "as before; 1000 recommended -- a third of a "
+                         "cell's contacts >= 1 kb have a near-copy.")
     ap.add_argument("--link-shuffle-bin", type=int, default=250_000,
                     help="link-shuffle: the donor end must lie in the same "
                          "bin of this size as the real end 2 (250000).")

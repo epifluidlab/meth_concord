@@ -287,7 +287,8 @@ def assign_stratum(anchor_g, d, anchor_cell, pool_e, pool_n, dbins, rng,
 
 def assign_same_cell(anchor_g, d, anchor_cell, anchor_id, pool, pool_id,
                      dbins, rng, n_draws: int = 1, bounds=None,
-                     max_widen: int = 0, max_rounds: int = 16):
+                     max_widen: int = 0, max_rounds: int = 16,
+                     pool_mate=None, partner_g=None, exclude: int = 0):
     """Null donors from each contact's OWN cell, as
     end_posterior_distance_correlation.py's link-shuffle under --null-scope
     cell: an end of another of the cell's read pairs -- never the contact's
@@ -304,11 +305,20 @@ def assign_same_cell(anchor_g, d, anchor_cell, anchor_id, pool, pool_id,
     null's own noise -- the WHY OTHER CELLS above, which this mode accepts
     for the sake of the shared state.
 
+    ``exclude`` W (with ``pool_mate``, each donor end's read pair's other
+    end, and ``partner_g``, each contact's real partner): an end within W
+    of the real partner -- likely its own molecule -- or whose read pair's
+    other end lies within W of the anchor -- ligated to the anchor's locus:
+    a near-copy of the contact (a third of a cortex cell's contacts >= 1 kb
+    have one) or another contact of the anchor -- is refused too, and a
+    contact left with none drops out.
+
     ``pool``: (coordinates, posteriors, cells, _) of the donor ends, in any
     order; ``pool_id``: the read pair each belongs to; ``anchor_id``: each
     contact's own.  Returns (level, m, donor_p, n_reused) as
     :func:`assign_stratum`: ``m`` the window's mean posterior, the contact's
-    own ends aside; ``n_reused`` 0."""
+    own ends aside (refusals by ``exclude`` not taken out); ``n_reused``
+    0."""
     anchor_g = np.asarray(anchor_g, np.int64)
     anchor_cell = np.asarray(anchor_cell, np.int64)
     anchor_id = np.asarray(anchor_id, np.int64)
@@ -333,9 +343,23 @@ def assign_same_cell(anchor_g, d, anchor_cell, anchor_id, pool, pool_id,
     key = (cell << np.int64(shift)) + g
     o = np.argsort(key, kind="mergesort")
     key = key[o]
+    gs = g[o]
     ps = np.asarray(pool[1], float)[o]
     ids = np.asarray(pool_id, np.int64)[o]
     cum = np.concatenate([[0.0], np.cumsum(ps)])
+    W = int(exclude or 0)
+    if W and pool_mate is not None and partner_g is not None:
+        mates = np.asarray(pool_mate, np.int64)[o]
+        partner_g = np.asarray(partner_g, np.int64)
+    else:
+        W = 0
+
+    def valid(j, i):
+        ok = ids[j] != anchor_id[i]
+        if W:
+            ok &= ((np.abs(gs[j] - partner_g[i]) > W)
+                   & (np.abs(mates[j] - anchor_g[i]) > W))
+        return ok
     # where each contact's own ends sit in that order: two at most, its
     # left and its right
     oi = np.argsort(ids, kind="mergesort")
@@ -370,6 +394,13 @@ def assign_same_cell(anchor_g, d, anchor_cell, anchor_id, pool, pool_id,
         level[hit] = w
         L[hit], H[hit] = lw[ok], hw[ok]
         m[hit] = (cum[hw] - cum[lw] - s_own)[ok] / free[ok]
+    if W:
+        # windows wholly within W of the real partner hold no stand-in
+        a_ = np.flatnonzero(level >= 0)
+        near = ((gs[L[a_]] >= partner_g[a_] - W)
+                & (gs[H[a_] - 1] <= partner_g[a_] + W))
+        level[a_[near]] = -1
+        m[a_[near]] = np.nan
     has = np.flatnonzero(level >= 0)
     for dr in range(n_draws):
         got = np.full(n, -1, np.int64)
@@ -379,12 +410,18 @@ def assign_same_cell(anchor_g, d, anchor_cell, anchor_id, pool, pool_id,
                 break
             j = L[todo] + (rng.random(todo.size)
                            * (H[todo] - L[todo])).astype(np.int64)
-            ok = ids[j] != anchor_id[todo]
+            ok = valid(j, todo)
             got[todo[ok]] = j[ok]
             todo = todo[~ok]
-        for i in todo:              # windows of the contact's own ends and
-            cand = np.arange(L[i], H[i])            # one other
-            got[i] = rng.choice(cand[ids[cand] != anchor_id[i]])
+        for i in todo:              # windows mostly of refused ends
+            cand = np.arange(L[i], H[i])
+            cand = cand[valid(cand, np.full(cand.size, i))]
+            if cand.size:
+                got[i] = rng.choice(cand)
+            else:                   # none it may take: out, every draw
+                level[i] = -1
+                m[i] = np.nan
+        has = has[level[has] >= 0]
         donor_p[dr, has] = ps[got[has]]
     return level, m, donor_p, 0
 

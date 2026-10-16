@@ -211,3 +211,34 @@ def test_a_same_cell_donor_is_another_read_pair_of_the_cell_at_its_place():
     assert lv.tolist() == [0, -1, -1] and ru == 0
     assert dp[:, 0].tolist() == [0.11, 0.11] and m[0] == pytest.approx(0.11)
     assert np.isnan(dp[:, 1:]).all()
+
+
+def test_a_same_cell_stand_in_may_not_be_the_contact_again():
+    """--null-exclude: within W of the real partner (its own molecule) or
+    ligated to within W of the anchor (a near-copy of the contact, another
+    contact of the anchor) -- refused; a clean end 10 kb off is taken."""
+    dbins = ls.log_dbins(1000, 10_000_000, 4)
+    # (coordinate, posterior, read pair, its other end), all of cell 0
+    near_copy = (1_050_400, 0.95, 7, 1_000_300)
+    anchor_mate = (1_045_000, 0.66, 8, 1_000_500)
+    clean = (1_040_000, 0.11, 1, 2_000_000)
+    own = (1_050_000, 0.5, 0, 1_000_000)
+
+    def draw(rows, w):
+        a = np.array(rows, dtype=float)
+        return ls.assign_same_cell(
+            np.array([1_000_000]), np.array([50_000]), np.array([0]),
+            np.array([0]),
+            (a[:, 0].astype(np.int64), a[:, 1], np.zeros(len(a), np.int64),
+             None), a[:, 2].astype(np.int64), dbins,
+            np.random.default_rng(0), n_draws=2,
+            bounds=(np.array([1_000_000]), np.array([1_250_000])),
+            pool_mate=a[:, 3].astype(np.int64),
+            partner_g=np.array([1_050_000]), exclude=w)
+
+    lv, _, dp, _ = draw([own, near_copy], 0)
+    assert lv[0] == 0 and dp[:, 0].tolist() == [0.95, 0.95]
+    lv, _, dp, _ = draw([own, near_copy, anchor_mate], 1000)
+    assert lv[0] == -1 and np.isnan(dp[:, 0]).all()
+    lv, _, dp, _ = draw([own, near_copy, anchor_mate, clean], 1000)
+    assert lv[0] == 0 and dp[:, 0].tolist() == [0.11, 0.11]
