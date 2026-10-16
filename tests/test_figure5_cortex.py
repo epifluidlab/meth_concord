@@ -202,12 +202,9 @@ def test_a_track_the_bins_follow_is_starred_and_the_rest_are_not():
     b = t["compartment: B"].to_numpy()
     t["delta"] += 0.004 * (b - b.mean()) / b.std()
     e = f5.track_rhos(t).set_index("track")
-    assert e.loc["compartment: B", "rho_given_tss"] > 0.5
+    assert e.loc["compartment: B", "rho"] > 0.5
     assert e.loc["compartment: B", "q"] < 0.05
     assert (e.drop(index="compartment: B")["q"] > 0.05).all()
-    # TSS density has no value given itself: its own, raw, is tested
-    assert np.isnan(e.loc[f5.TSS_TRACK, "rho_given_tss"])
-    assert np.isfinite(e.loc[f5.TSS_TRACK, "p"])
 
 
 def test_neighbouring_bins_alike_are_not_a_finding():

@@ -19,8 +19,8 @@ The panels:
      annotation_class_concordance.py)
   f  ΔC x w between chromHMM states
   g  concordance along the genome per 1-Mb bin, its hot bins, and what
-     the bins are -- each track's Spearman rho given TSS density, with p
-     against genome rotations (locus_hotspots.tsv.gz)
+     the bins are -- each track's Spearman rho, with p against genome
+     rotations (locus_hotspots.tsv.gz)
 
 The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
@@ -76,7 +76,7 @@ STATES = ("promoter", "enhancer", "transcribed", "polycomb",
 #: What + and - of ΔC x w mean, per mark.
 SIGN_WORDS = {"GCH": ("co-closed", "co-open"),
               "HCG": ("co-unmethylated", "co-methylated")}
-#: Panel g's tracks, (track, label); TSS density has no value given itself.
+#: Panel g's tracks, (track, label).
 TSS_TRACK = "TSSs (count)"
 G_TRACKS = (("compartment: B", "B compartment"),
             ("replication timing: late", "late replicating"),
@@ -514,8 +514,8 @@ def _rotation_p(x, y, min_shift: int = 50) -> float:
     the series when that is fewer), as annotation_class_concordance.py
     tests its contrasts: neighbouring bins are not independent, and a shift
     keeps each series' own autocorrelation while breaking their alignment.
-    The series as given -- ranks, or their residuals -- so the statistic is
-    the one drawn.  NaN when too few shifts remain to reach p < 0.05."""
+    The series as given -- ranks, so the statistic is the Spearman rho
+    drawn.  NaN when too few shifts remain to reach p < 0.05."""
     x, y = np.asarray(x, float), np.asarray(y, float)
     n = x.size
     ms = max(1, min(min_shift, n // 10))
@@ -532,39 +532,26 @@ def _rotation_p(x, y, min_shift: int = 50) -> float:
 
 def track_rhos(t: pd.DataFrame) -> pd.DataFrame:
     """Per track of G_TRACKS, over bins ``t`` (one mark's tested bins, in
-    genome order): Spearman rho between a bin's ΔC and the track, the same
-    given TSS density (the ranks' residuals on its ranks, as the run's
-    rho_given_tss), the control's both, and for the one drawn as the bar --
-    given TSS; TSS density's own, raw -- p against genome rotations and BH
-    q over the tracks.  Not the run's p_rho: that one counts the bins as
-    independent, and neighbouring bins share compartments and contacts."""
+    genome order): Spearman rho between a bin's ΔC and the track, the
+    control's, and rho's p against genome rotations with BH q over the
+    tracks.  Not the run's p_rho: that one counts the bins as independent,
+    and neighbouring bins share compartments and contacts."""
     from scipy.stats import rankdata
-
-    def resid(r, z):
-        z = np.column_stack([np.ones(z.size), z])
-        return r - z @ np.linalg.lstsq(z, r, rcond=None)[0]
 
     def corr(a, b):
         return (float(np.corrcoef(a, b)[0, 1])
                 if a.std() > 0 and b.std() > 0 else np.nan)
     rd, rc = rankdata(t["delta"]), rankdata(t["control"])
-    rt = rankdata(t[TSS_TRACK]) if TSS_TRACK in t else None
     rows = []
     for name, _ in G_TRACKS:
         row = {"track": name}
         if name in t:
             rx = rankdata(t[name])
             row["rho"], row["rho_control"] = corr(rd, rx), corr(rc, rx)
-            a, b = rd, rx
-            if rt is not None and name != TSS_TRACK:
-                a, b = resid(rd, rt), resid(rx, rt)
-                row["rho_given_tss"] = corr(a, b)
-                row["rho_control_given_tss"] = corr(resid(rc, rt), b)
-            row["p"] = _rotation_p(a, b)
+            row["p"] = _rotation_p(rd, rx)
         rows.append(row)
     out = pd.DataFrame(rows)
-    for c in ("rho", "rho_control", "rho_given_tss", "rho_control_given_tss",
-              "p"):
+    for c in ("rho", "rho_control", "p"):
         if c not in out:
             out[c] = np.nan
     out["q"] = fdr_bh(out["p"])
@@ -644,27 +631,22 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
     span = []
     for k, (_, mark, _) in enumerate(MARKS):
         e = track_rhos(h[h["context"] == mark])
-        given = e["rho_given_tss"].to_numpy(float)
-        raw = e["rho"].to_numpy(float)
+        rho = e["rho"].to_numpy(float)
+        ctl = e["rho_control"].to_numpy(float)
         yk = y + (0.19 if k == 0 else -0.19)
-        ok = np.isfinite(given)
-        ax_enr.barh(yk[ok], given[ok], height=0.36, color=MARK_COLOR[mark],
+        ok = np.isfinite(rho)
+        ax_enr.barh(yk[ok], rho[ok], height=0.36, color=MARK_COLOR[mark],
                     alpha=0.8, lw=0, label=mark)
-        ax_enr.scatter(raw, yk, s=4, facecolor="white", edgecolor="0.2",
-                       lw=0.45, zorder=3, label="raw" if k else None)
-        # the control as the bar is: given TSS, TSS density's own raw
-        ctl = np.where(ok, e["rho_control_given_tss"], e["rho_control"])
         ax_enr.scatter(ctl, yk, s=5, marker="|", color="0.45", lw=0.6,
                        zorder=3, label="control" if k else None)
-        shown = np.where(ok, given, raw)
-        for yy, s_, q_ in zip(yk, shown, e["q"]):
+        for yy, s_, q_ in zip(yk, rho, e["q"]):
             if q_ < 0.05:
                 # an asterisk rides high in its line: set down to the bar
                 ax_enr.text(s_ + (0.004 if s_ >= 0 else -0.004), yy - 0.24,
                             "*", ha="left" if s_ >= 0 else "right",
                             va="center", fontsize=6.5,
                             color=MARK_COLOR[mark])
-        span += [given, raw, ctl]
+        span += [rho, ctl]
     _zero(ax_enr, "x")
     v = np.concatenate(span)
     lim = np.nanmax(np.abs(v[np.isfinite(v)])) * 1.18 if np.isfinite(
@@ -674,9 +656,8 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
     ax_enr.set_yticklabels([lab for _, lab in G_TRACKS], fontsize=5)
     ax_enr.set_ylim(-0.7, len(G_TRACKS) - 0.3)
     ax_enr.set_xlabel("Spearman ρ, bins' ΔC against the track\n"
-                      "(bars: given TSS density; * q < 0.05, "
-                      "genome rotations)")
-    ax_enr.legend(frameon=False, loc="lower right", fontsize=4.6, ncol=4,
+                      "(* q < 0.05, genome rotations)")
+    ax_enr.legend(frameon=False, loc="lower right", fontsize=4.6, ncol=3,
                   handletextpad=0.2, borderaxespad=0.1, columnspacing=0.9,
                   bbox_to_anchor=(1.0, 1.0))
 
