@@ -348,6 +348,19 @@ def test_a_cells_regional_state_cancels_against_its_own_cells_donors(
     assert 0 < cell["pairs"] < pooled["pairs"]       # fewer have a donor
 
 
+def test_planted_coordination_survives_the_same_cell_null(tmp_path):
+    """What the cell's own ends cannot copy -- a partner that copies its
+    anchor -- stays: the same-cell donor is never the real partner."""
+    d = make_data(tmp_path, n_types=2, per=10, coord=lambda t, c: 0.5,
+                  seed=11)
+    r = _row(run(d, systems="pmd",
+                 extra=("--celltype-auc-stats", "none", "--n-locus-perm",
+                        "0", "--no-covariates", "--no-hotspots",
+                        "--null-scope", "cell", "--bins-per-decade", "8",
+                        "--max-widen", "0"))[0], "pmd", "HMD", "HMD")
+    assert r["delta_lo"] > 0.1                     # +15 pp, as pooled
+
+
 def test_an_excluded_region_drops_a_read_pair_with_an_end_in_it(tmp_path):
     """--exclude-bed, as end_posterior_distance_correlation.py: intervals
     merged, either end inside drops the pair, chromosome names as one."""
