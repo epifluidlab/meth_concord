@@ -82,6 +82,9 @@ G_TRACKS = (("compartment: B", "B compartment"),
             ("TSSs (count)", "TSS density"))
 #: The whole distance range of the class tables.
 ALL_BAND = "all 1kb-10Mb"
+#: Panel e's dot, as a share of an axis's range (2.2 pt of ~56): intervals
+#: narrower than it hide behind it.
+DOT_FRACTION = 0.05
 HOT_C, COLD_C = "#c0392b", "#2166ac"
 
 
@@ -346,6 +349,19 @@ def panel_e(axes, summ: pd.DataFrame):
                 xlab += f"\n+ {SIGN_WORDS[mark][1]}"
             ax.set_xlabel(xlab)
         axes[2 * k].set_title(label_of(mark), loc="left", color=col)
+        # millions of contacts: the intervals can be narrower than the dots
+        # -- say so, or they read as missing
+        narrow = []
+        for ax, stat in ((axes[2 * k], "delta"),
+                         (axes[2 * k + 1], "signed_rel")):
+            x0, x1 = ax.get_xlim()
+            w_ = 100 * (t[f"{stat}_hi"] - t[f"{stat}_lo"]).to_numpy(float)
+            narrow.append(np.nanmedian(w_) / (x1 - x0) < DOT_FRACTION)
+        if any(narrow):
+            axes[2 * k + 1].text(1.0, 1.02, "95% CIs within the dots",
+                                 transform=axes[2 * k + 1].transAxes,
+                                 ha="right", va="bottom", fontsize=4.6,
+                                 color="0.4")
     # the axes share y: the labels once, on the first
     axes[0].set_ylim(-0.6, len(E_PAIRS) - 0.4)
     axes[0].set_yticks(y)
