@@ -465,10 +465,14 @@ def _genome_x(hot: pd.DataFrame):
 def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame, enr: pd.DataFrame):
     """``ax_tracks``: per mark, ΔC per bin along the genome; ``ax_enr``:
     what the bins are, the marks side by side per track."""
-    h = hot[(hot["band"] == ALL_BAND) & hot["tested"].astype(bool)].copy()
-    h["x"], order, off, ends = _genome_x(h)
+    every = hot[hot["band"] == ALL_BAND].copy()
+    every["x"], order, off, ends = _genome_x(every)
+    h = every[every["tested"].astype(bool)]
     for r, (ax, (_, mark, label)) in enumerate(zip(ax_tracks, MARKS)):
         t = h[h["context"] == mark]
+        # bins short of contacts are not tested: ticked along the foot, so
+        # gaps read as untested bins, not as wider ones
+        un = every[(every["context"] == mark) & ~every["tested"].astype(bool)]
         key = t["chrom"].str.replace("chr", "", regex=False)
         alt = key.map({c: i % 2 for i, c in enumerate(order)})
         ax.scatter(t["x"] / 1e6, 100 * t["control"], s=0.6, color="0.88",
@@ -483,7 +487,10 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame, enr: pd.DataFrame):
             ax.scatter(t.loc[m, "x"] / 1e6, 100 * t.loc[m, "delta"], s=2.2,
                        color=c, lw=0, rasterized=True, zorder=2)
             n_[flag] = int(m.sum())
-        ax.text(0.005, 0.98, f"hot {n_['hot']} of {len(t):,} bins",
+        n_bins = len(t) + len(un)
+        ax.text(0.005, 0.98, f"hot {n_['hot']} of {len(t):,} tested bins"
+                + (f" (of {n_bins:,}; grey ticks: too few contacts)"
+                   if len(un) > 0.05 * n_bins else ""),
                 transform=ax.transAxes, ha="left", va="top", fontsize=4.8,
                 color=HOT_C)
         ax.text(0.995, 0.98, f"cold {n_['cold']}", transform=ax.transAxes,
@@ -491,8 +498,15 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame, enr: pd.DataFrame):
         _zero(ax)
         ax.set_xlim(0, (off[order[-1]] + ends[order[-1]]) / 1e6)
         lo = np.nanpercentile(100 * t["delta"], 0.5)
-        ax.set_ylim(min(lo, np.nanpercentile(100 * t["control"], 0.5)),
-                    1.25 * np.nanmax(100 * t["delta"]))
+        lo = min(lo, np.nanpercentile(100 * t["control"], 0.5))
+        hi = 1.25 * np.nanmax(100 * t["delta"])
+        if len(un):
+            foot = lo - 0.06 * (hi - lo)
+            ax.scatter(un["x"] / 1e6, np.full(len(un), foot), s=1.2,
+                       marker="|", color="0.7", lw=0.4, rasterized=True,
+                       zorder=0)
+            lo = foot - 0.04 * (hi - lo)
+        ax.set_ylim(lo, hi)
         ax.set_ylabel(f"{mark}\nΔC (pp)", color=MARK_COLOR[mark])
         mids = [(off[c] + ends[c] / 2) / 1e6 for c in order]
         ax.set_xticks(mids)
