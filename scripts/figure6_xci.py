@@ -22,10 +22,12 @@ The panels, from the runs' tables:
   f  escape against inactivated genes: levels (haplotype_genes_<line>.tsv),
      contacts 1 Mb or more (haplotype_contacts.tsv)
   g  cells by their own XCI strength (haplotype_xci_cells/_strata/_trend)
-  h  X's excess concordance over the autosomes, observed and predicted from
-     the copies' levels alone (copy_mixing_excess.py)
+  h  X's excess concordance over the autosomes, observed and expected from
+     the copies' level difference alone (copy_mixing_excess.py), with p of
+     the clonal line's observed against expected
   i  each copy's concordance against non-contacting pairs of the same cell
-     and copy (end_posterior_distance_correlation.py --haplotypes)
+     and copy, with p of X against the autosomes and of Xi against Xa
+     (end_posterior_distance_correlation.py --haplotypes)
 
     python scripts/figure6_xci.py --contacts haplotype_contacts_v2 \\
         --allelic-summary allelic_imbalance_gm12878_elements/allelic_summary.tsv \\
@@ -427,6 +429,36 @@ def panel_g(ax_h, ax1, ax2, cells, strata, trend):
     ax1.legend(frameon=False, loc="upper center", ncol=2)
 
 
+def _p(p) -> str:
+    return "p n/a" if not np.isfinite(p) else (
+        "p < 0.001" if p < 0.001 else f"p = {p:.2g}")
+
+
+def vs_expected(cme: pd.DataFrame) -> pd.Series:
+    """Per row of copy_mixing_excess.tsv, p of observed against expected:
+    their difference over both intervals' standard errors (95% interval /
+    3.92), taken as independent -- cells resampled for the one, SNP blocks
+    for the other."""
+    from scipy.stats import norm
+    z = norm.ppf(0.975)
+    se = np.hypot((cme["observed_hi"] - cme["observed_lo"]) / (2 * z),
+                  (cme["predicted_hi"] - cme["predicted_lo"]) / (2 * z))
+    return pd.Series(2 * norm.sf(np.abs(cme["observed"] - cme["predicted"])
+                                 / se), index=cme.index)
+
+
+def _tops(ax, xs, rows, gap=0.075):
+    """Rows of text along the top of ``ax``, one per (texts, colour), each
+    text at its x; the y range opened to make room."""
+    y0, y1 = ax.get_ylim()
+    ax.set_ylim(y0, y1 + (gap * len(rows) + 0.03) * (y1 - y0) / (
+        1 - gap * len(rows) - 0.03))
+    for k, (texts, col) in enumerate(rows):
+        for x, t in zip(xs, texts):
+            ax.text(x, 0.99 - gap * k, t, transform=ax.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=4.6, color=col)
+
+
 def panel_h(axes, cme: pd.DataFrame, fine: pd.DataFrame, clonal, mosaic):
     for ax, ctx in zip(axes, ("HCG", "GCH")):
         f = fine[fine["context"] == ctx]
@@ -436,7 +468,7 @@ def panel_h(axes, cme: pd.DataFrame, fine: pd.DataFrame, clonal, mosaic):
                         100 * f["predicted_hi"][ok], color=XI, alpha=0.18,
                         lw=0)
         ax.plot(xm[ok], 100 * f["predicted"][ok], color=XI,
-                label="predicted: copies' levels alone")
+                label="expected from the copies' level\ndifference alone")
         o = cme[cme["context"] == ctx]
         for k, (g, col, mk) in enumerate(((clonal, "black", "o"),
                                           (mosaic, BULK, "s"))):
@@ -451,37 +483,61 @@ def panel_h(axes, cme: pd.DataFrame, fine: pd.DataFrame, clonal, mosaic):
         ax.set_xlim(1e3, 1e7)
         ax.set_xlabel("distance between contact ends (bp)")
         ax.set_title(f"{ctx}–{ctx}", loc="left")
+        # the clonal line's observed against expected, band by band
+        u = o[o["group"] == clonal].sort_values("dist_lo")
+        if len(u) and {"predicted_lo", "predicted_hi"} <= set(u.columns):
+            _tops(ax, np.sqrt(u["dist_lo"] * u["dist_hi"]),
+                  [([_p(v) for v in vs_expected(u)], "black")])
+            ax.set_title(f"p: {clonal} against expected", loc="right",
+                         fontsize=5, color="0.3")
     axes[0].set_ylabel("ΔC, chrX − autosomes (pp)")
-    axes[0].legend(frameon=False, loc="upper right", fontsize=5)
+    axes[0].legend(frameon=False, loc="upper right", fontsize=5,
+                   bbox_to_anchor=(1.0, 0.9))
 
 
 def panel_i(ax, units: pd.DataFrame):
     u = units[units["measure"] == "gg"]
     series = (("chrX Xi", XI, "Xi"), ("chrX Xa", XA, "Xa"),
-              ("autosomes same copy", AUTO, "autosomes (per copy)"))
+              ("autosomes same copy", AUTO, "autosomes"))
     for k, (cmp_, col, lab) in enumerate(series):
         t = u[u["comparison"] == cmp_].sort_values("band_lo")
         if not len(t):
             continue
         xc = np.sqrt(t["band_lo"] * t["band_hi"]) * (1.25 ** (k - 1))
         _err(ax, xc, t["value"], t["lo"], t["hi"], col, lab)
-    d = u[u["comparison"] == "chrX − autosomes, same copy"]
-    if len(d):
-        inc = bool(((d["lo"] < 0) & (d["hi"] > 0)).all())
-        ax.text(0.97, 0.97, "chrX − autosomes, per copy:\n"
-                + ("no difference at any distance" if inc
-                   else "differs in some band"),
-                transform=ax.transAxes, va="top", ha="right", fontsize=5.2)
     _zero(ax)
     ax.set_xscale("log")
+    # room left of the first band for its p
+    ax.set_xlim(1.4e3, 7e6)
     ax.set_xlabel("distance between ends (bp)")
     ax.set_ylabel("Δr, contacts − same-cell, same-copy null")
     ax.set_title("GCH–GCH concordance per copy", loc="left")
     lo = np.nanmin(u.loc[u["comparison"].isin([c for c, _, _ in series]),
                          "lo"])
-    ax.set_ylim(min(lo, 0) - 0.06, ax.get_ylim()[1] + 0.06)
-    ax.legend(frameon=False, loc="lower center", ncol=3, handletextpad=0.2,
-              columnspacing=0.8)
+    # each band's p, X against the autosomes and Xi against Xa, the cells
+    # resampled -- in place of a word that says what they say; their key a
+    # coloured p in the legend
+    from matplotlib.lines import Line2D
+    rows, keys = [], []
+    for cmp_, col, lab in (("chrX − autosomes, same copy", AUTO,
+                            "X − autosomes"),
+                           ("chrX Xi − chrX Xa", XI, "Xi − Xa")):
+        d = u[u["comparison"] == cmp_].sort_values("band_lo")
+        if len(d) and "p" in d:
+            xs = np.sqrt(d["band_lo"] * d["band_hi"])
+            rows.append(([_p(v) for v in d["p"]], col))
+            keys.append((Line2D([], [], ls="", marker="$p$", ms=4.5,
+                                color=col), lab))
+    ax.set_ylim(min(lo, 0) - (0.12 if keys else 0.06), ax.get_ylim()[1])
+    if rows:
+        _tops(ax, xs, rows)
+    h, lab = ax.get_legend_handles_labels()
+    h, lab = h + [k for k, _ in keys], lab + [t for _, t in keys]
+    if len(h) == 5:
+        # filled column by column: the copies on one row, the p's below
+        h, lab = ([v[i] for i in (0, 3, 1, 4, 2)] for v in (h, lab))
+    ax.legend(h, lab, frameon=False, loc="lower center", ncol=3,
+              handletextpad=0.2, columnspacing=0.8)
 
 
 # ----------------------------------------------------------------- layout --

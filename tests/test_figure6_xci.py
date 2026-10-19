@@ -106,25 +106,29 @@ def _tables(root: Path, with_calls=True):
                      ).to_csv(c / "haplotype_xi_calls_IMR.tsv", sep="\t",
                               index=False)
     bands = [(1e3, 1e4), (1e4, 1e5), (1e5, 1e6), (1e6, 1e7)]
-    pd.DataFrame([(ctx, g, a, b, v, v - 0.01, v + 0.01)
-                  for ctx, v in (("HCG", 0.03), ("GCH", 0.0))
+    pd.DataFrame([(ctx, g, a, b, v, v - 0.01, v + 0.01, e, e - 0.004,
+                   e + 0.004)
+                  for ctx, v, e in (("HCG", 0.03, 0.015), ("GCH", 0.0, 0.0))
                   for g in ("GM", "IMR") for a, b in bands],
                  columns=["context", "group", "dist_lo", "dist_hi",
-                          "observed", "observed_lo", "observed_hi"]).to_csv(
-        cm / "copy_mixing_excess.tsv", sep="\t", index=False)
+                          "observed", "observed_lo", "observed_hi",
+                          "predicted", "predicted_lo", "predicted_hi"]
+                 ).to_csv(cm / "copy_mixing_excess.tsv", sep="\t",
+                          index=False)
     lo = 10 ** np.arange(3.0, 7.0, 0.1)
     pd.DataFrame([(ctx, a, a * 10 ** 0.1, v, v - 0.005, v + 0.005)
                   for ctx, v in (("HCG", 0.015), ("GCH", 0.0)) for a in lo],
                  columns=["context", "dist_lo", "dist_hi", "predicted",
                           "predicted_lo", "predicted_hi"]).to_csv(
         cm / "copy_mixing_excess_fine.tsv", sep="\t", index=False)
-    pd.DataFrame([("gg", cmp_, a, b, v, v - 0.03, v + 0.03)
+    pd.DataFrame([("gg", cmp_, a, b, v, v - 0.03, v + 0.03, 0.5)
                   for cmp_, v in (("chrX Xi", 0.05), ("chrX Xa", 0.05),
                                   ("autosomes same copy", 0.05),
-                                  ("chrX − autosomes, same copy", 0.0))
+                                  ("chrX − autosomes, same copy", 0.0),
+                                  ("chrX Xi − chrX Xa", 0.0))
                   for a, b in bands],
                  columns=["measure", "comparison", "band_lo", "band_hi",
-                          "value", "lo", "hi"]).to_csv(
+                          "value", "lo", "hi", "p"]).to_csv(
         un / "end_posterior_units_GM.tsv", sep="\t", index=False)
     return c, cm, un
 
@@ -188,3 +192,21 @@ def test_the_mosaic_calls_come_from_the_table_or_the_option(tmp_path):
         f6.main(_argv(tmp_path, c, cm, un))
     assert f6.main(_argv(tmp_path, c, cm, un,
                          ("--mosaic-calls", "hap1=10,hap2=20"))) == 0
+
+
+def test_observed_against_expected_is_tested_on_both_intervals():
+    cme = pd.DataFrame({"observed": [0.02, 0.05, 0.02],
+                        "observed_lo": [0.01, 0.045, 0.0],
+                        "observed_hi": [0.03, 0.055, 0.04],
+                        "predicted": [0.02, 0.02, 0.01],
+                        "predicted_lo": [0.015, 0.015, 0.005],
+                        "predicted_hi": [0.025, 0.025, 0.015]})
+    p = f6.vs_expected(cme)
+    assert p[0] == pytest.approx(1.0)
+    assert p[1] < 1e-6
+    # the expected interval widens the test: with it alone narrower, the
+    # same gap is less sure
+    wide = cme.assign(predicted_lo=cme["predicted"] - 0.02,
+                      predicted_hi=cme["predicted"] + 0.02)
+    assert f6.vs_expected(wide)[2] > p[2]
+
