@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 _SCRIPT = (Path(__file__).resolve().parent.parent / "scripts"
            / "end_posterior_distance_correlation.py")
@@ -261,4 +262,37 @@ def test_a_unit_with_no_pairs_for_a_measure_still_runs(tmp_path):
     x = t[(t["comparison"] == "chrX Xi") & (t["element"] == "all")]
     assert x.loc[x["measure"] == "hh", "value"].isna().all()
     assert x.loc[x["measure"] == "gg", "value"].notna().any()
+
+
+def _argv_units(root, sp, out, posteriors=None):
+    gch = posteriors or root / "GCH"
+    return ["--posteriors", f"GCH={gch}", "--posteriors",
+            f"HCG={posteriors or root / 'HCG'}", "--samples", str(sp),
+            "--group-column", "group", "--haplotypes", str(root / "haps"),
+            "--xi", "GM=1", "--genome", "none", "--chrx-par", "none",
+            "--chrx-escape", "none", "--null-type", "link-shuffle",
+            "--null-scope", "cell", "--min-pairs", "30", "--n-bootstrap",
+            "20", "--per-cell", "off", "--n-threads", "1", "--plot-format",
+            "png", "--output-dir", str(out)]
+
+
+def test_a_posteriors_directory_with_no_cells_stops_at_once(tmp_path):
+    m = _mod()
+    root = tmp_path / "d"
+    sp, _ = _fixture_elements(root, n_cells=4, per=200)
+    (root / "empty").mkdir()
+    with pytest.raises(SystemExit, match="posteriors.parquet"):
+        m.main(_argv_units(root, sp, tmp_path / "o", root / "empty"))
+
+
+def test_haplotypes_of_other_read_pairs_stop_at_once(tmp_path):
+    m = _mod()
+    root = tmp_path / "d"
+    sp, _ = _fixture_elements(root, n_cells=4, per=200)
+    # the haplotype files' read pairs a base off the posteriors' own
+    for f in (root / "haps").glob("*.parquet"):
+        t = pd.read_parquet(f)
+        t.assign(pos1=t["pos1"] + 1).to_parquet(f)
+    with pytest.raises(SystemExit, match="none of"):
+        m.main(_argv_units(root, sp, tmp_path / "o"))
 

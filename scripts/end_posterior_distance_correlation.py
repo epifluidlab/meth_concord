@@ -689,7 +689,8 @@ def unit_figure(t: pd.DataFrame, line: str, path) -> bool:
     return True
 
 
-def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom):
+def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom,
+                paths=None):
     """--haplotypes: the cells split into units (UNITS), one group per line
     (--group-column) and unit; each cell's inactive X (--xi); a pooled
     null's strata kept per unit.  Returns (groups, the units' strata,
@@ -762,6 +763,8 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom):
     if not xi_of:
         raise SystemExit(f"--haplotypes: no cell has {hd}/<cell>"
                          f".haplotypes.parquet (and an inactive X call)")
+    if paths:
+        _probe_haplotypes(paths, hd, list(xi_of)[:3], args)
     args.units_cfg = {"dir": str(hd), "xi": xi_of, "par": par,
                       "escape": esc, "elements": elements}
     logger.info(f"--haplotypes: {len(xi_of):,} cells in "
@@ -770,6 +773,37 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom):
                 f"without a haplotype file, {n_call} without an inactive-X "
                 f"call); lines: {sorted(lines)}")
     return groups, strata, lines
+
+
+def _probe_haplotypes(paths: dict, hd: Path, cells, args) -> None:
+    """A few cells' posteriors' read pairs against their haplotype files, as
+    the units find them (chrom and the two ends): how many carry a
+    haplotype, stopping where none does -- files made from other read pairs
+    would leave every unit empty."""
+    tagged = total = 0
+    for c in cells:
+        haps = _hap_frame(hd, c)
+        if haps is None:
+            continue
+        for f in _load_cell(paths, c, _min_sites(args)).values():
+            p1 = f["pos1"].to_numpy(np.int64)
+            p2 = f["pos2"].to_numpy(np.int64)
+            key = pd.MultiIndex.from_arrays(
+                [f["chrom"].astype(str).to_numpy(), np.minimum(p1, p2),
+                 np.maximum(p1, p2)])
+            tagged += int(haps.reindex(key).notna().sum())
+            total += len(f)
+    logger.info(f"--haplotypes: of {total:,} read pairs in {len(cells)} "
+                f"cells' posteriors, {tagged:,} carry a haplotype")
+    if total and not tagged:
+        raise SystemExit(
+            f"--haplotypes: none of {total:,} read pairs in {len(cells)} "
+            f"cells' posteriors is in {hd}'s files (chrom, pos1, pos2): "
+            f"were the haplotypes made from these posteriors' read pairs?")
+    if not total:
+        raise SystemExit(f"--haplotypes: {len(cells)} cells with haplotype "
+                         f"files have no posteriors' read pairs: check "
+                         f"--posteriors")
 
 
 def _pair_frames(per_ctx: dict[str, pd.DataFrame]):
@@ -2766,6 +2800,19 @@ def main(argv=None) -> int:
     cells = samples[args.cell_column].astype(str).tolist()
     if args.max_cells:
         cells = cells[:args.max_cells]
+    # a cell without a file is skipped where it is read, silently: say how
+    # many have one, and stop where none does -- a wrong directory would
+    # otherwise run to the end on no pairs at all
+    have = {ctx: sum((d / f"{c}.posteriors.parquet").exists() for c in cells)
+            for ctx, d in paths.items()}
+    for ctx, n_ in have.items():
+        logger.info(f"--posteriors {ctx}: {n_:,} of {len(cells):,} cells "
+                    f"have {paths[ctx]}/<cell>.posteriors.parquet")
+    if not any(have.values()):
+        raise SystemExit(
+            f"no cell of --samples has a <cell>.posteriors.parquet in "
+            f"{', '.join(str(d) for d in paths.values())}: check --posteriors "
+            f"and --cell-column")
     batch_of = None
     if args.null_match_column:
         cols = [c.strip() for c in args.null_match_column.split(",")
@@ -2811,7 +2858,8 @@ def main(argv=None) -> int:
     unit_lines = {}
     if args.haplotypes:
         groups, batch_of, unit_lines = _unit_setup(samples, cells, args,
-                                                   batch_of, excl_chrom)
+                                                   batch_of, excl_chrom,
+                                                   paths=paths)
         cells = [u for us in groups.values() for u in us]
     executor = None
     if args.n_threads > 1 and len(cells) > 1:
