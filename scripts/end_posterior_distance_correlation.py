@@ -673,7 +673,7 @@ def unit_figure(t: pd.DataFrame, line: str, path) -> bool:
                             fmt="o", ms=3, lw=0.8, capsize=1.5, color=col,
                             label=nm)
             ax.axhline(0, color="0.6", lw=0.5)
-            ax.set_xscale("log")
+            _log_x(ax, float(t["band_lo"].min()), float(t["band_hi"].max()))
             ax.set_xlabel("distance between the ends, bp", fontsize=6)
             ax.set_ylabel("Δr, linked − within-cell null" if row == 0
                           else "difference in Δr", fontsize=6)
@@ -764,9 +764,11 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom):
                          f".haplotypes.parquet (and an inactive X call)")
     args.units_cfg = {"dir": str(hd), "xi": xi_of, "par": par,
                       "escape": esc, "elements": elements}
-    logger.info(f"--haplotypes: {len(xi_of):,} cells in {len(keys)} units "
-                f"each ({n_file} without a haplotype file, {n_call} without "
-                f"an inactive-X call); lines: {sorted(lines)}")
+    logger.info(f"--haplotypes: {len(xi_of):,} cells in "
+                f"{len(keys) + len(ekeys)} units each ({len(ekeys)} at "
+                f"--unit-element's {len(elements)} elements; {n_file} cells "
+                f"without a haplotype file, {n_call} without an inactive-X "
+                f"call); lines: {sorted(lines)}")
     return groups, strata, lines
 
 
@@ -1242,6 +1244,15 @@ _OBS_LABEL = {"matched": "linked (pairs with a null partner)",
               "linked": "linked (every true pair)"}
 
 
+def _log_x(ax, lo: float, hi: float) -> None:
+    """A log distance axis over [lo, hi] whatever is drawn on it: a measure
+    with no pairs placed in any bin -- an inactive X's sparse HCG pairs
+    under the within-cell null -- would otherwise leave matplotlib no
+    positive value to scale, and the figure would stop the run."""
+    ax.set_xlim(lo, hi)
+    ax.set_xscale("log")
+
+
 def _draw_measure(ax, axd, key, title, curves, centers, args, boot,
                   fisher=None, first=True):
     """One measure's column: observed and null on ``ax``, the contrast below.
@@ -1267,7 +1278,12 @@ def _draw_measure(ax, axd, key, title, curves, centers, args, boot,
     ax.axhline(0, color="#9AA0A6", lw=0.8)
     ax.set_title(title, fontsize=11)
     ax.set_ylabel("Pearson r of end posteriors" if first else "")
-    ax.set_xscale("log")
+    _log_x(ax, centers[0] / 1.3, centers[-1] * 1.3)
+    if not any(np.isfinite(curves[(key, c)][0]).any() for c in (obs, "null")
+               if (key, c) in curves):
+        ax.text(0.5, 0.5, f"too few pairs (--min-pairs {args.min_pairs})",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=9, color="0.4")
     ax.legend(fontsize=8, frameon=False)
 
     if fisher is not None:
@@ -1305,7 +1321,7 @@ def _draw_measure(ax, axd, key, title, curves, centers, args, boot,
                              xytext=(0, 7), ha="center", fontsize=8,
                              color=_COLOR[key])
     axd.axhline(0, color="#9AA0A6", lw=0.8)
-    axd.set_xscale("log")
+    _log_x(axd, centers[0] / 1.3, centers[-1] * 1.3)
     axd.set_xlabel("genomic distance between the two ends (bp)")
     axd.set_ylabel(ylab if first else "")
     axd.legend(fontsize=8, frameon=False)
@@ -1384,7 +1400,7 @@ def _figure_by_group(per_group, out_path, args, colors=None):
                 ax.plot(centers, y, lw=1.4, color=colors[g], label=g,
                         marker="o", ms=2.5, alpha=0.9)
             ax.axhline(0, color="#9AA0A6", lw=0.8)
-            ax.set_xscale("log")
+            _log_x(ax, centers[0] / 1.3, centers[-1] * 1.3)
             if row == 0:
                 ax.set_title(title, fontsize=11)
                 ax.set_ylabel(("linked r (pairs with a null partner)"

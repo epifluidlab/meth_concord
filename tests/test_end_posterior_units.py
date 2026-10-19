@@ -236,3 +236,29 @@ def test_an_element_shows_the_coordination_of_its_own_contacts(tmp_path):
     # the element's units are the copies one by one: no pooled-copies rows
     assert not any("both copies" in c for c in v.loc["elem"].index)
 
+
+def test_a_unit_with_no_pairs_for_a_measure_still_runs(tmp_path):
+    """HCG read on the autosomes alone, as the inactive X's phased HCG
+    pairs are too few for the within-cell null to place any: X's HCG
+    columns are empty, and the run goes on to its tables."""
+    m = _mod()
+    root, out = tmp_path / "d", tmp_path / "o"
+    sp, bed = _fixture_elements(root, n_cells=8, per=500)
+    for f in (root / "HCG").glob("*.parquet"):
+        t = pd.read_parquet(f)
+        t[t["chrom"] != "chrX"].to_parquet(f)
+    argv = ["--posteriors", f"GCH={root / 'GCH'}",
+            "--posteriors", f"HCG={root / 'HCG'}", "--samples", str(sp),
+            "--group-column", "group", "--haplotypes", str(root / "haps"),
+            "--xi", "GM=1", "--genome", "none", "--chrx-par", "none",
+            "--chrx-escape", "none", "--null-type", "link-shuffle",
+            "--null-scope", "cell", "--null-exclude", "1000",
+            "--unit-element", f"elem={bed}", "--min-pairs", "30",
+            "--n-bootstrap", "50", "--per-cell", "off", "--n-threads", "1",
+            "--plot-format", "png", "--output-dir", str(out)]
+    assert m.main(argv) == 0
+    t = pd.read_csv(out / "end_posterior_units_GM.tsv", sep="\t")
+    x = t[(t["comparison"] == "chrX Xi") & (t["element"] == "all")]
+    assert x.loc[x["measure"] == "hh", "value"].isna().all()
+    assert x.loc[x["measure"] == "gg", "value"].notna().any()
+
