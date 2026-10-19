@@ -225,3 +225,19 @@ def test_e_says_its_counts_and_g_names_its_line(tmp_path):
     n = int(np.isfinite(cells["strength"]).sum())
     assert f"GM, {n} of {len(cells)} cells" in titles
 
+
+def test_i_draws_every_contact_band_by_band(tmp_path):
+    c, cm, un = _tables(tmp_path)
+    f = un / "end_posterior_units_GM.tsv"
+    u = pd.read_csv(f, sep="\t").assign(element="all", band="b")
+    # an element's rows and the bands together, as the run writes them
+    extra = pd.concat([u.assign(element="promoter", value=9.0),
+                       u.assign(band="all 1kb-10Mb", value=9.0)])
+    pd.concat([u, extra]).to_csv(f, sep="\t", index=False)
+    fig = f6.figure_from_args(f6.parse_args(_argv(tmp_path, c, cm, un)))
+    ax = next(a for a in fig.axes
+              if a.get_title(loc="left") == "GCH–GCH concordance per copy")
+    ys = np.concatenate([ln.get_ydata() for ln in ax.lines
+                         if len(ln.get_ydata())])
+    assert ys.size and np.nanmax(ys) < 1.0
+

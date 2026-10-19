@@ -81,6 +81,8 @@ def _run(root: Path, out: Path):
             str(out)]
     assert m.main(argv) == 0
     t = pd.read_csv(out / "end_posterior_units_GM.tsv", sep="\t")
+    # every contact, the bands one by one
+    t = t[(t["element"] == "all") & ~t["band"].str.startswith("all")]
     return t[t["measure"] == "gg"].set_index(["comparison", "band_lo"])
 
 
@@ -112,3 +114,125 @@ def test_coordination_within_x_copies_stands_above_the_autosomes(tmp_path):
         assert abs(t.loc[("chrX same copy", b), "value"] - (
             t.loc[("chrX Xi", b), "value"]
             + t.loc[("chrX Xa", b), "value"]) / 2) < 1e-9
+
+
+def test_a_pair_is_turned_so_its_element_end_is_kept():
+    m = _mod()
+    j = pd.DataFrame({"chrom": "chr1", "pos1": [100, 5000, 9000, 20000],
+                      "pos2": [3000, 900, 12000, 30000],
+                      "p1": [0.1, 0.2, 0.3, 0.4],
+                      "p2": [0.9, 0.8, 0.7, 0.6], "distance": [1, 1, 1, 1]})
+    j = j.assign(gpos1=m.genome_coords(j["chrom"], j["pos1"]),
+                 gpos2=m.genome_coords(j["chrom"], j["pos2"]))
+    iv = np.array([[m.genome_coords(["chr1"], [0])[0],
+                    m.genome_coords(["chr1"], [1000])[0]]])
+    f, ids = m._focus_frame(j, {"g": ("p1", "p2")}, iv, base=500)
+    # the first pair's end 1 is in it, the second's end 2: turned round;
+    # the last two touch it nowhere
+    assert list(ids) == [500, 501]
+    assert list(f["pos1"]) == [100, 900] and list(f["pos2"]) == [3000, 5000]
+    assert list(f["p1"]) == [0.1, 0.8] and list(f["p2"]) == [0.9, 0.2]
+    assert (f["gpos1"].to_numpy() < iv[0, 1]).all()
+
+
+def test_the_real_partner_is_refused_by_its_id_in_the_whole_frame():
+    m = _mod()
+    j = pd.DataFrame({"gpos1": np.array([1_000, 50_000], np.int64),
+                      "gpos2": np.array([11_000, 60_000], np.int64),
+                      "p1": [0.5, 0.5], "p2": [0.5, 0.5],
+                      "distance": [10_000.0, 10_000.0]})
+    edges = np.array([1e3, 1e5])
+    # the pool holds row 1's own end 2 (id 101) and another pair's (id 102)
+    pool = (np.array([11_000, 60_000, 60_500], np.int64),
+            {"g": np.array([0.1, 0.2, 0.3])},
+            np.array([100, 101, 102], np.int64))
+
+    class A:
+        link_shuffle_bin, null_scope, null_exclude = 250_000, "cell", 0
+    rng = np.random.default_rng(0)
+    # row 1 of the whole frame, passed alone: its partner is id 101
+    got = m._draw_link_shuffle(j.iloc[[1]].reset_index(drop=True),
+                               np.array([10_000.0]), {"g": ("p1", "p2")},
+                               pool, 100, edges, A(), rng,
+                               ids=np.array([101]))
+    assert got is not None and got[1]["g"][0] == 0.3
+
+
+def _fixture_elements(root: Path, n_cells=24, per=1500, seed=3):
+    """chr1 and chrX, both copies; coordination planted on the inactive X
+    (hap1) alone, and there only on contacts with an end in 'elem': every
+    other block of 200 kb."""
+    rng = np.random.default_rng(seed)
+    for d in ("GCH", "HCG", "haps"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    cells = [f"GM_{i}" for i in range(n_cells)]
+
+    def in_elem(p):
+        return (p // 200_000) % 2 == 0
+    for c in cells:
+        recs, haps = [], []
+        for chrom in ("chr1", "chrX"):
+            for hap in (1, 2):
+                p1 = rng.integers(0, L - 3_000_000, per)
+                d = (10 ** rng.uniform(3.0, 6.3, per)).astype(np.int64)
+                p2 = p1 + d
+                plant = ((chrom == "chrX") & (hap == 1)
+                         & (in_elem(p1) | in_elem(p2)))
+                z = np.where(plant, rng.normal(0, 1, per), 0.0)
+                post = [1 / (1 + np.exp(-(z + rng.normal(0, 0.7, per))))
+                        for _ in range(2)]
+                for i in range(per):
+                    recs.append((chrom, int(p1[i]), int(p2[i]), 6, 6,
+                                 int(d[i]), float(post[0][i]),
+                                 float(post[1][i])))
+                    haps.append((chrom, int(p1[i]), int(p2[i]), hap))
+        t = pd.DataFrame(recs, columns=["chrom", "pos1", "pos2", "n1", "n2",
+                                        "distance", "posterior1",
+                                        "posterior2"])
+        for ctx in ("GCH", "HCG"):
+            t.to_parquet(root / ctx / f"{c}.posteriors.parquet")
+        pd.DataFrame(haps, columns=["chrom", "pos1", "pos2", "hap"]
+                     ).to_parquet(root / "haps" / f"{c}.haplotypes.parquet")
+    sp = root / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "group": "GM"}).to_csv(
+        sp, sep="\t", index=False)
+    bed = root / "elem.bed"
+    pd.DataFrame([(ch, a, a + 200_000) for ch in ("chr1", "chrX")
+                  for a in range(0, L, 400_000)]).to_csv(
+        bed, sep="\t", header=False, index=False)
+    return sp, bed
+
+
+def test_an_element_shows_the_coordination_of_its_own_contacts(tmp_path):
+    m = _mod()
+    root, out = tmp_path / "d", tmp_path / "o"
+    sp, bed = _fixture_elements(root)
+    argv = ["--posteriors", f"GCH={root / 'GCH'}",
+            "--posteriors", f"HCG={root / 'HCG'}", "--samples", str(sp),
+            "--group-column", "group", "--haplotypes", str(root / "haps"),
+            "--xi", "GM=1", "--genome", "none", "--chrx-par", "none",
+            "--chrx-escape", "none", "--null-type", "link-shuffle",
+            "--null-scope", "cell", "--min-distance", "1000",
+            "--max-distance", "2000000", "--bins-per-decade", "4",
+            "--unit-bands", "1000,2000000", "--min-pairs", "30",
+            "--unit-element", f"elem={bed}", "--unit-element-flank", "0",
+            "--n-bootstrap", "200", "--fisher-z", "none", "--per-cell", "off",
+            "--n-threads", "1", "--plot-format", "png", "--output-dir",
+            str(out)]
+    assert m.main(argv) == 0
+    t = pd.read_csv(out / "end_posterior_units_GM.tsv", sep="\t")
+    t = t[(t["measure"] == "gg") & t["band"].str.startswith("all")]
+    v = t.set_index(["element", "comparison"])
+    # at the element, the inactive X's contacts agree, the active X's not
+    assert v.loc[("elem", "chrX Xi"), "lo"] > 0.15
+    assert abs(v.loc[("elem", "chrX Xa"), "value"]) < 0.06
+    assert v.loc[("elem", "chrX Xi − chrX Xa"), "lo"] > 0.1
+    # over every contact, the contacts away from it dilute the same
+    assert (v.loc[("all", "chrX Xi − chrX Xa"), "value"]
+            < v.loc[("elem", "chrX Xi − chrX Xa"), "value"])
+    # the autosomes' copies, the control, alike at the element too
+    assert abs(v.loc[("elem", "autosomes: Xi's − Xa's haplotype"),
+                     "value"]) < 0.06
+    # the element's units are the copies one by one: no pooled-copies rows
+    assert not any("both copies" in c for c in v.loc["elem"].index)
+

@@ -61,6 +61,13 @@ partners against the bulk track, the level per context of its phased SNPs
 chrx_haplotype_tracks.tsv) -- the last two for a line with one inactive X
 (--xi GROUP=1|2), whose haplotypes are its copies.
 
+At kinds of element (--element NAME=BED: CpG islands, promoters, CTCF
+sites...), the contacts with an end in one -- on X outside PAR1 and the
+escape genes, as allelic_imbalance.py reads their levels, and on the
+autosomes, the control -- per copy: their P(s) shares and their share of
+all the copy's contacts (haplotype_contacts.tsv, sets 'chrX NAME',
+'autosomes NAME' and 'NAME: chrX − autosomes').
+
 Is a copy's level tied to its folding?  With --genes, X's genes in two
 classes, those that escape X inactivation (--chrx-escape) and the others,
 which it silences: each copy's P(s) shares over the contacts with an end in
@@ -133,6 +140,10 @@ PS_CLASSES = (("0.1–1 Mb", 100_000, 1_000_000), ("≥ 1 Mb", 1_000_000, None),
               ("≥ 10 Mb", 10_000_000, None))
 #: The sets of contacts: X outside PAR1, X within PAR1, the autosomes.
 SETS = ("chrX", "chrX PAR1", "autosomes")
+#: --element: where its contacts are counted, and the measure of how many
+#: of a copy's contacts have an end in it.
+ELEMENT_SETS = ("chrX", "autosomes")
+ELEMENT_SHARE = "contacts with an end in it: share"
 #: The boundary profile's offsets from the boundaries.
 BOUNDARY_OFFSETS = np.arange(-1_000_000, 1_000_001, 100_000)
 #: Without --profile-window, the crossing profile keeps this far from
@@ -229,6 +240,36 @@ class Geometry:
         self.loop_excl = int(args.loop_exclude)
         # X's genes by GENE_CLASSES (--genes): {class: (start, end) rows}
         self.gene_iv: dict = {}
+        # --element: {name: {chromosome key: (start, end) rows}}; the escape
+        # genes, which the elements' X leaves out
+        self.elem_iv: dict = {}
+        self.escape_iv = None
+
+
+def read_elements(specs, flank: int) -> dict:
+    """--element NAME=BED: per name and chromosome (chrom_key) the BED's
+    intervals, each ``flank`` bp wider each side, sorted and merged."""
+    out = {}
+    for spec in specs or []:
+        name, _, path = str(spec).partition("=")
+        name, path = name.strip(), path.strip()
+        if not name or not path:
+            raise SystemExit(f"--element {spec}: NAME=BED")
+        b = pd.read_csv(path, sep="\t", header=None, comment="#",
+                        usecols=[0, 1, 2], dtype={0: str})
+        b = b[~b[0].str.startswith(("track", "browser"))]
+        per = {}
+        for c, g in b.groupby(b[0].map(chrom_key), sort=False):
+            iv = np.column_stack([np.maximum(g[1].to_numpy(np.int64) - flank,
+                                             0),
+                                  g[2].to_numpy(np.int64) + flank])
+            iv = iv[np.argsort(iv[:, 0], kind="stable")]
+            new = np.r_[True, iv[1:, 0] > np.maximum.accumulate(iv[:, 1])[:-1]]
+            per[c] = np.column_stack(
+                [iv[new, 0], np.maximum.reduceat(iv[:, 1],
+                                                 np.flatnonzero(new))])
+        out[name] = per
+    return out
 
 
 def read_boundaries(path) -> dict:
@@ -316,6 +357,12 @@ def cell_counts(t: pd.DataFrame, xi_hap: int, geo: Geometry) -> dict:
         out[f"loop{i}"] = np.zeros((2, sh.size))
     if geo.gene_iv:
         out["gshare"] = np.zeros((len(geo.gene_iv), 2, 1 + len(PS_CLASSES)))
+    if geo.elem_iv:
+        # per element, set (ELEMENT_SETS) and copy: its contacts in all and
+        # by PS_CLASSES; and per set and copy all of its contacts
+        out["eshare"] = np.zeros((len(geo.elem_iv), len(ELEMENT_SETS), 2,
+                                  1 + len(PS_CLASSES)))
+        out["edenom"] = np.zeros((len(ELEMENT_SETS), 2))
     if t is None or t.empty:
         return out
     t = t[(t["hi"] - t["lo"]) >= 10 ** PS_EDGES[0]]
@@ -350,6 +397,30 @@ def cell_counts(t: pd.DataFrame, xi_hap: int, geo: Geometry) -> dict:
         for j, (_, lo_d, hi_d) in enumerate(PS_CLASSES, 1):
             m = inn & (d >= lo_d) & (d < (hi_d or np.inf))
             np.add.at(out["gshare"], (gi, copy[m], j), 1)
+    # the same of the contacts with an end in each element: on X outside
+    # the escape genes too, as the levels there are read, and on the
+    # autosomes
+    if geo.elem_iv:
+        sx = far & (s_ == 0)
+        if geo.escape_iv is not None and len(geo.escape_iv):
+            sx &= (~in_intervals(lo, geo.escape_iv)
+                   & ~in_intervals(hi, geo.escape_iv))
+        base = (sx, far & (s_ == 2))
+        for si, m0 in enumerate(base):
+            np.add.at(out["edenom"], (si, copy[m0]), 1)
+        for ei, per in enumerate(geo.elem_iv.values()):
+            hit = np.zeros(len(t), bool)
+            for ck, iv in per.items():
+                mc = key == ck
+                if mc.any():
+                    hit[mc] = in_intervals(lo[mc], iv) | in_intervals(hi[mc],
+                                                                      iv)
+            for si, m0 in enumerate(base):
+                inn = m0 & hit
+                np.add.at(out["eshare"], (ei, si, copy[inn], 0), 1)
+                for j, (_, lo_d, hi_d) in enumerate(PS_CLASSES, 1):
+                    mm = inn & (d >= lo_d) & (d < (hi_d or np.inf))
+                    np.add.at(out["eshare"], (ei, si, copy[mm], j), 1)
     # the crossing profile along X
     m = (s_ == 0) & (d >= geo.prof_min)
     if geo.w > 0:
@@ -431,6 +502,14 @@ def contact_stats(a: dict, geo: Geometry) -> list:
             for j, (nm, _, _) in enumerate(PS_CLASSES, 1):
                 out.append((f"P(s): share {nm}", f"chrX {gname}",
                             sh[..., j] / sh[..., 0]))
+        for ei, ename in enumerate(geo.elem_iv):
+            for si, sname in enumerate(ELEMENT_SETS):
+                sh = a["eshare"][..., ei, si, :, :]
+                for j, (nm, _, _) in enumerate(PS_CLASSES, 1):
+                    out.append((f"P(s): share {nm}", f"{sname} {ename}",
+                                sh[..., j] / sh[..., 0]))
+                out.append((ELEMENT_SHARE, f"{sname} {ename}",
+                            sh[..., 0] / a["edenom"][..., si, :]))
         if geo.dxz4 is not None:
             out.append(("crossing DXZ4: log2 obs/exp", "chrX", np.log2(
                 a["prof_o"][..., geo.dxz4] / a["prof_e"][..., geo.dxz4])))
@@ -500,6 +579,14 @@ def group_stats(a: dict, geo: Geometry, w, labels) -> pd.DataFrame:
             (dx, bx), (da, ba) = by[(meas, "chrX")], by[(meas, "autosomes")]
             rows.append(_row(meas, "chrX − autosomes", (np.nan, np.nan),
                              dx - da, bx - ba, norm, labels))
+        # each element's copies' difference on X less on the autosomes
+        for ename in geo.elem_iv:
+            kx, ka = (meas, f"chrX {ename}"), (meas, f"autosomes {ename}")
+            if kx in by and ka in by:
+                (dx, bx), (da, ba) = by[kx], by[ka]
+                rows.append(_row(meas, f"{ename}: chrX − autosomes",
+                                 (np.nan, np.nan), dx - da, bx - ba, norm,
+                                 labels))
         # the escape genes' copies' difference less the inactivated genes'
         if (meas, ge) in by and (meas, gi) in by:
             (d1, b1), (d2, b2) = by[(meas, ge)], by[(meas, gi)]
@@ -1964,6 +2051,16 @@ def main(argv=None) -> int:
                          "(haplotype_genes_<line>.tsv).")
     ap.add_argument("--gene-flank", type=int, default=10_000,
                     help="--genes: each gene this much wider on each side.")
+    ap.add_argument("--element", action="append", default=None,
+                    metavar="NAME=BED",
+                    help="Repeatable: the contacts with an end in the BED's "
+                         "intervals, per copy -- their P(s) shares and their "
+                         "share of the copy's contacts -- on X outside PAR1 "
+                         "and the escape genes and on the autosomes, e.g. "
+                         "island=cpgIslands.bed promoter=PLS.bed.")
+    ap.add_argument("--element-flank", type=int, default=100,
+                    help="--element: bp each side of an interval an end may "
+                         "lie and count as in it (100, about half a read).")
     ap.add_argument("--gene-contexts",
                     default="HCG,GCH,HCG_island,GCH_island,HCG_promoter,"
                             "GCH_promoter",
@@ -2062,6 +2159,12 @@ def main(argv=None) -> int:
         tb = read_boundaries(tad_path)
         tads = next((v for c, v in tb.items() if chrom_key(c) == "X"), None)
     escape = parse_escape(args.chrx_escape, genome, par)
+    geo.escape_iv = escape
+    geo.elem_iv = read_elements(args.element, int(args.element_flank))
+    if geo.elem_iv:
+        logger.info("--element: " + ", ".join(
+            f"{k} {sum(len(v) for v in per.values()):,} intervals"
+            for k, per in geo.elem_iv.items()))
     if args.genes:
         if escape is None or not len(escape):
             logger.warning("--genes but no escape genes (--chrx-escape): no "

@@ -105,7 +105,13 @@ do.  The inactive X per line: --xi GROUP=1|2, or each cell's own (cells,
 'both copies', their pairs pooled against donors of either copy; X against
 the autosomes either way; and what pooling the copies makes ('both - same')
 on X less on the autosomes -- the cells resampled jointly, since a cell's
-units are paired.
+units are paired -- and the same over all the bands together.
+--unit-element NAME=BED asks it again of the contacts with an end in the
+BED's intervals (promoters, CpG islands, ...): that end is kept, the other
+replaced by an end of the same cell and copy at the partner's place
+(--null-type link-shuffle), drawn from all of the copy's ends, so the
+element shapes the contacts tested, not their stand-ins; rows under its
+NAME in the table's 'element' column ('all' for every contact).
 
     python scripts/end_posterior_distance_correlation.py \\
         --posteriors GCH=output/signed_250kb_rwr/context_GCH/04_posteriors \\
@@ -436,9 +442,79 @@ def _unit_filter(per_ctx: dict, haps, key: str, xi_hap: int, par=None,
     return out
 
 
+def _unit_key(key: str):
+    """A unit's key split: its UNITS key, and the --unit-element its
+    contacts are focused on (None: every contact)."""
+    base, _, elem = key.partition("@")
+    return base, (elem or None)
+
+
+def read_unit_elements(specs, flank: int) -> dict:
+    """--unit-element NAME=BED: per name, the BED's intervals widened by
+    ``flank`` each side, as sorted, disjoint (start, end) rows on the
+    genome-wide coordinate (:func:`genome_coords`)."""
+    out = {}
+    for spec in specs or []:
+        name, _, path = str(spec).partition("=")
+        name, path = name.strip(), path.strip()
+        if not name or not path:
+            raise SystemExit(f"--unit-element {spec}: NAME=BED")
+        if "@" in name or UNIT_SEP in name:
+            raise SystemExit(f"--unit-element {spec}: no '@' or "
+                             f"'{UNIT_SEP}' in the name")
+        b = pd.read_csv(path, sep="\t", header=None, comment="#",
+                        usecols=[0, 1, 2], dtype={0: str})
+        b = b[~b[0].str.startswith(("track", "browser"))]
+        chrom = b[0].to_numpy()
+        lo = genome_coords(chrom, np.maximum(
+            b[1].to_numpy(np.int64) - flank, 0))
+        hi = genome_coords(chrom, b[2].to_numpy(np.int64) + flank)
+        o = np.argsort(lo, kind="stable")
+        lo, hi = lo[o], hi[o]
+        # merged, so the rows are disjoint for in_intervals
+        new = np.r_[True, lo[1:] > np.maximum.accumulate(hi)[:-1]]
+        out[name] = np.column_stack(
+            [lo[new], np.maximum.reduceat(hi, np.flatnonzero(new))])
+    return out
+
+
+def _focus_frame(j: pd.DataFrame, cols: dict, iv, base: int):
+    """``j``'s pairs with an end in the intervals ``iv`` (genome
+    coordinates), each turned so that end is end 1 -- the end a
+    link-shuffle keeps -- and their ids in the whole of ``j``, as its pool
+    knows them (base + row)."""
+    from nome_hic_concordance.xci import in_intervals
+    g1 = j["gpos1"].to_numpy(np.int64)
+    g2 = j["gpos2"].to_numpy(np.int64)
+    in1, in2 = in_intervals(g1, iv), in_intervals(g2, iv)
+    sel = np.flatnonzero(in1 | in2)
+    f = j.iloc[sel].reset_index(drop=True)
+    flip = ~in1[sel]
+    if flip.any():
+        upd = {}
+        for a, b in [("gpos1", "gpos2"), ("pos1", "pos2"),
+                     *(tuple(c) for c in cols.values())]:
+            if a in f.columns and b in f.columns:
+                va, vb = f[a].to_numpy(), f[b].to_numpy()
+                upd[a], upd[b] = np.where(flip, vb, va), np.where(flip, va,
+                                                                  vb)
+        f = f.assign(**upd)
+    return f, base + sel.astype(np.int64)
+
+
+def _unit_focus(cell: str, args):
+    """The intervals a unit's contacts are focused on, or None."""
+    cfg = getattr(args, "units_cfg", None)
+    if not cfg or UNIT_SEP not in cell:
+        return None
+    elem = _unit_key(cell.split(UNIT_SEP, 1)[1])[1]
+    return None if elem is None else cfg["elements"][elem]
+
+
 def _load_any(paths: dict, cell: str, min_sites, merged, excl_chrom, args):
     """:func:`_load_cell`, or with --haplotypes and a unit in the name
-    (UNIT_SEP) that cell's read pairs of the unit."""
+    (UNIT_SEP) that cell's read pairs of the unit -- all of them for a unit
+    focused on an element, whose stand-ins are drawn from every end."""
     cfg = getattr(args, "units_cfg", None)
     if not cfg or UNIT_SEP not in cell:
         return _load_cell(paths, cell, min_sites, merged, excl_chrom)
@@ -446,9 +522,9 @@ def _load_any(paths: dict, cell: str, min_sites, merged, excl_chrom, args):
     per_ctx = _load_cell(paths, name, min_sites, merged, excl_chrom)
     if not per_ctx:
         return {}
-    return _unit_filter(per_ctx, _hap_frame(cfg["dir"], name), key,
-                        int(cfg["xi"].get(name, 1)), cfg.get("par"),
-                        cfg.get("escape"))
+    return _unit_filter(per_ctx, _hap_frame(cfg["dir"], name),
+                        _unit_key(key)[0], int(cfg["xi"].get(name, 1)),
+                        cfg.get("par"), cfg.get("escape"))
 
 
 #: The units' comparisons (unit_comparisons): (name, {unit: weight}).
@@ -459,6 +535,8 @@ def _load_any(paths: dict, cell: str, min_sites, merged, excl_chrom, args):
 #: either copy, so "both - same" is what pooling the copies makes.
 UNIT_COMPARISONS = (
     ("chrX Xi − chrX Xa", {"x_xi": 1, "x_xa": -1}),
+    # the control of the one above: the same haplotypes on the autosomes
+    ("autosomes: Xi's − Xa's haplotype", {"a_xi": 1, "a_xa": -1}),
     ("chrX − autosomes, same copy", {"x_same": 1, "a_same": -1}),
     ("chrX − autosomes, both copies", {"x_both": 1, "a_both": -1}),
     ("chrX: both copies − same copy", {"x_both": 1, "x_same": -1}),
@@ -480,7 +558,8 @@ def unit_comparisons(kept: dict, labels: dict, edges, bands, args,
     cells' order}; ``labels``: {unit key: its group label}."""
     arm = getattr(args, "delta_arm", "linked")
     have = {k: kept.get(lab) for k, lab in labels.items()}
-    if any(v is None for v in have.values()):
+    have = {k: v for k, v in have.items() if v is not None}
+    if not have:
         return pd.DataFrame()
     n = len(next(iter(have.values())))
     if n < 3 or any(len(v) != n for v in have.values()):
@@ -488,6 +567,11 @@ def unit_comparisons(kept: dict, labels: dict, edges, bands, args,
     centers = np.sqrt(edges[:-1] * edges[1:])
     bix = np.searchsorted(bands, centers, side="right") - 1
     nbd = len(bands) - 1
+    # the bands, then all of them together
+    band_of = [(bands[j], bands[j + 1], f"{_bp(bands[j])}-{_bp(bands[j + 1])}")
+               for j in range(nbd)]
+    band_of.append((bands[0], bands[-1],
+                    f"all {_bp(bands[0])}-{_bp(bands[-1])}"))
     rng = np.random.default_rng(args.seed + 99)
     W = np.vstack([np.ones((1, n)),
                    rng.multinomial(n, np.full(n, 1.0 / n),
@@ -500,33 +584,37 @@ def unit_comparisons(kept: dict, labels: dict, edges, bands, args,
             arrs = []
             for cond in (arm, "null"):
                 a = np.stack([x[(m, cond)] for x in pc]).astype(float)
-                bd = np.zeros(a.shape[:2] + (nbd,))
+                bd = np.zeros(a.shape[:2] + (nbd + 1,))
                 for j in range(nbd):
                     sel = bix == j
                     if sel.any():
                         bd[:, :, j] = a[:, :, sel].sum(-1)
+                bd[:, :, nbd] = bd[:, :, :nbd].sum(-1)
                 arrs.append(bd)
             delta[k] = arrs
         d_of = {}
         with np.errstate(invalid="ignore", divide="ignore"):
             for k, (ao, an) in delta.items():
                 ro = corr_from_acc((W @ ao.reshape(n, -1)).reshape(
-                    W.shape[0], 6, nbd), args.min_pairs)[0]
+                    W.shape[0], 6, nbd + 1), args.min_pairs)[0]
                 rn = corr_from_acc((W @ an.reshape(n, -1)).reshape(
-                    W.shape[0], 6, nbd), args.min_pairs)[0]
+                    W.shape[0], 6, nbd + 1), args.min_pairs)[0]
                 d_of[k] = ro - rn
         for tot, (u1, u2) in (("x_same", ("x_xi", "x_xa")),
                               ("a_same", ("a_xi", "a_xa"))):
-            d_of[tot] = (d_of[u1] + d_of[u2]) / 2
+            if u1 in d_of and u2 in d_of:
+                d_of[tot] = (d_of[u1] + d_of[u2]) / 2
         combos = [(unit_label(k, named) if k in UNITS else
                    {"x_same": "chrX same copy",
                     "a_same": "autosomes same copy"}[k], {k: 1})
                   for k in UNIT_SINGLES] + list(UNIT_COMPARISONS)
         for name, wts in combos:
+            if any(k not in d_of for k in wts):
+                continue
             if not named:
                 name = name.replace("Xi", "hap1").replace("Xa", "hap2")
             v = sum(w_ * d_of[k] for k, w_ in wts.items())
-            for j in range(nbd):
+            for j, (b_lo, b_hi, b_lab) in enumerate(band_of):
                 b = v[1:, j]
                 b = b[np.isfinite(b)]
                 lo, hi = (np.percentile(b, [2.5, 97.5]) if b.size >= 20
@@ -534,10 +622,19 @@ def unit_comparisons(kept: dict, labels: dict, edges, bands, args,
                 p = (min(1.0, 2.0 * (1 + min((b <= 0).sum(), (b >= 0).sum()))
                          / (b.size + 1)) if b.size >= 20 else np.nan)
                 rows.append({"measure": m, "comparison": name,
-                             "band_lo": bands[j], "band_hi": bands[j + 1],
-                             "value": v[0, j], "lo": lo, "hi": hi, "p": p,
-                             "cells": n})
+                             "band_lo": b_lo, "band_hi": b_hi,
+                             "band": b_lab, "value": v[0, j], "lo": lo,
+                             "hi": hi, "p": p, "cells": n})
     return pd.DataFrame(rows)
+
+
+def _bp(v) -> str:
+    """1000 -> '1kb', 10000000 -> '10Mb', 300 -> '300bp'."""
+    v = int(round(float(v)))
+    for unit, f in (("Mb", 1_000_000), ("kb", 1_000)):
+        if v >= f and v % f == 0:
+            return f"{v // f}{unit}"
+    return f"{v}bp"
 
 
 def unit_figure(t: pd.DataFrame, line: str, path) -> bool:
@@ -546,6 +643,10 @@ def unit_figure(t: pd.DataFrame, line: str, path) -> bool:
     autosomes, and the part the copies differing makes."""
     if t is None or not len(t):
         return False
+    if "element" in t.columns:
+        t = t[t["element"] == "all"]
+    if "band" in t.columns:
+        t = t[~t["band"].astype(str).str.startswith("all")]
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -602,6 +703,14 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom):
     if bad:
         raise SystemExit(f"--units: unknown {sorted(bad)}; choose from "
                          f"{list(UNITS)}")
+    elements = read_unit_elements(args.unit_element,
+                                  int(args.unit_element_flank))
+    if elements and args.null_type != "link-shuffle":
+        raise SystemExit("--unit-element needs --null-type link-shuffle: "
+                         "it keeps the element's end and replaces the other")
+    # per element the copies one by one -- 'both' is about pooling copies
+    ekeys = [f"{k}@{nm}" for nm in elements for k in keys
+             if UNITS[k][1] != "both"]
     xi = {}
     for v in args.xi or []:
         for tok in str(v).split(","):
@@ -641,9 +750,11 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom):
             h = int(mode) if mode else 1
         xi_of[c] = int(h)
         labs = lines.setdefault(line, (
-            {k: f"{line} {unit_label(k, mode is not None)}" for k in keys},
+            {k: f"{line} {unit_label(_unit_key(k)[0], mode is not None)}"
+                + (f" at {_unit_key(k)[1]}" if "@" in k else "")
+             for k in keys + ekeys},
             mode is not None))[0]
-        for k in keys:
+        for k in keys + ekeys:
             u = f"{c}{UNIT_SEP}{k}"
             groups.setdefault(labs[k], []).append(u)
             strata[u] = (f"{batch_of.get(c, '')}|{k}" if batch_of
@@ -652,7 +763,7 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom):
         raise SystemExit(f"--haplotypes: no cell has {hd}/<cell>"
                          f".haplotypes.parquet (and an inactive X call)")
     args.units_cfg = {"dir": str(hd), "xi": xi_of, "par": par,
-                      "escape": esc}
+                      "escape": esc, "elements": elements}
     logger.info(f"--haplotypes: {len(xi_of):,} cells in {len(keys)} units "
                 f"each ({n_file} without a haplotype file, {n_call} without "
                 f"an inactive-X call); lines: {sorted(lines)}")
@@ -878,7 +989,7 @@ def _own_contact_pool(j: pd.DataFrame, cols: dict, base: int, edges):
 
 
 def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
-                       max_rounds=16):
+                       max_rounds=16, ids=None):
     """Link-shuffle null: keep end 1, take another cell's contact end as end 2.
 
     The donor is an end of a linked pair (in range) from ANOTHER cell of the
@@ -889,7 +1000,9 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
     end 1, at a distance from end 1 inside the anchor pair's own distance
     bin.  Where the donor's own partner sits does not matter, so pairs far
     beyond the bin size keep their donors.  Same return shape as
-    :func:`_draw_null`.
+    :func:`_draw_null`.  ``ids``: each pair's id as the pool knows it, where
+    ``j`` is part of the frame the pool was built from (default base +
+    row).
     """
     if pool is None:
         return None
@@ -929,8 +1042,11 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
     W = int(getattr(args, "null_exclude", 0) or 0)
     W = W if same_cell and d_mate is not None else 0
 
+    rid = (base + np.arange(n, dtype=np.int64) if ids is None
+           else np.asarray(ids, np.int64))
+
     def ok_cell(kk, ii):
-        good = d_pi[kk] != (base + ii)
+        good = d_pi[kk] != rid[ii]
         if W:
             good &= ((np.abs(d_pos[kk] - g2[ii]) > W)
                      & (np.abs(d_mate[kk] - g1[ii]) > W))
@@ -977,10 +1093,11 @@ def _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
     return xa, xb, dn, g1[ai], ai
 
 
-def _draw(j, d, cols, pool, base, edges, args, rng):
+def _draw(j, d, cols, pool, base, edges, args, rng, ids=None):
     """Dispatch one null draw to the null type's own function."""
     if getattr(args, "null_type", "") == "link-shuffle":
-        return _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng)
+        return _draw_link_shuffle(j, d, cols, pool, base, edges, args, rng,
+                                  ids=ids)
     d_pos, d_vals, d_pi = pool
     return _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges, args,
                       rng)
@@ -1413,6 +1530,7 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
 
     base = _pair_base(seed_i)
     bkey = batch_of.get(cell, "") if batch_of else ""
+    focus = _unit_focus(cell, args)
 
     def donors(sk, j, cols):
         if args.null_scope == "pooled":
@@ -1427,6 +1545,14 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
         j = frames[sk]
         cols = _SET_COLS[sk]
         measures = [m for m, _ in _MEASURES if set_of[m] == sk]
+        ids = None
+        if focus is not None:
+            # the stand-ins from all of the unit's ends; only the contacts
+            # with an end in the element count, that end kept
+            pool = donors(sk, j, cols)
+            j, ids = _focus_frame(j, cols, focus, base)
+            if not len(j):
+                continue
         d = j["distance"].to_numpy()
         keep = (d >= edges[0]) & (d <= edges[-1])
         bins = np.clip(np.digitize(d, edges) - 1, 0, nb - 1)
@@ -1435,13 +1561,14 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
                 accumulate(accs[(m, "linked")], bins[keep], x[keep], y[keep])
         n_pairs += int(keep.sum())
 
-        pool = donors(sk, j, cols)
+        if focus is None:
+            pool = donors(sk, j, cols)
         if pool is None:
             if want_percell and not separate:
                 blocks.update(_percell_blocks(j, d, cols, measures, None,
                                               None, edges, args))
             continue
-        drawn = _draw(j, d, cols, pool, base, edges, args, rng)
+        drawn = _draw(j, d, cols, pool, base, edges, args, rng, ids=ids)
         if drawn is not None:
             xa, xb, dn, _anchor, aidx = drawn
             nkeep = (dn >= edges[0]) & (dn <= edges[-1])
@@ -2501,6 +2628,19 @@ def main(argv=None) -> int:
                                             "10000000",
                     help="--haplotypes: distance-band edges (bp) of the "
                          "units' comparisons.")
+    ap.add_argument("--unit-element", action="append", default=None,
+                    metavar="NAME=BED",
+                    help="--haplotypes, repeatable: also each copy over the "
+                         "contacts with an end in the BED's intervals, that "
+                         "end kept and the other replaced by an end of the "
+                         "same cell and copy (--null-type link-shuffle), "
+                         "drawn from all of the copy's ends; e.g. "
+                         "promoter=PLS.bed.  Its rows carry NAME in "
+                         "end_posterior_units_<line>.tsv's 'element'.")
+    ap.add_argument("--unit-element-flank", type=int, default=100,
+                    help="--unit-element: bp each side of an interval an "
+                         "end's midpoint may lie and count as in it (100, "
+                         "about half a read).")
     ap.add_argument("--genome", default="hg38",
                     help="--haplotypes: for PAR1 and the escape genes.")
     ap.add_argument("--chrx-par", default="auto")
@@ -2719,8 +2859,17 @@ def main(argv=None) -> int:
             # run_group keeps each group under its file-safe label
             safe_of = {k: lab.replace("/", "_").replace(" ", "_")
                        for k, lab in labels.items()}
-            t = unit_comparisons(kept, safe_of, edges, bands, args, named)
+            parts = []
+            for elem in ["all"] + list(args.units_cfg.get("elements", {})):
+                lab_e = {_unit_key(k)[0]: v for k, v in safe_of.items()
+                         if (_unit_key(k)[1] or "all") == elem}
+                t_ = unit_comparisons(kept, lab_e, edges, bands, args, named)
+                if len(t_):
+                    parts.append(t_.assign(element=elem))
+            t = (pd.concat(parts, ignore_index=True) if parts
+                 else pd.DataFrame())
             if len(t):
+                t.insert(0, "element", t.pop("element"))
                 t.insert(0, "line", line)
                 f_ = out_dir / f"end_posterior_units_{safe}.tsv"
                 t.to_csv(f_, sep="\t", index=False)

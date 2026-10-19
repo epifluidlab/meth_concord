@@ -569,3 +569,72 @@ def test_cells_alike_in_folding_show_no_slope(tmp_path):
     tr, _ = _strata_run(make_strength_data(tmp_path / "d", follow=False),
                         tmp_path / "o")
     assert tr.loc[("P(s): share ≥ 1 Mb", "chrX"), "p_perm"] > 0.05
+
+
+def _in_elem(p) -> bool:
+    """The elements: 200 kb at the start of every Mb."""
+    return p % 1_000_000 < 200_000
+
+
+def make_element_data(out: Path, n_cells=20, n=900, seed=5):
+    """GM, its inactive X hap1: its contacts with an end in an element kept
+    at 0.4 -- they avoid the elements -- every other copy's at random."""
+    rng = np.random.default_rng(seed)
+    hd = out / "haps"
+    hd.mkdir(parents=True)
+    rows = []
+    for ci in range(n_cells):
+        t = []
+        for chrom in ("chr1", "chrX"):
+            for hap in (1, 2):
+                xi = chrom == "chrX" and hap == 1
+                got = 0
+                while got < n:
+                    p1 = int(rng.integers(0, L))
+                    p2 = p1 + int(10 ** rng.uniform(3.0, 7.1))
+                    if p2 >= L:
+                        continue
+                    if xi and (_in_elem(p1) or _in_elem(p2)) \
+                            and rng.random() > 0.4:
+                        continue
+                    t.append((chrom, p1, p2, hap, 1))
+                    got += 1
+        pd.DataFrame(t, columns=["chrom", "pos1", "pos2", "hap",
+                                 "snp_reads"]).to_parquet(
+            hd / f"GM_{ci}.haplotypes.parquet", index=False)
+        rows.append((f"GM_{ci}", "GM"))
+    pd.DataFrame(rows, columns=["cell_name", "group"]).to_csv(
+        out / "samples.tsv", sep="\t", index=False)
+    with open(out / "elem.bed", "w") as fh:
+        for c in ("chr1", "chrX"):
+            for k in range(L // 1_000_000):
+                fh.write(f"{c}\t{k * 1_000_000}\t{k * 1_000_000 + 200_000}\n")
+    return out
+
+
+def test_an_element_the_inactive_x_avoids_has_fewer_of_its_contacts(
+        tmp_path):
+    d = make_element_data(tmp_path / "d")
+    o = tmp_path / "out"
+    hc.main(["--haplotypes", str(d / "haps"), "--samples",
+             str(d / "samples.tsv"), "--xi", "GM=1", "--genome", "none",
+             "--chrx-par", "none", "--xi-elements", "none",
+             "--chrx-escape", "none", "--element", f"elem={d / 'elem.bed'}",
+             "--element-flank", "0", "--locus", "none", "--n-boot", "200",
+             "--plot-format", "png", "--output-dir", str(o)])
+    s = pd.read_csv(o / "haplotype_contacts.tsv", sep="\t").set_index(
+        ["measure", "set"])
+    m = hc.ELEMENT_SHARE
+    # an end in the element on about a third of a copy's contacts, on the
+    # inactive X half as many
+    r = s.loc[(m, "chrX elem")]
+    assert 0.3 < r["copy2"] < 0.45 and r["copy1"] < 0.75 * r["copy2"]
+    assert r["ci_hi"] < -0.05
+    r = s.loc[(m, "autosomes elem")]
+    assert abs(r["difference"]) < 0.03 and r["ci_lo"] < 0 < r["ci_hi"]
+    r = s.loc[(m, "elem: chrX − autosomes")]
+    assert r["difference"] < -0.08 and r["ci_hi"] < 0
+    # the element's contacts are as long on either copy: nothing planted
+    r = s.loc[("P(s): share ≥ 1 Mb", "chrX elem")]
+    assert abs(r["difference"]) < 0.04
+

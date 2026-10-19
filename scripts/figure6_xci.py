@@ -501,6 +501,12 @@ def panel_h(axes, cme: pd.DataFrame, fine: pd.DataFrame, clonal, mosaic):
 
 def panel_i(ax, units: pd.DataFrame):
     u = units[units["measure"] == "gg"]
+    # every contact, band by band: the run also writes --unit-element's
+    # rows and all the bands together
+    if "element" in u.columns:
+        u = u[u["element"] == "all"]
+    if "band" in u.columns:
+        u = u[~u["band"].astype(str).str.startswith("all")]
     series = (("chrX Xi", XI, "Xi"), ("chrX Xa", XA, "Xa"),
               ("autosomes same copy", AUTO, "autosomes"))
     for k, (cmp_, col, lab) in enumerate(series):
