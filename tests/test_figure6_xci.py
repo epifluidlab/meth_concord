@@ -210,3 +210,18 @@ def test_observed_against_expected_is_tested_on_both_intervals():
                       predicted_hi=cme["predicted"] + 0.02)
     assert f6.vs_expected(wide)[2] > p[2]
 
+
+def test_e_says_its_counts_and_g_names_its_line(tmp_path):
+    c, cm, un = _tables(tmp_path)
+    fig = f6.figure_from_args(f6.parse_args(_argv(tmp_path, c, cm, un)))
+    texts = [t.get_text() for ax in fig.axes for t in ax.texts]
+    titles = [ax.get_title(loc="left") for ax in fig.axes]
+    # e: the mosaic line's calls in words, no bar chart of two numbers
+    assert "IMR: hap1 silenced in 10 cells, hap2 in 20" in texts
+    assert not any([x.get_text() for x in ax.get_xticklabels()]
+                   == ["hap1", "hap2"] for ax in fig.axes)
+    # g: the clonal line, its cells with a strength of all of them
+    cells = pd.read_csv(c / "haplotype_xci_cells_GM.tsv", sep="\t")
+    n = int(np.isfinite(cells["strength"]).sum())
+    assert f"GM, {n} of {len(cells)} cells" in titles
+

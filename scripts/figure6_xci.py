@@ -16,12 +16,14 @@ The panels, from the runs' tables:
      (haplotype_contacts_ps_ratio.tsv)
   d  Xi less Xa methylation and accessibility per kind of element
      (allelic_imbalance.py's allelic_summary.tsv)
-  e  a mosaic line: each cell's inactive X (haplotype_xi_calls_<line>.tsv
-     or --mosaic-calls), and its copies' differences as bulk data and as
-     each cell sees them (haplotype_contacts.tsv)
+  e  a mosaic line: how many cells silence each haplotype
+     (haplotype_xi_calls_<line>.tsv or --mosaic-calls), and its copies'
+     differences as bulk data and as each cell sees them
+     (haplotype_contacts.tsv)
   f  escape against inactivated genes: levels (haplotype_genes_<line>.tsv),
      contacts 1 Mb or more (haplotype_contacts.tsv)
-  g  cells by their own XCI strength (haplotype_xci_cells/_strata/_trend)
+  g  the clonal line's cells by their own XCI strength
+     (haplotype_xci_cells/_strata/_trend)
   h  X's excess concordance over the autosomes, observed and expected from
      the copies' level difference alone (copy_mixing_excess.py), with p of
      the clonal line's observed against expected
@@ -315,20 +317,18 @@ def panel_d(ax, summ: pd.DataFrame, group: str):
 
 #: Panel e's measures: (measure, short name).
 E_MEASURES = (("P(s): share ≥ 1 Mb", "contacts ≥1 Mb"),
-              ("P(s): share ≥ 10 Mb", "contacts ≥10 Mb"),
               ("A/B compartments: ends' correlation", "compartments"),
               ("crossing DXZ4: log2 obs/exp", "DXZ4 crossing"))
 
 
-def panel_e(ax_calls, axes, stats, clonal, mosaic, calls):
-    """``calls``: (hap1 cells, hap2 cells) of the mosaic line."""
+def panel_e(axes, stats, clonal, mosaic, calls):
+    """``calls``: (hap1 cells, hap2 cells) of the mosaic line, said above
+    the panels -- two numbers, no plot of their own."""
     n1, n2 = calls
-    ax_calls.bar([0, 1], [n1, n2], color=[XI, "#f4a582"], width=0.7)
-    ax_calls.set_xticks([0, 1])
-    ax_calls.set_xticklabels(["hap1", "hap2"])
-    ax_calls.set_ylabel("cells")
-    ax_calls.set_title(f"{mosaic} cells:\nhaplotype silenced",
-                       loc="left")
+    axes[0].annotate(f"{mosaic}: hap1 silenced in {n1} cells, hap2 in {n2}",
+                     xy=(0, 1), xycoords="axes fraction", xytext=(0, 13),
+                     textcoords="offset points", ha="left", va="bottom",
+                     fontsize=6.2)
     for ax, (m, nm) in zip(axes, E_MEASURES):
         pts = [(_row(stats, clonal, m, "chrX"), "black", "o"),
                (_row(stats, mosaic, m, "chrX", "haplotypes (bulk view)"),
@@ -340,7 +340,7 @@ def panel_e(ax_calls, axes, stats, clonal, mosaic, calls):
                      col, marker=mk)
         _zero(ax)
         ax.set_xticks([0, 1, 2])
-        ax.set_xticklabels(["GM", "IMR\nbulk", "IMR\ncell"])
+        ax.set_xticklabels([clonal, f"{mosaic}\nbulk", f"{mosaic}\nper cell"])
         ax.set_xlim(-0.6, 2.6)
         ax.set_title(nm, loc="left")
     axes[0].set_ylabel("Xi − Xa")
@@ -382,7 +382,7 @@ def panel_f(ax_lv, ax_3d, genes, stats, clonal, mosaic):
     ax_3d.set_title("…but fold like Xi", loc="left")
 
 
-def panel_g(ax_h, ax1, ax2, cells, strata, trend):
+def panel_g(ax_h, ax1, ax2, cells, strata, trend, clonal):
     from scipy.stats import norm
     s = cells["strength"].to_numpy(float)
     e = cells["noise_sd"].to_numpy(float)
@@ -397,11 +397,15 @@ def panel_g(ax_h, ax1, ax2, cells, strata, trend):
         dens = np.mean([norm.pdf(xs, s.mean(), v) for v in e], axis=0)
         ax_h.plot(xs, dens * s.size * (bins[1] - bins[0]), color="black",
                   lw=0.8, label="sampling alone")
-        ax_h.legend(frameon=False, loc="upper left")
+        # the key above the curve's peak, not across it
+        ax_h.set_ylim(0, ax_h.get_ylim()[1] * 1.3)
+        ax_h.legend(frameon=False, loc="upper right")
     ax_h.axvline(0, color="0.5", lw=0.4)
     ax_h.set_xlabel("XCI strength (Xi − Xa\nat CpG islands)")
     ax_h.set_ylabel("cells")
-    ax_h.set_title(f"{len(s)} cells", loc="left")
+    # the clonal line alone: a mosaic line's Xi is called from this same
+    # difference, so its strength would be positive by construction
+    ax_h.set_title(f"{clonal}, {len(s)} of {len(cells)} cells", loc="left")
     for ax, (m, nm) in ((ax1, ("P(s): share ≥ 1 Mb", "contacts ≥1 Mb")),
                         (ax2, ("A/B compartments: ends' correlation",
                                "compartment correlation"))):
@@ -570,12 +574,11 @@ def build_figure(d: dict, clonal: str, mosaic: str, calls: tuple,
     ax_d = fig.add_subplot(gs[1, 0:2])
     panel_d(ax_d, d["summary"], clonal)
     letters.append(("d", ax_d, 0.045))
-    ge = GridSpecFromSubplotSpec(1, 5, gs[1, 2:6],
-                                 width_ratios=[0.85, 1, 1, 1, 1], wspace=0.75)
-    ax_e0 = fig.add_subplot(ge[0])
-    ax_e = [fig.add_subplot(ge[i]) for i in range(1, 5)]
-    panel_e(ax_e0, ax_e, d["stats"], clonal, mosaic, calls)
-    letters.append(("e", ax_e0, 0.045))
+    ge = GridSpecFromSubplotSpec(1, len(E_MEASURES), gs[1, 2:6],
+                                 wspace=0.55)
+    ax_e = [fig.add_subplot(ge[i]) for i in range(len(E_MEASURES))]
+    panel_e(ax_e, d["stats"], clonal, mosaic, calls)
+    letters.append(("e", ax_e[0], 0.06))
     gf = GridSpecFromSubplotSpec(1, 2, gs[2, 0:2], width_ratios=[1.6, 1],
                                  wspace=0.7)
     ax_f1, ax_f2 = fig.add_subplot(gf[0]), fig.add_subplot(gf[1])
@@ -583,7 +586,7 @@ def build_figure(d: dict, clonal: str, mosaic: str, calls: tuple,
     letters.append(("f", ax_f1, 0.045))
     gg = GridSpecFromSubplotSpec(1, 3, gs[2, 2:6], wspace=0.65)
     ax_g = [fig.add_subplot(gg[i]) for i in range(3)]
-    panel_g(*ax_g, d["cells"], d["strata"], d["trend"])
+    panel_g(*ax_g, d["cells"], d["strata"], d["trend"], clonal)
     letters.append(("g", ax_g[0], 0.045))
     gh = GridSpecFromSubplotSpec(1, 2, gs[3, 0:4], wspace=0.3)
     ax_h = [fig.add_subplot(gh[i]) for i in range(2)]
