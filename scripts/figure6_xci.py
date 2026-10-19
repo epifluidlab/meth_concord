@@ -294,80 +294,70 @@ D_ELEMENTS = (("all", "", None), ("CpG\nislands", "_island", "island"),
               ("CTCF\nsites", "_ctcf", "ctcf"))
 
 
-def panel_d(ax, summ: pd.DataFrame, group: str, ax_c=None, stats=None,
-            mosaic=None):
-    """``ax``: each kind of element's Xi − Xa level; ``ax_c``, beneath it,
-    its contacts' (:func:`panel_d_contacts`)."""
+def panel_d(ax, summ: pd.DataFrame, group: str, ax_c=None, stats=None):
+    """``ax``: each kind of element's Xi − Xa level, with each one's p;
+    ``ax_c``, beneath it, its contacts' (:func:`panel_d_contacts`)."""
     s = summ[summ["group"] == group]
     sname = "chrX rest" if (s["set"] == "chrX rest").any() else "chrX"
     s = s[s["set"] == sname].set_index("context")
     cats = [(lab, suf) for lab, suf, _ in D_ELEMENTS]
-    for j, (mark, col, lab) in enumerate((("HCG", HCG_C,
-                                           "methylation (HCG)"),
-                                          ("GCH", GCH_C,
-                                           "accessibility (GCH)"))):
-        xs, ys, los, his = [], [], [], []
+    rows = []
+    for j, (mark, col) in enumerate((("HCG", HCG_C), ("GCH", GCH_C))):
+        xs, ys, los, his, ps = [], [], [], [], []
         for i, (_, suf) in enumerate(cats):
             k = f"{mark}{suf}"
             if k not in s.index:
+                ps.append(np.nan)
                 continue
             r = s.loc[k]
             xs.append(i + (j - 0.5) * 0.3)
             ys.append(r["xi_minus_xa"])
             los.append(r["xi_ci_lo"])
             his.append(r["xi_ci_hi"])
-        _err(ax, xs, ys, los, his, col, lab)
+            ps.append(float(r["p"]) if "p" in r else np.nan)
+        _err(ax, xs, ys, los, his, col)
+        rows.append(([_p_or_blank(v) for v in ps], col))
     _zero(ax)
     ax.set_xticks(range(len(cats)))
     ax.set_xticklabels([c for c, _ in cats])
     ax.set_ylabel("Xi − Xa level")
-    ax.set_title(f"Methylation and accessibility ({group})", loc="left")
-    # the key in one row above the points, the promoters' methylation the
-    # highest of them
-    y0, y1 = ax.get_ylim()
-    ax.set_ylim(y0, y1 + 0.25 * (y1 - y0))
-    ax.legend(frameon=False, loc="upper left", ncol=2, handletextpad=0.2,
-              columnspacing=0.9, borderaxespad=0.1)
+    # the marks named in their colours, the top left for each element's p
+    _title_parts(ax, [("Methylation", HCG_C), (" and ", "black"),
+                      ("accessibility", GCH_C), (f" ({group})", "black")])
+    # half a category each side, so the first p clears the axis
+    ax.set_xlim(-0.6, len(cats) - 0.4)
+    _tops(ax, range(len(cats)), rows, gap=0.1)
     if ax_c is not None and stats is not None:
-        panel_d_contacts(ax_c, stats, group, mosaic)
+        panel_d_contacts(ax_c, stats, group)
         # the axes share the elements: named once, beneath
         ax.tick_params(labelbottom=False)
         ax_c.set_xticks(range(len(cats)))
         ax_c.set_xticklabels([c for c, _ in cats], fontsize=5)
 
 
-def panel_d_contacts(ax, stats: pd.DataFrame, clonal: str, mosaic=None):
-    """Xi − Xa share of contacts 1 Mb or more apart: of all X's contacts,
+def panel_d_contacts(ax, stats: pd.DataFrame, clonal: str):
+    """Xi − Xa share of contacts 1 Mb or more apart, of all X's contacts
     and of those with an end in each kind of element (haplotype_contacts.py
-    --element sets 'chrX <name>'); the clonal line, the mosaic one cell by
-    cell, and the clonal line's autosomal copies -- the control."""
+    --element sets 'chrX <name>'), the clonal line's as the levels above,
+    each with its p."""
     m = "P(s): share ≥ 1 Mb"
-    series = [(clonal, "chrX", "black", "o", clonal),
-              (mosaic, "chrX", XI, "o", f"{mosaic}, per cell"),
-              (clonal, "autosomes", AUTO, "D", "autosomes")]
-    drawn = 0
-    for k, (g, base, col, mk, lab) in enumerate(s_ for s_ in series
-                                                if s_[0]):
-        xs, ys, los, his = [], [], [], []
-        for i, (_, _, el) in enumerate(D_ELEMENTS):
-            r = _row(stats, g, m, base if el is None else f"{base} {el}")
-            if r is None:
-                continue
-            xs.append(i + (k - 1) * 0.24)
-            ys.append(r["difference"])
-            los.append(r["ci_lo"])
-            his.append(r["ci_hi"])
-        if xs:
-            _err(ax, xs, ys, los, his, col, lab, marker=mk, ms=2.4)
-            drawn += 1
+    xs, ys, los, his, ps = [], [], [], [], []
+    for i, (_, _, el) in enumerate(D_ELEMENTS):
+        r = _row(stats, clonal, m, "chrX" if el is None else f"chrX {el}")
+        if r is None:
+            ps.append(np.nan)
+            continue
+        xs.append(i)
+        ys.append(r["difference"])
+        los.append(r["ci_lo"])
+        his.append(r["ci_hi"])
+        ps.append(float(r.get("p", np.nan)))
+    if xs:
+        _err(ax, xs, ys, los, his, "black", ms=2.6)
     _zero(ax)
     ax.set_ylabel("Xi − Xa, share of\ncontacts ≥1 Mb")
-    if drawn:
-        # a band above the intervals for the key, in one row
-        y0, y1 = ax.get_ylim()
-        ax.set_ylim(y0, y1 + 0.45 * (y1 - y0))
-        ax.legend(frameon=False, loc="upper left", ncol=3, fontsize=4.8,
-                  handletextpad=0.2, columnspacing=0.8, borderaxespad=0.1)
+    _tops(ax, range(len(D_ELEMENTS)), [([_p_or_blank(v) for v in ps],
+                                        "black")], gap=0.12)
 
 
 #: Panel e's measures: (measure, short name).
@@ -394,8 +384,17 @@ def panel_e(axes, stats, clonal, mosaic, calls):
                 _err(ax, [i], [r["difference"]], [r["ci_lo"]], [r["ci_hi"]],
                      col, marker=mk)
         _zero(ax)
+        # each copy difference against none
+        for i, (r, col, _) in enumerate(pts):
+            if r is not None and np.isfinite(r.get("p", np.nan)):
+                ax.text(i, 0.99, _p(float(r["p"])), color=col,
+                        transform=ax.get_xaxis_transform(), ha="center",
+                        va="top", fontsize=4.6)
+        y0, y1 = ax.get_ylim()
+        ax.set_ylim(y0, y1 + 0.14 * (y1 - y0))
         ax.set_xticks([0, 1, 2])
-        ax.set_xticklabels([clonal, f"{mosaic}\nbulk", f"{mosaic}\nper cell"])
+        ax.set_xticklabels([clonal, f"{mosaic}\nbulk", f"{mosaic}\nper cell"],
+                           fontsize=5)
         ax.set_xlim(-0.6, 2.6)
         ax.set_title(nm, loc="left")
     axes[0].set_ylabel("Xi − Xa")
@@ -419,10 +418,20 @@ def panel_f(ax_lv, ax_3d, genes, stats, clonal, mosaic):
         _err(ax_lv, xs, ys, los, his, col, cls)
     _zero(ax_lv)
     ax_lv.set_xticks(range(len(cats)))
-    ax_lv.set_xticklabels([c for _, c in cats])
+    ax_lv.set_xticklabels([c for _, c in cats], fontsize=5)
+    ax_lv.set_xlim(-0.5, len(cats) - 0.5)
     ax_lv.set_ylabel("Xi − Xa level")
     ax_lv.set_title("Escape genes: levels like Xa…", loc="left")
     ax_lv.legend(frameon=False, loc="center right")
+    # escape against inactivated genes, from the difference's interval
+    ps = []
+    for ctx, _ in cats:
+        r = genes[(genes["context"] == ctx)
+                  & (genes["class"] == "escape − inactivated genes")]
+        ps.append(p_from_ci(*r[["difference", "ci_lo", "ci_hi"]].iloc[0])
+                  if len(r) else np.nan)
+    _tops(ax_lv, range(len(cats)), [([_p_or_blank(v, True) for v in ps],
+                                     "black")], fontsize=4.4)
     for i, g in enumerate((clonal, mosaic)):
         for j, (cls, col) in enumerate((("escape genes", ESC_C),
                                         ("inactivated genes", INACT_C))):
@@ -431,8 +440,15 @@ def panel_f(ax_lv, ax_3d, genes, stats, clonal, mosaic):
                 _err(ax_3d, [i + (j - 0.5) * 0.3], [r["difference"]],
                      [r["ci_lo"]], [r["ci_hi"]], col)
     _zero(ax_3d)
+    ps = []
+    for g in (clonal, mosaic):
+        r = _row(stats, g, "P(s): share ≥ 1 Mb", "escape − inactivated genes")
+        ps.append(float(r.get("p", np.nan)) if r is not None else np.nan)
+    ax_3d.set_xlim(-0.4, 1.4)
+    _tops(ax_3d, [0, 1], [([_p_or_blank(v, True) for v in ps], "black")],
+          fontsize=4.4)
     ax_3d.set_xticks([0, 1])
-    ax_3d.set_xticklabels([clonal, f"{mosaic}\n(per cell)"])
+    ax_3d.set_xticklabels([clonal, f"{mosaic}\n(per cell)"], fontsize=5)
     ax_3d.set_ylabel("Xi − Xa, contacts ≥1 Mb")
     ax_3d.set_title("…but fold like Xi", loc="left")
 
@@ -497,6 +513,36 @@ def _p(p) -> str:
     return f"p = {p:.2f}" if p >= 0.01 else f"p = {p:.3f}"
 
 
+def p_from_ci(d, lo, hi) -> float:
+    """Two-sided p of a difference from its 95% interval, normal: for
+    tables that keep the interval alone (haplotype_genes_<line>.tsv)."""
+    from scipy.stats import norm
+    se = (hi - lo) / (2 * norm.ppf(0.975))
+    return float(2 * norm.sf(abs(d) / se)) if se > 0 and np.isfinite(
+        d) else np.nan
+
+
+def _p_or_blank(p, compact: bool = False) -> str:
+    """_p, or nothing where there is no p; ``compact``: without spaces, for
+    narrow panels."""
+    if not np.isfinite(p):
+        return ""
+    return _p(p).replace(" ", "") if compact else _p(p)
+
+
+def _title_parts(ax, parts, fontsize=6.2):
+    """A left-aligned title in pieces, each in its colour [(text, colour)]
+    -- the marks' colours named in it, in place of a legend."""
+    from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea
+    box = HPacker(children=[TextArea(t, textprops=dict(color=c,
+                                                       fontsize=fontsize))
+                            for t, c in parts], align="baseline", pad=0,
+                  sep=0)
+    ax.add_artist(AnchoredOffsetbox(
+        loc="lower left", child=box, pad=0, borderpad=0, frameon=False,
+        bbox_to_anchor=(0, 1.02), bbox_transform=ax.transAxes))
+
+
 def vs_expected(cme: pd.DataFrame) -> pd.Series:
     """Per row of copy_mixing_excess.tsv, p of observed against expected:
     their difference over both intervals' standard errors (95% interval /
@@ -510,7 +556,7 @@ def vs_expected(cme: pd.DataFrame) -> pd.Series:
                                  / se), index=cme.index)
 
 
-def _tops(ax, xs, rows, gap=0.075):
+def _tops(ax, xs, rows, gap=0.075, fontsize=4.6):
     """Rows of text along the top of ``ax``, one per (texts, colour), each
     text at its x; the y range opened to make room."""
     y0, y1 = ax.get_ylim()
@@ -519,7 +565,7 @@ def _tops(ax, xs, rows, gap=0.075):
     for k, (texts, col) in enumerate(rows):
         for x, t in zip(xs, texts):
             ax.text(x, 0.99 - gap * k, t, transform=ax.get_xaxis_transform(),
-                    ha="center", va="top", fontsize=4.6, color=col)
+                    ha="center", va="top", fontsize=fontsize, color=col)
 
 
 def panel_h(axes, cme: pd.DataFrame, fine: pd.DataFrame, clonal, mosaic):
@@ -637,23 +683,26 @@ def build_figure(d: dict, clonal: str, mosaic: str, calls: tuple,
     ax_c = fig.add_subplot(gl[1])
     panel_c(ax_c, d["ratio"], clonal)
     letters.append(("c", ax_c, 0.045))
-    gd = GridSpecFromSubplotSpec(2, 1, gs[1, 0:2], hspace=0.14,
+    # d and f name more categories than a third of the width holds: their
+    # rows split further right, across the grid's own gap
+    r1, r2 = (GridSpecFromSubplotSpec(1, 2, gs[r, :], width_ratios=[1, 1.75],
+                                      wspace=0.22) for r in (1, 2))
+    gd = GridSpecFromSubplotSpec(2, 1, r1[0], hspace=0.14,
                                  height_ratios=[1.25, 1])
     ax_d = fig.add_subplot(gd[0])
     ax_dc = fig.add_subplot(gd[1], sharex=ax_d)
-    panel_d(ax_d, d["summary"], clonal, ax_dc, d["stats"], mosaic)
+    panel_d(ax_d, d["summary"], clonal, ax_dc, d["stats"])
     letters.append(("d", ax_d, 0.045))
-    ge = GridSpecFromSubplotSpec(1, len(E_MEASURES), gs[1, 2:6],
-                                 wspace=0.55)
+    ge = GridSpecFromSubplotSpec(1, len(E_MEASURES), r1[1], wspace=0.55)
     ax_e = [fig.add_subplot(ge[i]) for i in range(len(E_MEASURES))]
     panel_e(ax_e, d["stats"], clonal, mosaic, calls)
     letters.append(("e", ax_e[0], 0.06))
-    gf = GridSpecFromSubplotSpec(1, 2, gs[2, 0:2], width_ratios=[1.6, 1],
-                                 wspace=0.7)
+    gf = GridSpecFromSubplotSpec(1, 2, r2[0], width_ratios=[1.7, 1],
+                                 wspace=0.6)
     ax_f1, ax_f2 = fig.add_subplot(gf[0]), fig.add_subplot(gf[1])
     panel_f(ax_f1, ax_f2, d["genes"], d["stats"], clonal, mosaic)
     letters.append(("f", ax_f1, 0.045))
-    gg = GridSpecFromSubplotSpec(1, 3, gs[2, 2:6], wspace=0.65)
+    gg = GridSpecFromSubplotSpec(1, 3, r2[1], wspace=0.65)
     ax_g = [fig.add_subplot(gg[i]) for i in range(3)]
     panel_g(*ax_g, d["cells"], d["strata"], d["trend"], clonal)
     letters.append(("g", ax_g[0], 0.045))

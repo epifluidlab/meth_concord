@@ -247,18 +247,24 @@ def test_d_draws_each_element_s_contacts_and_skips_the_missing():
     rows = []
     for g, xi in (("GM", "1"), ("IMR", "cells")):
         for sname, d_ in (("chrX", 0.09), ("chrX island", 0.12),
-                          ("chrX enhancer", 0.22), ("autosomes", 0.0),
-                          ("autosomes island", 0.0)):
+                          ("chrX enhancer", 0.22), ("autosomes", 0.0)):
             rows.append({"group": g, "xi": xi, "measure": "P(s): share ≥ 1 Mb",
                          "set": sname, "difference": d_, "ci_lo": d_ - 0.05,
-                         "ci_hi": d_ + 0.05})
+                         "ci_hi": d_ + 0.05, "p": 0.004})
     fig, ax = plt.subplots()
-    f6.panel_d_contacts(ax, pd.DataFrame(rows), "GM", "IMR")
-    # GM and IMR on X at all, islands and enhancers; the autosomes at all
-    # and islands; promoters and CTCF sites absent, so not drawn
-    xs = sorted(round(float(x), 2) for c in ax.containers
+    f6.panel_d_contacts(ax, pd.DataFrame(rows), "GM")
+    # the clonal line's X alone, as d's levels: at all, islands and
+    # enhancers; promoters and CTCF sites absent, so not drawn
+    xs = sorted(float(x) for c in ax.containers
                 for x in c.lines[0].get_xdata())
-    assert len(ax.containers) == 3 and len(xs) == 3 + 3 + 2
-    assert not any(1.5 < x < 2.5 or x > 3.5 for x in xs)
+    assert len(ax.containers) == 1 and xs == [0.0, 1.0, 3.0]
+    # each drawn element's p above it, the others blank
+    ps = [t_.get_text() for t_ in ax.texts]
+    assert ps.count("p = 0.004") == 3 and ps.count("") == 2
     assert f6._p(0.104) == "p = 0.10" and f6._p(0.004) == "p = 0.004"
 
+
+def test_a_difference_s_p_from_its_interval():
+    assert f6.p_from_ci(0.0, -0.1, 0.1) == pytest.approx(1.0)
+    # 1.96 standard errors from zero
+    assert f6.p_from_ci(0.196, 0.0, 0.392) == pytest.approx(0.05, abs=1e-3)
