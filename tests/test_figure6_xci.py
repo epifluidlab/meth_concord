@@ -241,3 +241,24 @@ def test_i_draws_every_contact_band_by_band(tmp_path):
                          if len(ln.get_ydata())])
     assert ys.size and np.nanmax(ys) < 1.0
 
+
+def test_d_draws_each_element_s_contacts_and_skips_the_missing():
+    plt = f6._style()
+    rows = []
+    for g, xi in (("GM", "1"), ("IMR", "cells")):
+        for sname, d_ in (("chrX", 0.09), ("chrX island", 0.12),
+                          ("chrX enhancer", 0.22), ("autosomes", 0.0),
+                          ("autosomes island", 0.0)):
+            rows.append({"group": g, "xi": xi, "measure": "P(s): share ≥ 1 Mb",
+                         "set": sname, "difference": d_, "ci_lo": d_ - 0.05,
+                         "ci_hi": d_ + 0.05})
+    fig, ax = plt.subplots()
+    f6.panel_d_contacts(ax, pd.DataFrame(rows), "GM", "IMR")
+    # GM and IMR on X at all, islands and enhancers; the autosomes at all
+    # and islands; promoters and CTCF sites absent, so not drawn
+    xs = sorted(round(float(x), 2) for c in ax.containers
+                for x in c.lines[0].get_xdata())
+    assert len(ax.containers) == 3 and len(xs) == 3 + 3 + 2
+    assert not any(1.5 < x < 2.5 or x > 3.5 for x in xs)
+    assert f6._p(0.104) == "p = 0.10" and f6._p(0.004) == "p = 0.004"
+
