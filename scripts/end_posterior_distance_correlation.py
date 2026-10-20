@@ -112,6 +112,13 @@ replaced by an end of the same cell and copy at the partner's place
 (--null-type link-shuffle), drawn from all of the copy's ends, so the
 element shapes the contacts tested, not their stand-ins; rows under its
 NAME in the table's 'element' column ('all' for every contact).
+--unit-split NAME=CHROM:START-END asks it of the contacts crossing the
+region -- an end on each side -- and of those with both ends on one side
+(DXZ4, the inactive X's megadomain boundary: does concordance across it
+differ from concordance within a megadomain, on the Xi and not the Xa?).
+A stand-in replaces end 2 near the real one, so a crossing contact's
+stand-ins cross too.  Rows under NAME: each copy crossing and on one side,
+crossing less one side per copy, and the copies' difference in that.
 
     python scripts/end_posterior_distance_correlation.py \\
         --posteriors GCH=output/signed_250kb_rwr/context_GCH/04_posteriors \\
@@ -478,6 +485,56 @@ def read_unit_elements(specs, flank: int) -> dict:
     return out
 
 
+#: --unit-split's two kinds of contact: an end on each side of the region,
+#: or both ends on one side of it (neither inside).
+SPLIT_PARTS = ("cross", "side")
+
+
+def read_unit_splits(specs) -> dict:
+    """--unit-split NAME=CHROM:START-END: per name, the region and its
+    chromosome's bounds on the genome-wide coordinate (:func:`genome_coords`)
+    -- 'lo', 'hi', 'c0', 'c1' -- and 'set', the units' chromosomes it lies on
+    (UNITS: 'X' or 'A')."""
+    out = {}
+    for spec in specs or []:
+        name, _, reg = str(spec).partition("=")
+        name, reg = name.strip(), reg.strip().replace(",", "")
+        chrom, _, span = reg.rpartition(":")
+        a_, _, b_ = span.partition("-")
+        if not name or not chrom or not (a_.isdigit() and b_.isdigit()
+                                         and int(a_) < int(b_)):
+            raise SystemExit(f"--unit-split {spec}: NAME=CHROM:START-END")
+        if any(c in name for c in ("@", ":", UNIT_SEP)):
+            raise SystemExit(f"--unit-split {spec}: no '@' or ':' in the "
+                             f"name")
+        c = _canon(chrom).upper()
+        if c != "X" and not c.isdigit():
+            raise SystemExit(f"--unit-split {spec}: on chrX or an autosome, "
+                             f"as the units are")
+        c0 = int(genome_coords([chrom], [0])[0])
+        out[name] = {"lo": c0 + int(a_), "hi": c0 + int(b_), "c0": c0,
+                     "c1": c0 + _GENOME_STRIDE, "set": "X" if c == "X"
+                     else "A", "region": f"{chrom}:{int(a_)}-{int(b_)}"}
+    return out
+
+
+def _split_frame(j: pd.DataFrame, region: dict, part: str, base: int):
+    """``j``'s pairs crossing ``region`` (:func:`read_unit_splits`) -- an
+    end on each side -- or, ``part`` 'side', with both ends on one side of
+    it, neither inside; and their ids in the whole of ``j`` (base + row)."""
+    g1 = j["gpos1"].to_numpy(np.int64)
+    g2 = j["gpos2"].to_numpy(np.int64)
+    lo, hi = np.minimum(g1, g2), np.maximum(g1, g2)
+    on = (lo >= region["c0"]) & (hi < region["c1"])
+    if part == "cross":
+        m = on & (lo < region["lo"]) & (hi >= region["hi"])
+    else:
+        m = on & ((hi < region["lo"]) | (lo >= region["hi"]))
+    sel = np.flatnonzero(m)
+    return (j.iloc[sel].reset_index(drop=True),
+            base + sel.astype(np.int64))
+
+
 def _focus_frame(j: pd.DataFrame, cols: dict, iv, base: int):
     """``j``'s pairs with an end in the intervals ``iv`` (genome
     coordinates), each turned so that end is end 1 -- the end a
@@ -503,12 +560,23 @@ def _focus_frame(j: pd.DataFrame, cols: dict, iv, base: int):
 
 
 def _unit_focus(cell: str, args):
-    """The intervals a unit's contacts are focused on, or None."""
+    """How a unit's contacts are focused, or None: a function of (frame,
+    its columns, the cell's pair base) giving the contacts it keeps and
+    their ids in the whole frame -- those with an end in an element
+    (:func:`_focus_frame`), or crossing a region or on one side of it
+    (:func:`_split_frame`)."""
     cfg = getattr(args, "units_cfg", None)
     if not cfg or UNIT_SEP not in cell:
         return None
     elem = _unit_key(cell.split(UNIT_SEP, 1)[1])[1]
-    return None if elem is None else cfg["elements"][elem]
+    if elem is None:
+        return None
+    if elem in cfg.get("elements", {}):
+        iv = cfg["elements"][elem]
+        return lambda j, cols, base: _focus_frame(j, cols, iv, base)
+    name, _, part = elem.rpartition(":")
+    region = cfg["splits"][name]
+    return lambda j, cols, base: _split_frame(j, region, part, base)
 
 
 def _load_any(paths: dict, cell: str, min_sites, merged, excl_chrom, args):
@@ -549,13 +617,15 @@ UNIT_SINGLES = ("x_xi", "x_xa", "x_same", "x_both", "a_xi", "a_xa",
 
 
 def unit_comparisons(kept: dict, labels: dict, edges, bands, args,
-                     named: bool = True) -> pd.DataFrame:
+                     named: bool = True, combos=None) -> pd.DataFrame:
     """One line's units against each other, by distance band: Δ (the
     --delta-arm arm less the null) of each unit and of UNIT_COMPARISONS'
     combinations, with 95% intervals and two-sided p from resampling the
     CELLS jointly -- a cell's units move together, so a comparison between
     them is paired.  ``kept``: {group label: per-cell accumulators, in the
-    cells' order}; ``labels``: {unit key: its group label}."""
+    cells' order}; ``labels``: {unit key: its group label}; ``combos``:
+    [(name, {unit key: weight})] in place of the units and
+    UNIT_COMPARISONS."""
     arm = getattr(args, "delta_arm", "linked")
     have = {k: kept.get(lab) for k, lab in labels.items()}
     have = {k: v for k, v in have.items() if v is not None}
@@ -604,11 +674,12 @@ def unit_comparisons(kept: dict, labels: dict, edges, bands, args,
                               ("a_same", ("a_xi", "a_xa"))):
             if u1 in d_of and u2 in d_of:
                 d_of[tot] = (d_of[u1] + d_of[u2]) / 2
-        combos = [(unit_label(k, named) if k in UNITS else
-                   {"x_same": "chrX same copy",
-                    "a_same": "autosomes same copy"}[k], {k: 1})
-                  for k in UNIT_SINGLES] + list(UNIT_COMPARISONS)
-        for name, wts in combos:
+        todo = combos if combos is not None else (
+            [(unit_label(k, named) if k in UNITS else
+              {"x_same": "chrX same copy",
+               "a_same": "autosomes same copy"}[k], {k: 1})
+             for k in UNIT_SINGLES] + list(UNIT_COMPARISONS))
+        for name, wts in todo:
             if any(k not in d_of for k in wts):
                 continue
             if not named:
@@ -626,6 +697,85 @@ def unit_comparisons(kept: dict, labels: dict, edges, bands, args,
                              "band": b_lab, "value": v[0, j], "lo": lo,
                              "hi": hi, "p": p, "cells": n})
     return pd.DataFrame(rows)
+
+
+def split_combos(name: str, bases, named: bool = True) -> list:
+    """--unit-split NAME's rows: per copy (UNITS key in ``bases``) its
+    contacts crossing the region and on one side, crossing less one side;
+    for two copies, the first's crossing less one side less the second's,
+    and the copies' difference among the crossing and among the one-side
+    contacts.  Keys 'unit|cross' and 'unit|side'."""
+    out = []
+    for b in bases:
+        lab = unit_label(b, named)
+        out += [(f"{lab} crossing {name}", {f"{b}|cross": 1}),
+                (f"{lab} same side of {name}", {f"{b}|side": 1}),
+                (f"{lab}: crossing − same side",
+                 {f"{b}|cross": 1, f"{b}|side": -1})]
+    if len(bases) == 2:
+        u, v = bases
+        lu, lv = unit_label(u, named), unit_label(v, named)
+        out += [(f"crossing − same side: {lu} − {lv}",
+                 {f"{u}|cross": 1, f"{u}|side": -1, f"{v}|cross": -1,
+                  f"{v}|side": 1}),
+                (f"crossing: {lu} − {lv}", {f"{u}|cross": 1,
+                                            f"{v}|cross": -1}),
+                (f"same side: {lu} − {lv}", {f"{u}|side": 1,
+                                             f"{v}|side": -1})]
+    return out
+
+
+def split_figure(t: pd.DataFrame, line: str, name: str, path) -> bool:
+    """--unit-split NAME, per measure: a, each copy's Δ for the contacts
+    crossing the region and those on one side, by distance band; b,
+    crossing less one side per copy, and the copies' difference in that."""
+    if t is None or not len(t):
+        return False
+    t = t[~t["band"].astype(str).str.startswith("all")]
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    meas = [m for m, _ in _MEASURES if (t["measure"] == m).any()]
+    comps = list(dict.fromkeys(t["comparison"]))
+    singles = [c for c in comps if c.endswith(f"crossing {name}")
+               or c.endswith(f"same side of {name}")]
+    diffs = [c for c in comps if ": crossing − same side" in c
+             or c.startswith("crossing − same side:")]
+    # the first copy red, the second blue, crossing dark and one side light;
+    # the copies' difference black
+    pal = (["#b2182b", "#ef8a62", "#2166ac", "#67a9cf"],
+           ["#b2182b", "#2166ac", "black"])
+    fig, axes = plt.subplots(2, len(meas), figsize=(3.4 * len(meas), 5.2),
+                             squeeze=False)
+    for j, m in enumerate(meas):
+        for row, items in ((0, singles), (1, diffs)):
+            ax = axes[row, j]
+            for i, nm in enumerate(items):
+                u = t[(t["measure"] == m) & (t["comparison"] == nm)]
+                if not len(u):
+                    continue
+                x = np.sqrt(u["band_lo"] * u["band_hi"]) * (
+                    1.12 ** (i - (len(items) - 1) / 2))
+                ax.errorbar(x, u["value"], yerr=[u["value"] - u["lo"],
+                                                 u["hi"] - u["value"]],
+                            fmt="o", ms=3, lw=0.8, capsize=1.5,
+                            color=pal[row][i % len(pal[row])], label=nm)
+            ax.axhline(0, color="0.6", lw=0.5)
+            _log_x(ax, float(t["band_lo"].min()), float(t["band_hi"].max()))
+            ax.set_xlabel("distance between the ends, bp", fontsize=6)
+            ax.set_ylabel("Δr, linked − within-cell null" if row == 0
+                          else "difference in Δr", fontsize=6)
+            ax.tick_params(labelsize=5.5)
+            ax.legend(fontsize=4.8, frameon=False)
+            ax.set_title(f"{'ab'[row]}  {dict(_MEASURES)[m].split('  ')[0]}",
+                         loc="left", fontsize=6.5)
+    fig.suptitle(f"{line}: contacts crossing {name} against those on one "
+                 f"side, each copy against donors of its own", fontsize=7,
+                 y=1.0)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    return True
 
 
 def _bp(v) -> str:
@@ -709,9 +859,26 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom,
     if elements and args.null_type != "link-shuffle":
         raise SystemExit("--unit-element needs --null-type link-shuffle: "
                          "it keeps the element's end and replaces the other")
+    splits = read_unit_splits(getattr(args, "unit_split", None))
+    if splits and args.null_type != "link-shuffle":
+        raise SystemExit("--unit-split needs --null-type link-shuffle: its "
+                         "stand-ins must stay on the real end's side")
+    clash = set(splits) & set(elements)
+    if clash:
+        raise SystemExit(f"--unit-split and --unit-element share "
+                         f"{sorted(clash)}")
     # per element the copies one by one -- 'both' is about pooling copies
     ekeys = [f"{k}@{nm}" for nm in elements for k in keys
              if UNITS[k][1] != "both"]
+    # per region the copies one by one, of the chromosomes it is on
+    ekeys += [f"{k}@{nm}:{part}" for nm, reg in splits.items()
+              for part in SPLIT_PARTS for k in keys
+              if UNITS[k][1] != "both" and UNITS[k][0] == reg["set"]]
+    for nm, reg in splits.items():
+        if not any(k.startswith(f"{u}@{nm}:") for k in ekeys for u in keys):
+            raise SystemExit(f"--unit-split {nm}: none of --units "
+                             f"{','.join(keys)} is a single copy of "
+                             f"{'chrX' if reg['set'] == 'X' else 'the autosomes'}")
     xi = {}
     for v in args.xi or []:
         for tok in str(v).split(","):
@@ -752,7 +919,7 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom,
         xi_of[c] = int(h)
         labs = lines.setdefault(line, (
             {k: f"{line} {unit_label(_unit_key(k)[0], mode is not None)}"
-                + (f" at {_unit_key(k)[1]}" if "@" in k else "")
+                + _focus_suffix(_unit_key(k)[1])
              for k in keys + ekeys},
             mode is not None))[0]
         for k in keys + ekeys:
@@ -766,13 +933,29 @@ def _unit_setup(samples: pd.DataFrame, cells, args, batch_of, excl_chrom,
     if paths:
         _probe_haplotypes(paths, hd, list(xi_of)[:3], args)
     args.units_cfg = {"dir": str(hd), "xi": xi_of, "par": par,
-                      "escape": esc, "elements": elements}
+                      "escape": esc, "elements": elements, "splits": splits}
+    n_split = sum(":" in (_unit_key(k)[1] or "") for k in ekeys)
     logger.info(f"--haplotypes: {len(xi_of):,} cells in "
-                f"{len(keys) + len(ekeys)} units each ({len(ekeys)} at "
-                f"--unit-element's {len(elements)} elements; {n_file} cells "
-                f"without a haplotype file, {n_call} without an inactive-X "
-                f"call); lines: {sorted(lines)}")
+                f"{len(keys) + len(ekeys)} units each "
+                f"({len(ekeys) - n_split} at --unit-element's "
+                f"{len(elements)} elements, {n_split} crossing or beside "
+                f"--unit-split's {len(splits)} regions"
+                + "".join(f" [{nm} {r['region']}]" for nm, r in splits.items())
+                + f"; {n_file} cells without a haplotype file, {n_call} "
+                f"without an inactive-X call); lines: {sorted(lines)}")
     return groups, strata, lines
+
+
+def _focus_suffix(elem) -> str:
+    """A focused unit's label after its copy's: ' at ELEMENT', ' crossing
+    NAME' or ' same side of NAME'; '' for every contact."""
+    if elem is None:
+        return ""
+    name, sep, part = elem.rpartition(":")
+    if sep and part in SPLIT_PARTS:
+        return f" crossing {name}" if part == "cross" else \
+            f" same side of {name}"
+    return f" at {elem}"
 
 
 def _probe_haplotypes(paths: dict, hd: Path, cells, args) -> None:
@@ -1597,10 +1780,11 @@ def _accumulate_cell(cell, seed_i, paths, edges, args, pools, batch_of,
         measures = [m for m, _ in _MEASURES if set_of[m] == sk]
         ids = None
         if focus is not None:
-            # the stand-ins from all of the unit's ends; only the contacts
-            # with an end in the element count, that end kept
+            # the stand-ins from all of the unit's ends; only the focused
+            # contacts count -- an end in the element, that end kept, or
+            # crossing a region or on one side of it
             pool = donors(sk, j, cols)
-            j, ids = _focus_frame(j, cols, focus, base)
+            j, ids = focus(j, cols, base)
             if not len(j):
                 continue
         d = j["distance"].to_numpy()
@@ -2687,6 +2871,19 @@ def main(argv=None) -> int:
                          "drawn from all of the copy's ends; e.g. "
                          "promoter=PLS.bed.  Its rows carry NAME in "
                          "end_posterior_units_<line>.tsv's 'element'.")
+    ap.add_argument("--unit-split", action="append", default=None,
+                    metavar="NAME=CHROM:START-END",
+                    help="--haplotypes, repeatable: also each copy over the "
+                         "contacts crossing the region (an end on each "
+                         "side) and over those with both ends on one side, "
+                         "neither inside -- e.g. DXZ4=chrX:115630000-"
+                         "115970000, the inactive X's megadomain boundary "
+                         "(--null-type link-shuffle, whose stand-in keeps "
+                         "the real end's side).  Rows under NAME in "
+                         "end_posterior_units_<line>.tsv's 'element'; "
+                         "figure end_posterior_units_<line>_NAME.  Crossing "
+                         "contacts are long: raise --max-distance and "
+                         "--unit-bands to 100 Mb for chrX.")
     ap.add_argument("--unit-element-flank", type=int, default=100,
                     help="--unit-element: bp each side of an interval an "
                          "end's midpoint may lie and count as in it (100, "
@@ -2930,6 +3127,18 @@ def main(argv=None) -> int:
                 t_ = unit_comparisons(kept, lab_e, edges, bands, args, named)
                 if len(t_):
                     parts.append(t_.assign(element=elem))
+            # each --unit-split region: crossing against one side, per copy
+            for nm in args.units_cfg.get("splits", {}):
+                lab_s = {}
+                for k, v in safe_of.items():
+                    base_, el = _unit_key(k)
+                    if el and el.rpartition(":")[0] == nm:
+                        lab_s[f"{base_}|{el.rpartition(':')[2]}"] = v
+                bases = list(dict.fromkeys(k.split("|")[0] for k in lab_s))
+                t_ = unit_comparisons(kept, lab_s, edges, bands, args, named,
+                                      combos=split_combos(nm, bases, named))
+                if len(t_):
+                    parts.append(t_.assign(element=nm))
             t = (pd.concat(parts, ignore_index=True) if parts
                  else pd.DataFrame())
             if len(t):
@@ -2939,6 +3148,10 @@ def main(argv=None) -> int:
                 t.to_csv(f_, sep="\t", index=False)
                 unit_figure(t, line, out_dir / f"end_posterior_units_{safe}."
                                                f"{args.plot_format}")
+                for nm in args.units_cfg.get("splits", {}):
+                    split_figure(t[t["element"] == nm], line, nm,
+                                 out_dir / f"end_posterior_units_{safe}_{nm}."
+                                           f"{args.plot_format}")
                 logger.info(f"{line}: the copies against each other -> {f_}")
             else:
                 logger.warning(f"{line}: too few cells in some unit for the "

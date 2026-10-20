@@ -296,3 +296,113 @@ def test_haplotypes_of_other_read_pairs_stop_at_once(tmp_path):
     with pytest.raises(SystemExit, match="none of"):
         m.main(_argv_units(root, sp, tmp_path / "o"))
 
+
+
+def test_a_split_keeps_the_contacts_crossing_it_or_on_one_side():
+    m = _mod()
+    reg = m.read_unit_splits(["R=chrX:1,000-2,000"])["R"]
+    assert reg["set"] == "X" and reg["region"] == "chrX:1000-2000"
+    j = pd.DataFrame({"chrom": ["chrX"] * 6 + ["chr1"],
+                      "pos1": [500, 100, 9000, 1500, 500, 3000, 500],
+                      "pos2": [3000, 900, 2500, 5000, 1500, 400, 3000]})
+    j = j.assign(gpos1=m.genome_coords(j["chrom"], j["pos1"]),
+                 gpos2=m.genome_coords(j["chrom"], j["pos2"]))
+    f, ids = m._split_frame(j, reg, "cross", base=100)
+    # an end each side, in either order; not chr1's at the same places
+    assert list(ids) == [100, 105]
+    assert list(f["pos1"]) == [500, 3000]
+    f, ids = m._split_frame(j, reg, "side", base=100)
+    # both ends left or both right; an end inside the region is in neither
+    assert list(ids) == [101, 102]
+
+
+def test_a_split_must_name_a_region():
+    m = _mod()
+    for bad in ("R=chrX:2000-1000", "R:x=chrX:1-2", "R=chrX", "=chrX:1-2",
+                "R=chrY:1-2"):
+        with pytest.raises(SystemExit, match="--unit-split"):
+            m.read_unit_splits([bad])
+
+
+def _fixture_split(root: Path, n_cells=20, per=1500, seed=5):
+    """chr1 and chrX, both copies, the contacts round 10 Mb; coordination
+    planted on the inactive X (hap1) alone, and there only on the contacts
+    crossing 10.0-10.2 Mb."""
+    rng = np.random.default_rng(seed)
+    for d in ("GCH", "HCG", "haps"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    cells = [f"GM_{i}" for i in range(n_cells)]
+    for c in cells:
+        recs, haps = [], []
+        for chrom in ("chr1", "chrX"):
+            for hap in (1, 2):
+                p1 = rng.integers(6_000_000, 14_000_000, per)
+                d = (10 ** rng.uniform(4.0, 6.6, per)).astype(np.int64)
+                p2 = p1 + d
+                cross = (p1 < 10_000_000) & (p2 >= 10_200_000)
+                plant = (chrom == "chrX") & (hap == 1) & cross
+                z = np.where(plant, rng.normal(0, 1, per), 0.0)
+                post = [1 / (1 + np.exp(-(z + rng.normal(0, 0.7, per))))
+                        for _ in range(2)]
+                for i in range(per):
+                    recs.append((chrom, int(p1[i]), int(p2[i]), 6, 6,
+                                 int(d[i]), float(post[0][i]),
+                                 float(post[1][i])))
+                    haps.append((chrom, int(p1[i]), int(p2[i]), hap))
+        t = pd.DataFrame(recs, columns=["chrom", "pos1", "pos2", "n1", "n2",
+                                        "distance", "posterior1",
+                                        "posterior2"])
+        for ctx in ("GCH", "HCG"):
+            t.to_parquet(root / ctx / f"{c}.posteriors.parquet")
+        pd.DataFrame(haps, columns=["chrom", "pos1", "pos2", "hap"]
+                     ).to_parquet(root / "haps" / f"{c}.haplotypes.parquet")
+    sp = root / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "group": "GM"}).to_csv(
+        sp, sep="\t", index=False)
+    return sp
+
+
+def test_a_split_shows_the_coordination_of_the_contacts_crossing_it(tmp_path):
+    m = _mod()
+    root, out = tmp_path / "d", tmp_path / "o"
+    sp = _fixture_split(root)
+    argv = ["--posteriors", f"GCH={root / 'GCH'}",
+            "--posteriors", f"HCG={root / 'HCG'}", "--samples", str(sp),
+            "--group-column", "group", "--haplotypes", str(root / "haps"),
+            "--xi", "GM=1", "--genome", "none", "--chrx-par", "none",
+            "--chrx-escape", "none", "--null-type", "link-shuffle",
+            "--null-scope", "cell", "--min-distance", "10000",
+            "--max-distance", "4000000", "--bins-per-decade", "4",
+            "--units", "x_xi,x_xa,a_xi,a_xa",
+            "--unit-bands", "10000,4000000", "--min-pairs", "30",
+            "--unit-split", "R=chrX:10000000-10200000",
+            "--n-bootstrap", "200", "--fisher-z", "none", "--per-cell", "off",
+            "--n-threads", "1", "--plot-format", "png", "--output-dir",
+            str(out)]
+    assert m.main(argv) == 0
+    t = pd.read_csv(out / "end_posterior_units_GM.tsv", sep="\t")
+    t = t[(t["measure"] == "gg") & t["band"].str.startswith("all")]
+    v = t[t["element"] == "R"].set_index("comparison")
+    # the inactive X's crossing contacts agree, its others and the active
+    # X's do not
+    assert v.loc["chrX Xi crossing R", "lo"] > 0.15
+    assert abs(v.loc["chrX Xi same side of R", "value"]) < 0.06
+    assert v.loc["chrX Xi: crossing − same side", "lo"] > 0.1
+    assert abs(v.loc["chrX Xa: crossing − same side", "value"]) < 0.08
+    assert v.loc["crossing − same side: chrX Xi − chrX Xa", "lo"] > 0.1
+    # an X region splits X's copies alone
+    assert not any("autosomes" in c for c in v.index)
+    # every contact, as before, under 'all'
+    assert (t["element"] == "all").any()
+    assert (out / "end_posterior_units_GM_R.png").exists()
+
+
+def test_a_split_needs_the_link_shuffle(tmp_path):
+    m = _mod()
+    root = tmp_path / "d"
+    sp, _ = _fixture_elements(root, n_cells=4, per=200)
+    argv = _argv_units(root, sp, tmp_path / "o")
+    i = argv.index("link-shuffle")
+    argv[i] = "distance-matched"
+    with pytest.raises(SystemExit, match="link-shuffle"):
+        m.main(argv + ["--unit-split", "R=chrX:1000000-1200000"])
