@@ -75,6 +75,8 @@ def _style():
         "xtick.major.size": 2, "ytick.major.size": 2,
         "lines.linewidth": 0.9, "pdf.fonttype": 42, "ps.fonttype": 42,
         "axes.spines.top": False, "axes.spines.right": False})
+    from nome_hic_concordance.figure_style import pdf_images_8bit
+    pdf_images_8bit()
     return plt
 
 

@@ -44,3 +44,28 @@ RC = {
     "legend.frameon": False,
     "lines.solid_capstyle": "round",
 }
+
+
+def pdf_images_8bit() -> None:
+    """Write every raster image into a PDF at 8 bits per sample.
+
+    matplotlib stores an image of 16 colours or fewer as a 4-, 2- or 1-bit
+    indexed image.  A reader the figures were assembled in drew such an
+    image -- a heatmap of few cells -- as one flat colour, while drawing the
+    8-bit ones right.  Padding the palette to 256 entries before it is
+    encoded keeps the samples 8-bit; the colours are unchanged.  Patches
+    matplotlib's PDF backend once, process-wide."""
+    from matplotlib.backends import backend_pdf
+    write = backend_pdf.PdfFile._writePng
+    if getattr(write, "_eight_bit", False):
+        return
+
+    def _write_png(self, img):
+        if img.mode == "P":
+            pal = img.getpalette() or []
+            if len(pal) < 768:
+                img = img.copy()
+                img.putpalette(pal + [0] * (768 - len(pal)))
+        return write(self, img)
+    _write_png._eight_bit = True
+    backend_pdf.PdfFile._writePng = _write_png

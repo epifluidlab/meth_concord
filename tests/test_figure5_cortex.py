@@ -306,3 +306,47 @@ def test_a_supplementary_figure_needs_a_run_for_a_and_b(tmp_path):
                                 str(tmp_path / "fig" / "S.pdf")]
     with pytest.raises(SystemExit, match="--distance-ab"):
         f5.main(argv)
+
+
+def test_panel_f_draws_its_cells_as_squares_in_the_scale_s_colours():
+    """No image a reader could flatten: one square per finite cell, in the
+    colour bar's colour, a cell beyond the scale in its end colour."""
+    import matplotlib.pyplot as plt
+    rows = []
+    for ctx, big in (("GCH", 0.4), ("HCG", -0.6)):
+        for i, a_ in enumerate(f5.STATES):
+            for b_ in f5.STATES[:i + 1]:
+                w = big if (a_, b_) == ("enhancer", "promoter") else 0.001 * i
+                rows.append({"context": ctx, "system": "chromhmm",
+                             "anchor": a_, "partner": b_, "band": f5.ALL_BAND,
+                             "signed_rel": w / 100,
+                             "signed_rel_lo": w / 100 - 1e-4,
+                             "signed_rel_hi": w / 100 + 1e-4,
+                             "sparse": a_ == b_ == "promoter"})
+    summ = pd.DataFrame(rows)
+    f5._style()
+    fig, axes = plt.subplots(1, 2)
+    f5.panel_f(axes, summ)
+    for ax, (_, mark, _) in zip(axes, f5.MARKS):
+        assert not ax.images
+        v, _ = f5.chromhmm_matrix(summ, mark)
+        assert len(ax.patches) == int(np.isfinite(v).sum())
+    # HCG's enhancer-promoter lies beyond its scale: the bar's bluest end
+    sq = [p for p in axes[1].patches if p.get_xy() == (-0.5, 0.5)][0]
+    cmap = plt.get_cmap("RdBu_r")
+    assert np.allclose(sq.get_facecolor(), cmap(0.0))
+    plt.close(fig)
+
+
+def test_a_pdf_keeps_a_few_colour_image_at_8_bits(tmp_path):
+    import re
+    import matplotlib.pyplot as plt
+    f5._style()
+    fig, ax = plt.subplots(figsize=(1, 1))
+    ax.imshow(np.ma.masked_invalid([[0.0, 1.0, np.nan], [1.0, 2.0, 0.0]]),
+              cmap="RdBu_r")
+    fig.savefig(tmp_path / "f.pdf")
+    plt.close(fig)
+    bits = set(re.findall(rb"/BitsPerComponent (\d+)",
+                          (tmp_path / "f.pdf").read_bytes()))
+    assert bits == {b"8"}

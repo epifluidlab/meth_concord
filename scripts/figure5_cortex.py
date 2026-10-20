@@ -139,6 +139,8 @@ def _style():
         "lines.linewidth": 0.9, "pdf.fonttype": 42, "ps.fonttype": 42,
         "mathtext.default": "regular",
         "axes.spines.top": False, "axes.spines.right": False})
+    from nome_hic_concordance.figure_style import pdf_images_8bit
+    pdf_images_8bit()
     return plt
 
 
@@ -486,17 +488,27 @@ def _limit(v) -> float:
 
 def panel_f(axes, summ: pd.DataFrame):
     """Per mark, ΔC x w between the states: each row's state on the left,
-    each column's at its head, along the diagonal."""
+    each column's at its head, along the diagonal.  The cells are squares
+    drawn one by one, not an image: a few-colour image is stored at a few
+    bits per sample, which some readers draw as one colour."""
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+    from matplotlib.patches import Rectangle
+    cmap = plt.get_cmap("RdBu_r")
     for ax, (_, mark, _) in zip(axes, MARKS):
         v, spans = chromhmm_matrix(summ, mark)
         lim = _limit(v)
-        im = ax.imshow(np.ma.masked_invalid(v), cmap="RdBu_r", vmin=-lim,
-                       vmax=lim)
+        norm = Normalize(-lim, lim)
         n = len(STATES)
         for i in range(n):
             for j in range(i + 1):
                 if not np.isfinite(v[i, j]):
                     continue
+                # beyond the scale, its end colour
+                ax.add_patch(Rectangle((j - 0.5, i - 0.5), 1, 1, lw=0,
+                                       facecolor=cmap(norm(v[i, j])),
+                                       zorder=1))
                 dark = abs(v[i, j]) > 0.6 * lim
                 ax.text(j, i, f"{v[i, j]:.2f}".replace("-", "−"),
                         ha="center", va="center", fontsize=4.2,
@@ -504,6 +516,7 @@ def panel_f(axes, summ: pd.DataFrame):
                         alpha=0.4 if spans[i, j] else 1.0)
             ax.text(i - 0.25, i - 0.62, STATES[i], rotation=40, ha="left",
                     va="bottom", fontsize=4.8, rotation_mode="anchor")
+        ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks(range(n))
         # the rows' states once, on the first; the heads name the columns
@@ -518,7 +531,8 @@ def panel_f(axes, summ: pd.DataFrame):
         ax.text(1.0, 1.04, label_of(mark), transform=ax.transAxes,
                 ha="right", va="top", color=MARK_COLOR[mark], fontsize=6)
         cax = ax.inset_axes([0.42, -0.1, 0.58, 0.045])
-        cb = ax.figure.colorbar(im, cax=cax, orientation="horizontal")
+        cb = ax.figure.colorbar(ScalarMappable(norm=norm, cmap=cmap),
+                                cax=cax, orientation="horizontal")
         cb.outline.set_linewidth(0.4)
         cb.ax.tick_params(labelsize=4.4, length=1.5, pad=1)
         cb.set_label(f"ΔC × w (pp), + {SIGN_WORDS[mark][1]}", fontsize=4.6,
