@@ -7,9 +7,15 @@ The panels:
      non-linked ones -- another end of the same cell at the partner's
      place and distance -- and their difference with its interval, for
      GCH-GCH, HCG-HCG and HCG-GCH, over the bins where a tenth of the
-     linked pairs or more found one (end_posterior_dist_all.tsv)
+     linked pairs or more found one (end_posterior_dist_all.tsv); below
+     1 kb, shaded, a pair's two ends are mostly one molecule
   b  per 10-Mb region, HCG-HCG against GCH-GCH concordance
      (end_posterior_regions.tsv, _summary.tsv)
+
+a and b come from --distance-ab where given: a run whose null keeps every
+stand-in, so a reaches down to 100 bp, where a null excluding the contact's
+near-copies (--null-exclude) finds none.  --supplementary then draws
+--distance's own a and b, that stricter null's, as a figure of their own.
   c  per cell, concordance against the negative control
      (end_posterior_percell.tsv)
   d  the same by cell type
@@ -28,8 +34,9 @@ signal is reproduced by links with no coordination (design §6b.6).
 
     python scripts/figure5_cortex.py \\
         --distance end_posterior_distance_correlation/end_posterior_dist.null_link_shuffled_match_per_cell.cell_center.excl1kb \\
+        --distance-ab end_posterior_distance_correlation/null_link_shuffled_match_per_cell.cell_center \\
         --classes annotation_class_concordance_v14_samecell_excl \\
-        --output Figure5.pdf
+        --output Figure5.pdf --supplementary FigureS5_near_copies.pdf
 """
 
 from __future__ import annotations
@@ -107,6 +114,9 @@ HOT_FIELDS = frozenset({
 #: Panel a draws a bin where this share of its linked pairs or more found
 #: a stand-in: below it, a few pairs, and those the ones with a stand-in.
 MIN_MATCHED = 0.1
+#: Below it, shaded in a, most read pairs are the two ends of one molecule
+#: (an unligated fragment), not a contact.
+ONE_MOLECULE_BP = 1000
 #: The whole distance range of the class tables.
 ALL_BAND = "all 1kb-10Mb"
 #: Panel e's dot, as a share of an axis's range (2.2 pt of ~56): intervals
@@ -204,15 +214,29 @@ def panel_a(axes_r, axes_d, dist: pd.DataFrame):
         for a in (ax, axd):
             a.set_xscale("log")
             a.set_xlim(*span)
+            if span[0] < ONE_MOLECULE_BP:
+                a.axvspan(span[0], ONE_MOLECULE_BP, color="0.93", lw=0,
+                          zorder=0)
         ax.tick_params(labelbottom=False)
         axd.set_xlabel("distance between the two ends (bp)")
         axd.legend(frameon=False, loc="best", handletextpad=0.2)
     axes_r[0].set_ylabel("r of end posteriors")
     axes_d[0].set_ylabel("Δr, linked − non-linked")
-    # beside the schematic, between the curves
-    axes_r[0].legend(frameon=False, loc="center left", handlelength=1.8,
-                     bbox_to_anchor=(0.0, 0.45))
-    _schematic(axes_r[0].inset_axes([0.42, 0.2, 0.56, 0.5]))
+    if span[0] < ONE_MOLECULE_BP:
+        # the short pairs' correlation is the molecule's own: the curves
+        # start high and the long range sits low -- the key and the
+        # schematic above it, on the right
+        axes_d[0].text(0.012, 0.97, "one\nmolecule", fontsize=4.6,
+                       color="0.4", transform=axes_d[0].transAxes,
+                       ha="left", va="top")
+        axes_r[0].legend(frameon=False, loc="lower right",
+                         handlelength=1.8, bbox_to_anchor=(1.0, 0.38))
+        _schematic(axes_r[0].inset_axes([0.5, 0.6, 0.48, 0.4]))
+    else:
+        # beside the schematic, between the curves
+        axes_r[0].legend(frameon=False, loc="center left", handlelength=1.8,
+                         bbox_to_anchor=(0.0, 0.45))
+        _schematic(axes_r[0].inset_axes([0.42, 0.2, 0.56, 0.5]))
 
 
 def region_table(regions: pd.DataFrame, summ: pd.Series,
@@ -794,12 +818,45 @@ def build_figure(d: dict, order, colors):
     return fig
 
 
+def build_supplementary(d: dict):
+    """--distance's own a and b, its null excluding the contacts'
+    near-copies, where the main figure's come from --distance-ab."""
+    plt = _style()
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+    fig = plt.figure(figsize=(7.2, 3.3))
+    # a's three measures, b beside them
+    gs = GridSpec(1, 2, figure=fig, wspace=0.16, width_ratios=[3.1, 1],
+                  left=0.07, right=0.985, top=0.9, bottom=0.14)
+    ga = GridSpecFromSubplotSpec(2, 3, gs[0], hspace=0.12, wspace=0.34)
+    ax_ar = [fig.add_subplot(ga[0, j]) for j in range(3)]
+    ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j]) for j in range(3)]
+    panel_a(ax_ar, ax_ad, d["dist_supp"])
+    gb = GridSpecFromSubplotSpec(3, 2, gs[1], width_ratios=[0.28, 1],
+                                 height_ratios=[0.12, 1, 0.12], wspace=0.0)
+    ax_b = fig.add_subplot(gb[1, 1])
+    panel_b(ax_b, d["regions_supp"], d["regions_summary_supp"])
+    fig.canvas.draw()
+    for lab, ax, dx in (("a", ax_ar[0], 0.06), ("b", ax_b, 0.06)):
+        bb = ax.get_position()
+        fig.text(bb.x0 - dx, bb.y1 + 0.015, lab, fontsize=8,
+                 fontweight="bold", va="bottom", ha="left")
+    return fig
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--distance", required=True,
                     help="end_posterior_distance_correlation.py's output "
                          "directory (per cell, link-shuffled null).")
+    ap.add_argument("--distance-ab", default=None,
+                    help="Panels a and b from this run instead: one whose "
+                         "null keeps every stand-in (no --null-exclude), so "
+                         "a reaches below 1 kb.  Default --distance.")
+    ap.add_argument("--supplementary", default=None, metavar="PDF",
+                    help="With --distance-ab: --distance's own a and b, its "
+                         "null without the contacts' near-copies, drawn "
+                         "here as a figure of their own.")
     ap.add_argument("--classes", required=True,
                     help="annotation_class_concordance.py's output directory "
                          "(--systems ab,rt,chromhmm,pmd).")
@@ -813,23 +870,36 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+#: A run's tables for a and b.
+AB_TABLES = ("end_posterior_dist_all.tsv", "end_posterior_regions.tsv",
+             "end_posterior_regions_summary.tsv")
+
+
 def read_tables(args) -> dict:
     dd, cc = Path(args.distance), Path(args.classes)
-    need = [dd / f for f in ("end_posterior_dist_all.tsv",
-                             "end_posterior_percell.tsv",
-                             "end_posterior_regions.tsv",
-                             "end_posterior_regions_summary.tsv")]
+    ab = Path(args.distance_ab) if getattr(args, "distance_ab", None) else dd
+    if getattr(args, "supplementary", None) and ab == dd:
+        sys.exit("--supplementary draws --distance's a and b beside "
+                 "--distance-ab's: give --distance-ab")
+    need = [dd / "end_posterior_percell.tsv"]
+    need += [r / f for r in dict.fromkeys((ab, dd)) for f in AB_TABLES]
     need += [cc / f for f in ("summary.tsv", "locus_hotspots.tsv.gz")]
     miss = [str(p) for p in need if not p.exists()]
     if miss:
         sys.exit("missing: " + ", ".join(miss))
-    rs = pd.read_csv(need[3], sep="\t")
-    return {"dist": pd.read_csv(need[0], sep="\t"),
-            "percell": pd.read_csv(need[1], sep="\t"),
-            "regions": pd.read_csv(need[2], sep="\t"),
-            "regions_summary": rs.iloc[0],
-            "summary": pd.read_csv(need[4], sep="\t"),
-            "hotspots": pd.read_csv(need[5], sep="\t")}
+
+    def ab_of(r: Path, suffix=""):
+        return {f"dist{suffix}": pd.read_csv(r / AB_TABLES[0], sep="\t"),
+                f"regions{suffix}": pd.read_csv(r / AB_TABLES[1], sep="\t"),
+                f"regions_summary{suffix}": pd.read_csv(
+                    r / AB_TABLES[2], sep="\t").iloc[0]}
+    d = {"percell": pd.read_csv(need[0], sep="\t"),
+         "summary": pd.read_csv(cc / "summary.tsv", sep="\t"),
+         "hotspots": pd.read_csv(cc / "locus_hotspots.tsv.gz", sep="\t")}
+    d.update(ab_of(ab))
+    if ab != dd:
+        d.update(ab_of(dd, "_supp"))
+    return d
 
 
 def cell_colors(args, groups) -> tuple:
@@ -847,21 +917,29 @@ def cell_colors(args, groups) -> tuple:
     return order, colors
 
 
-def figure_from_args(args):
-    d = read_tables(args)
+def figure_from_args(args, d=None):
+    d = read_tables(args) if d is None else d
     order, colors = cell_colors(args, d["percell"]["group"].dropna())
     return build_figure(d, order, colors)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    fig = figure_from_args(args)            # Agg first (_style)
+    d = read_tables(args)
+    fig = figure_from_args(args, d)         # Agg first (_style)
     import matplotlib.pyplot as plt
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=300)
     plt.close(fig)
     print(f"wrote {out}")
+    if args.supplementary:
+        sup = Path(args.supplementary)
+        sup.parent.mkdir(parents=True, exist_ok=True)
+        fig = build_supplementary(d)
+        fig.savefig(sup, dpi=300)
+        plt.close(fig)
+        print(f"wrote {sup}")
     return 0
 
 

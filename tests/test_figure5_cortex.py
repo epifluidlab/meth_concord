@@ -263,3 +263,46 @@ def test_the_figure_stops_naming_missing_tables(tmp_path):
     (tmp_path / "classes" / "locus_hotspots.tsv.gz").unlink()
     with pytest.raises(SystemExit, match="locus_hotspots"):
         f5.main(argv)
+
+
+def test_a_and_b_can_come_from_a_run_of_their_own(tmp_path):
+    """--distance-ab: a and b from a run whose null keeps every stand-in,
+    down to 100 bp; c and d still from --distance; and --supplementary
+    draws --distance's own a and b."""
+    argv = _tables(tmp_path)
+    ab = tmp_path / "dist_ab"
+    ab.mkdir()
+    _distance(ab, np.random.default_rng(1))
+    t = pd.read_csv(ab / "end_posterior_dist_all.tsv", sep="\t")
+    # every bin matched, the shortest too
+    for k in ("gg", "hh", "gh"):
+        t[f"{k}_matched_n"] = t[f"{k}_linked_n"] // 2
+        t[f"{k}_matched_r"] = t[f"{k}_matched_r"].fillna(0.3)
+        t[f"{k}_null_r"] = t[f"{k}_null_r"].fillna(0.28)
+    t.to_csv(ab / "end_posterior_dist_all.tsv", sep="\t", index=False)
+    s = pd.read_csv(ab / "end_posterior_regions_summary.tsv", sep="\t")
+    s.assign(pearson_r=0.7).to_csv(ab / "end_posterior_regions_summary.tsv",
+                                   sep="\t", index=False)
+    sup = tmp_path / "fig" / "FigureS5.pdf"
+    argv += ["--distance-ab", str(ab), "--supplementary", str(sup)]
+    args = f5.parse_args(argv)
+    d = f5.read_tables(args)
+    assert d["regions_summary"]["pearson_r"] == 0.7
+    assert d["regions_summary_supp"]["pearson_r"] == 0.5
+    assert f5.matched_bins(d["dist"], "gg").all()
+    assert not f5.matched_bins(d["dist_supp"], "gg")[:12].any()
+    fig = f5.figure_from_args(args, d)
+    titles = [a.get_title(loc="left") for a in fig.axes]
+    assert any(tt.startswith("r = +0.70") for tt in titles)
+    # a reaches below 1 kb: the one-molecule range shaded and named
+    texts = [tx.get_text() for a in fig.axes for tx in a.texts]
+    assert "one\nmolecule" in texts
+    assert f5.main(argv) == 0
+    assert sup.exists() and sup.stat().st_size > 10_000
+
+
+def test_a_supplementary_figure_needs_a_run_for_a_and_b(tmp_path):
+    argv = _tables(tmp_path) + ["--supplementary",
+                                str(tmp_path / "fig" / "S.pdf")]
+    with pytest.raises(SystemExit, match="--distance-ab"):
+        f5.main(argv)
