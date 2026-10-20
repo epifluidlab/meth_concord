@@ -392,3 +392,11 @@ def test_the_supplementary_figure_takes_e_and_f_from_their_own_run(tmp_path):
     # alone, --classes-supp has nowhere to go
     with pytest.raises(SystemExit, match="--supplementary"):
         f5.main(argv + ["--classes-supp", str(cs)])
+
+
+def test_a_colour_bar_takes_a_round_tick_within_its_range():
+    assert f5._nice_tick(0.046) == pytest.approx(0.04)
+    assert f5._nice_tick(0.52) == pytest.approx(0.5)
+    # a hair short of 0.2 still takes it, the scale widened to meet it
+    assert f5._nice_tick(0.198) == pytest.approx(0.2)
+    assert f5._nice_tick(0.163) == pytest.approx(0.1)

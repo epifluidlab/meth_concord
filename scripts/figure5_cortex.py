@@ -564,6 +564,16 @@ def _limit(v) -> float:
     return float(a[1] * 1.1) if a.size > 1 and a[0] > 2 * a[1] else float(a[0])
 
 
+def _nice_tick(lim: float) -> float:
+    """The largest of 1, 2, 4 or 5 x 10^k within ``lim`` (2% over allowed),
+    for a colour bar's ticks at -t, 0 and t."""
+    if not np.isfinite(lim) or lim <= 0:
+        return 1.0
+    k = 10.0 ** np.floor(np.log10(lim))
+    ok = [m * k for m in (1, 2, 4, 5, 10) if m * k <= lim * 1.02]
+    return float(max(ok)) if ok else float(k)
+
+
 def panel_f(axes, summ: pd.DataFrame):
     """Per mark, ΔC x w between the states: each row's state on the left,
     each column's at its head, along the diagonal.  The cells are squares
@@ -577,6 +587,9 @@ def panel_f(axes, summ: pd.DataFrame):
     for ax, (_, mark, _) in zip(axes, MARKS):
         v, spans = chromhmm_matrix(summ, mark)
         lim = _limit(v)
+        # three ticks, a round one at each end: a narrow bar fits no more
+        tk = _nice_tick(lim)
+        lim = max(lim, tk)
         norm = Normalize(-lim, lim)
         n = len(STATES)
         for i in range(n):
@@ -611,6 +624,8 @@ def panel_f(axes, summ: pd.DataFrame):
         cax = ax.inset_axes([0.42, -0.1, 0.58, 0.045])
         cb = ax.figure.colorbar(ScalarMappable(norm=norm, cmap=cmap),
                                 cax=cax, orientation="horizontal")
+        cb.set_ticks([-tk, 0, tk])
+        cb.set_ticklabels([f"−{tk:g}", "0", f"{tk:g}"])
         cb.outline.set_linewidth(0.4)
         cb.ax.tick_params(labelsize=4.4, length=1.5, pad=1)
         cb.set_label(f"ΔC × w (pp), + {SIGN_WORDS[mark][1]}", fontsize=4.6,
@@ -890,9 +905,7 @@ def build_figure(d: dict, order, colors):
     ax_e.append(fig.add_subplot(ge[2], sharey=ax_e[0]))
     panel_e(ax_e, d["summary"])
     letters.append(("e", ax_e[0], 0.075))
-    gf = GridSpecFromSubplotSpec(1, 4, gs[2, 6:12], wspace=0.06,
-                                 width_ratios=[0.3, 1, 1, 0.25])
-    ax_f = [fig.add_subplot(gf[1]), fig.add_subplot(gf[2])]
+    ax_f = _f_axes(fig, gs[2, 6:12])
     panel_f(ax_f, d["summary"])
     letters.append(("f", ax_f[0], 0.075))
     # g: along the genome, and what the bins are
@@ -912,6 +925,16 @@ def build_figure(d: dict, order, colors):
     return fig
 
 
+def _f_axes(fig, spec):
+    """f's two heatmaps in ``spec``, a gap between them: the first's last
+    column head runs past its squares, over where the second's first
+    column would be."""
+    from matplotlib.gridspec import GridSpecFromSubplotSpec
+    gf = GridSpecFromSubplotSpec(1, 5, spec, wspace=0.0,
+                                 width_ratios=[0.22, 1, 0.26, 1, 0.1])
+    return [fig.add_subplot(gf[1]), fig.add_subplot(gf[3])]
+
+
 def build_supplementary(d: dict):
     """The main figure's panels under the other version of the null, each
     pair a row: --distance's own a and b (its null excluding the contacts'
@@ -922,12 +945,16 @@ def build_supplementary(d: dict):
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
     rows = [r for r, key in (("ab", "dist_supp"), ("ef", "summary_supp"))
             if key in d]
-    heights = {"ab": 3.3, "ef": 2.7}
+    # e and f's row as tall as the main figure's, so f's squares, sized by
+    # the height, leave its column heads room between the two marks
+    heights = {"ab": 3.3, "ef": 2.35}
     fig = plt.figure(figsize=(7.2, sum(heights[r] for r in rows)))
     gs = GridSpec(len(rows), 1, figure=fig, hspace=0.45,
                   height_ratios=[heights[r] for r in rows], left=0.07,
                   right=0.985, top=1 - 0.3 / fig.get_figheight(),
-                  bottom=0.45 / fig.get_figheight())
+                  # e's key sits beneath its axes
+                  bottom=(0.75 if rows[-1] == "ef" else 0.45)
+                  / fig.get_figheight())
     first = []
     for i, r in enumerate(rows):
         if r == "ab":
@@ -954,9 +981,7 @@ def build_supplementary(d: dict):
             ax_e = [fig.add_subplot(ge[1])]
             ax_e.append(fig.add_subplot(ge[2], sharey=ax_e[0]))
             panel_e(ax_e, d["summary_supp"])
-            gf = GridSpecFromSubplotSpec(1, 4, g[0, 6:12], wspace=0.06,
-                                         width_ratios=[0.3, 1, 1, 0.25])
-            ax_f = [fig.add_subplot(gf[1]), fig.add_subplot(gf[2])]
+            ax_f = _f_axes(fig, g[0, 6:12])
             panel_f(ax_f, d["summary_supp"])
             first += [(ax_e[0], 0.075), (ax_f[0], 0.075)]
     fig.canvas.draw()
