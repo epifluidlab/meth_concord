@@ -155,20 +155,67 @@ def _p(p) -> str:
 
 # ----------------------------------------------------------------- panels --
 
-def _schematic(ax):
-    """Inset: a linked pair, and its non-linked match -- the same anchor,
-    a partner at the same distance in the same cell, no ligation."""
-    from matplotlib.patches import Arc
+#: The schematic's sites per mark: (marker, the set state's colour, the
+#: unset one's, their names).
+SITE_STYLE = {"GCH": ("s", "#1a9850", "white", "accessible", "inaccessible"),
+              "HCG": ("o", "black", "white", "methylated", "unmethylated")}
+SEGMENT_C = "#7cc5ea"
+
+
+def _reshuffle_schematic(ax, mark: str):
+    """Inset: three linked pairs, their two ends alike in ``mark``, against
+    the same ends shuffled -- each anchor with another pair's partner, at
+    the same distance and in the same cell -- their ends unalike."""
+    mk, on, off, lab_on, lab_off = SITE_STYLE[mark]
     ax.set_xlim(0, 10)
     ax.set_ylim(0, 10)
     ax.axis("off")
-    for y, ls, lab in ((6.6, "-", "linked"), (1.6, "--", "non-linked")):
-        ax.plot([0.3, 9.7], [y, y], color="0.55", lw=0.6)
-        ax.add_patch(Arc((5.0, y), 7.0, 5.6, theta1=0, theta2=180,
-                         color="0.15", lw=0.6, ls=ls))
-        for x in (1.5, 8.5):
-            ax.plot(x, y, "s", ms=2.6, color="0.15")
-        ax.text(5.0, y + 3.1, lab, ha="center", va="bottom", fontsize=4.6)
+
+    def segment(x0, y, states):
+        xs = x0 + 0.45 + 0.75 * np.arange(len(states))
+        ax.plot([x0, xs[-1] + 0.45], [y, y], color=SEGMENT_C, lw=2.6,
+                solid_capstyle="butt", zorder=1)
+        for x_, st in zip(xs, states):
+            ax.plot(x_, y, mk, ms=3.0, mfc=on if st else off, mec="black",
+                    mew=0.4, zorder=2)
+        return xs[-1] + 0.45
+
+    def tie(x0, y0, x1, y1):
+        ax.plot([x0, x1], [y0, y1], ls=(0, (1, 1.2)), color="0.4", lw=0.45,
+                zorder=0)
+
+    def d0(x_, y):
+        ax.text(x_, y, "$d$ = $d_0$", ha="center", va="center", fontsize=4.4,
+                zorder=3, bbox=dict(fc="white", ec="none", pad=0.2))
+
+    ax.text(3.4, 10.0, "Linked pairs", ha="center", va="top", fontsize=4.8)
+    # three contacts, each pair's ends alike
+    for y, lx, ls_, rx, rs in ((8.4, 0.4, (1, 1), 4.2, (1, 1, 1)),
+                               (7.4, 0.1, (0, 0), 4.6, (0, 0)),
+                               (6.4, 0.4, (1, 1), 4.2, (1, 1, 1))):
+        tie(segment(lx, y, ls_), y, rx, y)
+        segment(rx, y, rs)
+    d0(3.15, 7.4)
+    for y, st, lab in ((8.4, 0, lab_off), (7.4, 1, lab_on)):
+        ax.plot(7.3, y, mk, ms=3.0, mfc=on if st else off, mec="black",
+                mew=0.4)
+        ax.text(7.7, y, lab, ha="left", va="center", fontsize=4.6)
+    ax.text(0.9, 5.8, "vs.", ha="center", va="center", fontsize=4.6,
+            style="italic")
+    ax.text(5.0, 4.75, "Shuffled pairs (matched distance, same cell)",
+            ha="center", va="center", fontsize=4.8)
+    # the same anchors, each with another pair's partner
+    rows = (3.0, 2.0, 1.0)
+    left = [segment(x0, y, st) for x0, y, st in
+            ((0.6, rows[0], (1, 0)), (0.3, rows[1], (1, 0)),
+             (0.6, rows[2], (0, 1)))]
+    rx = (4.4, 4.8, 4.4)
+    for (x0, st), y in zip(((rx[0], (0, 1, 1)), (rx[1], (0, 0)),
+                            (rx[2], (0, 1, 0))), rows):
+        segment(x0, y, st)
+    for i, j in enumerate((2, 0, 1)):
+        tie(left[i], rows[i], rx[j], rows[j])
+    d0(3.35, 3.65)
 
 
 def matched_bins(dist: pd.DataFrame, k: str,
@@ -222,23 +269,31 @@ def panel_a(axes_r, axes_d, dist: pd.DataFrame):
         ax.tick_params(labelbottom=False)
         axd.set_xlabel("distance between the two ends (bp)")
         axd.legend(frameon=False, loc="best", handletextpad=0.2)
-    axes_r[0].set_ylabel("r of end posteriors")
+    axes_r[0].set_ylabel("Pearson r of end posteriors")
     axes_d[0].set_ylabel("Δr, linked − non-linked")
     if span[0] < ONE_MOLECULE_BP:
         # the short pairs' correlation is the molecule's own: the curves
-        # start high and the long range sits low -- the key and the
-        # schematic above it, on the right
+        # start high on the left and the long range sits low, leaving the
+        # top right to the schematics and the gap between the curves on
+        # the right to the keys
         axes_d[0].text(0.012, 0.97, "one\nmolecule", fontsize=4.6,
                        color="0.4", transform=axes_d[0].transAxes,
                        ha="left", va="top")
-        axes_r[0].legend(frameon=False, loc="lower right",
-                         handlelength=1.8, bbox_to_anchor=(1.0, 0.38))
-        _schematic(axes_r[0].inset_axes([0.5, 0.6, 0.48, 0.4]))
+        for ax, (k, *_), at in zip(axes_r, A_MEASURES,
+                                   ((1.0, 0.31), (1.0, 0.36), None)):
+            if at is None:
+                ax.legend(frameon=False, loc="lower right", handlelength=1.8)
+            else:
+                ax.legend(frameon=False, loc="upper right", handlelength=1.8,
+                          bbox_to_anchor=at)
+        _reshuffle_schematic(axes_r[0].inset_axes([0.17, 0.36, 0.83, 0.64]),
+                             "GCH")
+        _reshuffle_schematic(axes_r[1].inset_axes([0.25, 0.4, 0.75, 0.6]),
+                             "HCG")
     else:
-        # beside the schematic, between the curves
+        # between the curves; the main figure's a shows the shuffle
         axes_r[0].legend(frameon=False, loc="center left", handlelength=1.8,
                          bbox_to_anchor=(0.0, 0.45))
-        _schematic(axes_r[0].inset_axes([0.42, 0.2, 0.56, 0.5]))
 
 
 def region_table(regions: pd.DataFrame, summ: pd.Series,
@@ -776,13 +831,15 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
 def build_figure(d: dict, order, colors):
     plt = _style()
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
-    fig = plt.figure(figsize=(7.2, 10.5))
+    fig = plt.figure(figsize=(7.2, 10.9))
     gs = GridSpec(4, 12, figure=fig, hspace=0.46, wspace=1.6,
-                  height_ratios=[2.1, 1.75, 2.15, 1.95],
+                  height_ratios=[2.5, 1.75, 2.15, 1.95],
                   left=0.075, right=0.975, top=0.97, bottom=0.04)
     letters = []
-    # a: the three measures across the page
-    ga = GridSpecFromSubplotSpec(2, 3, gs[0, :], hspace=0.12, wspace=0.26)
+    # a: the three measures across the page, the correlations tall enough
+    # for the shuffle's schematic above their curves
+    ga = GridSpecFromSubplotSpec(2, 3, gs[0, :], hspace=0.1, wspace=0.26,
+                                 height_ratios=[1.5, 1])
     ax_ar = [fig.add_subplot(ga[0, j]) for j in range(3)]
     ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j]) for j in range(3)]
     panel_a(ax_ar, ax_ad, d["dist"])
