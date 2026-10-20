@@ -12,10 +12,10 @@ The panels:
   b  per 10-Mb region, HCG-HCG against GCH-GCH concordance
      (end_posterior_regions.tsv, _summary.tsv)
 
-The main figure takes runs whose null keeps every stand-in, so a reaches
-down to 100 bp; the same figure from runs barring the contacts' near-copies
-(--null-exclude 1000), whose stand-ins start near 7 kb, is the
-supplementary one.
+a and b come from --distance-ab where given: a run whose null keeps every
+stand-in, so a reaches down to 100 bp, where a null excluding the contact's
+near-copies (--null-exclude) finds none.  --supplementary then draws
+--distance's own a and b, that stricter null's, as a figure of their own.
   c  per cell, concordance against the negative control
      (end_posterior_percell.tsv)
   d  the same by cell type
@@ -33,9 +33,10 @@ The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
 
     python scripts/figure5_cortex.py \\
-        --distance end_posterior_distance_correlation/null_link_shuffled_match_per_cell.cell_center \\
-        --classes annotation_class_concordance_v15_samecell \\
-        --output Figure5.pdf
+        --distance end_posterior_distance_correlation/end_posterior_dist.null_link_shuffled_match_per_cell.cell_center.excl1kb \\
+        --distance-ab end_posterior_distance_correlation/null_link_shuffled_match_per_cell.cell_center \\
+        --classes annotation_class_concordance_v14_samecell_excl \\
+        --output Figure5.pdf --supplementary FigureS5_near_copies.pdf
 """
 
 from __future__ import annotations
@@ -817,12 +818,45 @@ def build_figure(d: dict, order, colors):
     return fig
 
 
+def build_supplementary(d: dict):
+    """--distance's own a and b, its null excluding the contacts'
+    near-copies, where the main figure's come from --distance-ab."""
+    plt = _style()
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+    fig = plt.figure(figsize=(7.2, 3.3))
+    # a's three measures, b beside them
+    gs = GridSpec(1, 2, figure=fig, wspace=0.16, width_ratios=[3.1, 1],
+                  left=0.07, right=0.985, top=0.9, bottom=0.14)
+    ga = GridSpecFromSubplotSpec(2, 3, gs[0], hspace=0.12, wspace=0.34)
+    ax_ar = [fig.add_subplot(ga[0, j]) for j in range(3)]
+    ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j]) for j in range(3)]
+    panel_a(ax_ar, ax_ad, d["dist_supp"])
+    gb = GridSpecFromSubplotSpec(3, 2, gs[1], width_ratios=[0.28, 1],
+                                 height_ratios=[0.12, 1, 0.12], wspace=0.0)
+    ax_b = fig.add_subplot(gb[1, 1])
+    panel_b(ax_b, d["regions_supp"], d["regions_summary_supp"])
+    fig.canvas.draw()
+    for lab, ax, dx in (("a", ax_ar[0], 0.06), ("b", ax_b, 0.06)):
+        bb = ax.get_position()
+        fig.text(bb.x0 - dx, bb.y1 + 0.015, lab, fontsize=8,
+                 fontweight="bold", va="bottom", ha="left")
+    return fig
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--distance", required=True,
                     help="end_posterior_distance_correlation.py's output "
                          "directory (per cell, link-shuffled null).")
+    ap.add_argument("--distance-ab", default=None,
+                    help="Panels a and b from this run instead: one whose "
+                         "null keeps every stand-in (no --null-exclude), so "
+                         "a reaches below 1 kb.  Default --distance.")
+    ap.add_argument("--supplementary", default=None, metavar="PDF",
+                    help="With --distance-ab: --distance's own a and b, its "
+                         "null without the contacts' near-copies, drawn "
+                         "here as a figure of their own.")
     ap.add_argument("--classes", required=True,
                     help="annotation_class_concordance.py's output directory "
                          "(--systems ab,rt,chromhmm,pmd).")
@@ -836,23 +870,36 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+#: A run's tables for a and b.
+AB_TABLES = ("end_posterior_dist_all.tsv", "end_posterior_regions.tsv",
+             "end_posterior_regions_summary.tsv")
+
+
 def read_tables(args) -> dict:
     dd, cc = Path(args.distance), Path(args.classes)
-    need = [dd / f for f in ("end_posterior_dist_all.tsv",
-                             "end_posterior_percell.tsv",
-                             "end_posterior_regions.tsv",
-                             "end_posterior_regions_summary.tsv")]
+    ab = Path(args.distance_ab) if getattr(args, "distance_ab", None) else dd
+    if getattr(args, "supplementary", None) and ab == dd:
+        sys.exit("--supplementary draws --distance's a and b beside "
+                 "--distance-ab's: give --distance-ab")
+    need = [dd / "end_posterior_percell.tsv"]
+    need += [r / f for r in dict.fromkeys((ab, dd)) for f in AB_TABLES]
     need += [cc / f for f in ("summary.tsv", "locus_hotspots.tsv.gz")]
     miss = [str(p) for p in need if not p.exists()]
     if miss:
         sys.exit("missing: " + ", ".join(miss))
-    rs = pd.read_csv(need[3], sep="\t")
-    return {"dist": pd.read_csv(need[0], sep="\t"),
-            "percell": pd.read_csv(need[1], sep="\t"),
-            "regions": pd.read_csv(need[2], sep="\t"),
-            "regions_summary": rs.iloc[0],
-            "summary": pd.read_csv(need[4], sep="\t"),
-            "hotspots": pd.read_csv(need[5], sep="\t")}
+
+    def ab_of(r: Path, suffix=""):
+        return {f"dist{suffix}": pd.read_csv(r / AB_TABLES[0], sep="\t"),
+                f"regions{suffix}": pd.read_csv(r / AB_TABLES[1], sep="\t"),
+                f"regions_summary{suffix}": pd.read_csv(
+                    r / AB_TABLES[2], sep="\t").iloc[0]}
+    d = {"percell": pd.read_csv(need[0], sep="\t"),
+         "summary": pd.read_csv(cc / "summary.tsv", sep="\t"),
+         "hotspots": pd.read_csv(cc / "locus_hotspots.tsv.gz", sep="\t")}
+    d.update(ab_of(ab))
+    if ab != dd:
+        d.update(ab_of(dd, "_supp"))
+    return d
 
 
 def cell_colors(args, groups) -> tuple:
@@ -886,6 +933,13 @@ def main(argv=None) -> int:
     fig.savefig(out, dpi=300)
     plt.close(fig)
     print(f"wrote {out}")
+    if args.supplementary:
+        sup = Path(args.supplementary)
+        sup.parent.mkdir(parents=True, exist_ok=True)
+        fig = build_supplementary(d)
+        fig.savefig(sup, dpi=300)
+        plt.close(fig)
+        print(f"wrote {sup}")
     return 0
 
 
