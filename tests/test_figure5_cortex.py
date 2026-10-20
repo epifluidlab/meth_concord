@@ -350,3 +350,45 @@ def test_a_pdf_keeps_a_few_colour_image_at_8_bits(tmp_path):
     bits = set(re.findall(rb"/BitsPerComponent (\d+)",
                           (tmp_path / "f.pdf").read_bytes()))
     assert bits == {b"8"}
+
+
+def test_panel_d_says_whether_the_cell_types_differ(tmp_path):
+    """Each mark's Kruskal-Wallis p across the types, from the cells drawn."""
+    import matplotlib.pyplot as plt
+    from scipy.stats import kruskal
+    _tables(tmp_path)
+    pc = pd.read_csv(tmp_path / "dist" / "end_posterior_percell.tsv",
+                     sep="\t")
+    order = list(f5.CELL_TYPES)
+    f5._style()
+    fig, axes = plt.subplots(2, 1)
+    f5.panel_d(axes, pc, order, f5.CELL_TYPES)
+    for ax, (_, mark, _) in zip(axes, f5.MARKS):
+        d = pc[pc["mark"] == mark]
+        want = kruskal(*[d.loc[d["group"] == g, "delta"] for g in order
+                         if (d["group"] == g).any()]).pvalue
+        txt = [t.get_text() for t in ax.texts if "Kruskal" in t.get_text()]
+        assert txt == [f"across types: Kruskal–Wallis {f5._p_short(want)}"]
+    plt.close(fig)
+    assert np.isnan(f5.types_p([np.array([0.1, 0.2])]))
+
+
+def test_the_supplementary_figure_takes_e_and_f_from_their_own_run(tmp_path):
+    argv = _tables(tmp_path)
+    cs = tmp_path / "classes_kept"
+    cs.mkdir()
+    _classes(cs, np.random.default_rng(7))
+    sup = tmp_path / "fig" / "S.pdf"
+    args = f5.parse_args(argv + ["--classes-supp", str(cs),
+                                 "--supplementary", str(sup)])
+    d = f5.read_tables(args)
+    assert "summary_supp" in d and "dist_supp" not in d
+    fig = f5.build_supplementary(d)
+    # e's two marks and f's two heatmaps, f's cells as squares
+    assert sum(bool(a.patches) for a in fig.axes) >= 2
+    assert [t.get_text() for t in fig.texts] == ["a", "b"]
+    assert f5.main(argv + ["--classes-supp", str(cs), "--supplementary",
+                           str(sup)]) == 0 and sup.exists()
+    # alone, --classes-supp has nowhere to go
+    with pytest.raises(SystemExit, match="--supplementary"):
+        f5.main(argv + ["--classes-supp", str(cs)])

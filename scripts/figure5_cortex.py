@@ -14,8 +14,10 @@ The panels:
 
 a and b come from --distance-ab where given: a run whose null keeps every
 stand-in, so a reaches down to 100 bp, where a null excluding the contact's
-near-copies (--null-exclude) finds none.  --supplementary then draws
---distance's own a and b, that stricter null's, as a figure of their own.
+near-copies (--null-exclude) finds none.  --supplementary then draws each
+panel under the other version of the null: --distance's own a and b, that
+stricter null's, and with --classes-supp e and f from a class run keeping
+near-copies, as a figure of their own.
   c  per cell, concordance against the negative control
      (end_posterior_percell.tsv)
   d  the same by cell type
@@ -151,6 +153,11 @@ def _zero(ax, axis="y"):
 
 def _p(p) -> str:
     return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
+
+
+def _p_short(p) -> str:
+    """p to two figures: 'p = 0.18', 'p = 0.0031', 'p < 0.001' below."""
+    return "p < 0.001" if p < 0.001 else f"p = {p:.2g}"
 
 
 # ----------------------------------------------------------------- panels --
@@ -396,6 +403,14 @@ def panel_c(axes, percell: pd.DataFrame):
     axes[-1].set_xlabel("per-cell Δr (contacts − null)")
 
 
+def types_p(data) -> float:
+    """Kruskal-Wallis p of the cell types' per-cell Δr against one
+    distribution for all (NaN with fewer than two types holding cells)."""
+    from scipy.stats import kruskal
+    data = [v for v in data if len(v)]
+    return float(kruskal(*data).pvalue) if len(data) >= 2 else np.nan
+
+
 def panel_d(axes, percell: pd.DataFrame, order, colors):
     rng = np.random.default_rng(1)
     for r, (ax, (_, mark, label)) in enumerate(zip(axes, MARKS)):
@@ -429,6 +444,14 @@ def panel_d(axes, percell: pd.DataFrame, order, colors):
                     transform=ax.get_xaxis_transform(), ha="center",
                     va="bottom", fontsize=4.8, color="0.3")
         ax.set_xlim(-0.6, len(present) + 0.45)
+        # do the types differ? the room for the answer above the cells
+        pk = types_p(data)
+        if np.isfinite(pk):
+            y0, y1 = ax.get_ylim()
+            ax.set_ylim(y0, y1 + 0.16 * (y1 - y0))
+            ax.text(0.01, 0.98, f"across types: Kruskal–Wallis {_p_short(pk)}",
+                    transform=ax.transAxes, ha="left", va="top",
+                    fontsize=4.8, color="0.25")
         ax.set_ylabel(f"{mark}: per-cell Δr", color=MARK_COLOR[mark])
         ax.set_xticks(range(len(present)))
         if r < len(axes) - 1:
@@ -890,27 +913,57 @@ def build_figure(d: dict, order, colors):
 
 
 def build_supplementary(d: dict):
-    """--distance's own a and b, its null excluding the contacts'
-    near-copies, where the main figure's come from --distance-ab."""
+    """The main figure's panels under the other version of the null, each
+    pair a row: --distance's own a and b (its null excluding the contacts'
+    near-copies), where the main figure's come from --distance-ab; and
+    --classes-supp's e and f (keeping them), where the main figure's
+    exclude them.  Lettered in order."""
     plt = _style()
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
-    fig = plt.figure(figsize=(7.2, 3.3))
-    # a's three measures, b beside them
-    gs = GridSpec(1, 2, figure=fig, wspace=0.16, width_ratios=[3.1, 1],
-                  left=0.07, right=0.985, top=0.9, bottom=0.14)
-    ga = GridSpecFromSubplotSpec(2, 3, gs[0], hspace=0.12, wspace=0.34)
-    ax_ar = [fig.add_subplot(ga[0, j]) for j in range(3)]
-    ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j]) for j in range(3)]
-    panel_a(ax_ar, ax_ad, d["dist_supp"])
-    gb = GridSpecFromSubplotSpec(3, 2, gs[1], width_ratios=[0.28, 1],
-                                 height_ratios=[0.12, 1, 0.12], wspace=0.0)
-    ax_b = fig.add_subplot(gb[1, 1])
-    panel_b(ax_b, d["regions_supp"], d["regions_summary_supp"])
+    rows = [r for r, key in (("ab", "dist_supp"), ("ef", "summary_supp"))
+            if key in d]
+    heights = {"ab": 3.3, "ef": 2.7}
+    fig = plt.figure(figsize=(7.2, sum(heights[r] for r in rows)))
+    gs = GridSpec(len(rows), 1, figure=fig, hspace=0.45,
+                  height_ratios=[heights[r] for r in rows], left=0.07,
+                  right=0.985, top=1 - 0.3 / fig.get_figheight(),
+                  bottom=0.45 / fig.get_figheight())
+    first = []
+    for i, r in enumerate(rows):
+        if r == "ab":
+            # a's three measures, b beside them
+            g = GridSpecFromSubplotSpec(1, 2, gs[i], wspace=0.16,
+                                        width_ratios=[3.1, 1])
+            ga = GridSpecFromSubplotSpec(2, 3, g[0], hspace=0.12,
+                                         wspace=0.34)
+            ax_ar = [fig.add_subplot(ga[0, j]) for j in range(3)]
+            ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j])
+                     for j in range(3)]
+            panel_a(ax_ar, ax_ad, d["dist_supp"])
+            gb = GridSpecFromSubplotSpec(3, 2, g[1], width_ratios=[0.28, 1],
+                                         height_ratios=[0.12, 1, 0.12],
+                                         wspace=0.0)
+            ax_b = fig.add_subplot(gb[1, 1])
+            panel_b(ax_b, d["regions_supp"], d["regions_summary_supp"])
+            first += [(ax_ar[0], 0.06), (ax_b, 0.06)]
+        else:
+            # e and f, laid out as in the main figure
+            g = GridSpecFromSubplotSpec(1, 12, gs[i], wspace=1.6)
+            ge = GridSpecFromSubplotSpec(1, 3, g[0, 0:6], wspace=0.12,
+                                         width_ratios=[0.3, 1, 1])
+            ax_e = [fig.add_subplot(ge[1])]
+            ax_e.append(fig.add_subplot(ge[2], sharey=ax_e[0]))
+            panel_e(ax_e, d["summary_supp"])
+            gf = GridSpecFromSubplotSpec(1, 4, g[0, 6:12], wspace=0.06,
+                                         width_ratios=[0.3, 1, 1, 0.25])
+            ax_f = [fig.add_subplot(gf[1]), fig.add_subplot(gf[2])]
+            panel_f(ax_f, d["summary_supp"])
+            first += [(ax_e[0], 0.075), (ax_f[0], 0.075)]
     fig.canvas.draw()
-    for lab, ax, dx in (("a", ax_ar[0], 0.06), ("b", ax_b, 0.06)):
+    for lab, (ax, dx) in zip("abcdefgh", first):
         bb = ax.get_position()
-        fig.text(bb.x0 - dx, bb.y1 + 0.015, lab, fontsize=8,
-                 fontweight="bold", va="bottom", ha="left")
+        fig.text(bb.x0 - dx, bb.y1 + 0.1 / fig.get_figheight(), lab,
+                 fontsize=8, fontweight="bold", va="bottom", ha="left")
     return fig
 
 
@@ -925,9 +978,15 @@ def parse_args(argv=None):
                          "null keeps every stand-in (no --null-exclude), so "
                          "a reaches below 1 kb.  Default --distance.")
     ap.add_argument("--supplementary", default=None, metavar="PDF",
-                    help="With --distance-ab: --distance's own a and b, its "
-                         "null without the contacts' near-copies, drawn "
-                         "here as a figure of their own.")
+                    help="With --distance-ab or --classes-supp: the panels "
+                         "under the other version of the null -- "
+                         "--distance's own a and b, its null without the "
+                         "contacts' near-copies, and --classes-supp's e and "
+                         "f -- drawn here as a figure of their own.")
+    ap.add_argument("--classes-supp", default=None,
+                    help="--supplementary: a class run keeping the "
+                         "contacts' near-copies among the reshuffled links "
+                         "(no --null-exclude), its e and f drawn there.")
     ap.add_argument("--classes", required=True,
                     help="annotation_class_concordance.py's output directory "
                          "(--systems ab,rt,chromhmm,pmd).")
@@ -949,12 +1008,17 @@ AB_TABLES = ("end_posterior_dist_all.tsv", "end_posterior_regions.tsv",
 def read_tables(args) -> dict:
     dd, cc = Path(args.distance), Path(args.classes)
     ab = Path(args.distance_ab) if getattr(args, "distance_ab", None) else dd
-    if getattr(args, "supplementary", None) and ab == dd:
-        sys.exit("--supplementary draws --distance's a and b beside "
-                 "--distance-ab's: give --distance-ab")
+    cs = getattr(args, "classes_supp", None)
+    if getattr(args, "supplementary", None) and ab == dd and not cs:
+        sys.exit("--supplementary draws the panels under the other null: "
+                 "give --distance-ab (a and b) or --classes-supp (e and f)")
+    if cs and not getattr(args, "supplementary", None):
+        sys.exit("--classes-supp is drawn in --supplementary: give it")
     need = [dd / "end_posterior_percell.tsv"]
     need += [r / f for r in dict.fromkeys((ab, dd)) for f in AB_TABLES]
     need += [cc / f for f in ("summary.tsv", "locus_hotspots.tsv.gz")]
+    if cs:
+        need.append(Path(cs) / "summary.tsv")
     miss = [str(p) for p in need if not p.exists()]
     if miss:
         sys.exit("missing: " + ", ".join(miss))
@@ -970,6 +1034,8 @@ def read_tables(args) -> dict:
     d.update(ab_of(ab))
     if ab != dd:
         d.update(ab_of(dd, "_supp"))
+    if cs:
+        d["summary_supp"] = pd.read_csv(Path(cs) / "summary.tsv", sep="\t")
     return d
 
 
