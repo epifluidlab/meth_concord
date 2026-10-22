@@ -200,13 +200,14 @@ CONTROLS = (("1  Same cell, near-copies refused", "Figs. 5c–g, 6i"),
             ("3  Same position, other cells", "Supplementary Fig. x"))
 
 
-def draw_control(a, k, heading=True):
-    """Control k (0, 1, 2 of CONTROLS) in an axes 0-10 each way."""
+def draw_control(a, k, heading=True, used=None):
+    """Control k (0, 1, 2 of CONTROLS) in an axes 0-10 each way; ``used``
+    in place of where CONTROLS says it is used."""
     if heading:
         a.text(0.2, 9.75, CONTROLS[k][0], fontsize=5.6, fontweight="bold",
                color=INK, ha="left", va="top")
-        a.text(0.2, 8.85, CONTROLS[k][1], fontsize=4.7, color=MUTED,
-               ha="left", va="top")
+        a.text(0.2, 8.85, CONTROLS[k][1] if used is None else used,
+               fontsize=4.7, color=MUTED, ha="left", va="top")
     y = 4.2
     if k < 2:
         a.plot([0.2, 9.8], [y, y], color="0.6", lw=0.6, zorder=0)

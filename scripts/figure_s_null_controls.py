@@ -46,6 +46,10 @@ s9 = _load("figure_s9_concordance_model")
 
 TABLES = ("end_posterior_dist_all.tsv", "end_posterior_regions.tsv",
           "end_posterior_regions_summary.tsv", "end_posterior_percell.tsv")
+#: Where each control is used, as its row's heading says it: the third is
+#: used here alone, which Supplementary Fig. 9c's "Supplementary Fig. x"
+#: would make this figure name itself.
+USED = (None, None, "this figure only")
 
 
 def read_run(d) -> dict:
@@ -106,7 +110,7 @@ def build_figure(runs: dict):
         a.set_xlim(0, 10)
         a.set_ylim(0, 10)
         a.axis("off")
-        s9.draw_control(a, k)
+        s9.draw_control(a, k, used=USED[k])
         first.setdefault("a", a)
         t = runs.get(k)
         if t is None:

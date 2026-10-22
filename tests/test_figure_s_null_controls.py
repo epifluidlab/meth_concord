@@ -45,3 +45,13 @@ def test_a_run_must_name_its_control(tmp_path):
     r1 = _run(tmp_path / "r1", 0)
     with pytest.raises(SystemExit, match="K=DIR"):
         sn.runs_of([f"4={r1}"])
+
+
+def test_the_third_control_does_not_name_this_figure(tmp_path):
+    """Supplementary Fig. 9c says where control 3 is used: here.  In its
+    own row that would be this figure naming itself."""
+    r3 = _run(tmp_path / "r3", 2)
+    fig = sn.build_figure(sn.runs_of([f"3={r3}"]))
+    texts = [t.get_text() for a in fig.axes for t in a.texts]
+    assert "this figure only" in texts
+    assert "Supplementary Fig. x" not in texts
