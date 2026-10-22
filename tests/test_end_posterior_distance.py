@@ -222,12 +222,13 @@ def test_pooled_donor_pool_keeps_identifiable_pair_ids(tmp_path):
     m = _mod()
     sp = _fixture(tmp_path)
     cells = pd.read_csv(sp, sep="\t")["cell_name"].astype(str).tolist()
-    args = argparse.Namespace(min_sites=2)
-    pools = m._build_pools(
-        cells, {"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"}, args,
-        None, None, ())
+    args = argparse.Namespace(min_sites=2, null_type="locus-matched")
+    pools = m._stratum_pool(
+        [(c, i) for i, c in enumerate(cells)],
+        {"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"},
+        m.build_edges(100, 10_000_000, 8), args, None, ())
     # Minimal args mean --pair-set joint: one pool, keyed by its pair set.
-    (pos, vals, pi), = pools["joint"].values()
+    pos, vals, pi = pools["joint"]
     assert (pi >= 0).all(), "no sentinel ids left"
     # Every end appears twice, once per member of its pair, and no two cells
     # share an id.
@@ -742,26 +743,40 @@ def test_drain_folds_identically_to_materialising_every_cell(tmp_path):
         assert np.allclose(got[k], want[k])
 
 
-def test_build_pools_parallel_matches_serial(tmp_path):
-    """Parallelising the donor pass must not move a single donor end."""
+@pytest.mark.parametrize("cap", [8, 0])
+def test_bounded_strata_stay_under_the_cap_and_all_run(cap):
+    """--pool-max-cells: the cells whose donors are held at once stay within
+    the cap -- a stratum over it alone runs alone -- and no stratum is
+    dropped; 0 is no limit."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
     m = _mod()
-    _fixture(tmp_path, n_cells=6)
-    paths = {"GCH": tmp_path / "GCH", "HCG": tmp_path / "HCG"}
-    cells = [f"c{i}" for i in range(6)]
-    a1, a8 = _args(m), _args(m)
-    a1.n_threads, a8.n_threads = 1, 8
-    ser = m._build_pools(cells, paths, a1, None, None, ())
-    par = m._build_pools(cells, paths, a8, None, None, ())
-    assert set(ser) == set(par)
-    for sk in ser:
-        assert set(ser[sk]) == set(par[sk])
-        for k in ser[sk]:
-            pos_s, vals_s, pi_s = ser[sk][k]
-            pos_p, vals_p, pi_p = par[sk][k]
-            assert np.array_equal(pos_s, pos_p)
-            assert np.array_equal(pi_s, pi_p)
-            for name in vals_s:
-                assert np.allclose(vals_s[name], vals_p[name])
+    lock = threading.Lock()
+    now = [0]
+    snaps = []
+    tasks = [(f"s{k}", [None] * n, False)
+             for k, n in enumerate([12, 5, 4, 4, 3, 2, 2, 1, 1])]
+
+    def fn(t):
+        n = len(t[1])
+        with lock:
+            now[0] += n
+            snaps.append((now[0], n))
+        time.sleep(0.03)
+        with lock:
+            now[0] -= n
+        return t[0]
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        got = list(m._bounded(ex, fn, tasks, 4, cap))
+    assert sorted(got) == sorted(t[0] for t in tasks)
+    peak = max(s for s, _ in snaps)
+    if cap:
+        assert all(s <= cap or s == n for s, n in snaps), snaps
+    else:
+        assert peak > 12, "no cap: the big stratum runs alongside others"
+    assert peak > 1, "strata still run in parallel"
 
 
 def test_pin_inner_threads_stops_pyarrow_fanning_out():
@@ -821,18 +836,24 @@ def test_backends_agree_and_auto_picks_by_cell_count(tmp_path):
             assert np.allclose(auto[c], other[c], equal_nan=True), (name, c)
 
 
-def test_process_backend_agrees_under_pooled_donors(tmp_path):
-    """--null-scope pooled builds its donor pool per GROUP.
-
-    That is the path where a process pool cannot ride on the run-wide
-    initializer, so it takes a separate branch; check that branch lands on the
-    same numbers as threads rather than on an empty or shared donor set.
-    """
-    kw = ["--n-threads", "2", "--null-scope", "pooled"]
-    thr, _ = _run_cli(tmp_path / "t", kw + ["--backend", "thread"])
-    prc, _ = _run_cli(tmp_path / "p", kw + ["--backend", "process"])
-    for c in thr.columns:
-        assert np.allclose(thr[c], prc[c], equal_nan=True), c
+@pytest.mark.parametrize("null", ["distance-matched", "locus-matched"])
+def test_process_backend_agrees_under_pooled_donors(tmp_path, null):
+    """--null-scope pooled builds each stratum's donors inside the stratum's
+    own task, where a process pool cannot ride on the run-wide initializer.
+    Serial, threads and processes must land on the same numbers -- with
+    --pool-max-cells binding, so the strata queue for it."""
+    kw = ["--null-scope", "pooled", "--null-type", null,
+          "--group-column", "group", "--null-match-column", "exp_batch",
+          "--pool-max-cells", "3"]
+    ser, _ = _run_cli(tmp_path / "s", kw + ["--n-threads", "1"])
+    thr, _ = _run_cli(tmp_path / "t",
+                      kw + ["--n-threads", "2", "--backend", "thread"])
+    prc, _ = _run_cli(tmp_path / "p",
+                      kw + ["--n-threads", "2", "--backend", "process"])
+    assert (ser["gg_null_n"] > 0).any()
+    for other in (thr, prc):
+        for c in ser.columns:
+            assert np.allclose(ser[c], other[c], equal_nan=True), c
 
 
 def test_auto_switches_to_processes_once_past_the_threshold(tmp_path):
@@ -1453,7 +1474,7 @@ def test_link_shuffle_null_pairs_never_cross_chromosomes():
     assert (_chrom_of(m, donor) == _chrom_of(m, g1)).all()
 
 
-def test_link_shuffle_strata_are_cell_type_by_batch():
+def test_pooled_strata_are_cell_type_by_batch():
     import argparse
     m = _mod()
     s = pd.DataFrame({"cell_name": ["a", "b", "c", "d"],
@@ -1461,7 +1482,7 @@ def test_link_shuffle_strata_are_cell_type_by_batch():
                       "exp_batch": ["e1", "e2", "e1", "e1"]})
     a = argparse.Namespace(cell_column="cell_name", group_column="group")
     batch_of = {"a": "e1", "b": "e2", "c": "e1", "d": "e1"}
-    st = m._link_strata(s, a, batch_of)
+    st = m._pool_strata(s, a, batch_of)
     assert st == {"a": "T1|e1", "b": "T1|e2", "c": "T2|e1", "d": "T2|e1"}
 
 
@@ -1616,24 +1637,82 @@ def test_link_shuffle_feeds_the_per_cell_test(tmp_path):
     assert (g["delta"] > 0).mean() > 0.8
 
 
-def test_link_shuffle_never_builds_a_run_wide_pool(tmp_path, monkeypatch):
-    """The run-wide pool is what ran out of memory on 1,577 cells."""
+@pytest.mark.parametrize("null", ["link-shuffle", "locus-matched",
+                                  "distance-matched"])
+def test_pooled_nulls_never_build_a_run_wide_pool(tmp_path, monkeypatch,
+                                                  null):
+    """The run-wide pool is what ran out of memory on 1,577 cells, under
+    link-shuffle first and the location-matched null after it: a donor pool
+    only ever holds one stratum's cells."""
     m = _mod()
     sp = _link_fixture(tmp_path, rho=1.0)
+    largest = (pd.read_csv(sp, sep="\t")
+               .groupby(["group", "exp_batch", "lib_batch"]).size().max())
+    real, seen = m._stratum_pool, []
 
-    def boom(*a, **k):
-        raise AssertionError("run-wide donor pool built under link-shuffle")
+    def spy(members, *a, **k):
+        seen.append(len(members))
+        return real(members, *a, **k)
 
-    monkeypatch.setattr(m, "_build_pools", boom)
+    monkeypatch.setattr(m, "_stratum_pool", spy)
     assert m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
                    "--samples", sp, "--output-dir", str(tmp_path / "o"),
-                   "--plot-format", "png", "--null-type", "link-shuffle",
+                   "--plot-format", "png", "--null-type", null,
                    "--null-scope", "pooled", "--group-column", "group",
                    "--null-match-column", "exp_batch,lib_batch",
                    "--min-distance", "1000", "--max-distance", "1000000",
                    "--bins-per-decade", "4", "--min-pairs", "50",
                    "--n-bootstrap", "0", "--fisher-z", "none",
                    "--per-cell", "off"]) == 0
+    assert seen and max(seen) <= largest < 16
+
+
+def test_pooled_locus_matched_never_takes_the_anchor_cell():
+    """Across cells means across cells: an end of the anchor's own cell at
+    the partner's place is often a near-copy of the contact itself."""
+    m = _mod()
+    S = m._PAIR_STRIDE
+    # anchor pair 0 of cell 0; donors within the window: the real partner,
+    # two more ends of cell 0, one end of cell 3
+    d_pos = np.array([49_800, 50_000, 50_100, 50_400])
+    d_pi = np.array([0 * S + 7, 0 * S + 0, 0 * S + 9, 3 * S + 2])
+    hits = set()
+    for seed in range(40):
+        got = m._null_indices_locus_matched(
+            np.array([50_000]), np.array([10_000]), np.array([0]), d_pos,
+            d_pi, np.random.default_rng(seed), 1000, other_cell=True)
+        if got is not None:
+            hits.update(got[1].tolist())
+    assert hits == {3}
+    # the same-cell version keeps refusing only the pair itself
+    same = set()
+    for seed in range(40):
+        got = m._null_indices_locus_matched(
+            np.array([50_000]), np.array([10_000]), np.array([0]), d_pos,
+            d_pi, np.random.default_rng(seed), 1000)
+        if got is not None:
+            same.update(got[1].tolist())
+    assert same == {0, 2, 3}
+
+
+def test_pooled_locus_matched_donors_are_centred_per_cell(tmp_path):
+    """The anchors are centred on their own cell under --cell-center on;
+    the donors, from other cells, must be too, or the two arms differ."""
+    import argparse
+    m = _mod()
+    sp = _link_fixture(tmp_path, offset_sd=1.0)
+    cells = pd.read_csv(sp, sep="\t")["cell_name"].tolist()
+    a = argparse.Namespace(min_sites=2, null_type="locus-matched",
+                           null_scope="pooled", cell_center="on",
+                           pair_set="per-mark")
+    pool = m._stratum_pool([(c, i) for i, c in enumerate(cells)],
+                           {"GCH": tmp_path / "GCH"},
+                           m.build_edges(1000, 1_000_000, 4), a, None, ())
+    _pos, vals, pi = pool["GCH"]
+    cell = pi // m._PAIR_STRIDE
+    means = [vals["g"][cell == k].mean() for k in np.unique(cell)]
+    assert np.allclose(means, 0, atol=1e-5)
+    assert vals["g"].dtype == np.float32 and "_gpos" not in vals
 
 
 def test_link_shuffle_per_cell_rows_stay_with_their_cells(tmp_path):

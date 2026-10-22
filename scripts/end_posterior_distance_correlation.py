@@ -28,7 +28,9 @@ Nulls mirror the site-level script:
         this cell".
     --null-type locus-matched      keep end 1 and swap end 2 for another end
         within +/---null-window of the true partner.  Answers "same two places,
-        different molecule".
+        different molecule".  Under --null-scope pooled the stand-in is an
+        end of ANOTHER cell of the anchor's stratum, never of its own cell:
+        "same two places, but not one nucleus".
 
     --null-type link-shuffle       re-pair contacts across cells: keep end 1
         of a contact and give it, as end 2, an end of ANOTHER cell's contact
@@ -56,9 +58,12 @@ Nulls mirror the site-level script:
         ligated to within W of end 1.
 
     --null-scope cell     donors come from the anchor's own cell.
-    --null-scope pooled   donors come from every cell in the group, optionally
-        restricted to cells sharing --null-match-column (e.g.
-        exp_batch,plate_batch,lib_batch), so a donor never crosses a batch.
+    --null-scope pooled   donors come from the cells of the anchor's stratum:
+        its cell type (--group-column) x --null-match-column (e.g.
+        exp_batch,plate_batch,lib_batch), so a donor never crosses a type or
+        a batch.  A stratum is a closed world for every null, so its donor
+        ends are built, used and dropped on their own, with at most
+        --pool-max-cells cells' worth held at once.
 
 Both nulls stay on the anchor's CHROMOSOME.  Ends are placed on a genome-wide
 coordinate (chromosome code x 2^33 + position) before any window is searched,
@@ -1169,13 +1174,18 @@ def _center_frame(f: pd.DataFrame, cols: dict) -> pd.DataFrame:
 def _merge_end_tables(parts: list):
     """Concatenate end tables ``(pos, vals, pair_ids[, mates])`` and sort by
     position; ``mates``, each end's read pair's other end, when every part
-    has them."""
+    has them.
+
+    One column at a time, each sorted as soon as it is joined: a stratum's
+    pool is gigabytes, and joining every column before sorting any held
+    three copies of it at once rather than two.
+    """
     pos = np.concatenate([p[0] for p in parts])
-    names = parts[0][1].keys()
-    vals = {n_: np.concatenate([p[1][n_] for p in parts]) for n_ in names}
-    pi = np.concatenate([p[2] for p in parts])
     o = np.argsort(pos, kind="stable")
-    out = (pos[o], {n_: v[o] for n_, v in vals.items()}, pi[o])
+    pos = pos[o]
+    vals = {n_: np.concatenate([p[1][n_] for p in parts])[o]
+            for n_ in parts[0][1]}
+    out = (pos, vals, np.concatenate([p[2] for p in parts])[o])
     if all(len(p) > 3 for p in parts):
         out += (np.concatenate([p[3] for p in parts])[o],)
     return out
@@ -1411,7 +1421,8 @@ def _null_indices_distance_matched(anchor_pos, anchor_dist, d_pos, d_pi,
 
 
 def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
-                                d_pi, rng, window, max_rounds=8):
+                                d_pi, rng, window, max_rounds=8,
+                                other_cell=False):
     """Indices for the locus-matched null: keep end 1, swap end 2 for another
     end within +/-window of the true partner.
 
@@ -1423,6 +1434,10 @@ def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
     that share it removes both the true partner and the anchor's own end 1 —
     the latter sits inside the window whenever the pair is closer than
     ``window``, and would otherwise be correlated with itself.
+
+    ``other_cell`` (--null-scope pooled) refuses every end of the anchor's
+    own cell, as the id carries the cell: an end of the same cell at the
+    partner's place is often a near-copy of the contact itself.
     """
     n = int(anchor_pos2.size)
     if d_pos.size < 2 or n == 0:
@@ -1439,7 +1454,11 @@ def _null_indices_locus_matched(anchor_pos2, anchor_pos1, anchor_idx, d_pos,
         span = (hi[idx] - lo[idx]).astype(np.int64)
         k = lo[idx] + (rng.random(idx.size) * span).astype(np.int64)
         k = np.clip(k, 0, d_pos.size - 1)
-        good = d_pi[k] != anchor_idx[idx]
+        if other_cell:
+            good = (d_pi[k] // _PAIR_STRIDE) != (anchor_idx[idx]
+                                                 // _PAIR_STRIDE)
+        else:
+            good = d_pi[k] != anchor_idx[idx]
         sel = idx[good]
         kb_out[sel] = k[good]
         alive[sel] = False
@@ -1876,7 +1895,8 @@ def _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges, args, rng):
         return xa, xb, dn, anchor, aidx
     got = _null_indices_locus_matched(
         p2, p1, base + np.arange(len(j), dtype=np.int64),
-        d_pos, d_pi, rng, args.null_window)
+        d_pos, d_pi, rng, args.null_window,
+        other_cell=getattr(args, "null_scope", "cell") == "pooled")
     if got is None:
         return None
     ai, kb, dn = got
@@ -1984,109 +2004,45 @@ def _pool_sets(args):
     return sorted(sets)
 
 
-def _build_pools(cells, paths, args, batch_of, merged, excl_chrom):
-    """Donor end pools for --null-scope pooled: ``{pair_set: {batch: pool}}``.
-
-    Not used by link-shuffle, which builds one small pool per stratum inside
-    the stratum's own task (:func:`_stratum_job`).
-
-    One pool per pair set, because each set's null draws from ends carrying
-    that set's values (GCH-only, HCG-only, or both).  Parallel over cells,
-    because this is a SECOND full pass of the same load-and-join that
-    dominates the run: left serial it silently doubled the wall clock of every
-    --null-scope pooled run while nine of ten cores idled.  Threads rather
-    than processes -- the per-cell end tables are large and would cost more to
-    pickle back than the join costs to compute, and with ``chrom`` categorical
-    the join no longer pins the GIL.
-    """
-    sets = _pool_sets(args)
-    ms = _min_sites(args)
-
-    def _one(job):
-        ci, cell = job
-        frames = set_frames(_load_any(paths, cell, ms, merged, excl_chrom,
-                                      args), sets)
-        if not frames:
-            return None
-        key = batch_of.get(cell, "") if batch_of else ""
-        # Same enumeration as run_group's job list, so a cell's ids here and
-        # in its own pass agree without either side recording an offset.
-        return key, {sk: end_table(f, _SET_COLS[sk], _pair_base(ci),
-                                   _coords(args))
-                     for sk, f in frames.items()}
-
-    jobs = list(enumerate(cells))
-    parts: dict = {}
-
-    def _take(got):
-        if got is None:
-            return
-        key, tabs = got
-        for sk, tab in tabs.items():
-            parts.setdefault(sk, {}).setdefault(key, []).append(tab)
-
-    bar = Progress(len(jobs), "pooled donors: cells")
-    try:
-        # getattr: callers that build a minimal args for this one helper
-        # never had to supply a thread count, and should not start to.
-        if getattr(args, "n_threads", 1) > 1 and len(jobs) > 1:
-            from concurrent.futures import ThreadPoolExecutor
-            _pin_inner_threads()
-            with ThreadPoolExecutor(max_workers=args.n_threads) as ex:
-                for got in ex.map(_one, jobs):
-                    _take(got)
-                    bar.update()
-        else:
-            for job in jobs:
-                _take(_one(job))
-                bar.update()
-    finally:
-        bar.close()
-    pools: dict = {}
-    for sk, by_key in parts.items():
-        # Run-wide ids, so a donor pair drawn out of ANY cell in the stratum
-        # is recognisable as a real ligation and refused.
-        pools[sk] = {k: _merge_end_tables(ps) for k, ps in by_key.items()}
-    logger.info("  pooled donor ends: " + ", ".join(
-        f"{sk}: {sum(int(v[0].size) for v in by.values()):,}"
-        for sk, by in pools.items()))
-    return pools
-
-
-def _link_strata(samples: pd.DataFrame, args, batch_of):
-    """Stratum per cell for link-shuffle: cell type x --null-match-column.
+def _pool_strata(samples: pd.DataFrame, args, batch_of):
+    """Stratum per cell for --null-scope pooled: cell type x
+    --null-match-column.
 
     The cell type is added from --group-column so that even the all-cells
-    run never hands a cell another type's link.
+    run never hands a cell another type's donor.
     """
     idx = samples.set_index(args.cell_column)
     parts = []
     if args.group_column:
         parts.append(idx[args.group_column].astype(str))
     else:
-        logger.warning("--null-type link-shuffle without --group-column: "
-                       "donor links are not restricted to the anchor's cell "
-                       "type.")
+        logger.warning("--null-scope pooled without --group-column: donor "
+                       "ends are not restricted to the anchor's cell type.")
     if batch_of:
         parts.append(pd.Series(batch_of))
     if not parts:
         return None
     strata = pd.concat(parts, axis=1).astype(str).agg("|".join, axis=1)
-    logger.info(f"link-shuffle strata: {strata.nunique()} "
+    logger.info(f"pooled strata: {strata.nunique()} "
                 f"(median {int(strata.value_counts().median())} cells each)")
     return strata.to_dict()
 
 
 def _stratum_pool(members, paths, edges, args, merged, excl_chrom):
-    """link-shuffle donors for ONE stratum: its cells' contact ends.
+    """Donor ends for ONE stratum of a --null-scope pooled run.
 
-    Both ends of every linked pair in the distance range, centred on their
-    own cell's mean, values as float32 and without the genome-coordinate
-    copy (the position already is one) -- roughly a third of a full end
-    table, and only ever one stratum's worth at a time per worker.
+    link-shuffle takes its cells' contact ends (both ends of every linked
+    pair in the distance range); the other nulls every end, as their
+    same-cell versions do.  Values are centred on their own cell's mean
+    when the run centres, kept as float32 and without the genome-coordinate
+    copy wherever the position already is one -- 20-24 bytes an end against
+    a full end table's 32-40, and only ever one stratum's worth at a time
+    per worker.
     """
     ms = _min_sites(args)
     sets = _pool_sets(args)
+    coords = _coords(args)
+    links = getattr(args, "null_type", "") == "link-shuffle"
     parts: dict = {}
     for cell, i in members:
         frames = set_frames(_load_any(paths, cell, ms, merged, excl_chrom,
@@ -2094,15 +2050,19 @@ def _stratum_pool(members, paths, edges, args, merged, excl_chrom):
         for sk, f in frames.items():
             if _center_on(args):
                 f = _center_frame(f, _SET_COLS[sk])
-            f = _contact_ends(f, edges)
+            if links:
+                f = _contact_ends(f, edges)
             if not len(f):
                 continue
-            pos, vals, pi = end_table(f, _SET_COLS[sk], _pair_base(i),
-                                      "genome")
-            vals = {n_: v.astype(np.float32) for n_, v in vals.items()
-                    if n_ != "_gpos"}
+            pos, vals, pi = end_table(f, _SET_COLS[sk], _pair_base(i), coords)
+            # the genome coordinate only rides along where the position is
+            # per chromosome (--null-chrom any), and stays an integer there
+            vals = {n_: (v if n_ == "_gpos" else v.astype(np.float32))
+                    for n_, v in vals.items()
+                    if n_ != "_gpos" or coords == "raw"}
             parts.setdefault(sk, []).append((pos, vals, pi))
-    return {sk: _merge_end_tables(ps) for sk, ps in parts.items()}
+    # one pair set at a time, its parts let go as soon as it is merged
+    return {sk: _merge_end_tables(parts.pop(sk)) for sk in sorted(parts)}
 
 
 def _stratum_job(task, paths, edges, args, batch_of, merged, excl_chrom):
@@ -2126,17 +2086,47 @@ def _stratum_worker(task):
                         _W["batch_of"], _W["merged"], _W["excl_chrom"])
 
 
+def _bounded(executor, fn, tasks, slots, cap):
+    """``fn`` over ``tasks`` (key, members, ...), results as they finish.
+
+    At most ``slots`` tasks are out at once and, with ``cap``, at most
+    ``cap`` member cells among them: each task holds its whole stratum's
+    donor ends while it runs, so the cells in flight are what sets the
+    memory.  Tasks go out largest first wherever they fit; one larger than
+    ``cap`` on its own runs once nothing else does.
+    """
+    from concurrent.futures import FIRST_COMPLETED, wait
+    pending = list(tasks)
+    running: dict = {}
+    held = 0
+    while pending or running:
+        k = 0
+        while k < len(pending) and len(running) < slots:
+            n = len(pending[k][1])
+            if not cap or not running or held + n <= cap:
+                running[executor.submit(fn, pending.pop(k))] = n
+                held += n
+            else:
+                k += 1
+        done, _ = wait(running, return_when=FIRST_COMPLETED)
+        for f in done:
+            held -= running.pop(f)
+            yield f.result()
+
+
 def _run_strata(cells, paths, edges, args, batch_of, merged, excl_chrom,
                 executor, want, accs, per_cell, label):
-    """link-shuffle, one stratum per task.
+    """Every --null-scope pooled null, one stratum per task.
 
-    A run-wide donor pool -- every contact end of every cell, for every pair
-    set -- was the whole run's pairs held at once, briefly twice while it
-    was merged, and handed to each worker process: on 1,577 cells the job
-    was killed for memory the moment the pool was built.  A stratum (cell
-    type x batch, median 7 cells) is its own closed world for this null, so
-    it can be built, used and dropped on its own.  Results go back into
-    cell order, because per_cell[i] has to belong to cells[i].
+    A run-wide donor pool -- every end of every cell, for every pair set --
+    was the whole run's pairs held at once, briefly twice while it was
+    merged, and handed to each worker process: on 1,577 cells the job was
+    killed for memory while the pool was still being built, first under
+    link-shuffle and again under the location-matched null.  A stratum
+    (cell type x batch) is its own closed world for every null, so it can
+    be built, used and dropped on its own; --pool-max-cells bounds how many
+    cells' donors are held at once across the workers.  Results go back
+    into cell order, because per_cell[i] has to belong to cells[i].
     """
     by: dict = {}
     for i, c in enumerate(cells):
@@ -2147,14 +2137,19 @@ def _run_strata(cells, paths, edges, args, batch_of, merged, excl_chrom,
     tasks = sorted(((k, m, want) for k, m in by.items()),
                    key=lambda t: -len(t[1]))
     sizes = [len(t[1]) for t in tasks]
-    logger.info(f"  link-shuffle: {len(tasks)} strata, "
-                f"{min(sizes)}-{max(sizes)} cells each")
+    cap = int(getattr(args, "pool_max_cells", 0) or 0)
+    logger.info(f"  pooled null: {len(tasks)} strata, "
+                f"{min(sizes)}-{max(sizes)} cells each"
+                + (f", donors of at most {cap} cells held at once"
+                   if cap else ""))
     if executor is not None and len(tasks) > 1:
         if args.backend == "process":
-            it = executor.map(_stratum_worker, tasks)
+            fn = _stratum_worker
         else:
-            it = executor.map(lambda t: _stratum_job(
-                t, paths, edges, args, batch_of, merged, excl_chrom), tasks)
+            def fn(t):
+                return _stratum_job(t, paths, edges, args, batch_of, merged,
+                                    excl_chrom)
+        it = _bounded(executor, fn, tasks, args.n_threads, cap)
     else:
         it = (_stratum_job(t, paths, edges, args, batch_of, merged,
                            excl_chrom) for t in tasks)
@@ -2182,17 +2177,15 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
               keep=None):
     nb = len(edges) - 1
     accs = {(m, c): new_acc(nb) for m, _ in _MEASURES for c, _ in _CONDS}
-    links = (args.null_type == "link-shuffle"
-             and args.null_scope == "pooled")
-    pools = ({} if args.null_scope != "pooled" or links
-             else _build_pools(cells, paths, args, batch_of, merged,
-                               excl_chrom))
+    # Same-cell donors come out of each cell's own frame; pooled ones out of
+    # its stratum's pool, built inside the stratum's task (_run_strata).
+    pools: dict = {}
 
     n_pairs = n_null = 0
     per_cell: list = []   # kept for the cell-level bootstrap
     want = percell is not None
     jobs = [(c, i, want) for i, c in enumerate(cells)]
-    if links:
+    if args.null_scope == "pooled":
         n_pairs, n_null = _run_strata(cells, paths, edges, args, batch_of,
                                       merged, excl_chrom, executor, want,
                                       accs, per_cell, label)
@@ -2203,19 +2196,7 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
         # long tail of cells while the rest idle -- cells differ several-fold
         # in depth, which is exactly when a coarse chunking strands work.
         chunk = max(1, min(8, len(jobs) // (args.n_threads * 16)))
-        if args.backend == "process" and pools:
-            # Pooled donors are per GROUP, so they cannot ride on a pool built
-            # once for the whole run: a shared initializer would hand every
-            # group the same (or an empty) donor set and silently produce the
-            # wrong null.  Threads close over `pools` directly and are fine.
-            from concurrent.futures import ProcessPoolExecutor
-            with ProcessPoolExecutor(
-                    max_workers=args.n_threads, initializer=_init_worker,
-                    initargs=(paths, edges, args, pools, batch_of, merged,
-                              excl_chrom)) as gex:
-                out = _drain(gex.map(_worker, jobs, chunksize=chunk),
-                             accs, per_cell, len(jobs), label)
-        elif args.backend == "process":
+        if args.backend == "process":
             out = _drain(executor.map(_worker, jobs, chunksize=chunk),
                          accs, per_cell, len(jobs), label)
         else:
@@ -2328,6 +2309,10 @@ def run_group(cells, paths, edges, args, label, out_dir, batch_of=None,
                + ("other cells" if args.null_scope == "pooled"
                   else "same cell")
                if args.null_type == "link-shuffle" else "")
+            + (f", within {args.null_window:,} bp of end 2, "
+               + ("other cells" if args.null_scope == "pooled"
+                  else "same cell")
+               if args.null_type == "locus-matched" else "")
             + (", ends centred per cell" if _center_on(args) else ""))
     _figure(curves, centers, label,
             Path(out_dir) / f"end_posterior_dist_{label}.{args.plot_format}",
@@ -2739,7 +2724,8 @@ def main(argv=None) -> int:
     ap.add_argument("--null-match-column", default=None,
                     help="With --null-scope pooled, restrict donor ends to "
                          "cells sharing these columns (e.g. "
-                         "exp_batch,plate_batch,lib_batch).")
+                         "exp_batch,plate_batch,lib_batch), on top of the "
+                         "cell type from --group-column.")
     ap.add_argument("--null-type",
                     choices=["distance-matched", "locus-matched",
                              "link-shuffle"],
@@ -2767,6 +2753,13 @@ def main(argv=None) -> int:
                          "accordingly.  The same reasoning applies to a "
                          "pooled locus-matched null; 'on' covers it.")
     ap.add_argument("--null-scope", choices=["cell", "pooled"], default="cell")
+    ap.add_argument("--pool-max-cells", type=int, default=300,
+                    help="--null-scope pooled: hold the donor ends of at most "
+                         "this many cells at once, over all workers (300).  "
+                         "A stratum's donors are held while its cells run; "
+                         "every end of a cortex cell takes ~30-40 MB, so 300 "
+                         "cells is ~9-12 GB.  A stratum larger than this runs "
+                         "on its own.  0: no limit.")
     ap.add_argument("--null-window", type=int, default=1000,
                     help="Tolerance in bp; also the minimum width of the "
                          "distance-matched target band (1 kb).")
@@ -3024,8 +3017,8 @@ def main(argv=None) -> int:
         args.exclude_bed,
         [c.strip() for c in args.exclude_chrom.split(",") if c.strip()])
 
-    if args.null_type == "link-shuffle" and args.null_scope == "pooled":
-        batch_of = _link_strata(samples, args, batch_of)
+    if args.null_scope == "pooled":
+        batch_of = _pool_strata(samples, args, batch_of)
     if args.null_chrom == "any" and args.null_type != "link-shuffle":
         logger.warning(
             "--null-chrom any: null partners are drawn by per-chromosome "
