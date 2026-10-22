@@ -197,7 +197,7 @@ def _mate(ax, x_from, x_to, y, color, ls=":"):
 #: The three non-linked controls: (heading, where each is used).
 CONTROLS = (("1  Same cell, near-copies refused", "Figs. 5c–g, 6i"),
             ("2  Same cell, near-copies kept", "Fig. 5a,b"),
-            ("3  Same position, other cells", "Supplementary Fig. x"))
+            ("3  Same position, other cells", "Supplementary Fig. 11"))
 
 
 def draw_control(a, k, heading=True, used=None):

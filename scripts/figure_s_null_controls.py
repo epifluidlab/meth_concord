@@ -47,8 +47,8 @@ s9 = _load("figure_s9_concordance_model")
 TABLES = ("end_posterior_dist_all.tsv", "end_posterior_regions.tsv",
           "end_posterior_regions_summary.tsv", "end_posterior_percell.tsv")
 #: Where each control is used, as its row's heading says it: the third is
-#: used here alone, which Supplementary Fig. 9c's "Supplementary Fig. x"
-#: would make this figure name itself.
+#: used here alone, which Supplementary Fig. 9c's own line for it -- this
+#: figure's number -- would make this figure name itself.
 USED = (None, None, "this figure only")
 
 

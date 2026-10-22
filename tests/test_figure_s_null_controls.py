@@ -54,4 +54,4 @@ def test_the_third_control_does_not_name_this_figure(tmp_path):
     fig = sn.build_figure(sn.runs_of([f"3={r3}"]))
     texts = [t.get_text() for a in fig.axes for t in a.texts]
     assert "this figure only" in texts
-    assert "Supplementary Fig. x" not in texts
+    assert sn.s9.CONTROLS[2][1] not in texts
