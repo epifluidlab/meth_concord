@@ -1715,6 +1715,68 @@ def test_pooled_locus_matched_donors_are_centred_per_cell(tmp_path):
     assert vals["g"].dtype == np.float32 and "_gpos" not in vals
 
 
+def _locus_level_fixture(tmp_path, n_cells=8, seed=5):
+    """Every cell shares one level per 2-kb block -- a property of the
+    locus, as methylation largely is -- and nothing else.  Pairs 200-900 bp
+    apart mostly sit in one block and agree in every cell alike; pairs
+    2.5-50 kb apart never share a block and agree in no cell."""
+    rng = np.random.default_rng(seed)
+    n_blocks = 2000
+    level = rng.normal(0, 1.5, n_blocks)
+    for ctx in ("GCH", "HCG"):
+        (tmp_path / ctx).mkdir(parents=True, exist_ok=True)
+    cells = [f"c{i}" for i in range(n_cells)]
+    for c in cells:
+        p1 = np.r_[rng.integers(0, n_blocks * 2000 - 3000, 6000),
+                   rng.integers(0, n_blocks * 2000 - 60_000, 1500)]
+        d = np.r_[rng.integers(200, 900, 6000),
+                  rng.integers(2500, 50_000, 1500)]
+        p2 = p1 + d
+
+        def post(p):
+            return 1 / (1 + np.exp(-(level[p // 2000]
+                                     + rng.normal(0, 0.5, p.size))))
+        df = pd.DataFrame({"chrom": "chr1", "pos1": p1, "pos2": p2,
+                           "n1": 6, "n2": 6, "distance": d,
+                           "posterior1": post(p1), "posterior2": post(p2)})
+        for ctx in ("GCH", "HCG"):
+            df.to_parquet(tmp_path / ctx / f"{c}.posteriors.parquet")
+    sp = tmp_path / "s.tsv"
+    pd.DataFrame({"cell_name": cells, "group": "A",
+                  "exp_batch": "e1"}).to_csv(sp, sep="\t", index=False)
+    return str(sp)
+
+
+def test_locus_matched_null_pairs_stay_in_their_real_pairs_bin(tmp_path):
+    """A stand-in up to --null-window from the partner moved its null pair
+    up to that far in distance: below a few kb, into another bin.  In the
+    cortex the pairs under 1 kb -- most of them one molecule -- spilled
+    tens of millions of null pairs into the 1-2 kb bins, and since loci
+    1-2 kb apart share their methylation in every cell, the per-cell test
+    (contacts >= 1 kb) read 99% of cells as anti-concordant.  The null pair
+    belongs to the real pair it stands in for, in that pair's bin."""
+    m = _mod()
+    sp = _locus_level_fixture(tmp_path)
+    out = tmp_path / "out"
+    assert m.main(["--posteriors", f"GCH={tmp_path / 'GCH'}",
+                   "--samples", sp, "--output-dir", str(out),
+                   "--plot-format", "png", "--null-type", "locus-matched",
+                   "--null-scope", "pooled", "--group-column", "group",
+                   "--null-match-column", "exp_batch", "--cell-center", "on",
+                   "--min-distance", "100", "--max-distance", "100000",
+                   "--bins-per-decade", "4", "--min-pairs", "50",
+                   "--n-bootstrap", "0", "--fisher-z", "none",
+                   "--per-cell-bootstrap", "20",
+                   "--per-cell-min-pairs", "50"]) == 0
+    t = pd.read_csv(out / "end_posterior_dist_all.tsv", sep="\t")
+    assert (t["gg_null_n"] == t["gg_matched_n"]).all()
+    pc = pd.read_csv(out / "end_posterior_percell.tsv", sep="\t")
+    g = pc[pc["mark"] == "GCH"]
+    assert len(g) == 8
+    # nothing links the ends of pairs >= 1 kb, in any cell
+    assert abs(g["delta"].median()) < 0.04, g["delta"].tolist()
+
+
 def test_link_shuffle_per_cell_rows_stay_with_their_cells(tmp_path):
     """Strata finish out of order; per_cell[i] must still be cells[i]."""
     planted = {1, 4, 6, 11, 13}

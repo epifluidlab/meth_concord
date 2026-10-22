@@ -30,7 +30,9 @@ Nulls mirror the site-level script:
         within +/---null-window of the true partner.  Answers "same two places,
         different molecule".  Under --null-scope pooled the stand-in is an
         end of ANOTHER cell of the anchor's stratum, never of its own cell:
-        "same two places, but not one nucleus".
+        "same two places, but not one nucleus".  A null pair counts at its
+        real pair's distance, so the two arms hold the same pairs in every
+        bin.
 
     --null-type link-shuffle       re-pair contacts across cells: keep end 1
         of a contact and give it, as end 2, an end of ANOTHER cell's contact
@@ -1899,11 +1901,17 @@ def _draw_null(j, d, cols, d_pos, d_vals, d_pi, base, edges, args, rng):
         other_cell=getattr(args, "null_scope", "cell") == "pooled")
     if got is None:
         return None
-    ai, kb, dn = got
+    ai, kb, _ = got
     # end 1 stays with the anchor; end 2 comes from the donor pool
     xa = {name: j[c1].to_numpy()[ai] for name, (c1, _c2) in cols.items()}
     xb = {k: v[kb] for k, v in d_vals.items()}
-    return xa, xb, dn, j["gpos1"].to_numpy()[ai], ai
+    # At the REAL pair's distance: the stand-in is the same place within
+    # --null-window, and its own separation from end 1 -- up to the window
+    # off -- would move the null pair into another bin below a few kb.  In
+    # the cortex the pairs under 1 kb (most of them one molecule) put tens
+    # of millions of null pairs into the 1-2 kb bins that way, against a
+    # few hundred thousand real ones.
+    return xa, xb, d[ai].astype(float), j["gpos1"].to_numpy()[ai], ai
 
 
 def _percell_blocks(j, d, cols, measures, drawn, drawn2, edges, args):
