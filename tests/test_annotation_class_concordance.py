@@ -1252,7 +1252,7 @@ def test_all_regions_pool_every_contact_of_a_system(planted):
 # --------------------------------------------------------------- human --
 
 
-def test_human_chromhmm_group_names_map_to_the_six_classes(tmp_path):
+def test_human_chromhmm_group_names_map_to_their_classes(tmp_path):
     groups = {"1_Quies1": "quescient", "2_PromF1": "promoters",
               "3_EnhWk1": "weak enhancers", "4_TxWk1": "weak transcription",
               "5_ReprPC1": "polycomb repressed", "6_HET1": "HET",
@@ -1271,9 +1271,11 @@ def test_human_chromhmm_group_names_map_to_the_six_classes(tmp_path):
                            acc._enrichment())
     got = [iv.classes[k] if k >= 0 else None
            for k in iv.lookup(["chr1"] * 9, np.arange(9) * 1000 + 500)]
+    # bivalent promoters a class of their own, apart from the polycomb
+    # repressed; ZNF heterochromatin
     assert got == ["quiescent", "promoter", "enhancer", "transcribed",
                    "polycomb", "heterochromatin", "heterochromatin",
-                   "polycomb", None]
+                   "bivalent", None]
 
 
 def test_replication_timing_from_log2_tracks(tmp_path):

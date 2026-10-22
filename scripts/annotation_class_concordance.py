@@ -13,8 +13,9 @@ partner) -- under up to four annotation systems:
             replication timing or gene density -- never by GCH or HCG, which
             would make the classes partly the thing under test)
   rt        replication timing, log2(early/late) of Repli-seq tracks
-  chromhmm  a chromHMM segmentation collapsed to six groups (promoter,
-            enhancer, transcribed, polycomb, heterochromatin, quiescent)
+  chromhmm  a chromHMM segmentation collapsed to seven groups (promoter,
+            enhancer, transcribed, bivalent, polycomb, heterochromatin,
+            quiescent)
   pmd       PMD / HMD domains
 
 plus any --annotation NAME=BED (a labelled BED's labels, or a plain BED's
@@ -289,7 +290,11 @@ from nome_hic_concordance.xci import (  # noqa: E402
 logger = logging.getLogger("annotation_class_concordance")
 
 #: The full-stack chromHMM's 16 groups, collapsed so a cell keeps enough
-#: contacts per class pair.  'artifacts' is left out.
+#: contacts per class pair, by each group's defining marks.  Bivalent
+#: promoters (H3K27me3 with H3K4me2/3, accessible) stand apart from the
+#: other H3K27me3 states, so that polycomb is the repressed ones; the ZNF
+#: group (H3K9me3 with H3K36me3) is heterochromatin.  'artifacts' is left
+#: out.
 CHROMHMM_GROUPS = {
     # mouse full-stack (mm10) group names
     "TSS": "promoter", "Prom": "promoter",
@@ -297,13 +302,13 @@ CHROMHMM_GROUPS = {
     "OpenC": "enhancer",
     "Tx": "transcribed", "TxEx": "transcribed", "TxWk": "transcribed",
     "ReprPC": "polycomb", "ReprPC and openC": "polycomb",
-    "BivProm": "polycomb",
+    "BivProm": "bivalent",
     "HET": "heterochromatin", "ZNF": "heterochromatin",
     "quiescent": "quiescent",
     # human full-stack (hg19 / hg38: Vu & Ernst 2022) group names -- its
     # "quescient" is spelled so in the release; 'others' (gaps, artifacts)
     # stays out
-    "promoters": "promoter", "bivalent promoters": "polycomb",
+    "promoters": "promoter", "bivalent promoters": "bivalent",
     "weak enhancers": "enhancer", "transcribed and enhancer": "enhancer",
     "acetylations": "enhancer", "DNase": "enhancer",
     "transcription": "transcribed", "weak transcription": "transcribed",
@@ -311,7 +316,8 @@ CHROMHMM_GROUPS = {
     "quescient": "quiescent",
 }
 _CHROMHMM_LC = {k.lower(): v for k, v in CHROMHMM_GROUPS.items()}
-CHROMHMM_ORDER = ("promoter", "enhancer", "transcribed", "polycomb",
+CHROMHMM_ORDER = ("promoter", "enhancer", "transcribed", "bivalent",
+                  "polycomb",
                   "heterochromatin", "quiescent")
 SYSTEMS = ("ab", "rt", "chromhmm", "pmd")
 

@@ -248,11 +248,13 @@ def test_every_track_the_run_tested_is_drawn(tmp_path):
     assert [t for t, _ in rows] == [t for t, _ in f5.G_TRACKS] + [
         "lamina (BED)"]
     assert rows[-1] == ("lamina (BED)", "lamina (BED)")
-    assert breaks == [7, 13, 15, 19]
+    # a break after each group, the BED's own row last
+    assert breaks == list(np.cumsum([len(g) for g in f5.G_GROUPS]))
     # a group the run did not test leaves no empty rows
     rows2, breaks2 = f5.g_rows([t for t in tracks if "chromHMM" not in t])
     assert len(rows2) == len(rows) - len(f5.STATES)
-    assert breaks2 == [7, 9, 13]
+    no_states = [len(g) for g in f5.G_GROUPS if g[0][1] not in f5.STATES]
+    assert breaks2 == list(np.cumsum(no_states))
     # every q is over all of them
     e = f5.hot_enrichment(hot[hot["context"] == "GCH"], tracks)
     assert len(e) == len(tracks) == len(f5.G_TRACKS) + 1

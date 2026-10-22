@@ -80,8 +80,9 @@ E_PAIRS = (("ab", "A", "A", "A–A"), ("ab", "A", "B", "A–B"),
            ("rt", "late", "late", "late–late"),
            ("pmd", "HMD", "HMD", "HMD–HMD"), ("pmd", "HMD", "PMD", "HMD–PMD"),
            ("pmd", "PMD", "PMD", "PMD–PMD"))
-#: Panel f's states, active to silent.
-STATES = ("promoter", "enhancer", "transcribed", "polycomb",
+#: Panel f's states, active to silent; a run without bivalent promoters as
+#: their own class (their states then inside polycomb) draws the other six.
+STATES = ("promoter", "enhancer", "transcribed", "bivalent", "polycomb",
           "heterochromatin", "quiescent")
 #: What + and - of ΔC x w mean, per mark.
 SIGN_WORDS = {"GCH": ("co-closed", "co-open"),
@@ -534,16 +535,25 @@ def label_of(mark: str) -> str:
     return dict((m, lab) for _, m, lab in MARKS)[mark]
 
 
-def chromhmm_matrix(summ: pd.DataFrame, context: str, stat="signed_rel"):
-    """ΔC x w between STATES (pp, lower triangle; NaN where sparse) and
-    whether its interval spans 0."""
+def f_states(summ: pd.DataFrame) -> tuple:
+    """STATES the run's chromHMM rows name, in STATES's order."""
+    s = summ[summ["system"] == "chromhmm"]
+    have = set(s["anchor"]) | set(s["partner"])
+    return tuple(st for st in STATES if st in have)
+
+
+def chromhmm_matrix(summ: pd.DataFrame, context: str, stat="signed_rel",
+                    states=None):
+    """ΔC x w between the run's states (f_states; pp, lower triangle; NaN
+    where sparse) and whether its interval spans 0."""
+    states = f_states(summ) if states is None else states
     s = summ[(summ["context"] == context) & (summ["system"] == "chromhmm")
              & (summ["band"] == ALL_BAND)]
-    n = len(STATES)
+    n = len(states)
     v = np.full((n, n), np.nan)
     spans = np.zeros((n, n), bool)
-    for i, a_ in enumerate(STATES):
-        for j, b_ in enumerate(STATES[:i + 1]):
+    for i, a_ in enumerate(states):
+        for j, b_ in enumerate(states[:i + 1]):
             m = s[((s["anchor"] == a_) & (s["partner"] == b_))
                   | ((s["anchor"] == b_) & (s["partner"] == a_))]
             if not len(m) or bool(m["sparse"].iloc[0]):
@@ -584,14 +594,15 @@ def panel_f(axes, summ: pd.DataFrame):
     from matplotlib.colors import Normalize
     from matplotlib.patches import Rectangle
     cmap = plt.get_cmap("RdBu_r")
+    states = f_states(summ)
     for ax, (_, mark, _) in zip(axes, MARKS):
-        v, spans = chromhmm_matrix(summ, mark)
+        v, spans = chromhmm_matrix(summ, mark, states=states)
         lim = _limit(v)
         # three ticks, a round one at each end: a narrow bar fits no more
         tk = _nice_tick(lim)
         lim = max(lim, tk)
         norm = Normalize(-lim, lim)
-        n = len(STATES)
+        n = len(states)
         for i in range(n):
             for j in range(i + 1):
                 if not np.isfinite(v[i, j]):
@@ -605,13 +616,13 @@ def panel_f(axes, summ: pd.DataFrame):
                         ha="center", va="center", fontsize=4.2,
                         color="white" if dark else "0.15",
                         alpha=0.4 if spans[i, j] else 1.0)
-            ax.text(i - 0.25, i - 0.62, STATES[i], rotation=40, ha="left",
+            ax.text(i - 0.25, i - 0.62, states[i], rotation=40, ha="left",
                     va="bottom", fontsize=4.8, rotation_mode="anchor")
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks(range(n))
         # the rows' states once, on the first; the heads name the columns
-        ax.set_yticklabels(STATES if ax is axes[0] else [], fontsize=4.8)
+        ax.set_yticklabels(states if ax is axes[0] else [], fontsize=4.8)
         ax.tick_params(length=0)
         ax.set_xlim(-0.5, n - 0.5)
         ax.set_ylim(n - 0.5, -0.5)
