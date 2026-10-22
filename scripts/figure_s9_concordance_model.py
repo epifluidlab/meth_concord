@@ -6,9 +6,11 @@ cells -- a schematic of the model behind Figs. 5 and 6, no data drawn.
      (or HCG) sites methylated
   b  the end posterior: a two-component beta-binomial mixture, P(open or
      methylated | k, n), centred on the cell's mean
-  c  the within-cell null: the anchor kept, the partner replaced by an end
-     of the same cell in the partner's 250-kb bin and distance bin, near-
-     copies refused
+  c  the three non-linked controls, each keeping the anchor and replacing
+     the partner: (1) an end of the same cell in the partner's 250-kb bin
+     and distance bin, near-copies refused; (2) the same with near-copies
+     allowed; (3) an end within 1 kb of the partner's position from another
+     cell of the same type and batch
   d  concordance by distance: Δr = r(linked) − r(non-linked)
   e  per cell, against a second null draw, across cells and cell types
   f  per region, GCH against HCG, with a circular genomic permutation
@@ -152,39 +154,117 @@ def panel_b(fig, ax, rect):
                      "cell's mean:  $x = p - m_c$."])
 
 
-def panel_c(ax):
-    y = 4.9
-    ax.plot([0.3, 9.7], [y, y], color="0.6", lw=0.6, zorder=0)
+def _null_axes(fig, rect, k):
+    """The k-th of three sub-panels across c's row, 0-10 each way."""
+    x0, y0, w, h = rect
+    ax = fig.add_axes([x0 + 0.012 + k * w / 3, y0 + 0.02 * h,
+                       w / 3 - 0.024, 0.8 * h])
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.axis("off")
+    ax.patch.set_visible(False)
+    return ax
+
+
+def _bin(ax, x0, x1, y, label="partner's 250-kb bin"):
     from matplotlib.patches import Rectangle
-    ax.add_patch(Rectangle((6.05, y - 0.55), 2.3, 1.1, fc="#e8eef7",
+    ax.add_patch(Rectangle((x0, y - 0.6), x1 - x0, 1.2, fc="#e8eef7",
                            ec="none", zorder=0))
-    ax.text(7.2, y - 0.7, "partner's 250-kb bin", fontsize=4.6,
-            color=MUTED, ha="center", va="top")
-    # the anchor, the partner and two stand-ins
-    for x_, mfc, mec in ((1.3, "black", "black"), (6.5, "black", "black")):
-        ax.plot(x_, y, "s", ms=3.6, mfc=mfc, mec=mec, mew=0.5, zorder=3)
-    for x_ in (7.35, 7.9):
-        ax.plot(x_, y, "s", ms=3.6, mfc="white", mec=NULL, mew=0.6,
+    if label:
+        ax.text((x0 + x1) / 2, y - 0.75, label, fontsize=4.5, color=MUTED,
+                ha="center", va="top")
+
+
+def _end(ax, x, y, kind="real", color=None):
+    """An end: real (filled), stand-in (open) or refused (crossed)."""
+    if kind == "real":
+        ax.plot(x, y, "s", ms=3.4, mfc="black", mec="black", mew=0.5,
                 zorder=3)
-    _arc(ax, 1.3, 6.5, y + 0.15, 2.4)
-    _arc(ax, 1.3, 7.35, y + 0.15, 1.75, color=NULL, ls=(0, (2.2, 1.6)))
-    ax.text(3.9, y + 2.65, "linked", fontsize=5, color=LINK, ha="center",
-            va="bottom")
-    ax.text(4.4, y + 0.95, "non-linked", fontsize=5, color=NULL,
-            ha="center", va="bottom")
-    ax.text(1.3, y - 0.35, "anchor\n(kept)", fontsize=4.6, ha="center",
-            va="top", color=INK, linespacing=0.95)
-    # a near-copy: its mate sits on the anchor
-    ax.plot(7.9, y, "x", ms=4.2, color=HOT, mew=0.9, zorder=4)
-    ax.annotate("", xy=(1.55, y - 0.25), xytext=(7.85, y - 0.25),
-                arrowprops=dict(arrowstyle="-", lw=0.5, color=HOT, ls=":",
-                                connectionstyle="arc3,rad=0.25"))
-    ax.text(8.15, y + 0.42, "near-copy\nrefused", fontsize=4.5, color=HOT,
-            ha="left", va="bottom", linespacing=0.95)
-    _note(ax, 2.55, ["Partner replaced by an end of another read pair of",
-                     "the same cell, in the partner's 250-kb bin and its",
-                     "distance bin.  Refused: within 1 kb of the partner,",
-                     "or with its own mate within 1 kb of the anchor."])
+    else:
+        ax.plot(x, y, "s", ms=3.4, mfc="white", mec=color or NULL, mew=0.7,
+                zorder=3)
+    if kind == "refused":
+        ax.plot(x, y, "x", ms=4.4, color=HOT, mew=0.9, zorder=4)
+
+
+def _mate(ax, x_from, x_to, y, color, ls=":"):
+    """A stand-in's own read pair, its other end back near the anchor."""
+    ax.annotate("", xy=(x_to, y - 0.28), xytext=(x_from, y - 0.28),
+                arrowprops=dict(arrowstyle="-", lw=0.5, color=color, ls=ls,
+                                connectionstyle="arc3,rad=0.28"))
+
+
+def panel_c(fig, ax, rect):
+    """The three non-linked controls, side by side."""
+    heads = ("1  Same cell, near-copies refused",
+             "2  Same cell, near-copies kept",
+             "3  Same position, other cells")
+    uses = ("Figs. 5c–g, 6i", "Fig. 5a,b", "Supplementary Fig. x")
+    for k in range(3):
+        a = _null_axes(fig, rect, k)
+        a.text(0.2, 9.75, heads[k], fontsize=5.6, fontweight="bold",
+               color=INK, ha="left", va="top")
+        a.text(0.2, 8.85, uses[k], fontsize=4.7, color=MUTED, ha="left",
+               va="top")
+        y = 4.2
+        if k < 2:
+            a.plot([0.2, 9.8], [y, y], color="0.6", lw=0.6, zorder=0)
+            _bin(a, 5.7, 8.5, y)
+            _end(a, 1.0, y)
+            _end(a, 6.2, y)
+            _arc(a, 1.0, 6.2, y + 0.15, 2.6)
+            a.text(3.6, y + 2.85, "linked", fontsize=4.8, color=LINK,
+                   ha="center", va="bottom")
+            # the drawn stand-in
+            _end(a, 7.4, y)
+            _arc(a, 1.0, 7.4, y + 0.15, 1.75, color=NULL,
+                 ls=(0, (2.2, 1.6)))
+            a.text(4.3, y + 1.95, "non-linked", fontsize=4.8, color=NULL,
+                   ha="center", va="bottom")
+            # a near-copy: within 1 kb of the partner, its mate within 1 kb
+            # of the anchor
+            if k == 0:
+                _end(a, 6.55, y, "refused")
+                _mate(a, 6.5, 1.3, y, HOT)
+                a.text(9.85, y + 0.75, "near-copy\nrefused", fontsize=4.5,
+                       color=HOT, ha="right", va="bottom", linespacing=0.95)
+            else:
+                _end(a, 6.55, y, "stand-in", color="#2e8b57")
+                _mate(a, 6.5, 1.3, y, "#2e8b57")
+                a.text(9.85, y + 0.75, "near-copy\nmay stand in", fontsize=4.5,
+                       color="#2e8b57", ha="right", va="bottom",
+                       linespacing=0.95)
+            a.text(1.0, y - 0.35, "anchor", fontsize=4.5, color=INK,
+                   ha="center", va="top")
+            _note(a, 1.95, ["Stand-in: another read pair's end in the same",
+                            "cell, the partner's bin and its distance bin."],
+                  size=4.7, x=0.2, gap=0.75)
+        else:
+            y1, y2 = 5.6, 3.0
+            for yy, lab, x1 in ((y1, "cell", 9.8),
+                                (y2, "other cell,\nsame type\nand batch",
+                                 7.7)):
+                a.plot([0.9, x1], [yy, yy], color="0.6", lw=0.6, zorder=0)
+                a.text(0.75, yy, lab, fontsize=4.4, color=MUTED, ha="right",
+                       va="center", linespacing=0.9)
+            _end(a, 1.6, y1)
+            _end(a, 6.8, y1)
+            _arc(a, 1.6, 6.8, y1 + 0.15, 1.9)
+            a.text(4.2, y1 + 2.1, "linked", fontsize=4.8, color=LINK,
+                   ha="center", va="bottom")
+            _bin(a, 6.2, 7.6, y2, label=None)
+            a.text(7.8, y2, "±1 kb of\nthe partner's\nposition", fontsize=4.5,
+                   color=MUTED, ha="left", va="center", linespacing=0.95)
+            _end(a, 7.05, y2)
+            a.annotate("", xy=(7.0, y2 + 0.25), xytext=(1.65, y1 - 0.25),
+                       arrowprops=dict(arrowstyle="-", lw=0.8, color=NULL,
+                                       ls=(0, (2.2, 1.6)),
+                                       connectionstyle="arc3,rad=-0.15"))
+            a.text(3.3, (y1 + y2) / 2 - 0.15, "non-linked", fontsize=4.8,
+                   color=NULL, ha="center", va="top")
+            _note(a, 1.95, ["Stand-in: an end at the partner's position in",
+                            "another cell; ends centred on their cell's mean."],
+                  size=4.7, x=0.2, gap=0.75)
 
 
 def _curves(d):
@@ -369,14 +449,17 @@ def panel_i(ax):
 
 def build_figure():
     plt = _style()
-    fig = plt.figure(figsize=(7.2, 7.4))
+    fig = plt.figure(figsize=(7.2, 9.3))
     cols = (0.035, 0.36, 0.685)
-    rows = (0.675, 0.355, 0.035)
-    w, h = 0.295, 0.29
-    R = {k: (cols[i % 3], rows[i // 3], w, h) for i, k in enumerate("abcdefghi")}
+    w, h = 0.295, 0.228
+    # a and b over the top, c a row of its own, then d-f and g-i
+    R = {"a": (0.035, 0.775, 0.457, 0.2), "b": (0.523, 0.775, 0.457, 0.2),
+         "c": (0.035, 0.535, 0.945, 0.2)}
+    for i, k in enumerate("defghi"):
+        R[k] = (cols[i % 3], (0.275, 0.02)[i // 3], w, h)
     titles = {"a": "A contact and its ends",
               "b": "End posterior",
-              "c": "Non-linked pairs from the same cell",
+              "c": "Three non-linked controls: the anchor kept, the partner replaced",
               "d": "Concordance by distance",
               "e": "Concordance in each cell",
               "f": "Concordance across regions",
@@ -386,7 +469,7 @@ def build_figure():
     ax = {k: _panel(fig, R[k], k, titles[k]) for k in "abcdefghi"}
     panel_a(ax["a"])
     panel_b(fig, ax["b"], R["b"])
-    panel_c(ax["c"])
+    panel_c(fig, ax["c"], R["c"])
     panel_d(fig, ax["d"], R["d"])
     panel_e(fig, ax["e"], R["e"])
     panel_f(fig, ax["f"], R["f"])
@@ -394,7 +477,7 @@ def build_figure():
     panel_h(fig, ax["h"], R["h"])
     panel_i(ax["i"])
     # the sites, once for all panels
-    fig.text(0.035, 0.012, "●  methylated / accessible     ○  unmethylated / "
+    fig.text(0.035, 0.003, "●  methylated / accessible     ○  unmethylated / "
              "closed     ━  linked (a contact)     ┅  non-linked (a stand-in)",
              fontsize=5.2, color=MUTED, ha="left", va="bottom")
     return fig
