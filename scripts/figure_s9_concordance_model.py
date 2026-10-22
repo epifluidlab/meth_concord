@@ -194,77 +194,82 @@ def _mate(ax, x_from, x_to, y, color, ls=":"):
                                 connectionstyle="arc3,rad=0.28"))
 
 
+#: The three non-linked controls: (heading, where each is used).
+CONTROLS = (("1  Same cell, near-copies refused", "Figs. 5c–g, 6i"),
+            ("2  Same cell, near-copies kept", "Fig. 5a,b"),
+            ("3  Same position, other cells", "Supplementary Fig. x"))
+
+
+def draw_control(a, k, heading=True):
+    """Control k (0, 1, 2 of CONTROLS) in an axes 0-10 each way."""
+    if heading:
+        a.text(0.2, 9.75, CONTROLS[k][0], fontsize=5.6, fontweight="bold",
+               color=INK, ha="left", va="top")
+        a.text(0.2, 8.85, CONTROLS[k][1], fontsize=4.7, color=MUTED,
+               ha="left", va="top")
+    y = 4.2
+    if k < 2:
+        a.plot([0.2, 9.8], [y, y], color="0.6", lw=0.6, zorder=0)
+        _bin(a, 5.7, 8.5, y)
+        _end(a, 1.0, y)
+        _end(a, 6.2, y)
+        _arc(a, 1.0, 6.2, y + 0.15, 2.6)
+        a.text(3.6, y + 2.85, "linked", fontsize=4.8, color=LINK,
+               ha="center", va="bottom")
+        # the drawn stand-in
+        _end(a, 7.4, y)
+        _arc(a, 1.0, 7.4, y + 0.15, 1.75, color=NULL, ls=(0, (2.2, 1.6)))
+        a.text(4.3, y + 1.95, "non-linked", fontsize=4.8, color=NULL,
+               ha="center", va="bottom")
+        # a near-copy: within 1 kb of the partner, its mate within 1 kb
+        # of the anchor
+        if k == 0:
+            _end(a, 6.55, y, "refused")
+            _mate(a, 6.5, 1.3, y, HOT)
+            a.text(9.85, y + 0.75, "near-copy\nrefused", fontsize=4.5,
+                   color=HOT, ha="right", va="bottom", linespacing=0.95)
+        else:
+            _end(a, 6.55, y, "stand-in", color="#2e8b57")
+            _mate(a, 6.5, 1.3, y, "#2e8b57")
+            a.text(9.85, y + 0.75, "near-copy\nmay stand in", fontsize=4.5,
+                   color="#2e8b57", ha="right", va="bottom",
+                   linespacing=0.95)
+        a.text(1.0, y - 0.35, "anchor", fontsize=4.5, color=INK,
+               ha="center", va="top")
+        _note(a, 1.95, ["Stand-in: another read pair's end in the same",
+                        "cell, the partner's bin and its distance bin."],
+              size=4.7, x=0.2, gap=0.75)
+    else:
+        y1, y2 = 5.6, 3.0
+        for yy, lab, x1 in ((y1, "cell", 9.8),
+                            (y2, "other cell,\nsame type\nand batch", 7.7)):
+            a.plot([0.9, x1], [yy, yy], color="0.6", lw=0.6, zorder=0)
+            a.text(0.75, yy, lab, fontsize=4.4, color=MUTED, ha="right",
+                   va="center", linespacing=0.9)
+        _end(a, 1.6, y1)
+        _end(a, 6.8, y1)
+        _arc(a, 1.6, 6.8, y1 + 0.15, 1.9)
+        a.text(4.2, y1 + 2.1, "linked", fontsize=4.8, color=LINK,
+               ha="center", va="bottom")
+        _bin(a, 6.2, 7.6, y2, label=None)
+        a.text(7.8, y2, "±1 kb of\nthe partner's\nposition", fontsize=4.5,
+               color=MUTED, ha="left", va="center", linespacing=0.95)
+        _end(a, 7.05, y2)
+        a.annotate("", xy=(7.0, y2 + 0.25), xytext=(1.65, y1 - 0.25),
+                   arrowprops=dict(arrowstyle="-", lw=0.8, color=NULL,
+                                   ls=(0, (2.2, 1.6)),
+                                   connectionstyle="arc3,rad=-0.15"))
+        a.text(3.3, (y1 + y2) / 2 - 0.15, "non-linked", fontsize=4.8,
+               color=NULL, ha="center", va="top")
+        _note(a, 1.95, ["Stand-in: an end at the partner's position in",
+                        "another cell; ends centred on their cell's mean."],
+              size=4.7, x=0.2, gap=0.75)
+
+
 def panel_c(fig, ax, rect):
     """The three non-linked controls, side by side."""
-    heads = ("1  Same cell, near-copies refused",
-             "2  Same cell, near-copies kept",
-             "3  Same position, other cells")
-    uses = ("Figs. 5c–g, 6i", "Fig. 5a,b", "Supplementary Fig. x")
     for k in range(3):
-        a = _null_axes(fig, rect, k)
-        a.text(0.2, 9.75, heads[k], fontsize=5.6, fontweight="bold",
-               color=INK, ha="left", va="top")
-        a.text(0.2, 8.85, uses[k], fontsize=4.7, color=MUTED, ha="left",
-               va="top")
-        y = 4.2
-        if k < 2:
-            a.plot([0.2, 9.8], [y, y], color="0.6", lw=0.6, zorder=0)
-            _bin(a, 5.7, 8.5, y)
-            _end(a, 1.0, y)
-            _end(a, 6.2, y)
-            _arc(a, 1.0, 6.2, y + 0.15, 2.6)
-            a.text(3.6, y + 2.85, "linked", fontsize=4.8, color=LINK,
-                   ha="center", va="bottom")
-            # the drawn stand-in
-            _end(a, 7.4, y)
-            _arc(a, 1.0, 7.4, y + 0.15, 1.75, color=NULL,
-                 ls=(0, (2.2, 1.6)))
-            a.text(4.3, y + 1.95, "non-linked", fontsize=4.8, color=NULL,
-                   ha="center", va="bottom")
-            # a near-copy: within 1 kb of the partner, its mate within 1 kb
-            # of the anchor
-            if k == 0:
-                _end(a, 6.55, y, "refused")
-                _mate(a, 6.5, 1.3, y, HOT)
-                a.text(9.85, y + 0.75, "near-copy\nrefused", fontsize=4.5,
-                       color=HOT, ha="right", va="bottom", linespacing=0.95)
-            else:
-                _end(a, 6.55, y, "stand-in", color="#2e8b57")
-                _mate(a, 6.5, 1.3, y, "#2e8b57")
-                a.text(9.85, y + 0.75, "near-copy\nmay stand in", fontsize=4.5,
-                       color="#2e8b57", ha="right", va="bottom",
-                       linespacing=0.95)
-            a.text(1.0, y - 0.35, "anchor", fontsize=4.5, color=INK,
-                   ha="center", va="top")
-            _note(a, 1.95, ["Stand-in: another read pair's end in the same",
-                            "cell, the partner's bin and its distance bin."],
-                  size=4.7, x=0.2, gap=0.75)
-        else:
-            y1, y2 = 5.6, 3.0
-            for yy, lab, x1 in ((y1, "cell", 9.8),
-                                (y2, "other cell,\nsame type\nand batch",
-                                 7.7)):
-                a.plot([0.9, x1], [yy, yy], color="0.6", lw=0.6, zorder=0)
-                a.text(0.75, yy, lab, fontsize=4.4, color=MUTED, ha="right",
-                       va="center", linespacing=0.9)
-            _end(a, 1.6, y1)
-            _end(a, 6.8, y1)
-            _arc(a, 1.6, 6.8, y1 + 0.15, 1.9)
-            a.text(4.2, y1 + 2.1, "linked", fontsize=4.8, color=LINK,
-                   ha="center", va="bottom")
-            _bin(a, 6.2, 7.6, y2, label=None)
-            a.text(7.8, y2, "±1 kb of\nthe partner's\nposition", fontsize=4.5,
-                   color=MUTED, ha="left", va="center", linespacing=0.95)
-            _end(a, 7.05, y2)
-            a.annotate("", xy=(7.0, y2 + 0.25), xytext=(1.65, y1 - 0.25),
-                       arrowprops=dict(arrowstyle="-", lw=0.8, color=NULL,
-                                       ls=(0, (2.2, 1.6)),
-                                       connectionstyle="arc3,rad=-0.15"))
-            a.text(3.3, (y1 + y2) / 2 - 0.15, "non-linked", fontsize=4.8,
-                   color=NULL, ha="center", va="top")
-            _note(a, 1.95, ["Stand-in: an end at the partner's position in",
-                            "another cell; ends centred on their cell's mean."],
-                  size=4.7, x=0.2, gap=0.75)
+        draw_control(_null_axes(fig, rect, k), k)
 
 
 def _curves(d):
