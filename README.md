@@ -36,6 +36,13 @@ The pipeline runs in seven steps (1 = context extraction, 2 = BAM parsing,
 6 = shrinkage, 7 = matrix processing + UMAP). Pass `--steps 4,5,6,7` to
 resume from intermediate outputs.
 
+## Reproducing the manuscript's Figures 5 and 6
+
+[`reproduce/`](reproduce/README.md) holds Jupyter notebooks that rebuild
+Figure 5, Figure 6 and Supplementary Figures 9–12 from the per-cell BAM files,
+with the sample sheets, a script for the public data, and checks against the
+manuscript's numbers.
+
 ## Tests
 
 ```
