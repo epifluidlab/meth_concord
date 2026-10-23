@@ -477,23 +477,30 @@ def read_pmd(path, class_col: int = 5, common_only: bool = False) -> Intervals:
     return Intervals("pmd", ("HMD", "PMD"), df[0], df[1], df[2], code)
 
 
-def read_chromhmm(bed, groups_tsv, enr) -> Intervals:
+def read_chromhmm(bed, groups_tsv, enr, bivalent="own") -> Intervals:
     """A chromHMM BED (column 4 = state) mapped to its groups through the
     state annotation (as marker_bin_enrichment.py does), then to
-    CHROMHMM_ORDER."""
+    CHROMHMM_ORDER.  ``bivalent='polycomb'`` puts the bivalent-promoter
+    states back in polycomb: the six groups of the manuscript's Fig. 5f and
+    Supplementary Fig. 12."""
+    order = (CHROMHMM_ORDER if bivalent == "own"
+             else tuple(g for g in CHROMHMM_ORDER if g != "bivalent"))
     seg = enr._read_bed(bed, want_name=True)
     ann = pd.read_csv(groups_tsv, sep=None, engine="python", dtype=str)
     gcol = next((c for c in ann.columns if c.lower() == "group"), None)
     if gcol is None:
         sys.exit(f"{groups_tsv}: no 'group' column ({list(ann.columns)})")
     mp, hit, tot, col = enr._label_to_group(seg["name"].unique(), ann, gcol)
-    grp = seg["name"].map(mp).map(
-        lambda g: _CHROMHMM_LC.get(str(g).strip().lower()))
+
+    def group_of(g):
+        v = _CHROMHMM_LC.get(str(g).strip().lower())
+        return "polycomb" if v == "bivalent" and bivalent != "own" else v
+    grp = seg["name"].map(mp).map(group_of)
     logger.info(f"chromHMM: {hit}/{tot} states matched via {col!r}; "
                 f"{grp.notna().mean():.1%} of segments in "
-                f"{len(CHROMHMM_ORDER)} groups")
-    code = grp.map({g: i for i, g in enumerate(CHROMHMM_ORDER)})
-    return Intervals("chromhmm", CHROMHMM_ORDER, seg["chrom"], seg["start"],
+                f"{len(order)} groups")
+    code = grp.map({g: i for i, g in enumerate(order)})
+    return Intervals("chromhmm", order, seg["chrom"], seg["start"],
                      seg["end"], code.fillna(-1).astype(int))
 
 
@@ -7665,6 +7672,12 @@ def main(argv=None) -> int:
                     help="chromHMM BED (column 4 = state).  --genome mm10 "
                          "fills in the full-stack model.")
     ap.add_argument("--chromhmm-groups", default=None)
+    ap.add_argument("--chromhmm-bivalent", choices=["own", "polycomb"],
+                    default="own",
+                    help="'own' (default): the bivalent-promoter states are "
+                         "a group of their own (seven groups).  'polycomb': "
+                         "they stay in polycomb -- the six groups of the "
+                         "manuscript's Fig. 5f and Supplementary Fig. 12.")
     ap.add_argument("--pmd", default=None,
                     help="PMD/HMD file or URL, e.g. the Zhou-lab "
                          "PMD_coordinates_mm10.bed.gz; --genome hg38 / hg19 "
@@ -8033,7 +8046,8 @@ def main(argv=None) -> int:
                            or preset.get("chromhmm_groups"), cache,
                            "chromhmm-groups")
         if bed and grp:
-            systems["chromhmm"] = read_chromhmm(bed, grp, enr)
+            systems["chromhmm"] = read_chromhmm(
+                bed, grp, enr, getattr(args, "chromhmm_bivalent", "own"))
         else:
             logger.warning("chromhmm: needs --chromhmm and --chromhmm-groups "
                            "(or --genome mm10); skipped")

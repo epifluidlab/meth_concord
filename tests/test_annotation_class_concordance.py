@@ -1278,6 +1278,27 @@ def test_human_chromhmm_group_names_map_to_their_classes(tmp_path):
                    "bivalent", None]
 
 
+def test_bivalent_states_can_stay_in_polycomb(tmp_path):
+    """--chromhmm-bivalent polycomb: the six groups of the manuscript's
+    Fig. 5f -- bivalent promoters back in polycomb, no bivalent class."""
+    groups = {"1_ReprPC1": "polycomb repressed",
+              "2_BivProm1": "bivalent promoters", "3_PromF1": "promoters"}
+    rows = [("chr1", i * 1000, (i + 1) * 1000, st)
+            for i, st in enumerate(groups)]
+    pd.DataFrame(rows).to_csv(tmp_path / "chmm.bed", sep="\t", header=False,
+                              index=False)
+    pd.DataFrame({"state": [k.split("_")[0] for k in groups],
+                  "mneumonics": [k.split("_")[1] for k in groups],
+                  "Group": list(groups.values())}).to_csv(
+        tmp_path / "groups.csv", index=False)
+    iv = acc.read_chromhmm(tmp_path / "chmm.bed", tmp_path / "groups.csv",
+                           acc._enrichment(), bivalent="polycomb")
+    assert "bivalent" not in iv.classes and len(iv.classes) == 6
+    got = [iv.classes[k] for k in iv.lookup(["chr1"] * 3,
+                                            np.arange(3) * 1000 + 500)]
+    assert got == ["polycomb", "polycomb", "promoter"]
+
+
 def test_replication_timing_from_log2_tracks(tmp_path):
     rows = [("chr1", s_, s_ + 250_000, 1.5 if (s_ // 2_000_000) % 2 == 0
              else -1.2) for s_ in range(0, 10_000_000, 250_000)]
