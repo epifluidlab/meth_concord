@@ -1107,6 +1107,48 @@ def variable_enrichment(t: pd.DataFrame, tracks) -> pd.DataFrame:
     return out
 
 
+def h_enrichment(lv: pd.DataFrame, hot: pd.DataFrame, chromhmm=None,
+                 stat: str = H_STAT, n_bins: int = H_BINS) -> pd.DataFrame:
+    """What h's bins are, as g tests its hot bins: per annotation, its mean
+    over the ``n_bins`` bins drawn against its mean over every bin tested
+    across types (fold), p against genome rotations, BH q over every
+    annotation tested -- the run's (``hot``, locus_hotspots.tsv.gz), with
+    chromHMM's from the full-stack states when ``chromhmm`` is given
+    (:func:`chromhmm_types`).  Rows in h's order, with their label, whether
+    they are indented beneath their class, and whether h draws them:
+    chromHMM's states, TSS density and CpG islands whatever their q, the
+    rest where q < 0.05."""
+    a, v = variable_bins(lv, stat)
+    top = v.head(n_bins)
+    tracks = tested_tracks(hot)
+    hh = hot[(hot["band"] == ALL_BAND) & (hot["context"] == "GCH")]
+    t = a.merge(hh[["chrom", "start", "delta"] + tracks],
+                on=["chrom", "start"], suffixes=("", "_g"))
+    rows, _ = g_rows(tracks)
+    if chromhmm is not None:
+        t = t.drop(columns=[c for c in t.columns
+                            if c.startswith("chromHMM: ")]).merge(
+            chromhmm, on=["chrom", "start"], how="left")
+        chm = [(c, lab) for c, lab, _ in H_CHROMHMM_ROWS]
+        t[[c for c, _ in chm]] = t[[c for c, _ in chm]].fillna(0.0)
+        sub = {c for c, _, ind in H_CHROMHMM_ROWS if ind}
+    else:
+        chm = [(tr, lab) for tr, lab in rows if tr.startswith("chromHMM: ")]
+        sub = set()
+    t = t.sort_values("x", kind="stable")
+    drawn = set(zip(top["chrom"], top["start"]))
+    t["variable"] = [k in drawn for k in zip(t["chrom"], t["start"])]
+    rest = [(tr, lab) for tr, lab in rows if not tr.startswith("chromHMM: ")]
+    rows = (chm + [r for r in rest if r[0] in H_ALWAYS]
+            + [r for r in rest if r[0] not in H_ALWAYS])
+    res = variable_enrichment(t, [tr for tr, _ in rows])
+    always = {tr for tr, _ in chm} | set(H_ALWAYS)
+    res.insert(1, "label", [lab for _, lab in rows])
+    res["indent"] = res["track"].isin(sub)
+    res["shown"] = res["track"].isin(always) | (res["q"] < 0.05)
+    return res
+
+
 def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
             colors, genes=None, stat: str = H_STAT, n_bins: int = H_BINS,
             chromhmm=None):
@@ -1187,35 +1229,13 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     cb.ax.xaxis.set_ticks_position("top")
     cb.ax.text(1.04, 0.5, "ΔC × w (pp), + co-open", transform=cb.ax.transAxes,
                ha="left", va="center", fontsize=4.6)
-    # what the bins drawn are, against every bin tested across types, as g
-    # tests its hot bins: chromHMM's states, TSS density and CpG islands
-    # whatever their q, any other annotation where q < 0.05
+    # what the bins drawn are (:func:`h_enrichment`)
     from matplotlib.transforms import blended_transform_factory
-    tracks = tested_tracks(hot)
-    hh = hot[(hot["band"] == ALL_BAND) & (hot["context"] == "GCH")]
-    t = a.merge(hh[["chrom", "start", "delta"] + tracks],
-                on=["chrom", "start"], suffixes=("", "_g"))
-    rows, _ = g_rows(tracks)
-    if chromhmm is not None:
-        t = t.drop(columns=[c for c in t.columns
-                            if c.startswith("chromHMM: ")]).merge(
-            chromhmm, on=["chrom", "start"], how="left")
-        chm = [(c, lab) for c, lab, _ in H_CHROMHMM_ROWS]
-        t[[c for c, _ in chm]] = t[[c for c, _ in chm]].fillna(0.0)
-    else:
-        chm = [(tr, lab) for tr, lab in rows if tr.startswith("chromHMM: ")]
-    sub = {c for c, _, ind in H_CHROMHMM_ROWS if ind} if chromhmm is not None \
-        else set()
-    t = t.sort_values("x", kind="stable")
-    drawn = set(zip(top["chrom"], top["start"]))
-    t["variable"] = [k in drawn for k in zip(t["chrom"], t["start"])]
-    rest = [(tr, lab) for tr, lab in rows if not tr.startswith("chromHMM: ")]
-    rows = (chm + [r for r in rest if r[0] in H_ALWAYS]
-            + [r for r in rest if r[0] not in H_ALWAYS])
-    res = variable_enrichment(t, [tr for tr, _ in rows]).set_index("track")
-    always = {tr for tr, _ in chm} | set(H_ALWAYS)
-    shown = [(tr, lab) for tr, lab in rows
-             if tr in always or res.loc[tr, "q"] < 0.05]
+    he = h_enrichment(lv, hot, chromhmm, stat, n_bins)
+    res = he.set_index("track")
+    shown = list(zip(he.loc[he["shown"], "track"], he.loc[he["shown"], "label"]))
+    chm = [(tr, lab) for tr, lab in shown if tr.startswith("chromHMM: ")]
+    sub = set(he.loc[he["indent"], "track"])
     ax_enr.set_xlabel(f"annotation in these {nr} bins, fold over all bins "
                       f"tested\n(q: genome rotations, BH)")
     if not shown:
