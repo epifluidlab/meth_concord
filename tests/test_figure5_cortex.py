@@ -481,9 +481,12 @@ def test_h_draws_the_variable_bins_and_writes_their_table(tmp_path):
         len(f5.CELL_TYPES) + 1)
     texts = [t.get_text() for t in heat[0].texts]
     assert "Olfr1" in texts and "Zfp2" in texts
+    # the places are in the table, not on the heatmap
+    assert not [x.get_text() for x in heat[0].get_yticklabels()]
     assert f5.main(argv) == 0
     t = pd.read_csv(tab, sep="\t")
     assert len(t) == 9 and set(t["chrom"]) == {"chr1", "chr2", "chr10"}
+    assert list(t["rank"]) == list(range(1, 10))
     assert t.loc[(t["chrom"] == "chr1") & (t["start"] == 5_000_000),
                  "genes"].item() == "Olfr1"
     assert t["IT-L2/3_pp"].abs().max() == pytest.approx(1.0)

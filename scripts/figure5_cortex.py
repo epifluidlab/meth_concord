@@ -34,13 +34,14 @@ near-copies, as a figure of their own.
      sampling, q < 0.05 (locus_variability.tsv.gz, --h-statistic: by
      default signed_rel, each contact's w that of its class pair, A/B
      called per cell type -- a bin one type calls A and another B reads
-     co-open in one and co-closed in the other; signed_local reads w at
-     the locus): each type's value in the most variable of them, as the
-     run's own locus_variability_GCH_<statistic> panel b, in blocks by the
-     type each bin is most co-open in, with their genes (--genes); and the
-     annotations enriched in them at q < 0.05 against genome rotations,
-     those only, each beside the same over the most concordant bins.
-     Drawn when the class run has the statistic.
+     co-open in one and co-closed in the other, as in e and f;
+     signed_local reads w at the locus): each type's value in the
+     --h-bins most variable of them, as the run's own
+     locus_variability_GCH_<statistic> panel b, in blocks by the type each
+     bin is most co-open in, with their genes (--genes; their places in
+     --h-table); and the annotations enriched in the bins drawn at q < 0.05
+     against genome rotations, those only, each beside the same over the
+     most concordant bins.  Drawn when the class run has the statistic.
 
 The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
@@ -142,7 +143,7 @@ HOT_C, COLD_C = "#c0392b", "#2166ac"
 #: (signed_rel; signed_local reads w at the locus) -- and how many of the
 #: variable bins it draws, as the run's own panel b.
 H_STAT = "signed_rel"
-H_BINS = 60
+H_BINS = 40
 #: h's second comparison: the variable bins against the bins this share of
 #: the genome's most concordant (by g's ΔC), where most of them lie -- a
 #: change of direction is seen most where there is most concordance.
@@ -983,14 +984,15 @@ def variable_bins(lv: pd.DataFrame, stat: str = H_STAT,
 
 def variable_bins_table(lv: pd.DataFrame, genes=None, stat: str = H_STAT,
                         context: str = "GCH") -> pd.DataFrame:
-    """Every variable bin of h, the largest between-type SD first: its
-    place, the pooled value, the between-type SD and each type's value (pp),
-    the heterogeneity q, and with ``genes`` the protein-coding genes in it
-    (--h-table)."""
+    """Every variable bin of h, ranked by between-type SD (h draws the
+    first H_BINS): its place, the pooled value, the between-type SD and
+    each type's value (pp), the heterogeneity q, and with ``genes`` the
+    protein-coding genes in it (--h-table)."""
     _, v = variable_bins(lv, stat, context)
     pp = ["pooled", "between_type_sd"] + [c for c in v.columns
                                           if c.startswith("type:")]
     t = v[["chrom", "start", "end", "het_q"] + pp].copy()
+    t.insert(0, "rank", np.arange(1, len(t) + 1))
     t[pp] = 100 * t[pp]
     t = t.rename(columns={c: (c[5:] if c.startswith("type:") else c) + "_pp"
                           for c in pp})
@@ -1042,11 +1044,11 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     cell type's ΔC x w there (+ co-open, - co-closed; grey, too few of the
     type's contacts), in blocks by the type each is most co-open in
     (:func:`block_order`), a strip in its colour, each bin's genes beside
-    it.  ``ax_enr``: the annotations enriched in the variable bins
-    over all bins tested across types, at q < 0.05 against genome rotations
-    -- those only -- each with a tick for the same over the H_MATCH most
-    concordant bins (filled where q < 0.05 there too).  The cells are
-    squares, as f's."""
+    it; the bins' places are in the --h-table.  ``ax_enr``: the
+    annotations enriched in the bins drawn over all bins tested across
+    types, at q < 0.05 against genome rotations -- those only -- each with
+    a tick for the same over the H_MATCH most concordant bins (filled where
+    q < 0.05 there too).  The cells are squares, as f's."""
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import Normalize, to_rgba
@@ -1086,14 +1088,8 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
                             rotation_mode="anchor", fontsize=4.8)
     for lab, t in zip(ax_heat.get_xticklabels(), types):
         lab.set_color(colors.get(t, "0.2"))
-    ax_heat.set_yticks(range(nr))
-    ax_heat.set_yticklabels(
-        [f"{c}: {s // 1_000_000}–{e // 1_000_000} Mb"
-         for c, s, e in zip(top["chrom"], top["start"], top["end"])],
-        fontsize=fs)
-    # clear of the strip
-    ax_heat.tick_params(length=0, pad=1.5 + 0.9 * 72 * ax_heat.get_position()
-                        .width * ax_heat.figure.get_figwidth() / nc)
+    ax_heat.set_yticks([])
+    ax_heat.tick_params(length=0)
     for sp in ax_heat.spines.values():
         sp.set_visible(False)
     if genes is not None:
@@ -1102,10 +1098,11 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
             ax_heat.text(nc - 0.5 + 0.35, i, gene_label(genes_in(genes, c, s, e)),
                          ha="left", va="center", fontsize=fs, color="0.3",
                          clip_on=False)
-    ax_heat.set_title(f"GCH: {len(v)} of {len(a):,} bins vary between cell "
-                      f"types (q < 0.05)"
-                      + (f"; the {nr} most" if nr < len(v) else ""),
-                      loc="left", fontsize=5.2, pad=3)
+    ax_heat.set_title((f"GCH: the {nr} bins that vary most between cell "
+                       f"types ({len(v)} of {len(a):,} at q < 0.05)")
+                      if nr < len(v) else
+                      f"GCH: {len(v)} of {len(a):,} bins vary between cell "
+                      f"types (q < 0.05)", loc="left", fontsize=5.2, pad=3)
     cax = ax_heat.inset_axes([0.0, 1.035, 1.0, 0.022])
     cb = ax_heat.figure.colorbar(ScalarMappable(norm=norm, cmap=cmap),
                                  cax=cax, orientation="horizontal")
@@ -1123,17 +1120,18 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     t = a.merge(hh[["chrom", "start", "delta"] + tracks],
                 on=["chrom", "start"], suffixes=("", "_g"))
     t = t.sort_values("x", kind="stable")
-    t["variable"] = t["het_q"] < 0.05
+    drawn = set(zip(top["chrom"], top["start"]))
+    t["variable"] = [k in drawn for k in zip(t["chrom"], t["start"])]
     rows, _ = g_rows(tracks)
     res = variable_enrichment(t, [tr for tr, _ in rows]).set_index("track")
     top_ = t[t["delta"] >= t["delta"].quantile(1 - H_MATCH)]
     res_m = variable_enrichment(top_, [tr for tr, _ in rows]
                                 ).set_index("track")
     sig = [(tr, lab) for tr, lab in rows if res.loc[tr, "q"] < 0.05]
-    ax_enr.set_xlabel("annotation in variable bins, fold over all bins "
-                      "tested\n(q < 0.05, genome rotations)")
+    ax_enr.set_xlabel(f"annotation in these {nr} bins, fold over all bins "
+                      f"tested\n(q < 0.05, genome rotations)")
     if not sig:
-        ax_enr.text(0.5, 0.5, "no annotation enriched in\nthe variable bins "
+        ax_enr.text(0.5, 0.5, f"no annotation enriched in\nthese {nr} bins "
                               "(q < 0.05)", transform=ax_enr.transAxes,
                     ha="center", va="center", fontsize=5, color="0.4")
         ax_enr.set_xticks([])
@@ -1267,7 +1265,7 @@ def build_figure(d: dict, order, colors, genes=None, h_stat: str = H_STAT,
                       top=(extra + 0.04 * 10.9 - H_GAP) / H,
                       bottom=H_FOOT / H)
         gh1 = GridSpecFromSubplotSpec(1, 3, gh[0, 0:7], wspace=0.0,
-                                      width_ratios=[0.33, 0.42, 0.62])
+                                      width_ratios=[0.1, 0.42, 0.85])
         ax_hh = fig.add_subplot(gh1[1])
         gh2 = GridSpecFromSubplotSpec(1, 2, gh[0, 7:12], wspace=0.0,
                                       width_ratios=[0.42, 1])
@@ -1275,7 +1273,7 @@ def build_figure(d: dict, order, colors, genes=None, h_stat: str = H_STAT,
         panel_h(ax_hh, ax_he, d["variability"], d["hotspots"], order, colors,
                 genes, h_stat, h_bins)
         # above its colour bar: level with its title
-        letters.append(("h", ax_hh, 0.14, "title"))
+        letters.append(("h", ax_hh, 0.04, "title"))
     fig.canvas.draw()
     to_fig = fig.transFigure.inverted()
     for lab, ax, dx, *at in letters:
