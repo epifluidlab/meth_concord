@@ -432,3 +432,105 @@ def test_a_colour_bar_takes_a_round_tick_within_its_range():
     # a hair short of 0.2 still takes it, the scale widened to meet it
     assert f5._nice_tick(0.198) == pytest.approx(0.2)
     assert f5._nice_tick(0.163) == pytest.approx(0.1)
+
+
+# ------------------------------------------------------------- panel h --
+
+
+def _variability(c: Path, stat=f5.H_STAT, variable=(5, 15, 25)):
+    """locus_variability.tsv.gz beside the hot bins: GCH's bins tested
+    across the types, ``variable`` (bin numbers on each chromosome) the
+    run's variable set, ΔC alone for HCG."""
+    rng = np.random.default_rng(3)
+    rows = []
+    for ctx, st in (("GCH", stat), ("GCH", "delta"), ("HCG", "delta")):
+        for chrom in ("chr1", "chr2", "chr10"):
+            for b in range(50):
+                v = ctx == "GCH" and st == stat and b in variable
+                row = {"context": ctx, "system": "ab", "chrom": chrom,
+                       "start": b * 1_000_000, "end": (b + 1) * 1_000_000,
+                       "statistic": st, "set": "variable" if v else "",
+                       "pooled": rng.normal(0.01, 0.002),
+                       "between_type_sd": 0.004 if v else 0.0005,
+                       "het_q": 0.001 if v else 0.6}
+                for i, t in enumerate(f5.CELL_TYPES):
+                    row[f"type:{t}"] = (0.01 * (-1) ** i if v
+                                        else rng.normal(0.01, 0.001))
+                rows.append(row)
+    pd.DataFrame(rows).to_csv(c / "locus_variability.tsv.gz", sep="\t",
+                              index=False)
+
+
+def test_h_draws_the_variable_bins_and_writes_their_table(tmp_path):
+    """With the statistic in the class run: h below g, a to g their size,
+    one row per variable bin, its genes named and in the table."""
+    argv = _tables(tmp_path)
+    _variability(tmp_path / "classes")
+    pd.DataFrame({0: ["chr1", "chr2"], 1: [5_100_000, 15_200_000],
+                  2: [5_200_000, 15_300_000], 3: ["Olfr1", "Zfp2"]}).to_csv(
+        tmp_path / "genes.bed", sep="\t", header=False, index=False)
+    tab = tmp_path / "fig" / "h.tsv"
+    argv += ["--genes", str(tmp_path / "genes.bed"), "--h-table", str(tab)]
+    args = f5.parse_args(argv)
+    fig = f5.figure_from_args(args)
+    assert fig.get_figheight() == pytest.approx(10.9 + f5.H_EXTRA)
+    assert [t.get_text() for t in fig.texts] == list("abcdefgh")
+    heat = [a for a in fig.axes if a.get_title(loc="left").startswith("GCH:")]
+    # each bin's squares, and its strip
+    assert len(heat) == 1 and len(heat[0].patches) == 9 * (
+        len(f5.CELL_TYPES) + 1)
+    texts = [t.get_text() for t in heat[0].texts]
+    assert "Olfr1" in texts and "Zfp2" in texts
+    assert f5.main(argv) == 0
+    t = pd.read_csv(tab, sep="\t")
+    assert len(t) == 9 and set(t["chrom"]) == {"chr1", "chr2", "chr10"}
+    assert t.loc[(t["chrom"] == "chr1") & (t["start"] == 5_000_000),
+                 "genes"].item() == "Olfr1"
+    assert t["IT-L2/3_pp"].abs().max() == pytest.approx(1.0)
+
+
+def test_without_its_statistic_the_figure_is_as_before(tmp_path):
+    argv = _tables(tmp_path)
+    _variability(tmp_path / "classes", stat="signed_rel")
+    fig = f5.figure_from_args(f5.parse_args(argv))
+    assert fig.get_figheight() == pytest.approx(10.9)
+    assert [t.get_text() for t in fig.texts] == list("abcdefg")
+
+
+def test_a_bins_genes_in_a_few_words():
+    assert f5.gene_label(["Olfr1", "Abc1", "Olfr2", "Gm123", "Olfr3",
+                          "1700001A01Rik", "BC147527", "H2-K1", "H2-D1",
+                          "H2-Q1", "Def1", "Ghi2", "Jkl3"]) \
+        == "Olfr ×3, H2 ×3, Abc1, Def1, Ghi2 +1"
+    assert f5.gene_label(["Pcdha1", "Pcdhb2", "Pcdhgc3"]) == "Pcdh ×3"
+    assert f5.gene_label(["Gm1", "Gm2"]) == f5.gene_label([]) == "—"
+
+
+def test_what_the_variable_bins_are_is_tested_against_rotations():
+    """A track high in clustered variable bins is found, at q < 0.05
+    against genome rotations; one that is not is not."""
+    rng = np.random.default_rng(4)
+    n = 1000
+    var = np.zeros(n, bool)
+    for s in range(50, n, 120):
+        var[s:s + 5] = True
+    t = pd.DataFrame({"variable": var,
+                      "planted": np.where(var, 3.0, 1.0) + rng.uniform(0, 1, n),
+                      "other": rng.uniform(0, 1, n)})
+    r = f5.variable_enrichment(t, ["planted", "other"]).set_index("track")
+    assert r.loc["planted", "fold"] > 1.5 and r.loc["planted", "q"] < 0.05
+    assert r.loc["other", "q"] > 0.05
+
+
+def test_h_puts_each_bin_with_the_type_it_is_most_co_open_in():
+    """Bins in blocks by type, in the types' order -- each with the type
+    of its largest value, a type without contacts enough passed over --
+    each block by that value, largest first."""
+    nan = np.nan
+    H = np.array([[0.1, 0.1, -0.9, 0.2],     # type 3
+                  [0.3, 0.0, 0.1, nan],      # type 0
+                  [nan, 1.0, 0.0, 0.0],      # type 1
+                  [0.9, 0.1, 0.0, 0.1],      # type 0, more open
+                  [0.0, 0.1, 0.8, nan]])     # type 2
+    assert list(f5.most_open(H)) == [3, 0, 1, 0, 2]
+    assert list(f5.block_order(H)) == [3, 1, 2, 4, 0]

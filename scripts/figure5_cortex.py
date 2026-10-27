@@ -30,6 +30,15 @@ near-copies, as a figure of their own.
      the hot bins are -- each annotation the run tested, its share in
      them over all tested bins, with p against genome rotations
      (locus_hotspots.tsv.gz)
+  h  GCH's 1-Mb bins where ΔC x w differs between the cell types beyond
+     sampling (locus_variability.tsv.gz, --h-statistic: by default w read
+     at the locus, so a change of sign is the bin's contacts turning from
+     co-open in one type to co-closed in another), each type's value in
+     blocks by the type each bin is most co-open in, with their genes
+     (--genes); and the annotations enriched in them at q < 0.05 against
+     genome rotations, those only, each beside the same over the most
+     concordant bins (most of the variable bins are among them).  Drawn
+     when the class run has the statistic.
 
 The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
@@ -38,6 +47,7 @@ signal is reproduced by links with no coordination (design §6b.6).
         --distance end_posterior_distance_correlation/end_posterior_dist.null_link_shuffled_match_per_cell.cell_center.excl1kb \\
         --distance-ab end_posterior_distance_correlation/null_link_shuffled_match_per_cell.cell_center \\
         --classes annotation_class_concordance_v14_samecell_excl \\
+        --genes gencode.vM25.annotation.gtf.gz --h-table Figure5h_bins.tsv \\
         --output Figure5.pdf --supplementary FigureS5_near_copies.pdf
 """
 
@@ -126,6 +136,15 @@ ALL_BAND = "all 1kb-10Mb"
 #: narrower than it hide behind it.
 DOT_FRACTION = 0.05
 HOT_C, COLD_C = "#c0392b", "#2166ac"
+#: Panel h: its statistic -- ΔC x w with w read at the locus, a cell type's
+#: co-open share among its contacts in the bin against its own over the
+#: genome -- and how many of the variable bins it draws.
+H_STAT = "signed_local"
+H_BINS = 50
+#: h's second comparison: the variable bins against the bins this share of
+#: the genome's most concordant (by g's ΔC), where most of them lie -- a
+#: change of direction is seen most where there is most concordance.
+H_MATCH = 0.2
 
 
 def _style():
@@ -886,15 +905,313 @@ def panel_g(ax_tracks, ax_enr, hot: pd.DataFrame):
                   bbox_to_anchor=(1.0, 1.0))
 
 
+def read_genes(path) -> pd.DataFrame:
+    """Protein-coding genes, 0-based half-open: a GTF's 'gene' lines with
+    gene_type protein_coding (GENCODE), or a BED's first four columns."""
+    import gzip
+    import re
+    p = str(path)
+    if not p.endswith((".gtf", ".gtf.gz")):
+        g = pd.read_csv(p, sep="\t", header=None, comment="#",
+                        usecols=[0, 1, 2, 3])
+        g.columns = ["chrom", "start", "end", "name"]
+        return g
+    rows = []
+    with (gzip.open if p.endswith(".gz") else open)(p, "rt") as fh:
+        for line in fh:
+            f = line.split("\t", 8)
+            if len(f) < 9 or f[2] != "gene" \
+                    or 'gene_type "protein_coding"' not in f[8]:
+                continue
+            m = re.search(r'gene_name "([^"]+)"', f[8])
+            if m:
+                rows.append((f[0], int(f[3]) - 1, int(f[4]), m.group(1)))
+    return pd.DataFrame(rows, columns=["chrom", "start", "end", "name"])
+
+
+def genes_in(genes: pd.DataFrame, chrom: str, start: int, end: int) -> list:
+    """The genes overlapping [start, end) on ``chrom``, in genome order,
+    each name once (GENCODE has a few twice)."""
+    g = genes[(genes["chrom"] == chrom) & (genes["start"] < end)
+              & (genes["end"] > start)]
+    return list(dict.fromkeys(g.sort_values("start", kind="stable")["name"]))
+
+
+#: Gene names that say nothing in a label -- predicted genes, RIKEN and
+#: other cDNA clones; the --h-table keeps them.
+UNNAMED_GENE = r"Gm\d+|.*Rik|(?:A[A-Z]|B[A-Z]|C\d)\d{5,}"
+
+
+def gene_label(names, k: int = 3) -> str:
+    """A bin's genes in a few words: each family of three or more first,
+    largest first (Olfr ×23 -- a family, the name before its first hyphen
+    or else the letters before its first digit, the protocadherins one),
+    then up to ``k`` others in genome order and how many more; predicted
+    and clone names (UNNAMED_GENE) left out, '—' where none is left."""
+    import re
+    names = [nm for nm in names if not re.fullmatch(UNNAMED_GENE, nm)]
+    fam = {}
+    for nm in names:
+        m = re.match(r"([^-]+)-", nm) or re.match(r"([A-Za-z]+)\d", nm)
+        f = m.group(1) if m else nm
+        fam.setdefault("Pcdh" if f.startswith("Pcdh") else f, []).append(nm)
+    big = sorted((f for f, v in fam.items() if len(v) >= 3),
+                 key=lambda f: -len(fam[f]))
+    inbig = {nm for f in big for nm in fam[f]}
+    rest = [nm for nm in names if nm not in inbig]
+    s = ", ".join([f"{f} ×{len(fam[f])}" for f in big] + rest[:k])
+    return (s + (f" +{len(rest) - k}" if len(rest) > k else "")) or "—"
+
+
+def variable_bins(lv: pd.DataFrame, stat: str = H_STAT,
+                  context: str = "GCH") -> tuple:
+    """The bins ``lv`` (locus_variability.tsv.gz) tested across cell types
+    for ``stat`` in ``context``, in genome order, and the run's variable
+    ones among them, the largest between-type SD first."""
+    a = lv[(lv["context"] == context) & (lv["statistic"] == stat)].copy()
+    if a.empty:
+        return a, a
+    a["x"] = _genome_x(a)[0]
+    a = a.sort_values("x", kind="stable")
+    return a, a[a["set"] == "variable"].sort_values(
+        "between_type_sd", ascending=False, kind="stable")
+
+
+def variable_bins_table(lv: pd.DataFrame, genes=None, stat: str = H_STAT,
+                        context: str = "GCH") -> pd.DataFrame:
+    """Every variable bin of h, the largest between-type SD first: its
+    place, the pooled value, the between-type SD and each type's value (pp),
+    the heterogeneity q, and with ``genes`` the protein-coding genes in it
+    (--h-table)."""
+    _, v = variable_bins(lv, stat, context)
+    pp = ["pooled", "between_type_sd"] + [c for c in v.columns
+                                          if c.startswith("type:")]
+    t = v[["chrom", "start", "end", "het_q"] + pp].copy()
+    t[pp] = 100 * t[pp]
+    t = t.rename(columns={c: (c[5:] if c.startswith("type:") else c) + "_pp"
+                          for c in pp})
+    if genes is not None:
+        t["genes"] = [", ".join(genes_in(genes, c, s, e))
+                      for c, s, e in zip(t["chrom"], t["start"], t["end"])]
+    return t
+
+
+def most_open(H) -> np.ndarray:
+    """Per row of ``H`` (bins x types, NaN where a type has too few
+    contacts): the type in which the bin is most co-open, its largest
+    value."""
+    return np.where(np.isfinite(H), H, -np.inf).argmax(1)
+
+
+def block_order(H) -> np.ndarray:
+    """The rows of ``H`` in blocks, one per type in its column order: the
+    bins most co-open in it (:func:`most_open`), each block by that value,
+    largest first -- the steps run down the diagonal."""
+    return np.lexsort((-np.where(np.isfinite(H), H, -np.inf).max(1),
+                       most_open(H)))
+
+
+def variable_enrichment(t: pd.DataFrame, tracks) -> pd.DataFrame:
+    """Per track, over bins ``t`` in genome order (``variable`` marking the
+    variable ones): its mean over the variable bins against its mean over
+    all of them (fold), with p against genome rotations and BH q over
+    ``tracks`` -- as g's hot bins (:func:`hot_enrichment`)."""
+    v = t["variable"].to_numpy(bool)
+    rows = []
+    for name in tracks:
+        x = t[name].to_numpy(float)
+        m = x.mean() if x.size else np.nan
+        if not v.any() or not np.ptp(x) > 0 or not m > 0:
+            rows.append({"track": name})
+            continue
+        rows.append({"track": name, "fold": x[v].mean() / m,
+                     "p": _rotation_p(v, x)})
+    out = pd.DataFrame(rows).reindex(columns=["track", "fold", "p"])
+    out["q"] = fdr_bh(out["p"])
+    return out
+
+
+def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
+            colors, genes=None, stat: str = H_STAT, n_bins: int = H_BINS):
+    """``ax_heat``: GCH's variable bins -- the run's variable set, the
+    ``n_bins`` of largest between-type SD where there are more -- and each
+    cell type's ΔC x w there (+ co-open, - co-closed; grey, too few of the
+    type's contacts), in blocks by the type each is most co-open in
+    (:func:`block_order`), a strip in its colour, each bin's genes beside
+    it.  ``ax_enr``: the annotations enriched in the variable bins
+    over all bins tested across types, at q < 0.05 against genome rotations
+    -- those only -- each with a tick for the same over the H_MATCH most
+    concordant bins (filled where q < 0.05 there too).  The cells are
+    squares, as f's."""
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize, to_rgba
+    from matplotlib.patches import Rectangle
+    from matplotlib.ticker import NullLocator
+    a, v = variable_bins(lv, stat)
+    top = v.head(n_bins)
+    types = [t for t in order if f"type:{t}" in top.columns]
+    H = 100 * top[[f"type:{t}" for t in types]].to_numpy(float)
+    o = block_order(H)
+    H, top = H[o], top.iloc[o]
+    apart = most_open(H)
+    cmap = plt.get_cmap("RdBu_r")
+    lim = _limit(H)
+    tk = _nice_tick(lim)
+    lim = max(lim, tk)
+    norm = Normalize(-lim, lim)
+    nr, nc = H.shape
+    # the labels' size follows the rows'
+    fs = min(4.4, 0.92 * 72 * ax_heat.get_position().height
+             * ax_heat.figure.get_figheight() / max(nr, 1))
+    for i in range(nr):
+        for j in range(nc):
+            ax_heat.add_patch(Rectangle(
+                (j - 0.5, i - 0.5), 1, 1, lw=0,
+                facecolor=cmap(norm(H[i, j])) if np.isfinite(H[i, j])
+                else "0.88"))
+        # the strip: the type the bin is most co-open in
+        ax_heat.add_patch(Rectangle((-1.15, i - 0.5), 0.45, 1, lw=0,
+                                    clip_on=False,
+                                    facecolor=colors.get(types[apart[i]],
+                                                         "0.5")))
+    ax_heat.set_xlim(-0.5, nc - 0.5)
+    ax_heat.set_ylim(nr - 0.5, -0.5)
+    ax_heat.set_xticks(range(nc))
+    ax_heat.set_xticklabels(types, rotation=60, ha="right",
+                            rotation_mode="anchor", fontsize=4.8)
+    for lab, t in zip(ax_heat.get_xticklabels(), types):
+        lab.set_color(colors.get(t, "0.2"))
+    ax_heat.set_yticks(range(nr))
+    ax_heat.set_yticklabels(
+        [f"{c}: {s // 1_000_000}–{e // 1_000_000} Mb"
+         for c, s, e in zip(top["chrom"], top["start"], top["end"])],
+        fontsize=fs)
+    # clear of the strip
+    ax_heat.tick_params(length=0, pad=1.5 + 0.9 * 72 * ax_heat.get_position()
+                        .width * ax_heat.figure.get_figwidth() / nc)
+    for sp in ax_heat.spines.values():
+        sp.set_visible(False)
+    if genes is not None:
+        for i, (c, s, e) in enumerate(zip(top["chrom"], top["start"],
+                                          top["end"])):
+            ax_heat.text(nc - 0.5 + 0.35, i, gene_label(genes_in(genes, c, s, e)),
+                         ha="left", va="center", fontsize=fs, color="0.3",
+                         clip_on=False)
+    ax_heat.set_title(f"GCH: {len(v)} of {len(a):,} bins vary between cell "
+                      f"types (q < 0.05)"
+                      + (f"; the {nr} most" if nr < len(v) else ""),
+                      loc="left", fontsize=5.2, pad=3)
+    cax = ax_heat.inset_axes([0.0, 1.035, 1.0, 0.022])
+    cb = ax_heat.figure.colorbar(ScalarMappable(norm=norm, cmap=cmap),
+                                 cax=cax, orientation="horizontal")
+    cb.set_ticks([-tk, 0, tk])
+    cb.set_ticklabels([f"−{tk:g}", "0", f"{tk:g}"])
+    cb.outline.set_linewidth(0.4)
+    cb.ax.tick_params(labelsize=4.4, length=1.5, pad=1)
+    cb.ax.xaxis.set_ticks_position("top")
+    cb.ax.text(1.04, 0.5, "ΔC × w (pp), + co-open", transform=cb.ax.transAxes,
+               ha="left", va="center", fontsize=4.6)
+    # what the variable bins are: the annotations g tests, over every bin
+    # tested across types, the enriched ones only
+    tracks = tested_tracks(hot)
+    hh = hot[(hot["band"] == ALL_BAND) & (hot["context"] == "GCH")]
+    t = a.merge(hh[["chrom", "start", "delta"] + tracks],
+                on=["chrom", "start"], suffixes=("", "_g"))
+    t = t.sort_values("x", kind="stable")
+    t["variable"] = t["set"] == "variable"
+    rows, _ = g_rows(tracks)
+    res = variable_enrichment(t, [tr for tr, _ in rows]).set_index("track")
+    top_ = t[t["delta"] >= t["delta"].quantile(1 - H_MATCH)]
+    res_m = variable_enrichment(top_, [tr for tr, _ in rows]
+                                ).set_index("track")
+    sig = [(tr, lab) for tr, lab in rows if res.loc[tr, "q"] < 0.05]
+    ax_enr.set_xlabel("annotation in variable bins, fold over all bins "
+                      "tested\n(q < 0.05, genome rotations)")
+    if not sig:
+        ax_enr.text(0.5, 0.5, "no annotation enriched in\nthe variable bins "
+                              "(q < 0.05)", transform=ax_enr.transAxes,
+                    ha="center", va="center", fontsize=5, color="0.4")
+        ax_enr.set_xticks([])
+        ax_enr.set_yticks([])
+        return
+    f = np.array([res.loc[tr, "fold"] for tr, _ in sig], float)
+    q = np.array([res.loc[tr, "q"] for tr, _ in sig], float)
+    fm = np.array([res_m.loc[tr, "fold"] for tr, _ in sig], float)
+    qm = np.array([res_m.loc[tr, "q"] for tr, _ in sig], float)
+    y = np.arange(len(sig))[::-1].astype(float)
+    ax_enr.barh(y, f - 1, left=1, height=0.55, lw=0,
+                color=to_rgba(MARK_COLOR["GCH"], 0.85))
+    okm = np.isfinite(fm) & (fm > 0)
+    for filled in (True, False):
+        m_ = okm & ((qm < 0.05) == filled)
+        ax_enr.scatter(fm[m_], y[m_], s=9, marker="d", lw=0.5, zorder=3,
+                       facecolor="0.15" if filled else "white",
+                       edgecolor="0.15")
+    for yy, f_, q_, fm_ in zip(y, f, q, fm):
+        out_ = max(f_, fm_) if f_ >= 1 else min(f_, fm_)
+        ax_enr.text(out_ * 1.12 if f_ >= 1 else out_ / 1.12, yy,
+                    "q < 0.001" if q_ < 0.001 else f"q = {q_:.2g}",
+                    ha="left" if f_ >= 1 else "right", va="center",
+                    fontsize=4.4, color="0.35")
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    ax_enr.legend(handles=[
+        Patch(color=to_rgba(MARK_COLOR["GCH"], 0.85),
+              label="over all bins tested"),
+        Line2D([], [], marker="d", ls="", ms=3.2, mew=0.5, color="0.15",
+               label=f"over the {100 * H_MATCH:.0f}% most concordant "
+                     f"(hollow: q ≥ 0.05)")],
+        frameon=False, loc="lower right", fontsize=4.6, ncol=1,
+        handletextpad=0.4, handlelength=1.2, borderaxespad=0.1,
+        bbox_to_anchor=(1.0, 1.0))
+    # room beyond the longest bar for its q
+    lim2 = max(1.0, 1.6 * np.abs(np.log2(np.r_[f, fm[okm]])).max())
+    ax_enr.axvline(1, color="0.7", lw=0.4, zorder=0)
+    ax_enr.set_xscale("log", base=2)
+    ax_enr.set_xlim(2.0 ** -lim2, 2.0 ** lim2)
+    ticks = [2.0 ** i for i in range(-int(lim2), int(lim2) + 1)]
+    ax_enr.set_xticks(ticks)
+    ax_enr.set_xticklabels([f"{t_:g}×" for t_ in ticks])
+    ax_enr.xaxis.set_minor_locator(NullLocator())
+    ax_enr.set_yticks(y)
+    ax_enr.set_yticklabels([lab for _, lab in sig], fontsize=5)
+    # bars as thick as g's, from the top, however few
+    ax_enr.set_ylim(len(sig) - 0.3 - max(len(sig), 10), len(sig) - 0.3)
+    ax_enr.tick_params(axis="y", length=0)
+
+
 # ----------------------------------------------------------------- layout --
 
-def build_figure(d: dict, order, colors):
+def has_h(d: dict, stat: str = H_STAT) -> bool:
+    """Whether the class run has h's statistic, with variable GCH bins."""
+    lv = d.get("variability")
+    return lv is not None and bool(
+        ((lv["context"] == "GCH") & (lv["statistic"] == stat)
+         & (lv["set"] == "variable")).any())
+
+
+#: h's row below g, in inches: what it adds to the figure's height, the gap
+#: g's labels need above it, and the margin for its cell types beneath --
+#: its axes take the rest.  A quarter inch, exact in binary, at the usual
+#: resolutions a whole number of pixels.
+H_EXTRA, H_GAP, H_FOOT = 3.25, 0.75, 0.5
+
+
+def build_figure(d: dict, order, colors, genes=None, h_stat: str = H_STAT,
+                 h_bins: int = H_BINS):
     plt = _style()
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
-    fig = plt.figure(figsize=(7.2, 10.9))
+    h = has_h(d, h_stat)
+    # with h, a to g keep their size in inches and h is added below them
+    extra = H_EXTRA if h else 0.0
+    H = 10.9 + extra
+    fig = plt.figure(figsize=(7.2, H))
     gs = GridSpec(4, 12, figure=fig, hspace=0.46, wspace=1.6,
                   height_ratios=[2.5, 1.75, 2.15, 1.95],
-                  left=0.075, right=0.975, top=0.97, bottom=0.04)
+                  left=0.075, right=0.975,
+                  top=1 - 0.03 * 10.9 / H if h else 0.97,
+                  bottom=(0.04 * 10.9 + extra) / H if h else 0.04)
     letters = []
     # a: the three measures across the page, the correlations tall enough
     # for the shuffle's schematic above their curves
@@ -939,11 +1256,31 @@ def build_figure(d: dict, order, colors):
     ax_ge = fig.add_subplot(ge2[1])
     panel_g(ax_gt, ax_ge, d["hotspots"])
     letters.append(("g", ax_gt[0], 0.06))
+    if h:
+        # h: the variable bins by type, their genes, and what they are --
+        # the enrichment under g's
+        gh = GridSpec(1, 12, figure=fig, wspace=1.6, left=0.075, right=0.975,
+                      top=(extra + 0.04 * 10.9 - H_GAP) / H,
+                      bottom=H_FOOT / H)
+        gh1 = GridSpecFromSubplotSpec(1, 3, gh[0, 0:7], wspace=0.0,
+                                      width_ratios=[0.33, 0.42, 0.62])
+        ax_hh = fig.add_subplot(gh1[1])
+        gh2 = GridSpecFromSubplotSpec(1, 2, gh[0, 7:12], wspace=0.0,
+                                      width_ratios=[0.42, 1])
+        ax_he = fig.add_subplot(gh2[1])
+        panel_h(ax_hh, ax_he, d["variability"], d["hotspots"], order, colors,
+                genes, h_stat, h_bins)
+        # above its colour bar: level with its title
+        letters.append(("h", ax_hh, 0.14, "title"))
     fig.canvas.draw()
-    for lab, ax, dx in letters:
+    to_fig = fig.transFigure.inverted()
+    for lab, ax, dx, *at in letters:
         bb = ax.get_position()
-        fig.text(bb.x0 - dx, bb.y1 + 0.01, lab, fontsize=8,
-                 fontweight="bold", va="bottom", ha="left")
+        y = (ax.title.get_window_extent(fig.canvas.get_renderer())
+             .transformed(to_fig).y0 if at
+             else bb.y1 + (0.109 / H if h else 0.01))
+        fig.text(bb.x0 - dx, y, lab, fontsize=8, fontweight="bold",
+                 va="bottom", ha="left")
     return fig
 
 
@@ -1043,6 +1380,23 @@ def parse_args(argv=None):
                          "cortex defaults.")
     ap.add_argument("--group-column", default="group")
     ap.add_argument("--color-column", default="color")
+    ap.add_argument("--genes", default=None, metavar="GTF",
+                    help="h: a gene annotation naming the protein-coding "
+                         "genes in each variable bin -- a GTF (GENCODE; "
+                         "annotation_class_concordance.py fetches vM25 into "
+                         "its --cache-dir) or a BED with names in column 4.")
+    ap.add_argument("--h-statistic", default=H_STAT,
+                    help="h: the statistic of --classes' "
+                         "locus_variability.tsv.gz (default %(default)s: "
+                         "ΔC x w, w read at the locus).  Without it h is "
+                         "left out.")
+    ap.add_argument("--h-bins", type=int, default=H_BINS,
+                    help="h: how many of the variable bins to draw "
+                         "(default %(default)s).")
+    ap.add_argument("--h-table", default=None, metavar="TSV",
+                    help="Every variable bin of h -- its place, each type's "
+                         "value and, with --genes, the genes in it -- "
+                         "written here.")
     ap.add_argument("--output", required=True)
     return ap.parse_args(argv)
 
@@ -1078,6 +1432,9 @@ def read_tables(args) -> dict:
     d = {"percell": pd.read_csv(need[0], sep="\t"),
          "summary": pd.read_csv(cc / "summary.tsv", sep="\t"),
          "hotspots": pd.read_csv(cc / "locus_hotspots.tsv.gz", sep="\t")}
+    if (cc / "locus_variability.tsv.gz").exists():
+        d["variability"] = pd.read_csv(cc / "locus_variability.tsv.gz",
+                                       sep="\t")
     d.update(ab_of(ab))
     if ab != dd:
         d.update(ab_of(dd, "_supp"))
@@ -1101,22 +1458,38 @@ def cell_colors(args, groups) -> tuple:
     return order, colors
 
 
-def figure_from_args(args, d=None):
+def figure_from_args(args, d=None, genes=None):
     d = read_tables(args) if d is None else d
     order, colors = cell_colors(args, d["percell"]["group"].dropna())
-    return build_figure(d, order, colors)
+    stat = getattr(args, "h_statistic", H_STAT)
+    if genes is None and getattr(args, "genes", None) and has_h(d, stat):
+        genes = read_genes(args.genes)
+    return build_figure(d, order, colors, genes, stat,
+                        getattr(args, "h_bins", H_BINS))
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     d = read_tables(args)
-    fig = figure_from_args(args, d)         # Agg first (_style)
+    h = has_h(d, args.h_statistic)
+    if not h:
+        print(f"h left out: --classes has no {args.h_statistic} in "
+              f"locus_variability.tsv.gz")
+    genes = read_genes(args.genes) if args.genes and h else None
+    fig = figure_from_args(args, d, genes)  # Agg first (_style)
     import matplotlib.pyplot as plt
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=300)
     plt.close(fig)
     print(f"wrote {out}")
+    if args.h_table and h:
+        tab = Path(args.h_table)
+        tab.parent.mkdir(parents=True, exist_ok=True)
+        variable_bins_table(d["variability"], genes, args.h_statistic
+                            ).to_csv(tab, sep="\t", index=False,
+                                     float_format="%.4g")
+        print(f"wrote {tab}")
     if args.supplementary:
         sup = Path(args.supplementary)
         sup.parent.mkdir(parents=True, exist_ok=True)
