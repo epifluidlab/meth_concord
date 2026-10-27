@@ -475,7 +475,8 @@ def test_h_draws_the_variable_bins_and_writes_their_table(tmp_path):
     fig = f5.figure_from_args(args)
     assert fig.get_figheight() == pytest.approx(10.9 + f5.H_EXTRA)
     assert [t.get_text() for t in fig.texts] == list("abcdefgh")
-    heat = [a for a in fig.axes if a.get_title(loc="left").startswith("GCH:")]
+    heat = [a for a in fig.axes
+            if a.get_title(loc="left").startswith("long-range GCH–GCH:")]
     # each bin's squares, and its strip
     assert len(heat) == 1 and len(heat[0].patches) == 9 * (
         len(f5.CELL_TYPES) + 1)
@@ -537,3 +538,56 @@ def test_h_puts_each_bin_with_the_type_it_is_most_co_open_in():
                   [0.0, 0.1, 0.8, nan]])     # type 2
     assert list(f5.most_open(H)) == [3, 0, 1, 0, 2]
     assert list(f5.block_order(H)) == [3, 1, 2, 4, 0]
+
+
+def _chromhmm(d: Path):
+    """A full-stack style segmentation and its state annotation, the two
+    numbering their states differently, as the release does."""
+    pd.DataFrame({"state": ["40", "41", "89", "86", "15"],
+                  "comments": ["Strongly enriched over TSS",
+                               "Promoter, flanking TSS state",
+                               "Poised promoters/proximal enhancers",
+                               "Bivalent promoter state",
+                               "Weak enhancer"],
+                  "group": ["TSS", "Prom", "Prom", "BivProm", "WkEnh"],
+                  "mneumonics": ["mTSS1", "mPromF2", "mPromF7", "mBivProm1",
+                                 "mEnhWk1"]}).to_csv(d / "states.tsv",
+                                                     sep="\t", index=False)
+    pd.DataFrame([("chr1", 0, 200_000, "1_mTSS1"),
+                  ("chr1", 500_000, 1_500_000, "2_mPromF2"),
+                  ("chr1", 2_000_000, 2_100_000, "3_mPromF7"),
+                  ("chr1", 3_000_000, 3_300_000, "4_mBivProm1"),
+                  ("chr1", 4_000_000, 5_000_000, "15_mEnhWk1")]).to_csv(
+        d / "seg.bed.gz", sep="\t", header=False, index=False)
+    return d / "seg.bed.gz", d / "states.tsv"
+
+
+def test_promoter_types_from_the_full_stack_states(tmp_path):
+    """Matched by mnemonic, not by number: a segment across two bins split
+    between them; a state of no promoter type left out."""
+    bed, st = _chromhmm(tmp_path)
+    p = f5.promoter_types(bed, st).set_index(["chrom", "start"])
+    assert list(p.columns) == list(f5.PROMOTER_TYPES)
+    assert p.loc[("chr1", 0)].tolist() == pytest.approx([0.2, 0.5, 0, 0])
+    assert p.loc[("chr1", 1_000_000)].tolist() == pytest.approx([0, 0.5, 0, 0])
+    assert p.loc[("chr1", 2_000_000), "promoter: poised"] == pytest.approx(0.1)
+    assert p.loc[("chr1", 3_000_000), "promoter: bivalent"] == pytest.approx(
+        0.3)
+    assert ("chr1", 4_000_000) not in p.index
+
+
+def test_h_splits_the_promoter_class_into_its_types(tmp_path):
+    """With --chromhmm: the four promoter types in place of 'promoter',
+    drawn whatever their q."""
+    argv = _tables(tmp_path)
+    _variability(tmp_path / "classes")
+    bed, st = _chromhmm(tmp_path)
+    fig = f5.figure_from_args(f5.parse_args(
+        argv + ["--chromhmm", str(bed), "--chromhmm-states", str(st)]))
+    enr = [a for a in fig.axes
+           if a.get_xlabel().startswith("annotation in these")]
+    assert len(enr) == 1
+    rows = [x.get_text() for x in enr[0].get_yticklabels()]
+    assert set(f5.PROMOTER_TYPES) <= set(rows) and "promoter" not in rows
+    with pytest.raises(SystemExit, match="go together"):
+        f5.main(argv + ["--chromhmm", str(bed)])

@@ -41,7 +41,9 @@ near-copies, as a figure of their own.
      bin is most co-open in, with their genes (--genes; their places in
      --h-table); and the annotations enriched in the bins drawn at q < 0.05
      against genome rotations, those only, each beside the same over the
-     most concordant bins.  Drawn when the class run has the statistic.
+     most concordant bins -- with --chromhmm, the promoter class split into
+     the full-stack chromHMM's TSS, flanking, poised and bivalent states,
+     all four drawn.  Drawn when the class run has the statistic.
 
 The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
@@ -51,6 +53,8 @@ signal is reproduced by links with no coordination (design §6b.6).
         --distance-ab end_posterior_distance_correlation/null_link_shuffled_match_per_cell.cell_center \\
         --classes annotation_class_concordance_v14_samecell_excl \\
         --genes gencode.vM25.annotation.gtf.gz --h-table Figure5h_bins.tsv \\
+        --chromhmm mm10_100_segments_segments.bed.gz \\
+        --chromhmm-states state_annotation_processed.tsv \\
         --output Figure5.pdf --supplementary FigureS5_near_copies.pdf
 """
 
@@ -1002,6 +1006,52 @@ def variable_bins_table(lv: pd.DataFrame, genes=None, stat: str = H_STAT,
     return t
 
 
+#: h's promoter types, in order: the full-stack chromHMM state groups they
+#: gather (its Prom group split where a state's description calls it
+#: poised -- in mm10 mPromF7, poised promoters and proximal enhancers,
+#: mostly in brain).  Figure 5's 'promoter' class is TSS, flanking and
+#: poised; its run folds the bivalent ones into polycomb.
+PROMOTER_TYPES = ("promoter: TSS", "promoter: flanking", "promoter: poised",
+                  "promoter: bivalent")
+
+
+def promoter_types(bed, states_tsv, bin_bp: int = 1_000_000) -> pd.DataFrame:
+    """Per ``bin_bp`` bin (chrom, start), the share of it in each of
+    PROMOTER_TYPES, from a full-stack chromHMM segmentation and its state
+    annotation (the files annotation_class_concordance.py reads).  A state
+    is matched by its mnemonic -- '15_mHET9' is mHET9 -- never by its
+    number: the segmentation numbers the states differently from the
+    annotation."""
+    ann = pd.read_csv(states_tsv, sep=None, engine="python", dtype=str)
+    mcol = next(c for c in ann.columns if c.lower().startswith("mn"))
+    poised = ann["comments"].fillna("").str.lower().str.startswith("poised")
+    tss, flank, poi, biv = PROMOTER_TYPES
+    kind = np.select(
+        [ann["group"] == "TSS", (ann["group"] == "Prom") & poised,
+         ann["group"] == "Prom", ann["group"] == "BivProm"],
+        [tss, poi, flank, biv], "")
+    of = dict(zip(ann[mcol], kind))
+    seg = pd.read_csv(bed, sep="\t", header=None, usecols=[0, 1, 2, 3],
+                      names=["chrom", "s", "e", "label"], dtype={0: str})
+    seg["type"] = seg["label"].str.split("_", n=1).str[-1].map(of)
+    seg = seg[seg["type"].fillna("") != ""]
+    s, e = seg["s"].to_numpy(np.int64), seg["e"].to_numpy(np.int64)
+    # a segment across bins is split at their edges
+    b0, b1 = s // bin_bp, (e - 1) // bin_bp
+    span = b1 - b0 + 1
+    rep = np.repeat(np.arange(s.size), span)
+    b = b0[rep] + (np.arange(rep.size) - np.repeat(np.cumsum(span) - span,
+                                                   span))
+    bp = np.minimum(e[rep], (b + 1) * bin_bp) - np.maximum(s[rep], b * bin_bp)
+    cov = (pd.DataFrame({"chrom": seg["chrom"].to_numpy()[rep],
+                         "start": b * bin_bp,
+                         "type": seg["type"].to_numpy()[rep], "bp": bp})
+           .groupby(["chrom", "start", "type"])["bp"].sum()
+           .unstack("type", fill_value=0) / bin_bp)
+    return cov.reindex(columns=list(PROMOTER_TYPES), fill_value=0.0
+                       ).reset_index()
+
+
 def most_open(H) -> np.ndarray:
     """Per row of ``H`` (bins x types, NaN where a type has too few
     contacts): the type in which the bin is most co-open, its largest
@@ -1038,7 +1088,8 @@ def variable_enrichment(t: pd.DataFrame, tracks) -> pd.DataFrame:
 
 
 def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
-            colors, genes=None, stat: str = H_STAT, n_bins: int = H_BINS):
+            colors, genes=None, stat: str = H_STAT, n_bins: int = H_BINS,
+            promoters=None):
     """``ax_heat``: GCH's variable bins (:func:`variable_bins`), the
     ``n_bins`` of largest between-type SD where there are more -- and each
     cell type's ΔC x w there (+ co-open, - co-closed; grey, too few of the
@@ -1048,7 +1099,9 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     annotations enriched in the bins drawn over all bins tested across
     types, at q < 0.05 against genome rotations -- those only -- each with
     a tick for the same over the H_MATCH most concordant bins (filled where
-    q < 0.05 there too).  The cells are squares, as f's."""
+    q < 0.05 there too).  With ``promoters`` (:func:`promoter_types`) the
+    promoter class is split into its types, each drawn whatever its q
+    (faded at q >= 0.05).  The cells are squares, as f's."""
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import Normalize, to_rgba
@@ -1098,11 +1151,11 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
             ax_heat.text(nc - 0.5 + 0.35, i, gene_label(genes_in(genes, c, s, e)),
                          ha="left", va="center", fontsize=fs, color="0.3",
                          clip_on=False)
-    ax_heat.set_title((f"GCH: the {nr} bins that vary most between cell "
-                       f"types ({len(v)} of {len(a):,} at q < 0.05)")
-                      if nr < len(v) else
-                      f"GCH: {len(v)} of {len(a):,} bins vary between cell "
-                      f"types (q < 0.05)", loc="left", fontsize=5.2, pad=3)
+    ax_heat.set_title((f"long-range GCH–GCH: the top {nr} bins that vary "
+                       f"most between cell types") if nr < len(v) else
+                      f"long-range GCH–GCH: the {nr} bins that vary between "
+                      f"cell types (q < 0.05)", loc="left", fontsize=5.2,
+                      pad=3)
     cax = ax_heat.inset_axes([0.0, 1.035, 1.0, 0.022])
     cb = ax_heat.figure.colorbar(ScalarMappable(norm=norm, cmap=cmap),
                                  cax=cax, orientation="horizontal")
@@ -1123,13 +1176,24 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     drawn = set(zip(top["chrom"], top["start"]))
     t["variable"] = [k in drawn for k in zip(t["chrom"], t["start"])]
     rows, _ = g_rows(tracks)
+    always = []
+    if promoters is not None:
+        # the promoter class, split into its types where it stood
+        t = t.merge(promoters, on=["chrom", "start"], how="left")
+        always = [c for c in PROMOTER_TYPES if c in t.columns]
+        t[always] = t[always].fillna(0.0)
+        i = next((k for k, (tr, _) in enumerate(rows)
+                  if tr == "chromHMM: promoter"), len(rows))
+        rows = rows[:i] + [(c, c) for c in always] + rows[i + 1:]
     res = variable_enrichment(t, [tr for tr, _ in rows]).set_index("track")
     top_ = t[t["delta"] >= t["delta"].quantile(1 - H_MATCH)]
     res_m = variable_enrichment(top_, [tr for tr, _ in rows]
                                 ).set_index("track")
-    sig = [(tr, lab) for tr, lab in rows if res.loc[tr, "q"] < 0.05]
+    sig = [(tr, lab) for tr, lab in rows
+           if res.loc[tr, "q"] < 0.05 or tr in always]
     ax_enr.set_xlabel(f"annotation in these {nr} bins, fold over all bins "
-                      f"tested\n(q < 0.05, genome rotations)")
+                      f"tested\n(q < 0.05, genome rotations"
+                      + ("; promoter types all shown)" if always else ")"))
     if not sig:
         ax_enr.text(0.5, 0.5, f"no annotation enriched in\nthese {nr} bins "
                               "(q < 0.05)", transform=ax_enr.transAxes,
@@ -1142,16 +1206,22 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     fm = np.array([res_m.loc[tr, "fold"] for tr, _ in sig], float)
     qm = np.array([res_m.loc[tr, "q"] for tr, _ in sig], float)
     y = np.arange(len(sig))[::-1].astype(float)
-    ax_enr.barh(y, f - 1, left=1, height=0.55, lw=0,
-                color=to_rgba(MARK_COLOR["GCH"], 0.85))
+    ok = np.isfinite(f) & (f > 0)
+    ax_enr.barh(y[ok], f[ok] - 1, left=1, height=0.55, lw=0,
+                color=[to_rgba(MARK_COLOR["GCH"], 0.85 if q_ < 0.05 else 0.22)
+                       for q_ in q[ok]])
     okm = np.isfinite(fm) & (fm > 0)
     for filled in (True, False):
         m_ = okm & ((qm < 0.05) == filled)
         ax_enr.scatter(fm[m_], y[m_], s=9, marker="d", lw=0.5, zorder=3,
                        facecolor="0.15" if filled else "white",
                        edgecolor="0.15")
-    for yy, f_, q_, fm_ in zip(y, f, q, fm):
-        out_ = max(f_, fm_) if f_ >= 1 else min(f_, fm_)
+    # a type none of the bins drawn touches: no bar, a 0
+    for yy in y[np.isfinite(f) & (f <= 0)]:
+        ax_enr.text(1 / 1.08, yy, "0", ha="right", va="center", fontsize=4.2,
+                    color="0.45")
+    for yy, f_, q_, fm_ in zip(y[ok], f[ok], q[ok], fm[ok]):
+        out_ = (np.nanmax([f_, fm_]) if f_ >= 1 else np.nanmin([f_, fm_]))
         ax_enr.text(out_ * 1.12 if f_ >= 1 else out_ / 1.12, yy,
                     "q < 0.001" if q_ < 0.001 else f"q = {q_:.2g}",
                     ha="left" if f_ >= 1 else "right", va="center",
@@ -1160,15 +1230,18 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     from matplotlib.patches import Patch
     ax_enr.legend(handles=[
         Patch(color=to_rgba(MARK_COLOR["GCH"], 0.85),
-              label="over all bins tested"),
-        Line2D([], [], marker="d", ls="", ms=3.2, mew=0.5, color="0.15",
-               label=f"over the {100 * H_MATCH:.0f}% most concordant "
-                     f"(hollow: q ≥ 0.05)")],
+              label="over all bins tested")]
+        + ([Patch(color=to_rgba(MARK_COLOR["GCH"], 0.22), label="q ≥ 0.05")]
+           if (q[ok] >= 0.05).any() else [])
+        + [Line2D([], [], marker="d", ls="", ms=3.2, mew=0.5, color="0.15",
+                  label=f"over the {100 * H_MATCH:.0f}% most concordant "
+                        f"(hollow: q ≥ 0.05)")],
         frameon=False, loc="lower right", fontsize=4.6, ncol=1,
         handletextpad=0.4, handlelength=1.2, borderaxespad=0.1,
         bbox_to_anchor=(1.0, 1.0))
     # room beyond the longest bar for its q
-    lim2 = max(1.0, 1.6 * np.abs(np.log2(np.r_[f, fm[okm]])).max())
+    lv_ = np.abs(np.log2(np.r_[f[ok], fm[okm]]))
+    lim2 = max(1.0, 1.6 * lv_.max()) if lv_.size else 1.0
     ax_enr.axvline(1, color="0.7", lw=0.4, zorder=0)
     ax_enr.set_xscale("log", base=2)
     ax_enr.set_xlim(2.0 ** -lim2, 2.0 ** lim2)
@@ -1201,7 +1274,7 @@ H_EXTRA, H_GAP, H_FOOT = 3.25, 0.75, 0.5
 
 
 def build_figure(d: dict, order, colors, genes=None, h_stat: str = H_STAT,
-                 h_bins: int = H_BINS):
+                 h_bins: int = H_BINS, promoters=None):
     plt = _style()
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
     h = has_h(d, h_stat)
@@ -1271,7 +1344,7 @@ def build_figure(d: dict, order, colors, genes=None, h_stat: str = H_STAT,
                                       width_ratios=[0.42, 1])
         ax_he = fig.add_subplot(gh2[1])
         panel_h(ax_hh, ax_he, d["variability"], d["hotspots"], order, colors,
-                genes, h_stat, h_bins)
+                genes, h_stat, h_bins, promoters)
         # above its colour bar: level with its title
         letters.append(("h", ax_hh, 0.04, "title"))
     fig.canvas.draw()
@@ -1387,6 +1460,14 @@ def parse_args(argv=None):
                          "genes in each variable bin -- a GTF (GENCODE; "
                          "annotation_class_concordance.py fetches vM25 into "
                          "its --cache-dir) or a BED with names in column 4.")
+    ap.add_argument("--chromhmm", default=None, metavar="BED",
+                    help="h: the full-stack chromHMM segmentation the class "
+                         "run read (mm10_100_segments_segments.bed.gz, in "
+                         "its --cache-dir), with --chromhmm-states: the "
+                         "promoter class split into its types.")
+    ap.add_argument("--chromhmm-states", default=None, metavar="TSV",
+                    help="h: that segmentation's state annotation "
+                         "(state_annotation_processed.tsv).")
     ap.add_argument("--h-statistic", default=H_STAT,
                     help="h: the statistic of --classes' "
                          "locus_variability.tsv.gz (default %(default)s: "
@@ -1461,14 +1542,27 @@ def cell_colors(args, groups) -> tuple:
     return order, colors
 
 
-def figure_from_args(args, d=None, genes=None):
+def h_promoters(args):
+    """:func:`promoter_types` from --chromhmm and --chromhmm-states, or
+    None without both."""
+    bed, st = (getattr(args, "chromhmm", None),
+               getattr(args, "chromhmm_states", None))
+    if bool(bed) != bool(st):
+        sys.exit("--chromhmm and --chromhmm-states go together")
+    return promoter_types(bed, st) if bed else None
+
+
+def figure_from_args(args, d=None, genes=None, promoters=None):
     d = read_tables(args) if d is None else d
     order, colors = cell_colors(args, d["percell"]["group"].dropna())
     stat = getattr(args, "h_statistic", H_STAT)
-    if genes is None and getattr(args, "genes", None) and has_h(d, stat):
-        genes = read_genes(args.genes)
+    if has_h(d, stat):
+        if genes is None and getattr(args, "genes", None):
+            genes = read_genes(args.genes)
+        if promoters is None:
+            promoters = h_promoters(args)
     return build_figure(d, order, colors, genes, stat,
-                        getattr(args, "h_bins", H_BINS))
+                        getattr(args, "h_bins", H_BINS), promoters)
 
 
 def main(argv=None) -> int:
@@ -1479,7 +1573,8 @@ def main(argv=None) -> int:
         print(f"h left out: --classes has no {args.h_statistic} in "
               f"locus_variability.tsv.gz")
     genes = read_genes(args.genes) if args.genes and h else None
-    fig = figure_from_args(args, d, genes)  # Agg first (_style)
+    promoters = h_promoters(args) if h else None
+    fig = figure_from_args(args, d, genes, promoters)  # Agg first (_style)
     import matplotlib.pyplot as plt
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
