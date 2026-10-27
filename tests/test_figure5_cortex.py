@@ -562,23 +562,28 @@ def _chromhmm(d: Path):
     return d / "seg.bed.gz", d / "states.tsv"
 
 
-def test_promoter_types_from_the_full_stack_states(tmp_path):
+def test_h_s_chromhmm_rows_from_the_full_stack_states(tmp_path):
     """Matched by mnemonic, not by number: a segment across two bins split
-    between them; a state of no promoter type left out."""
+    between them; the promoter class in its types, the rest in the run's
+    groups."""
     bed, st = _chromhmm(tmp_path)
-    p = f5.promoter_types(bed, st).set_index(["chrom", "start"])
-    assert list(p.columns) == list(f5.PROMOTER_TYPES)
-    assert p.loc[("chr1", 0)].tolist() == pytest.approx([0.2, 0.5, 0, 0])
-    assert p.loc[("chr1", 1_000_000)].tolist() == pytest.approx([0, 0.5, 0, 0])
-    assert p.loc[("chr1", 2_000_000), "promoter: poised"] == pytest.approx(0.1)
-    assert p.loc[("chr1", 3_000_000), "promoter: bivalent"] == pytest.approx(
-        0.3)
-    assert ("chr1", 4_000_000) not in p.index
+    p = f5.chromhmm_types(bed, st).set_index(["chrom", "start"])
+    assert list(p.columns) == [c for c, _, _ in f5.H_CHROMHMM]
+    tss, flank, poised, biv = (c for c, _, _ in f5.H_CHROMHMM[:4])
+    assert p.loc[("chr1", 0), [tss, flank]].tolist() == pytest.approx(
+        [0.2, 0.5])
+    assert p.loc[("chr1", 1_000_000), flank] == pytest.approx(0.5)
+    assert p.loc[("chr1", 2_000_000), poised] == pytest.approx(0.1)
+    assert p.loc[("chr1", 3_000_000), biv] == pytest.approx(0.3)
+    assert p.loc[("chr1", 4_000_000), "chromHMM: enhancer"] == pytest.approx(
+        1.0)
+    assert p.loc[("chr1", 3_000_000), "chromHMM: polycomb"] == 0
 
 
-def test_h_splits_the_promoter_class_into_its_types(tmp_path):
-    """With --chromhmm: the four promoter types in place of 'promoter',
-    drawn whatever their q."""
+def test_h_draws_chromhmm_tss_and_cpg_islands_whatever_their_q(tmp_path):
+    """With --chromhmm: the promoter class in its four types and the other
+    states, then TSS density and CpG islands -- all drawn, whatever their
+    q; the axes no taller than their rows."""
     argv = _tables(tmp_path)
     _variability(tmp_path / "classes")
     bed, st = _chromhmm(tmp_path)
@@ -588,6 +593,10 @@ def test_h_splits_the_promoter_class_into_its_types(tmp_path):
            if a.get_xlabel().startswith("annotation in these")]
     assert len(enr) == 1
     rows = [x.get_text() for x in enr[0].get_yticklabels()]
-    assert set(f5.PROMOTER_TYPES) <= set(rows) and "promoter" not in rows
+    assert rows[:len(f5.H_CHROMHMM)] == [lab for _, lab, _ in f5.H_CHROMHMM]
+    assert {"TSS density", "CpG islands"} <= set(rows)
+    assert "promoter" not in rows
+    assert enr[0].get_position().height * fig.get_figheight() \
+        == pytest.approx(len(rows) * f5.H_ROW_IN)
     with pytest.raises(SystemExit, match="go together"):
         f5.main(argv + ["--chromhmm", str(bed)])
