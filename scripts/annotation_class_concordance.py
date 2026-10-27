@@ -228,7 +228,12 @@ count), and the most stable concordant ones -- with what each set is
 enriched in (locus_variability.tsv.gz, locus_variability_enrichment.tsv,
 locus_variability_<ctx>_<stat>) and as plain BEDs for
 marker_bin_enrichment.py (locus_<set>_<ctx>_<stat>.bed, with
-locus_tested_* as the background).
+locus_tested_* as the background).  ΔC x w is read twice: signed_rel
+gives each contact its class pair's genome-wide w, so with A/B called per
+cell type a bin one type calls A and another B changes sign whatever it
+holds; signed_local reads w at the locus -- each type's co-open share among
+its contacts in the bin against its own over the genome -- so a change of
+sign is the bin's contacts turning from co-open to co-closed.
 
 CELL TYPE FROM CONCORDANCE.  celltype_auc_<statistic> (celltype_auc.tsv,
 celltype_auc_by_type.tsv): per context and both together, how well each
@@ -1624,7 +1629,8 @@ _CONTROL_OF = {"delta": "control", "delta_r": "control_r",
 COV_STATS = ("delta", "delta_r", "signed_rel", "signed_sgn")
 _STAT_LABEL = {"delta": "ΔC", "delta_r": "Δr (ΔC on the correlation scale)",
                "signed_rel": "ΔC × w", "signed_sgn": "ΔC × sign(w)",
-               "signed": "ΔC × (2F − 1)"}
+               "signed": "ΔC × (2F − 1)",
+               "signed_local": "ΔC × w at the locus"}
 
 
 def _center(v, t):
@@ -5916,10 +5922,43 @@ def plot_domains(tab: pd.DataFrame, ctab: pd.DataFrame, context: str,
 # ------------------------------------------- variable and stable loci --
 
 
+def _signed_at_locus(acc_, n, ct, T: int, d, oo, oc) -> tuple:
+    """Each cell type's ΔC x w in each bin, with w read at the locus: the
+    type's co-open share F among its contacts in the bin (co-open / (co-open
+    + co-closed) mass, a contact's two ends together) against its share F_g
+    over all its contacts (:func:`_weight`) -- + where the type's contacts
+    there are more co-open than its genome's, - more co-closed.  signed_rel
+    gives each contact its class pair's genome-wide w instead, so a bin that
+    one type calls A and another B reads co-open in one and co-closed in the
+    other whatever the bin holds; this reads the bin.  ``acc_`` sums a
+    per-contact array into bins x types (``n``, the contacts).  The standard
+    error is the delta method's, w's own sampling included: ΔC and F come
+    from the same contacts.  Returns (value, standard error), bins x
+    types."""
+    S = {k: acc_(v) for k, v in (
+        ("d", d), ("dd", d * d), ("o", oo), ("c", oc), ("oo", oo * oo),
+        ("cc", oc * oc), ("oc", oo * oc), ("od", oo * d), ("cd", oc * d))}
+    so = np.bincount(ct, weights=oo, minlength=T)
+    sc = np.bincount(ct, weights=oc, minlength=T)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        D, O, C = S["d"] / n, S["o"] / n, S["c"] / n
+        F, Fg = O / (O + C), (so / (so + sc))[None, :]
+        w = _weight(F, Fg)
+        # a contact's influence on w D: w (d - D) + a (C oo - O oc), with
+        # a = D (dw/dF) / (O + C)^2, dw/dF = 2 Fg (1 - Fg) / (F + Fg - 2 F Fg)^2
+        a = (D * 2 * Fg * (1 - Fg) / (F + Fg - 2 * F * Fg) ** 2
+             / (O + C) ** 2)
+        var = (w ** 2 * (S["dd"] - n * D ** 2)
+               + a ** 2 * (C ** 2 * S["oo"] - 2 * C * O * S["oc"]
+                           + O ** 2 * S["cc"])
+               + 2 * w * a * (C * S["od"] - O * S["cd"])) / n ** 2
+    return w * D, np.sqrt(np.maximum(var, 0))
+
+
 def locus_variability(grid, g_lo, g_hi, ctype_contact, parts: dict,
                       type_names, min_contacts: int = 100, min_types: int = 3,
                       fraction: float = 0.1, fdr: float = 0.05,
-                      min_z: float = 3.0) -> pd.DataFrame:
+                      min_z: float = 3.0, local: dict = None) -> pd.DataFrame:
     """Which loci are concordant in one cell type and not another, and which
     the same in every one?
 
@@ -5931,6 +5970,11 @@ def locus_variability(grid, g_lo, g_hi, ctype_contact, parts: dict,
     sampling -- DerSimonian-Laird tau^2 from Cochran's Q -- with a
     heterogeneity q against a null fitted to the controls' Q
     (:func:`_empirical_q`).  Bins with ``min_types`` types are tested.
+    ``local`` ({name: (each contact's part of ΔC, the control's, its
+    co-open and co-closed mass, reshuffled draw 2's)}) adds ΔC x w with w
+    read at the locus (:func:`_signed_at_locus`; its control, the control's
+    parts and draw 2's mass), pooled as the types' values weighted by their
+    contacts.
 
       variable  heterogeneous (q < ``fdr``), the ``fraction`` of tested bins
                 with the largest between-type SD
@@ -5949,22 +5993,41 @@ def locus_variability(grid, g_lo, g_hi, ctype_contact, parts: dict,
     i_lo, i_hi = grid.index_g(g_lo), grid.index_g(g_hi)
     sel_lo, sel_hi = i_lo >= 0, (i_hi >= 0) & (i_hi != i_lo)
     ct = np.asarray(ctype_contact, np.int64)
-    out = []
+
+    def acc_(w=None):
+        o = np.zeros(grid.n * T)
+        for idx, sel in ((i_lo, sel_lo), (i_hi, sel_hi)):
+            o += np.bincount(idx[sel] * T + ct[sel],
+                             weights=None if w is None else w[sel],
+                             minlength=grid.n * T)
+        return o.reshape(grid.n, T)
+    n = acc_()
+    N = n.sum(1)
+    # per statistic: each type's value and standard error, the control's,
+    # and the pooled value with its standard error
+    stats = {}
     for stat, (v, vc) in parts.items():
         v, vc = np.asarray(v, float), np.asarray(vc, float)
-
-        def acc_(w=None):
-            o = np.zeros(grid.n * T)
-            for idx, sel in ((i_lo, sel_lo), (i_hi, sel_hi)):
-                o += np.bincount(idx[sel] * T + ct[sel],
-                                 weights=None if w is None else w[sel],
-                                 minlength=grid.n * T)
-            return o.reshape(grid.n, T)
-        n, s1, s2, c1, c2 = acc_(), acc_(v), acc_(v * v), acc_(vc), acc_(vc * vc)
+        s1, s2, c1, c2 = acc_(v), acc_(v * v), acc_(vc), acc_(vc * vc)
         with np.errstate(invalid="ignore", divide="ignore"):
             x, xc = s1 / n, c1 / n
-            se = np.sqrt(np.maximum(s2 / n - x ** 2, 0) / n)
-            sec = np.sqrt(np.maximum(c2 / n - xc ** 2, 0) / n)
+            pooled = s1.sum(1) / N
+            stats[stat] = (
+                x, np.sqrt(np.maximum(s2 / n - x ** 2, 0) / n),
+                xc, np.sqrt(np.maximum(c2 / n - xc ** 2, 0) / n), pooled,
+                np.sqrt(np.maximum(s2.sum(1) / N - pooled ** 2, 0) / N))
+    for stat, arrs in (local or {}).items():
+        d, c, oo, oc, oon, ocn = (np.asarray(a_, float) for a_ in arrs)
+        x, se = _signed_at_locus(acc_, n, ct, T, d, oo, oc)
+        xc, sec = _signed_at_locus(acc_, n, ct, T, c, oon, ocn)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            has = n > 0
+            stats[stat] = (
+                x, se, xc, sec, (n * np.where(has, x, 0)).sum(1) / N,
+                np.sqrt((n ** 2 * np.where(has, se, 0) ** 2).sum(1)) / N)
+    out = []
+    for stat, (x, se, xc, sec, pooled, pse) in stats.items():
+        with np.errstate(invalid="ignore", divide="ignore"):
             ok = (n >= min_contacts) & (se > 0) & (sec > 0)
             k = ok.sum(1)
             test = k >= min_types
@@ -5981,9 +6044,6 @@ def locus_variability(grid, g_lo, g_hi, ctype_contact, parts: dict,
                 return Q, df, tau2, (Q - df) / np.sqrt(2 * df)
             Q, df, tau2, zq = het(x, se)
             _, _, _, zq0 = het(xc, sec)
-            N = n.sum(1)
-            pooled = s1.sum(1) / N
-            pse = np.sqrt(np.maximum(s2.sum(1) / N - pooled ** 2, 0) / N)
             zp = pooled / pse
         b = np.flatnonzero(test)
         if b.size == 0:
@@ -6023,8 +6083,9 @@ def locus_variability(grid, g_lo, g_hi, ctype_contact, parts: dict,
             "Q": Q[b], "df": df[b], "het_q": hq, "set": label,
             "between_type_sd_scaled": taus, "het_q_scaled": hqs,
             "set_scaled": label_s})
-        for j, nm in enumerate(type_names):
-            df_[f"type:{nm}"] = np.where(ok[b, j], x[b, j], np.nan)
+        df_ = pd.concat([df_, pd.DataFrame(
+            {f"type:{nm}": np.where(ok[b, j], x[b, j], np.nan)
+             for j, nm in enumerate(type_names)})], axis=1)
         out.append(df_)
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
@@ -8563,8 +8624,12 @@ def main(argv=None) -> int:
                     for k, v in sgn_parts.items()}
             if best_hot is not None and best_hot[1] == name and \
                     best_arrays is not None:
-                best_arrays = best_arrays[:7] + (sgn_parts["sd"],
-                                                 sgn_parts["sc"])
+                # and each contact's co-open and co-closed mass, real and
+                # draw 2's, for w read at the locus
+                best_arrays = best_arrays[:7] + (
+                    sgn_parts["sd"], sgn_parts["sc"],
+                    *(w[k_].astype(np.float32)
+                      for k_ in ("oo", "oc", "no2", "nc2")))
             if cpairs_ctx:
                 for r_ in group_contrast(
                         acc, sd, tot, S_sg, cgroups, classes, band_labels,
@@ -8883,7 +8948,10 @@ def main(argv=None) -> int:
                  "signed_rel": (best_arrays[7], best_arrays[8])},
                 tnames, args.variability_min_contacts,
                 min(3, len(tnames)), args.variability_fraction,
-                args.hotspot_fdr)
+                args.hotspot_fdr,
+                local=({"signed_local": (best_arrays[2], best_arrays[5],
+                                         *best_arrays[9:13])}
+                       if len(best_arrays) >= 13 else None))
             if not lv.empty:
                 if tracks is None:
                     tracks = hotspot_tracks(grid, systems, ab_maps, genes,

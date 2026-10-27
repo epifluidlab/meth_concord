@@ -2207,12 +2207,14 @@ def test_variable_and_stable_loci_across_cell_types():
 def test_the_variability_outputs_are_written(planted):
     _, _, o = planted
     lv = pd.read_csv(o / "locus_variability.tsv.gz", sep="\t")
-    assert {"delta", "signed_rel"} <= set(lv["statistic"])
+    assert {"delta", "signed_rel", "signed_local"} <= set(lv["statistic"])
     assert {"between_type_sd", "het_q", "set", "type:T0"} <= set(lv.columns)
     for nm in ("variable", "variable_beyond_type_level", "stable",
                "tested"):
         assert (o / f"locus_{nm}_GCH_delta.bed").exists()
+        assert (o / f"locus_{nm}_GCH_signed_local.bed").exists()
     assert (o / "locus_variability_GCH_signed_rel.png").exists()
+    assert (o / "locus_variability_GCH_signed_local.png").exists()
     assert (o / "locus_variability_enrichment.tsv").exists()
 
 
@@ -2243,6 +2245,73 @@ def test_variability_beyond_each_types_overall_level():
     assert not plain & {7, 17, 27, 37}               # the scale's bins
     assert all(x % 2 == 0 for x in plain)
     assert scaled == {7, 17, 27, 37}
+
+
+def test_w_read_at_the_locus_follows_the_bins_own_contacts():
+    """ΔC alike in every bin and type.  In bins 6 and 16 type 0's contacts
+    are open at both ends and type 1's closed, in 26 and 36 the reverse;
+    type 2 is open in 6 and 26.  Each type has two open bins, so its
+    genome-wide share is the others'.  ΔC does not vary between the types;
+    ΔC x w read at the locus does, in those four bins, with each type's
+    sign its contacts' state there."""
+    rng = np.random.default_rng(17)
+    code = acc._chrom_code("chr1")
+    grid = acc.BinGrid([code], 50_000_000, 1_000_000)
+    n = 300_000
+    lo = rng.integers(0, 40_000_000, n)
+    hi = lo + rng.integers(1_000, 20_000, n)
+    ty = rng.integers(0, 3, n)
+    b = lo // 1_000_000
+    open_ = {0: [6, 16], 1: [26, 36], 2: [6, 26]}
+    lev = np.full(n, 0.25)
+    for t, bins in open_.items():
+        shifted = np.isin(b, [6, 16, 26, 36]) & (ty == t)
+        lev[shifted] = np.where(np.isin(b[shifted], bins), 0.7, 0.05)
+    a, p = (np.clip(lev + rng.normal(0, 0.1, n), 0, 1) for _ in range(2))
+    oo, oc = a * p, (1 - a) * (1 - p)
+    d = 0.3 + rng.normal(0, 1, n)
+    c = rng.normal(0, 1, n)
+    g0 = code * acc.STRIDE
+    lv = acc.locus_variability(
+        grid, g0 + lo, g0 + hi, ty, {"delta": (d, c)}, ["T0", "T1", "T2"],
+        min_contacts=100, fraction=0.1,
+        local={"signed_local": (d, c, oo, oc, oo, oc)})
+    by = {s: g.set_index(g["start"] // 1_000_000)
+          for s, g in lv.groupby("statistic")}
+    want = {6, 16, 26, 36}
+    assert not want & set(by["delta"].index[by["delta"]["set"] == "variable"])
+    loc = by["signed_local"]
+    assert set(loc.index[loc["set"] == "variable"]) == want
+    for t, bins in open_.items():
+        x = loc.loc[sorted(want), f"type:T{t}"]
+        assert (np.sign(x) == np.where(np.isin(sorted(want), bins), 1, -1)
+                ).all()
+
+
+def test_w_read_at_the_locus_has_the_error_its_spread_says():
+    """200 types alike: in the one bin, their values of ΔC x w read at the
+    locus spread as their standard errors say (Cochran's Q ~ its df) --
+    w's own sampling included, ΔC correlated with the co-open mass."""
+    rng = np.random.default_rng(18)
+    code = acc._chrom_code("chr1")
+    grid = acc.BinGrid([code], 5_000_000, 1_000_000)
+    T, n0, n1 = 200, 400, 10_000
+    ty = np.repeat(np.arange(T), n0 + n1)
+    at = np.tile(np.r_[np.zeros(n0, int), np.ones(n1, int)], T)
+    lo = at * 1_000_000 + rng.integers(0, 900_000, at.size)
+    hi = lo + rng.integers(1_000, 20_000, at.size)
+    a = np.where(at == 0, rng.beta(2, 5, at.size), rng.beta(1.5, 6, at.size))
+    p = np.where(at == 0, rng.beta(2, 5, at.size), rng.beta(1.5, 6, at.size))
+    oo, oc = a * p, (1 - a) * (1 - p)
+    d = 0.3 + 4 * (oo - oo.mean()) + rng.normal(0, 1, at.size)
+    c = rng.normal(0, 1, at.size)
+    g0 = code * acc.STRIDE
+    lv = acc.locus_variability(
+        grid, g0 + lo, g0 + hi, ty, {}, [f"T{i}" for i in range(T)],
+        min_contacts=100, local={"signed_local": (d, c, oo, oc, oo, oc)})
+    r = lv.set_index(lv["start"] // 1_000_000).loc[0]
+    assert r["pooled"] > 0.02                       # w and ΔC both away from 0
+    assert 0.8 < r["Q"] / r["df"] < 1.25
 
 
 def test_posteriors_that_are_not_there_say_why(tmp_path):
