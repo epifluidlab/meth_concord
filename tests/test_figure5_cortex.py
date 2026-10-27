@@ -491,7 +491,7 @@ def test_h_draws_the_variable_bins_and_writes_their_table(tmp_path):
 
 def test_without_its_statistic_the_figure_is_as_before(tmp_path):
     argv = _tables(tmp_path)
-    _variability(tmp_path / "classes", stat="signed_rel")
+    _variability(tmp_path / "classes", stat="signed_sgn")
     fig = f5.figure_from_args(f5.parse_args(argv))
     assert fig.get_figheight() == pytest.approx(10.9)
     assert [t.get_text() for t in fig.texts] == list("abcdefg")

@@ -31,14 +31,16 @@ near-copies, as a figure of their own.
      them over all tested bins, with p against genome rotations
      (locus_hotspots.tsv.gz)
   h  GCH's 1-Mb bins where ΔC x w differs between the cell types beyond
-     sampling (locus_variability.tsv.gz, --h-statistic: by default w read
-     at the locus, so a change of sign is the bin's contacts turning from
-     co-open in one type to co-closed in another), each type's value in
-     blocks by the type each bin is most co-open in, with their genes
-     (--genes); and the annotations enriched in them at q < 0.05 against
-     genome rotations, those only, each beside the same over the most
-     concordant bins (most of the variable bins are among them).  Drawn
-     when the class run has the statistic.
+     sampling, q < 0.05 (locus_variability.tsv.gz, --h-statistic: by
+     default signed_rel, each contact's w that of its class pair, A/B
+     called per cell type -- a bin one type calls A and another B reads
+     co-open in one and co-closed in the other; signed_local reads w at
+     the locus): each type's value in the most variable of them, as the
+     run's own locus_variability_GCH_<statistic> panel b, in blocks by the
+     type each bin is most co-open in, with their genes (--genes); and the
+     annotations enriched in them at q < 0.05 against genome rotations,
+     those only, each beside the same over the most concordant bins.
+     Drawn when the class run has the statistic.
 
 The cells' own values only, nothing imputed: the imputed matrices' cell-type
 signal is reproduced by links with no coordination (design §6b.6).
@@ -136,11 +138,11 @@ ALL_BAND = "all 1kb-10Mb"
 #: narrower than it hide behind it.
 DOT_FRACTION = 0.05
 HOT_C, COLD_C = "#c0392b", "#2166ac"
-#: Panel h: its statistic -- ΔC x w with w read at the locus, a cell type's
-#: co-open share among its contacts in the bin against its own over the
-#: genome -- and how many of the variable bins it draws.
-H_STAT = "signed_local"
-H_BINS = 50
+#: Panel h: its statistic -- ΔC x w, each contact's w its class pair's
+#: (signed_rel; signed_local reads w at the locus) -- and how many of the
+#: variable bins it draws, as the run's own panel b.
+H_STAT = "signed_rel"
+H_BINS = 60
 #: h's second comparison: the variable bins against the bins this share of
 #: the genome's most concordant (by g's ΔC), where most of them lie -- a
 #: change of direction is seen most where there is most concordance.
@@ -964,16 +966,18 @@ def gene_label(names, k: int = 3) -> str:
 
 
 def variable_bins(lv: pd.DataFrame, stat: str = H_STAT,
-                  context: str = "GCH") -> tuple:
+                  context: str = "GCH", fdr: float = 0.05) -> tuple:
     """The bins ``lv`` (locus_variability.tsv.gz) tested across cell types
-    for ``stat`` in ``context``, in genome order, and the run's variable
-    ones among them, the largest between-type SD first."""
+    for ``stat`` in ``context``, in genome order, and the variable ones
+    among them -- heterogeneity q < ``fdr`` (the run's 'variable' set is
+    the tenth of tested bins of largest SD among them) -- the largest
+    between-type SD first."""
     a = lv[(lv["context"] == context) & (lv["statistic"] == stat)].copy()
     if a.empty:
         return a, a
     a["x"] = _genome_x(a)[0]
     a = a.sort_values("x", kind="stable")
-    return a, a[a["set"] == "variable"].sort_values(
+    return a, a[a["het_q"] < fdr].sort_values(
         "between_type_sd", ascending=False, kind="stable")
 
 
@@ -1033,7 +1037,7 @@ def variable_enrichment(t: pd.DataFrame, tracks) -> pd.DataFrame:
 
 def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
             colors, genes=None, stat: str = H_STAT, n_bins: int = H_BINS):
-    """``ax_heat``: GCH's variable bins -- the run's variable set, the
+    """``ax_heat``: GCH's variable bins (:func:`variable_bins`), the
     ``n_bins`` of largest between-type SD where there are more -- and each
     cell type's ΔC x w there (+ co-open, - co-closed; grey, too few of the
     type's contacts), in blocks by the type each is most co-open in
@@ -1119,7 +1123,7 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     t = a.merge(hh[["chrom", "start", "delta"] + tracks],
                 on=["chrom", "start"], suffixes=("", "_g"))
     t = t.sort_values("x", kind="stable")
-    t["variable"] = t["set"] == "variable"
+    t["variable"] = t["het_q"] < 0.05
     rows, _ = g_rows(tracks)
     res = variable_enrichment(t, [tr for tr, _ in rows]).set_index("track")
     top_ = t[t["delta"] >= t["delta"].quantile(1 - H_MATCH)]
@@ -1188,7 +1192,7 @@ def has_h(d: dict, stat: str = H_STAT) -> bool:
     lv = d.get("variability")
     return lv is not None and bool(
         ((lv["context"] == "GCH") & (lv["statistic"] == stat)
-         & (lv["set"] == "variable")).any())
+         & (lv["het_q"] < 0.05)).any())
 
 
 #: h's row below g, in inches: what it adds to the figure's height, the gap
@@ -1388,8 +1392,9 @@ def parse_args(argv=None):
     ap.add_argument("--h-statistic", default=H_STAT,
                     help="h: the statistic of --classes' "
                          "locus_variability.tsv.gz (default %(default)s: "
-                         "ΔC x w, w read at the locus).  Without it h is "
-                         "left out.")
+                         "ΔC x w, as the run's own panel b; signed_local "
+                         "reads w at the locus).  Without it h is left "
+                         "out.")
     ap.add_argument("--h-bins", type=int, default=H_BINS,
                     help="h: how many of the variable bins to draw "
                          "(default %(default)s).")
