@@ -8,6 +8,7 @@ rotations, and stop, naming them, without its tables."""
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import numpy as np
@@ -568,8 +569,12 @@ def test_h_s_chromhmm_rows_from_the_full_stack_states(tmp_path):
     groups."""
     bed, st = _chromhmm(tmp_path)
     p = f5.chromhmm_types(bed, st).set_index(["chrom", "start"])
-    assert list(p.columns) == [c for c, _, _ in f5.H_CHROMHMM]
+    assert list(p.columns) == [f5.H_PROMOTER] + [c for c, _, _ in
+                                                  f5.H_CHROMHMM]
     tss, flank, poised, biv = (c for c, _, _ in f5.H_CHROMHMM[:4])
+    # promoter: its four types together
+    np.testing.assert_allclose(p[f5.H_PROMOTER], p[[tss, flank, poised,
+                                                     biv]].sum(1))
     assert p.loc[("chr1", 0), [tss, flank]].tolist() == pytest.approx(
         [0.2, 0.5])
     assert p.loc[("chr1", 1_000_000), flank] == pytest.approx(0.5)
@@ -581,9 +586,9 @@ def test_h_s_chromhmm_rows_from_the_full_stack_states(tmp_path):
 
 
 def test_h_draws_chromhmm_tss_and_cpg_islands_whatever_their_q(tmp_path):
-    """With --chromhmm: the promoter class in its four types and the other
+    """With --chromhmm: promoter, its four types beneath it, the other
     states, then TSS density and CpG islands -- all drawn, whatever their
-    q; the axes no taller than their rows."""
+    q, each with its q; the axes no taller than their rows."""
     argv = _tables(tmp_path)
     _variability(tmp_path / "classes")
     bed, st = _chromhmm(tmp_path)
@@ -592,10 +597,14 @@ def test_h_draws_chromhmm_tss_and_cpg_islands_whatever_their_q(tmp_path):
     enr = [a for a in fig.axes
            if a.get_xlabel().startswith("annotation in these")]
     assert len(enr) == 1
-    rows = [x.get_text() for x in enr[0].get_yticklabels()]
-    assert rows[:len(f5.H_CHROMHMM)] == [lab for _, lab, _ in f5.H_CHROMHMM]
-    assert {"TSS density", "CpG islands"} <= set(rows)
-    assert "promoter" not in rows
+    rows = [x.get_text() for x in enr[0].texts if x.get_gid() == "h-row"]
+    assert rows == [lab for _, lab, _ in f5.H_CHROMHMM_ROWS] + [
+        "TSS density", "CpG islands"]
+    # a q for every bar
+    qs = [x.get_text() for x in enr[0].texts if x.get_gid() != "h-row"
+          and x.get_text() != "0"]
+    assert qs and all(re.match(r"q (=|<) [0-9.]+$", x) for x in qs)
+    assert len(qs) == len(enr[0].patches)
     assert enr[0].get_position().height * fig.get_figheight() \
         == pytest.approx(len(rows) * f5.H_ROW_IN)
     with pytest.raises(SystemExit, match="go together"):

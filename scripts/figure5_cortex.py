@@ -1005,33 +1005,41 @@ def variable_bins_table(lv: pd.DataFrame, genes=None, stat: str = H_STAT,
 
 #: h's chromHMM rows, from the full-stack segmentation, in order: (column,
 #: label, the state groups they gather).  The groups are
-#: annotation_class_concordance.py's (CHROMHMM_GROUPS), with the promoter
-#: class split into its types -- TSS, flanking, and the Prom states whose
+#: annotation_class_concordance.py's (CHROMHMM_GROUPS), but promoter is
+#: drawn with its types beneath it -- TSS, flanking, the Prom states whose
 #: description calls them poised (in mm10 mPromF7, poised promoters and
-#: proximal enhancers, mostly in brain) -- and the bivalent promoters apart,
-#: not in polycomb as in Figure 5's run.
+#: proximal enhancers, mostly in brain) and bivalent, which therefore is
+#: not in polycomb, as it is in Figure 5's run.  'promoter' is the four
+#: together.
 H_CHROMHMM = (
-    ("chromHMM: promoter TSS", "promoter (TSS)", ("TSS",)),
-    ("chromHMM: promoter flanking", "promoter (flanking)", ("Prom",)),
-    ("chromHMM: promoter poised", "promoter (poised)", ()),
-    ("chromHMM: promoter bivalent", "promoter (bivalent)", ("BivProm",)),
+    ("chromHMM: promoter TSS", "TSS", ("TSS",)),
+    ("chromHMM: promoter flanking", "flanking", ("Prom",)),
+    ("chromHMM: promoter poised", "poised", ()),
+    ("chromHMM: promoter bivalent", "bivalent", ("BivProm",)),
     ("chromHMM: enhancer", "enhancer", ("enhancers", "WkEnh", "TxEnh",
                                         "OpenC")),
     ("chromHMM: transcribed", "transcribed", ("Tx", "TxEx", "TxWk")),
     ("chromHMM: polycomb", "polycomb", ("ReprPC", "ReprPC and openC")),
     ("chromHMM: heterochromatin", "heterochromatin", ("HET", "ZNF")),
     ("chromHMM: quiescent", "quiescent", ("quiescent",)))
+H_PROMOTER = "chromHMM: promoter"
+#: h's chromHMM rows as drawn: promoter, its types indented beneath it, then
+#: the other states -- (column, label, indented).
+H_CHROMHMM_ROWS = ((H_PROMOTER, "promoter", False),
+                   *((c, lab, True) for c, lab, _ in H_CHROMHMM[:4]),
+                   *((c, lab, False) for c, lab, _ in H_CHROMHMM[4:]))
 #: h's rows besides chromHMM's, drawn whatever their q; any other annotation
 #: the run tested is drawn where q < 0.05.
 H_ALWAYS = (TSS_TRACK, "CpG islands")
 #: h's right side: inches per row.
-H_ROW_IN = 0.1
+H_ROW_IN = 0.14
 
 
 def chromhmm_types(bed, states_tsv, bin_bp: int = 1_000_000) -> pd.DataFrame:
     """Per ``bin_bp`` bin (chrom, start), the share of it in each of
-    H_CHROMHMM's rows, from a full-stack chromHMM segmentation and its state
-    annotation (the files annotation_class_concordance.py reads).  A state
+    H_CHROMHMM's rows and in promoter, its four types together, from a
+    full-stack chromHMM segmentation and its state annotation (the files
+    annotation_class_concordance.py reads).  A state
     is matched by its mnemonic -- '15_mHET9' is mHET9 -- never by its
     number: the segmentation numbers the states differently from the
     annotation."""
@@ -1059,8 +1067,9 @@ def chromhmm_types(bed, states_tsv, bin_bp: int = 1_000_000) -> pd.DataFrame:
                          "type": seg["type"].to_numpy()[rep], "bp": bp})
            .groupby(["chrom", "start", "type"])["bp"].sum()
            .unstack("type", fill_value=0) / bin_bp)
-    return cov.reindex(columns=[c for c, _, _ in H_CHROMHMM], fill_value=0.0
-                       ).reset_index()
+    cov = cov.reindex(columns=[c for c, _, _ in H_CHROMHMM], fill_value=0.0)
+    cov.insert(0, H_PROMOTER, cov[[c for c, _, _ in H_CHROMHMM[:4]]].sum(1))
+    return cov.reset_index()
 
 
 def most_open(H) -> np.ndarray:
@@ -1181,7 +1190,7 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     # what the bins drawn are, against every bin tested across types, as g
     # tests its hot bins: chromHMM's states, TSS density and CpG islands
     # whatever their q, any other annotation where q < 0.05
-    from matplotlib.patches import Patch
+    from matplotlib.transforms import blended_transform_factory
     tracks = tested_tracks(hot)
     hh = hot[(hot["band"] == ALL_BAND) & (hot["context"] == "GCH")]
     t = a.merge(hh[["chrom", "start", "delta"] + tracks],
@@ -1191,10 +1200,12 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
         t = t.drop(columns=[c for c in t.columns
                             if c.startswith("chromHMM: ")]).merge(
             chromhmm, on=["chrom", "start"], how="left")
-        chm = [(c, lab) for c, lab, _ in H_CHROMHMM]
+        chm = [(c, lab) for c, lab, _ in H_CHROMHMM_ROWS]
         t[[c for c, _ in chm]] = t[[c for c, _ in chm]].fillna(0.0)
     else:
         chm = [(tr, lab) for tr, lab in rows if tr.startswith("chromHMM: ")]
+    sub = {c for c, _, ind in H_CHROMHMM_ROWS if ind} if chromhmm is not None \
+        else set()
     t = t.sort_values("x", kind="stable")
     drawn = set(zip(top["chrom"], top["start"]))
     t["variable"] = [k in drawn for k in zip(t["chrom"], t["start"])]
@@ -1206,7 +1217,7 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     shown = [(tr, lab) for tr, lab in rows
              if tr in always or res.loc[tr, "q"] < 0.05]
     ax_enr.set_xlabel(f"annotation in these {nr} bins, fold over all bins "
-                      f"tested\n(* q < 0.05, genome rotations)")
+                      f"tested\n(q: genome rotations, BH)")
     if not shown:
         ax_enr.text(0.5, 0.5, f"no annotation enriched in\nthese {nr} bins "
                               "(q < 0.05)", transform=ax_enr.transAxes,
@@ -1215,23 +1226,28 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
         ax_enr.set_yticks([])
         return
     f = np.array([res.loc[tr, "fold"] for tr, _ in shown], float)
-    sig = np.array([res.loc[tr, "q"] < 0.05 for tr, _ in shown])
+    q = np.array([res.loc[tr, "q"] for tr, _ in shown], float)
+    sig = q < 0.05
     y = np.arange(len(shown))[::-1].astype(float)
     ok = np.isfinite(f) & (f > 0)
-    ax_enr.barh(y[ok], f[ok] - 1, left=1, height=0.6, lw=0,
+    # a type beneath its class: a thinner bar
+    ind = np.array([tr in sub for tr, _ in shown])
+    ax_enr.barh(y[ok], f[ok] - 1, left=1, lw=0,
+                height=np.where(ind[ok], 0.45, 0.62),
                 color=[to_rgba(MARK_COLOR["GCH"], 0.85 if s_ else 0.22)
                        for s_ in sig[ok]])
     # a row none of the bins drawn touches: no bar, a 0
     for yy in y[np.isfinite(f) & (f <= 0)]:
         ax_enr.text(1 / 1.08, yy, "0", ha="right", va="center", fontsize=4.2,
                     color="0.45")
-    for yy, f_, s_ in zip(y[ok], f[ok], sig[ok]):
-        if s_:
-            # an asterisk rides high in its line: set down to the bar
-            ax_enr.text(f_ * 1.06 if f_ >= 1 else f_ / 1.06, yy - 0.24, "*",
-                        ha="left" if f_ >= 1 else "right", va="center",
-                        fontsize=6.5, color=MARK_COLOR["GCH"])
-    lim2 = max(1.0, 1.15 * np.abs(np.log2(f[ok])).max()) if ok.any() else 1.0
+    # each row's q at its bar's end, darker where q < 0.05
+    for yy, f_, q_ in zip(y[ok], f[ok], q[ok]):
+        ax_enr.text(f_ * 1.06 if f_ >= 1 else f_ / 1.06, yy,
+                    "q < 0.001" if q_ < 0.001 else f"q = {q_:.2g}",
+                    ha="left" if f_ >= 1 else "right", va="center",
+                    fontsize=4.4, color="0.15" if q_ < 0.05 else "0.55")
+    # room for the q beyond the longest bar
+    lim2 = max(1.0, 1.9 * np.abs(np.log2(f[ok])).max()) if ok.any() else 1.0
     ax_enr.axvline(1, color="0.7", lw=0.4, zorder=0)
     ax_enr.set_xscale("log", base=2)
     ax_enr.set_xlim(2.0 ** -lim2, 2.0 ** lim2)
@@ -1239,8 +1255,15 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
     ax_enr.set_xticks(ticks)
     ax_enr.set_xticklabels([f"{t_:g}×" for t_ in ticks])
     ax_enr.xaxis.set_minor_locator(NullLocator())
+    # the rows' names, left-aligned so a class's types sit indented beneath
+    # it
     ax_enr.set_yticks(y)
-    ax_enr.set_yticklabels([lab for _, lab in shown], fontsize=5)
+    ax_enr.set_yticklabels([])
+    tr_ = blended_transform_factory(ax_enr.transAxes, ax_enr.transData)
+    for yy, (tr, lab), i_ in zip(y, shown, ind):
+        ax_enr.text(-0.38 + (0.05 if i_ else 0.0), yy, lab, transform=tr_,
+                    ha="left", va="center", fontsize=4.6 if i_ else 5,
+                    color="0.3" if i_ else "black", gid="h-row")
     # chromHMM's states, then the rest, as g's groups
     nchm = sum(tr in dict(chm) for tr, _ in shown)
     if 0 < nchm < len(shown):
@@ -1248,12 +1271,6 @@ def panel_h(ax_heat, ax_enr, lv: pd.DataFrame, hot: pd.DataFrame, order,
                        zorder=0)
     ax_enr.set_ylim(-0.6, len(shown) - 0.4)
     ax_enr.tick_params(axis="y", length=0)
-    if not sig.all():
-        ax_enr.legend(handles=[Patch(color=to_rgba(MARK_COLOR["GCH"], 0.22),
-                                     label="q ≥ 0.05")],
-                      frameon=False, loc="lower right", fontsize=4.6,
-                      handlelength=1.2, handletextpad=0.3, borderaxespad=0.1,
-                      bbox_to_anchor=(1.0, 1.0))
     # as tall as its rows, from the top of h
     fig = ax_enr.figure
     p_ = ax_enr.get_position()
@@ -1275,7 +1292,7 @@ def has_h(d: dict, stat: str = H_STAT) -> bool:
 #: g's labels need above it, and the margin for its cell types beneath --
 #: its axes take the rest.  A quarter inch, exact in binary, at the usual
 #: resolutions a whole number of pixels.
-H_EXTRA, H_GAP, H_FOOT = 3.25, 0.75, 0.5
+H_EXTRA, H_GAP, H_FOOT = 3.0, 0.65, 0.45
 
 
 def build_figure(d: dict, order, colors, genes=None, h_stat: str = H_STAT,
@@ -1343,7 +1360,7 @@ def build_figure(d: dict, order, colors, genes=None, h_stat: str = H_STAT,
                       top=(extra + 0.04 * 10.9 - H_GAP) / H,
                       bottom=H_FOOT / H)
         gh1 = GridSpecFromSubplotSpec(1, 3, gh[0, 0:7], wspace=0.0,
-                                      width_ratios=[0.1, 0.42, 0.85])
+                                      width_ratios=[0.08, 0.56, 0.76])
         ax_hh = fig.add_subplot(gh1[1])
         gh2 = GridSpecFromSubplotSpec(1, 2, gh[0, 7:12], wspace=0.0,
                                       width_ratios=[0.42, 1])
