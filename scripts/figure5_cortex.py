@@ -371,6 +371,17 @@ def panel_b(ax, regions: pd.DataFrame, summ: pd.Series):
               handlelength=1.6, borderaxespad=0.1)
 
 
+def cell_share(frac: float) -> str:
+    """A share of cells to one decimal, so 1,574 of 1,577 prints 99.8%, not
+    the 100% a whole percent would round it to.  All of them is an exact
+    100%, printed without the decimal, which also leaves d's labels room
+    between the types; short of all, never 100.0%."""
+    if frac == 1:
+        return "100%"
+    s = f"{100 * frac:.1f}"
+    return ("99.9" if s == "100.0" else s) + "%"
+
+
 def panel_c(axes, percell: pd.DataFrame):
     for ax, (_, mark, label) in zip(axes, MARKS):
         d = percell[(percell["mark"] == mark)
@@ -389,12 +400,12 @@ def panel_c(axes, percell: pd.DataFrame):
         ax.axvline(0, color="0.25", lw=0.5, ls="--")
         # two short lines, one long one runs into d; spaced in points, as
         # the p's exponent rises into the line above
-        ax.annotate(f"{100 * obs['frac']:.0f}% of {obs['n']:,} cells Δ > 0",
+        ax.annotate(f"{cell_share(obs['frac'])} of {obs['n']:,} cells Δ > 0",
                     xy=(0, 1), xycoords="axes fraction", xytext=(0, 10.5),
                     textcoords="offset points", ha="left", va="bottom",
                     color=col, fontsize=5.4, fontweight="bold")
         ax.annotate(f"{fmt_p(obs['p'])}; control (grey) "
-                    f"{100 * ctl['frac']:.0f}%",
+                    f"{cell_share(ctl['frac'])}",
                     xy=(0, 1), xycoords="axes fraction", xytext=(0, 1.5),
                     textcoords="offset points", ha="left", va="bottom",
                     color="0.4", fontsize=5)
@@ -441,7 +452,7 @@ def panel_d(axes, percell: pd.DataFrame, order, colors):
             v = data[i]
             ax.scatter(i + rng.uniform(-0.2, 0.2, v.size), v, s=0.8,
                        color=c, alpha=0.4, lw=0, zorder=1, rasterized=True)
-            ax.text(i, 1.0, f"{100 * (v > 0).mean():.0f}%",
+            ax.text(i, 1.0, cell_share((v > 0).mean()),
                     transform=ax.get_xaxis_transform(), ha="center",
                     va="bottom", fontsize=4.8, color="0.3")
         ax.set_xlim(-0.6, len(present) + 0.45)

@@ -375,6 +375,36 @@ def test_panel_d_says_whether_the_cell_types_differ(tmp_path):
     assert np.isnan(f5.types_p([np.array([0.1, 0.2])]))
 
 
+def test_the_shares_of_cells_print_one_decimal():
+    """c's and d's shares of cells with Δ > 0 to one decimal, so a few
+    cells below zero do not round up to 100% (1,574 of 1,577 is 99.8%);
+    100% only when it is all of them."""
+    import matplotlib.pyplot as plt
+    rows = []
+    for g, n in (("IT-L2/3", 202), ("IT-L4", 180), ("IT-L5/6", 246),
+                 ("ASC", 949)):
+        rows += [(f"{g}{i}", g, "GCH",
+                  -0.01 if i == 0 and g != "ASC" else 0.05,
+                  0.01 if i % 2 else -0.01) for i in range(n)]
+    rows += [(f"h{i}", "ASC", "HCG", 0.02 if i < 524 else -0.02,
+              0.01 if i % 2 else -0.01) for i in range(719)]
+    pc = pd.DataFrame(rows, columns=["cell_id", "group", "mark", "delta",
+                                     "delta_null"])
+    f5._style()
+    fig, axes = plt.subplots(2, 2)
+    f5.panel_c(axes[:, 0], pc)
+    f5.panel_d(axes[:, 1], pc, list(f5.CELL_TYPES), f5.CELL_TYPES)
+    texts = [[t.get_text() for t in ax.texts] for ax in axes.ravel()]
+    plt.close(fig)
+    assert "99.8% of 1,577 cells Δ > 0" in texts[0]
+    assert "72.9% of 719 cells Δ > 0" in texts[2]
+    assert any(t.endswith("control (grey) 50.0%") for t in texts[0])
+    shares = [t for t in texts[1] if t.endswith("%") and "control" not in t]
+    assert shares == ["99.5%", "99.4%", "99.6%", "100%"]
+    # all of them is an exact 100%; short of all, never 100.0%
+    assert f5.cell_share(1.0) == "100%" and f5.cell_share(2499 / 2500) == "99.9%"
+
+
 def test_the_supplementary_figure_takes_e_and_f_from_their_own_run(tmp_path):
     argv = _tables(tmp_path)
     cs = tmp_path / "classes_kept"
