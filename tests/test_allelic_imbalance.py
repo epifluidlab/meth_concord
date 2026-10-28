@@ -173,14 +173,60 @@ def make_data(out: Path, n_cells=6, reads_per_hap=4, seed=0, parts=None):
 def test_allele_calls_know_the_conversion_strand():
     # C->T read: T fits both C (unmethylated) and T
     assert ai.call_allele("T", "C", "T", "CT") == -1
-    assert ai.call_allele("C", "C", "T", "CT") == 0
-    # G->A read: A fits both G and A
+    # and a C is no call there either: only a methylated C stays C, so it
+    # would take the C allele's reads by their methylation, and the T
+    # allele's never
+    assert ai.call_allele("C", "C", "T", "CT") == -1
+    # the G->A read sees a C/T SNP as it is
+    assert ai.call_allele("C", "C", "T", "GA") == 0
+    assert ai.call_allele("T", "C", "T", "GA") == 1
+    # G->A read: A fits both G and A, and a G/A SNP is read on C->T reads
     assert ai.call_allele("A", "A", "G", "GA") == -1
-    assert ai.call_allele("G", "A", "G", "GA") == 1
+    assert ai.call_allele("G", "A", "G", "GA") == -1
+    assert ai.call_allele("G", "A", "G", "CT") == 1
+    assert ai.call_allele("A", "A", "G", "CT") == 0
+    # a transversion on either strand: a converted C is still the C allele
+    assert ai.call_allele("T", "A", "C", "CT") == 1
+    assert ai.call_allele("C", "A", "C", "CT") == 1
+    assert ai.call_allele("A", "A", "C", "CT") == 0
     assert ai.call_allele("T", "A", "T", "CT") == 1
     assert ai.call_allele("T", "A", "T", "GA") == 1
     assert ai.call_allele("A", "A", "T", "unknown") == -1
     assert ai.call_allele("G", "A", "T", "CT") == -1
+
+
+def test_a_c_t_snp_is_read_on_the_strand_that_does_not_convert_it(tmp_path):
+    """One C/T SNP under C->T reads -- six show C (methylated), two T --
+    and G->A reads, three C and four T: only the G->A reads are called, so
+    the C allele is not chosen by its methylation."""
+    rng = np.random.default_rng(3)
+    pos, s = 200, 150
+    ref = list("".join(rng.choice(list("ACGT"), 400)))
+    ref[pos] = "C"
+    ref = "".join(ref)
+    header = {"HD": {"VN": "1.6", "SO": "coordinate"},
+              "SQ": [{"SN": "chr1", "LN": len(ref)}]}
+    reads = ([("CT", "C")] * 6 + [("CT", "T")] * 2 + [("GA", "C")] * 3
+             + [("GA", "T")] * 4)
+    bam = tmp_path / "c.bam"
+    with pysam.AlignmentFile(str(bam), "wb", header=header) as fh:
+        for k, (strand, base) in enumerate(reads):
+            conv, to = ("C", "T") if strand == "CT" else ("G", "A")
+            q = [to if b == conv else b for b in ref[s:s + READ]]
+            q[pos - s] = base
+            seg = pysam.AlignedSegment()
+            seg.query_name, seg.query_sequence, seg.flag = f"r{k}", "".join(q), 0
+            seg.reference_id, seg.reference_start = 0, s
+            seg.mapping_quality, seg.cigarstring = 60, f"{READ}M"
+            seg.query_qualities = pysam.qualitystring_to_array("I" * READ)
+            seg.set_tag("MD", _md(seg.query_sequence, ref[s:s + READ]))
+            fh.write(seg)
+    pysam.index(str(bam))
+    snps = {"chr1": (np.array([pos]), np.array(["C"]), np.array(["T"]),
+                     np.array([0]))}
+    keys, vals, _, _ = ai.cell_alleles(bam, snps, {}, [], 0, 0, 0, False)
+    got = {int(k) & 1: int(v[0]) for k, v in zip(keys, vals)}
+    assert got == {0: 3, 1: 4}
 
 
 def test_vcf_keeps_heterozygous_snvs_and_their_phase(tmp_path):

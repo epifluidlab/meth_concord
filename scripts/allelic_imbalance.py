@@ -4,7 +4,10 @@
 Every read that covers a heterozygous SNP is given the SNP's allele --
 bisulfite-aware: on a C->T read a T may be a T or an unmethylated C, on a
 G->A read an A may be an A or an unmethylated G, so a base that fits both
-alleles calls neither -- and its HCG / GCH sites are counted as the pipeline
+alleles calls neither, and a C/T SNP is read only on G->A reads, a G/A SNP
+only on C->T reads: on its own converted strand a C stays C only when
+methylated or protected, and its calls would pick the C allele's reads by
+their methylation -- and its HCG / GCH sites are counted as the pipeline
 counts them (nome_hic_concordance.bam_parser: the conversion strand from the
 read's mismatches, the sites of that strand only) -- but not the sites
 within SNP_FLANK bp of any SNP: at a site a C/T SNP reads as methylation,
@@ -122,12 +125,20 @@ CLONAL_SHARE = 0.75
 
 
 def call_allele(base: str, ref: str, alt: str, strand: str) -> int:
-    """0 for the ref allele, 1 for alt, -1 when the base fits both or
-    neither under the read's conversion strand."""
+    """0 for the ref allele, 1 for alt, -1 when the read cannot tell them
+    apart under its conversion strand: the base fits both or neither, or
+    the two alleles can show the same base on that strand -- a C/T SNP on a
+    C->T read, a G/A SNP on a G->A read.  There a C (G) stays itself only
+    when methylated or protected, so calling it would pick that allele's
+    reads by their methylation: the C allele would gain the converted
+    strand's methylated and accessible reads, the T allele none of its."""
     s = _SHOWS.get(strand)
     if s is None:
         return -1
-    r, a = base in s.get(ref, ref), base in s.get(alt, alt)
+    rs, as_ = s.get(ref, ref), s.get(alt, alt)
+    if set(rs) & set(as_):
+        return -1
+    r, a = base in rs, base in as_
     if r and not a:
         return 0
     if a and not r:
