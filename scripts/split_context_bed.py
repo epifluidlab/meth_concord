@@ -10,15 +10,16 @@ accessibility signal".  This writes a GCH BED's sites as two BEDs, GCA and
 GCY, bgzipped and tabix-indexed for nome_hic_concordance --context-bed,
 every line as it was.
 
-The C is at start + --c-offset (as the pipeline's --context-bed-offset),
-its strand from column 6 (BED6) or column 4 (+/-, C/G), else plus; the base
-after it on its own strand from --fasta -- plus: the next base; minus: the
-previous one, complemented.  A site whose own base is not the C (plus) or
-G (minus), or not after a G on its strand -- a wrong offset -- is counted
-and left out.
+The C is at start + --c-offset (as the pipeline's --context-bed-offset: 0
+for the seqkit BEDs of reproduce/download_public_data.sh, which start at
+the C), its strand from column 6 (BED6) or column 4 (+/-, C/G), else plus;
+the base after it on its own strand from --reference, a .2bit or an
+indexed FASTA -- plus: the next base; minus: the previous one,
+complemented.  A site whose own base is not the C (plus) or G (minus), or
+not after a G on its strand -- a wrong offset -- is counted and left out.
 
     python scripts/split_context_bed.py \\
-        --bed GCH_motif_seqkit.mm10.bed.gz --fasta mm10.fa --c-offset 1 \\
+        --bed GCH_motif_seqkit.mm10.bed.gz --reference mm10.2bit \\
         --out-prefix GCH_motif_seqkit.mm10
 """
 
@@ -67,12 +68,36 @@ def _strand(df: pd.DataFrame) -> np.ndarray:
     return np.zeros(len(df), bool)
 
 
-def split_bed(bed, fasta, c_offset: int, out_prefix, chunk: int = 2_000_000):
+class _TwoBit:
+    """A .2bit genome through the two calls split_bed makes of
+    pysam.FastaFile."""
+
+    def __init__(self, path):
+        import py2bit
+        self._tb = py2bit.open(str(path))
+        self.references = list(self._tb.chroms())
+
+    def fetch(self, chrom: str) -> str:
+        return self._tb.sequence(chrom)
+
+
+def _genome(path):
+    """The genome at ``path``: a .2bit, else an indexed FASTA."""
+    if str(path).endswith(".2bit"):
+        return _TwoBit(path)
+    import pysam
+    return pysam.FastaFile(str(path))
+
+
+def split_bed(bed, reference, c_offset: int, out_prefix,
+              chunk: int = 2_000_000):
     """Write ``out_prefix``_GCA.bed.gz and _GCY.bed.gz (tabix-indexed);
     returns the counts per class, '' those left out."""
     import pysam
-    fa = pysam.FastaFile(str(fasta))
+    fa = _genome(reference)
     outs = {k: Path(f"{out_prefix}_{k}.bed") for k in ("GCA", "GCY")}
+    for p in outs.values():
+        p.parent.mkdir(parents=True, exist_ok=True)
     fh = {k: open(p, "w") for k, p in outs.items()}
     counts = {"GCA": 0, "GCY": 0, "": 0}
     cache = {}
@@ -109,17 +134,20 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--bed", required=True, help="The GCH sites' BED.")
-    ap.add_argument("--fasta", required=True,
-                    help="The genome (indexed FASTA) the BED is on.")
-    ap.add_argument("--c-offset", type=int, default=1,
+    ap.add_argument("--reference", "--fasta", dest="reference",
+                    required=True,
+                    help="The genome the BED is on: a .2bit, or an indexed "
+                         "FASTA.")
+    ap.add_argument("--c-offset", type=int, default=0,
                     help="The C's offset from the BED start, as the "
-                         "pipeline's --context-bed-offset (seqkit locate: "
-                         "1).")
+                         "pipeline's --context-bed-offset (default 0: the "
+                         "seqkit BEDs of download_public_data.sh start at "
+                         "the C).")
     ap.add_argument("--out-prefix", required=True)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    n = split_bed(args.bed, args.fasta, args.c_offset, args.out_prefix)
+    n = split_bed(args.bed, args.reference, args.c_offset, args.out_prefix)
     tot = sum(n.values())
     logger.info(f"{tot:,} sites: GCA {n['GCA']:,} ({n['GCA'] / max(tot, 1):.1%}),"
                 f" GCY {n['GCY']:,} ({n['GCY'] / max(tot, 1):.1%}); left out "

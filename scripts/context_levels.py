@@ -18,8 +18,7 @@ chromosomes hold ample sites for one cell's level.
     python scripts/context_levels.py --samples samples.tsv \\
         --group-column cell_type \\
         --context-bed GCA:GCH_motif.mm10_GCA.bed.gz,GCY:GCH_motif.mm10_GCY.bed.gz,HCG:HCG_motif.mm10.bed.gz \\
-        --context-bed-offset 1 --chroms chr1,chr2 --n-threads 10 \\
-        --output-dir output/context_levels
+        --chroms chr1,chr2 --n-threads 10 --output-dir output/context_levels
 """
 
 from __future__ import annotations

@@ -87,6 +87,40 @@ def test_split_by_the_base_after_the_c(tmp_path):
     assert n0[""] > 0.9 * sum(n0.values())
 
 
+def _two_bit(seq: str, path: Path, name: str = "chr1"):
+    """``seq`` as a one-sequence .2bit: no N or masked blocks; T, C, A, G
+    two bits each, the first base highest."""
+    import struct
+    code = {"T": 0, "C": 1, "A": 2, "G": 3}
+    packed = bytearray()
+    for i in range(0, len(seq), 4):
+        b = 0
+        for ch in seq[i:i + 4].ljust(4, "T"):
+            b = (b << 2) | code[ch]
+        packed.append(b)
+    index = struct.pack("<B", len(name)) + name.encode()
+    offset = 16 + len(index) + 4
+    path.write_bytes(struct.pack("<IIII", 0x1A412743, 0, 1, 0) + index
+                     + struct.pack("<I", offset)
+                     + struct.pack("<IIII", len(seq), 0, 0, 0)
+                     + bytes(packed))
+
+
+def test_the_genome_can_be_a_2bit(tmp_path):
+    """--reference mm10.2bit splits as the FASTA does, into a folder made
+    for the BEDs."""
+    pytest.importorskip("py2bit")
+    seq, truth = make_genome(tmp_path)
+    _two_bit(seq, tmp_path / "g.2bit")
+    out = tmp_path / "new" / "GCH"
+    assert scb.main(["--bed", str(tmp_path / "GCH.bed.gz"), "--reference",
+                     str(tmp_path / "g.2bit"), "--c-offset", "1",
+                     "--out-prefix", str(out)]) == 0
+    t = pd.read_csv(f"{out}_GCY.bed.gz", sep="\t", header=None)
+    assert {(s + 1, st) for s, st in zip(t[1], t[3])} == \
+        {site for site, k in truth.items() if k == "GCY"}
+
+
 def _reads(seq, sites, meth, rng, n_reads=1500):
     """C->T reads: a plus-strand GCH C kept with its class's probability,
     every other C converted."""
