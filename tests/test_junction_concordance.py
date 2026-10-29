@@ -488,5 +488,11 @@ def test_the_command_reads_bams_and_writes_the_tables(tmp_path):
     assert (summ["junction_both"] == 1).all()
     tab = pd.read_csv(out / "junction_concordance.tsv", sep="\t")
     assert set(tab["set"]) == set(jc.SETS)
-    # a second run reads no BAM again
+    # a resumed run reads only the cell it lacks, and its summary still
+    # lists every cell
+    (out / "pairs" / "c1.parquet").unlink()
+    (out / "extract_cells.tsv").unlink()
     assert jc.main(argv + ["--steps", "extract"]) == 0
+    again = pd.read_csv(out / "extract_cells.tsv", sep="\t")
+    assert sorted(again["cell"]) == ["c0", "c1", "c2"]
+    assert (again["cis"] == 150).all()

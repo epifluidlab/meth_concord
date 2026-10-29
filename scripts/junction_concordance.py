@@ -336,12 +336,27 @@ def _extract_one(job):
     tmp = out.with_suffix(".tmp.parquet")
     t.to_parquet(tmp, index=False)
     tmp.replace(out)
+    return cell
+
+
+def cell_summary(cell: str, t: pd.DataFrame) -> dict:
+    """A cell's read pairs of each kind, and the share of its contacts with
+    a junction found at both ends."""
     kinds = t["kind"].value_counts()
     lig = t["kind"] != "molecule"
     return {"cell": cell, **{k: int(kinds.get(k, 0)) for k in
                              ("cis", "trans", "molecule")},
             "junction_both": float(((t["j1"] >= 0) & (t["j2"] >= 0))[lig]
                                    .mean()) if lig.any() else np.nan}
+
+
+def extract_summary(cells, pairs_dir: Path) -> pd.DataFrame:
+    """cell_summary of every cell with a pairs table, whichever run wrote
+    it."""
+    rows = [cell_summary(c, pd.read_parquet(pairs_dir / f"{c}.parquet",
+                                            columns=["kind", "j1", "j2"]))
+            for c in cells if (pairs_dir / f"{c}.parquet").exists()]
+    return pd.DataFrame(rows)
 
 
 def load_genome(args, excl_chrom):
@@ -374,7 +389,7 @@ def load_genome(args, excl_chrom):
     return sites, gatc, allowed
 
 
-def run_extract(cells, bams, args, excl_chrom) -> pd.DataFrame:
+def run_extract(cells, bams, args, excl_chrom) -> None:
     out_dir = Path(args.output_dir) / "pairs"
     out_dir.mkdir(parents=True, exist_ok=True)
     jobs = [(c, b, out_dir / f"{c}.parquet") for c, b in zip(cells, bams)
@@ -385,16 +400,13 @@ def run_extract(cells, bams, args, excl_chrom) -> pd.DataFrame:
     logger.info(f"extract: {len(jobs)} of {len(cells)} cells to read "
                 f"({len(cells) - len(jobs)} done before)")
     if not jobs:
-        return pd.DataFrame()
+        return
     sites, gatc, allowed = load_genome(args, excl_chrom)
     _X.update(sites=sites, gatc=gatc, allowed=allowed, args=args)
-    rows = []
-    for i, r in enumerate(_map(_extract_one, jobs, args.n_threads), 1):
-        rows.append(r)
+    for i, _cell in enumerate(_map(_extract_one, jobs, args.n_threads), 1):
         if i % 50 == 0 or i == len(jobs):
             logger.info(f"  extract: {i}/{len(jobs)} cells")
     _X.clear()                  # the genome, before analyze's workers fork
-    return pd.DataFrame(rows)
 
 
 def _map(fn, jobs, n_threads):
@@ -928,15 +940,13 @@ def main(argv=None) -> int:
     if "extract" in steps:
         if not args.context_bed or not args.reference:
             sys.exit("extract needs --context-bed and --reference")
-        summ = run_extract(cells, samples[args.bam_column].tolist(), args,
-                           excl_chrom)
+        run_extract(cells, samples[args.bam_column].tolist(), args,
+                    excl_chrom)
+        # every cell's, so a resumed run's table covers the earlier runs too
+        summ = extract_summary(cells, out / "pairs")
         if len(summ):
-            p = out / "extract_cells.tsv"
-            if p.exists() and not args.overwrite:
-                old = pd.read_csv(p, sep="\t")
-                summ = pd.concat([old[~old["cell"].isin(summ["cell"])],
-                                  summ])
-            summ.to_csv(p, sep="\t", index=False, float_format="%.4g")
+            summ.to_csv(out / "extract_cells.tsv", sep="\t", index=False,
+                        float_format="%.4g")
             n = summ[["cis", "trans", "molecule"]].sum().to_dict()
             logger.info(f"extract: {n} read pairs over {len(summ)} cells")
     if "analyze" in steps:
