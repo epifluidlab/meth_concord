@@ -59,18 +59,78 @@ F5_TOP, F5_BOTTOM = 0.03, 0.04
 FOOT = 0.4
 
 
-def layout() -> tuple:
-    """Fig. 5's rows of a to d, as tall as there and as far apart: the
-    page's height, and GridSpec's hspace, top and bottom for the two."""
+def ad_inches() -> tuple:
+    """Fig. 5's rows of a to d in inches: the room above them for the
+    letters and titles, the two rows with the space between them, and
+    GridSpec's hspace for that space."""
     rows = np.asarray(F5_ROWS)
     n = rows.size
     # GridSpec's own arithmetic: an average row, the space between rows
     cell = (1 - F5_TOP - F5_BOTTOM) * F5_H / (n + F5_HSPACE * (n - 1))
     ad = cell * n * rows[:2] / rows.sum()
     gap = F5_HSPACE * cell
-    body = F5_TOP * F5_H + ad.sum() + gap
+    return F5_TOP * F5_H, ad.sum() + gap, gap / ad.mean()
+
+
+def layout() -> tuple:
+    """Fig. 5's rows of a to d, as tall as there and as far apart: the
+    page's height, and GridSpec's hspace, top and bottom for the two."""
+    above, span, hspace = ad_inches()
+    body = above + span
     H = float(np.ceil((body + FOOT) * 4) / 4)
-    return H, gap / ad.mean(), 1 - F5_TOP * F5_H / H, (H - body) / H
+    return H, hspace, 1 - above / H, (H - body) / H
+
+
+def ad_grid(fig, top: float, bottom: float, hspace: float):
+    """Fig. 5's grid for a to d, its two rows between ``top`` and
+    ``bottom`` (shares of the page)."""
+    from matplotlib.gridspec import GridSpec
+    return GridSpec(2, 12, figure=fig, hspace=hspace, wspace=1.6,
+                    height_ratios=list(F5_ROWS[:2]), left=0.075, right=0.975,
+                    top=top, bottom=bottom)
+
+
+def draw_ad(fig, gs, d: dict, order, colors, schematics: bool = True) -> list:
+    """Fig. 5a-d in :func:`ad_grid`'s ``gs``, by figure5_cortex.py's own
+    functions: a across the first row, b, c and d along the second.  With
+    ``schematics`` false, a's reshuffle schematics are left out.  The axes
+    each letter goes on, and how far left of them it sits (a share of the
+    page's width): [(letter, axes, dx)], a to d."""
+    from matplotlib.gridspec import GridSpecFromSubplotSpec
+    # as in Fig. 5: a across the page, then b, c and d
+    ga = GridSpecFromSubplotSpec(2, 3, gs[0, :], hspace=0.1, wspace=0.26,
+                                 height_ratios=[1.5, 1])
+    ax_ar = [fig.add_subplot(ga[0, j]) for j in range(3)]
+    ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j]) for j in range(3)]
+    f5.panel_a(ax_ar, ax_ad, d["dist"])
+    if not schematics:
+        for ax in ax_ar:
+            for inset in list(ax.child_axes):
+                inset.remove()
+    gb = GridSpecFromSubplotSpec(1, 2, gs[1, 0:4], width_ratios=[0.12, 1],
+                                 wspace=0.0)
+    ax_b = fig.add_subplot(gb[1])
+    f5.panel_b(ax_b, d["regions"], d["regions_summary"])
+    gc = GridSpecFromSubplotSpec(2, 2, gs[1, 4:7], hspace=0.95, wspace=0.0,
+                                 width_ratios=[0.15, 1])
+    ax_c = [fig.add_subplot(gc[i, 1]) for i in range(2)]
+    f5.panel_c(ax_c, d["percell"])
+    gd = GridSpecFromSubplotSpec(2, 1, gs[1, 7:12], hspace=0.22)
+    ax_d = [fig.add_subplot(gd[0])]
+    ax_d.append(fig.add_subplot(gd[1], sharex=ax_d[0]))
+    f5.panel_d(ax_d, d["percell"], order, colors)
+    return [("a", ax_ar[0], 0.06), ("b", ax_b, 0.06), ("c", ax_c[0], 0.035),
+            ("d", ax_d[0], 0.06)]
+
+
+def put_letters(fig, letters, H: float):
+    """``letters`` (:func:`draw_ad`'s) as Fig. 5's, a tenth of an inch and
+    a bit above their axes, on a page ``H`` inches tall."""
+    fig.canvas.draw()
+    for lab, ax, dx in letters:
+        bb = ax.get_position()
+        fig.text(bb.x0 - dx, bb.y1 + 0.01 * F5_H / H, lab, fontsize=8,
+                 fontweight="bold", va="bottom", ha="left")
 
 
 def read_tables(args) -> dict:
@@ -101,37 +161,10 @@ def relabel(fig, name: str):
 
 def build_figure(d: dict, order, colors, label: str = "GCY"):
     plt = f5._style()
-    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
     H, hspace, top, bottom = layout()
     fig = plt.figure(figsize=(7.2, H))
-    gs = GridSpec(2, 12, figure=fig, hspace=hspace, wspace=1.6,
-                  height_ratios=list(F5_ROWS[:2]), left=0.075, right=0.975,
-                  top=top, bottom=bottom)
-    # as in Fig. 5: a across the page, then b, c and d
-    ga = GridSpecFromSubplotSpec(2, 3, gs[0, :], hspace=0.1, wspace=0.26,
-                                 height_ratios=[1.5, 1])
-    ax_ar = [fig.add_subplot(ga[0, j]) for j in range(3)]
-    ax_ad = [fig.add_subplot(ga[1, j], sharex=ax_ar[j]) for j in range(3)]
-    f5.panel_a(ax_ar, ax_ad, d["dist"])
-    gb = GridSpecFromSubplotSpec(1, 2, gs[1, 0:4], width_ratios=[0.12, 1],
-                                 wspace=0.0)
-    ax_b = fig.add_subplot(gb[1])
-    f5.panel_b(ax_b, d["regions"], d["regions_summary"])
-    gc = GridSpecFromSubplotSpec(2, 2, gs[1, 4:7], hspace=0.95, wspace=0.0,
-                                 width_ratios=[0.15, 1])
-    ax_c = [fig.add_subplot(gc[i, 1]) for i in range(2)]
-    f5.panel_c(ax_c, d["percell"])
-    gd = GridSpecFromSubplotSpec(2, 1, gs[1, 7:12], hspace=0.22)
-    ax_d = [fig.add_subplot(gd[0])]
-    ax_d.append(fig.add_subplot(gd[1], sharex=ax_d[0]))
-    f5.panel_d(ax_d, d["percell"], order, colors)
-    fig.canvas.draw()
-    # the letters as Fig. 5's, a tenth of an inch and a bit above the axes
-    for lab, ax, dx in (("a", ax_ar[0], 0.06), ("b", ax_b, 0.06),
-                        ("c", ax_c[0], 0.035), ("d", ax_d[0], 0.06)):
-        bb = ax.get_position()
-        fig.text(bb.x0 - dx, bb.y1 + 0.01 * F5_H / H, lab, fontsize=8,
-                 fontweight="bold", va="bottom", ha="left")
+    gs = ad_grid(fig, top, bottom, hspace)
+    put_letters(fig, draw_ad(fig, gs, d, order, colors), H)
     return relabel(fig, label)
 
 
