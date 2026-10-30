@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """Supplementary figure: Fig. 5a-d in human cells -- the GM12878 and IMR-90
-lines, and a meningioma's tumour cells and monocytes -- so that the long-
+lines, and a meningioma's tumour cells and macrophages -- so that the long-
 range concordance of the mouse cortex can be seen in other cells too.
 
-Each dataset is its own pipeline run (its own end posteriors and mixture
-fit), put through end_posterior_distance_correlation.py as the cortex was
+Each dataset's end posteriors, its cells as its samples sheet lists them,
+are put through end_posterior_distance_correlation.py as the cortex's were
 for Fig. 5 (reproduce/figure5_cortex.ipynb, Step 3): once with the null
 keeping the contacts' near-copies (--distance-ab: a and b), once refusing
 them (--null-exclude 1000; --distance: c and d), on the autosomes, the
-blacklist left out:
+blacklist left out; each run into its own folder:
 
     python scripts/end_posterior_distance_correlation.py \\
         --posteriors GCH=pipeline/context_GCH/04_posteriors \\
         --posteriors HCG=pipeline/context_HCG/04_posteriors \\
         --samples SHEET --group-column group \\
         --null-scope cell --null-type link-shuffle [--null-exclude 1000] \\
-        --exclude-chrom chrM,chrX,chrY --exclude-bed hg38-blacklist.v2.bed \\
+        --exclude-chrom chrM,chrX,chrY \\
+        --exclude-bed GRCh38_unified_blacklist.ENCFF356LFX.bed \\
         --min-sites-gch 1 --min-sites-hcg 1 --delta-arm matched \\
         --cell-center on --seed 42 --plot-format pdf --output-dir RUN
 
@@ -32,12 +33,12 @@ functions, as large and where it is in Fig. 5:
 
     python scripts/figure_s_human.py \\
         --dataset "GM12878 and IMR-90" \\
-        --distance lines/end_posterior_dist.null_link_shuffled_match_per_cell.cell_center.excl1kb \\
-        --distance-ab lines/end_posterior_dist.null_link_shuffled_match_per_cell.cell_center \\
+        --distance output/fig5ad_lines.near_copies_refused \\
+        --distance-ab output/fig5ad_lines.near_copies_kept \\
         --dataset "Meningioma" \\
-        --distance meningioma/end_posterior_dist.null_link_shuffled_match_per_cell.cell_center.excl1kb \\
-        --distance-ab meningioma/end_posterior_dist.null_link_shuffled_match_per_cell.cell_center \\
-        --samples meningioma_292_cells.samples.with_batches.tsv \\
+        --distance output/fig5ad_meningioma.near_copies_refused \\
+        --distance-ab output/fig5ad_meningioma.near_copies_kept \\
+        --samples all_human.samples.fixed_imr90_color.tsv \\
         --output FigureS_human.pdf
 
 --dataset, --distance and --distance-ab go once per dataset, in order; the
@@ -73,8 +74,9 @@ f5 = sg.f5
 #: colours where no --samples table gives one.
 TYPES = {"GM12878": "#7b4fa0", "IMR90": "#d9822b", "tumor1": "#b2443a",
          "tumor2": "#e0a33e", "monocyte": "#2a9d8f"}
-#: How d names them.
-NAMES = {"IMR90": "IMR-90", "tumor1": "tumor 1", "tumor2": "tumor 2"}
+#: How d names them; the sheets' monocytes are the meningioma's macrophages.
+NAMES = {"IMR90": "IMR-90", "tumor1": "tumor 1", "tumor2": "tumor 2",
+         "monocyte": "macrophage"}
 #: Above each block, room in inches for its name over a's letter and
 #: titles.
 HEAD = 0.18

@@ -98,11 +98,12 @@ def test_d_names_and_colours_the_lines_and_the_meningioma_s_types(tmp_path):
               for t in fig.axes[(k + 1) * n - 1].get_xticklabels()}
              for k in range(2)]
     assert list(ticks[0]) == ["GM12878", "IMR-90"]
-    assert list(ticks[1]) == ["tumor 1", "tumor 2", "monocyte"]
+    # the sheets' monocytes named as the macrophages they are
+    assert list(ticks[1]) == ["tumor 1", "tumor 2", "macrophage"]
     assert ticks[0] == {"GM12878": sh.TYPES["GM12878"],
                         "IMR-90": sh.TYPES["IMR90"]}
     assert ticks[1] == {"tumor 1": "#123456", "tumor 2": sh.TYPES["tumor2"],
-                        "monocyte": "#654321"}
+                        "macrophage": "#654321"}
 
 
 def test_unpaired_runs_and_missing_tables_named(tmp_path):
